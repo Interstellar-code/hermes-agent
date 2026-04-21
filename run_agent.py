@@ -1041,7 +1041,7 @@ class AIAgent:
                 for quiet_logger in [
                     'tools',               # all tools.* (terminal, browser, web, file, etc.)
                     'run_agent',            # agent runner internals
-                    'trajectory_compressor',
+                    'scripts.trajectory_compressor',
                     'cron',                 # scheduler (only relevant in daemon mode)
                     'hermes_cli',           # CLI helpers
                 ]:

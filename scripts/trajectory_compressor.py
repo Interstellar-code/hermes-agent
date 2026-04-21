@@ -30,8 +30,12 @@ Usage:
     python trajectory_compressor.py --input=data/my_run --sample_percent=10
 """
 
-import json
 import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import json
 import time
 import yaml
 import logging
@@ -52,7 +56,7 @@ from agent.retry_utils import jittered_backoff
 from hermes_cli.env_loader import load_hermes_dotenv
 
 _hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / ".env"
+_project_env = Path(__file__).parent.parent / ".env"
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
 

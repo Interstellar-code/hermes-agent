@@ -19,9 +19,12 @@ Environment Variables:
     OPENROUTER_API_KEY: API key for OpenRouter (required for agent)
 """
 
-import asyncio
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import asyncio
 from pathlib import Path
 
 import fire
@@ -32,7 +35,7 @@ from hermes_constants import get_hermes_home, OPENROUTER_BASE_URL
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 _hermes_home = get_hermes_home()
-_project_env = Path(__file__).parent / '.env'
+_project_env = Path(__file__).parent.parent / '.env'
 
 from hermes_cli.env_loader import load_hermes_dotenv
 

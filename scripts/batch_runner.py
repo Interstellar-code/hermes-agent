@@ -20,9 +20,13 @@ Usage:
     python batch_runner.py --dataset_file=data.jsonl --batch_size=10 --run_name=my_run --distribution=image_gen
 """
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
