@@ -107,37 +107,12 @@ def _codex_curated_models() -> list[str]:
 
 
 _PROVIDER_MODELS: dict[str, list[str]] = {
-    "nous": [
-        "moonshotai/kimi-k2.6",
-        "xiaomi/mimo-v2.5-pro",
-        "xiaomi/mimo-v2.5",
-        "anthropic/claude-opus-4.7",
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-sonnet-4.6",
-        "anthropic/claude-sonnet-4.5",
-        "anthropic/claude-haiku-4.5",
-        "openai/gpt-5.4",
-        "openai/gpt-5.4-mini",
-        "openai/gpt-5.3-codex",
-        "google/gemini-3-pro-preview",
-        "google/gemini-3-flash-preview",
-        "google/gemini-3.1-pro-preview",
-        "google/gemini-3.1-flash-lite-preview",
-        "qwen/qwen3.5-plus-02-15",
-        "qwen/qwen3.5-35b-a3b",
-        "stepfun/step-3.5-flash",
-        "minimax/minimax-m2.7",
-        "minimax/minimax-m2.5",
-        "minimax/minimax-m2.5:free",
-        "z-ai/glm-5.1",
-        "z-ai/glm-5v-turbo",
-        "z-ai/glm-5-turbo",
-        "x-ai/grok-4.20-beta",
-        "nvidia/nemotron-3-super-120b-a12b",
-        "arcee-ai/trinity-large-thinking",
-        "openai/gpt-5.4-pro",
-        "openai/gpt-5.4-nano",
-    ],
+    # The "nous" catalog is NOT hardcoded. It is fetched live from the Portal's
+    # /api/nous/recommended-models endpoint via get_nous_recommended_catalog()
+    # and resolved through _nous_catalog() wherever callers look up a nous
+    # catalog. This keeps the Hermes model picker in sync with the Portal's
+    # curated list (paid vs free) without requiring a Hermes release every
+    # time the Portal adds/removes a model.
     "openai-codex": _codex_curated_models(),
     "copilot-acp": [
         "copilot-acp",
@@ -673,6 +648,81 @@ def get_nous_recommended_aux_model(
     return None
 
 
+def get_nous_recommended_catalog(
+    *,
+    free_tier: Optional[bool] = None,
+    portal_base_url: str = "",
+    force_refresh: bool = False,
+) -> list[str]:
+    """Return the Portal's recommended model catalog for the user's tier.
+
+    Picks ``freeRecommendedModels`` or ``paidRecommendedModels`` from the
+    Portal payload depending on the tier and returns the list of
+    ``modelName`` strings **in the order specified by the server**
+    (the endpoint already orders each array by ``position``).
+
+    When ``free_tier`` is ``None`` (default) the user's tier is auto-detected
+    via :func:`check_nous_free_tier`. Pass an explicit bool to bypass the
+    detection — useful for tests or when the caller already knows the tier.
+
+    Reuses :func:`fetch_nous_recommended_models` so repeated callers share
+    the 10-minute process-wide cache — no extra network per lookup.
+
+    Returns ``[]`` on any failure (network, parse, empty payload). Callers
+    should fall back to their own default catalog.
+    """
+    base = portal_base_url or _resolve_nous_portal_url()
+    payload = fetch_nous_recommended_models(base, force_refresh=force_refresh)
+    if not payload:
+        return []
+
+    if free_tier is None:
+        try:
+            free_tier = check_nous_free_tier()
+        except Exception:
+            # On any detection error, assume paid — matches get_nous_recommended_aux_model.
+            free_tier = False
+
+    key = "freeRecommendedModels" if free_tier else "paidRecommendedModels"
+    entries = payload.get(key)
+    if not isinstance(entries, list):
+        return []
+
+    # Preserve server-specified ordering; skip malformed / blank entries.
+    # De-dup case-insensitively while preserving original casing of the
+    # first occurrence — defensive against any future duplicates in the
+    # feed.
+    seen_lower: set[str] = set()
+    result: list[str] = []
+    for entry in entries:
+        name = _extract_model_name(entry)
+        if not name:
+            continue
+        key_lower = name.lower()
+        if key_lower in seen_lower:
+            continue
+        seen_lower.add(key_lower)
+        result.append(name)
+    return result
+
+
+def _nous_catalog() -> list[str]:
+    """Safely fetch the Portal-driven Nous model catalog.
+
+    Thin exception-safe wrapper around :func:`get_nous_recommended_catalog`
+    used by call-sites that previously read ``_PROVIDER_MODELS["nous"]``
+    directly. Returns ``[]`` on any failure so callers can treat it as a
+    missing/empty catalog.
+
+    Hits the shared 10-minute cache in :func:`fetch_nous_recommended_models`,
+    so repeated calls within the picker / auto-detect flows cost nothing.
+    """
+    try:
+        return get_nous_recommended_catalog()
+    except Exception:
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Canonical provider list — single source of truth for provider identity.
 # Every code path that lists, displays, or iterates providers derives from
@@ -801,6 +851,12 @@ def get_default_model_for_provider(provider: str) -> str:
     selected a model (e.g. ``hermes auth add openai-codex`` without
     ``hermes model``).
     """
+    if provider == "nous":
+        # Nous catalog lives at the Portal — not in _PROVIDER_MODELS.
+        nous = _nous_catalog()
+        if nous:
+            return nous[0]
+        return ""
     models = _PROVIDER_MODELS.get(provider, [])
     return models[0] if models else ""
 
@@ -1377,6 +1433,14 @@ def detect_provider_for_model(
 
     name_lower = name.lower()
 
+    # Helper: resolve a provider's model catalog. For "nous" the catalog
+    # lives at the Portal (not _PROVIDER_MODELS); everything else reads
+    # the static dict.
+    def _catalog_for(pid: str) -> list[str]:
+        if pid == "nous":
+            return _nous_catalog()
+        return _PROVIDER_MODELS.get(pid, [])
+
     # --- Step 0: bare provider name typed as model ---
     # If someone types `/model nous` or `/model anthropic`, treat it as a
     # provider switch and pick the first model from that provider's catalog.
@@ -1384,7 +1448,7 @@ def detect_provider_for_model(
     # openrouter requires an explicit model name to be useful.
     resolved_provider = _PROVIDER_ALIASES.get(name_lower, name_lower)
     if resolved_provider not in {"custom", "openrouter"}:
-        default_models = _PROVIDER_MODELS.get(resolved_provider, [])
+        default_models = _catalog_for(resolved_provider)
         if (
             resolved_provider in _PROVIDER_LABELS
             and default_models
@@ -1396,7 +1460,7 @@ def detect_provider_for_model(
     _AGGREGATORS = {"nous", "openrouter", "ai-gateway", "copilot", "kilocode"}
 
     # If the model belongs to the current provider's catalog, don't suggest switching
-    current_models = _PROVIDER_MODELS.get(current_provider, [])
+    current_models = _catalog_for(current_provider)
     if any(name_lower == m.lower() for m in current_models):
         return None
 
@@ -1701,7 +1765,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if normalized == "copilot-acp":
             return list(_PROVIDER_MODELS.get("copilot", []))
     if normalized == "nous":
-        # Try live Nous Portal /models endpoint
+        # Primary: Portal's curated recommended-models endpoint. Returns
+        # either the free or paid list depending on the user's tier, in
+        # the order specified by the Portal (position field). Shares the
+        # 10-minute process-wide cache with get_nous_recommended_aux_model.
+        try:
+            recommended = get_nous_recommended_catalog(force_refresh=force_refresh)
+            if recommended:
+                return recommended
+        except Exception:
+            pass
+        # Fallback: live Nous inference /models endpoint (whatever the
+        # user's API key actually has access to right now).
         try:
             from hermes_cli.auth import fetch_nous_models, resolve_nous_runtime_credentials
             creds = resolve_nous_runtime_credentials()

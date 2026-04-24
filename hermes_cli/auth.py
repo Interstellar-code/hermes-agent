@@ -3414,10 +3414,11 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 )
 
             from hermes_cli.models import (
-                _PROVIDER_MODELS, get_pricing_for_provider,
+                _nous_catalog, get_pricing_for_provider,
                 check_nous_free_tier, partition_nous_models_by_tier,
             )
-            model_ids = _PROVIDER_MODELS.get("nous", [])
+            # Portal-driven catalog — already tier-filtered server-side.
+            model_ids = _nous_catalog()
 
             print()
             unavailable_models: list = []

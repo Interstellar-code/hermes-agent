@@ -2177,17 +2177,16 @@ def _model_flow_nous(config, current_model="", args=None):
         # login_nous already handles model selection + config update
         return
 
-    # Already logged in — use curated model list (same as OpenRouter defaults).
-    # The live /models endpoint returns hundreds of models; the curated list
-    # shows only agentic models users recognize from OpenRouter.
+    # Already logged in — use curated model list fetched live from the
+    # Portal's recommended-models endpoint (tier-filtered server-side).
     from hermes_cli.models import (
-        _PROVIDER_MODELS,
+        _nous_catalog,
         get_pricing_for_provider,
         check_nous_free_tier,
         partition_nous_models_by_tier,
     )
 
-    model_ids = _PROVIDER_MODELS.get("nous", [])
+    model_ids = _nous_catalog()
     if not model_ids:
         print("No curated models available for Nous Portal.")
         return

@@ -381,6 +381,16 @@ class TestLoginNousSkipKeepsCurrent:
             models_mod, "partition_nous_models_by_tier",
             lambda ids, p, free_tier=False: (ids, []),
         )
+        # The nous catalog is fetched live from the Portal — stub it so the
+        # login flow has models to present to the user without a network call.
+        monkeypatch.setattr(
+            models_mod, "get_nous_recommended_catalog",
+            lambda *a, **kw: [
+                "xiaomi/mimo-v2-pro",
+                "anthropic/claude-sonnet-4.6",
+                "openai/gpt-5.4",
+            ],
+        )
         monkeypatch.setattr(ns, "prompt_enable_tool_gateway", lambda cfg: None)
 
     def test_skip_keep_current_preserves_provider_and_model(self, tmp_path, monkeypatch):
