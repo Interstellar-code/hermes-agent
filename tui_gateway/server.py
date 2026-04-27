@@ -1024,6 +1024,17 @@ def _session_info(agent) -> dict:
     except Exception:
         info["mcp_servers"] = []
     try:
+        from hermes_cli.learning_ledger import build_learning_ledger
+
+        ledger = build_learning_ledger(_get_db(), limit=1)
+        info["learning"] = {
+            "counts": ledger.get("counts", {}),
+            "inventory": ledger.get("inventory", {}),
+            "total": ledger.get("total", 0),
+        }
+    except Exception:
+        pass
+    try:
         from hermes_cli.banner import get_update_result
         from hermes_cli.config import recommended_update_command
 
@@ -1145,6 +1156,14 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff"):
         _emit("tool.complete", sid, payload)
+    try:
+        from hermes_cli.learning_ledger import learning_event_from_tool
+
+        event = learning_event_from_tool(name, args, result)
+        if event:
+            _emit("learning.event", sid, event)
+    except Exception:
+        pass
 
 
 def _on_tool_progress(

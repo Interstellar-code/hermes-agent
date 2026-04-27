@@ -418,6 +418,11 @@ export type GatewayEvent =
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
   | { payload: SessionInfo; session_id?: string; type: 'session.info' }
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
+  | {
+      payload?: { source?: string; summary?: string; title?: string; type?: string; verb?: string; via?: string }
+      session_id?: string
+      type: 'learning.event'
+    }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
   | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
   | { payload?: { state?: 'idle' | 'listening' | 'transcribing' }; session_id?: string; type: 'voice.status' }

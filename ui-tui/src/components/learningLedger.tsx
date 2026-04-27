@@ -24,7 +24,7 @@ const typeVerb: Record<string, string> = {
   integration: 'connected',
   memory: 'remembered',
   recall: 'recalled',
-  'skill-use': 'reused skill',
+  'skill-use': 'applied skill',
   user: 'remembered'
 }
 
@@ -171,11 +171,11 @@ export function LearningLedger({ gw, onClose, t }: LearningLedgerProps) {
         {detailOpen && selected ? <LedgerDetails item={selected} t={t} width={detailWidth} /> : null}
       </Box>
 
-      {offset + VISIBLE_ROWS < items.length && <Text color={t.color.dim}> ↓ {items.length - offset - VISIBLE_ROWS} more</Text>}
+      {offset + VISIBLE_ROWS < items.length && (
+        <Text color={t.color.dim}> ↓ {items.length - offset - VISIBLE_ROWS} more</Text>
+      )}
 
-      <OverlayHint t={t}>
-        ↑/↓ select · Enter/Space details · 1-9,0 quick · Esc/q close
-      </OverlayHint>
+      <OverlayHint t={t}>↑/↓ select · Enter/Space details · 1-9,0 quick · Esc/q close</OverlayHint>
     </Box>
   )
 }
@@ -215,6 +215,9 @@ function LedgerDetails({ item, t, width }: LedgerDetailsProps) {
       </Text>
       {memoryLike ? <Text color={t.color.cornsilk}>{item.summary}</Text> : null}
       {item.count ? <Text color={t.color.dim}>used: {item.count}×</Text> : null}
+      {item.learned_from ? <Text color={t.color.dim}>from: {item.learned_from}</Text> : null}
+      {item.via ? <Text color={t.color.dim}>via: {item.via}</Text> : null}
+      {item.last_used_at ? <Text color={t.color.dim}>last used: {fmtTime(item.last_used_at)}</Text> : null}
       <Text color={t.color.dim}>source: {item.source}</Text>
     </Box>
   )
@@ -222,12 +225,14 @@ function LedgerDetails({ item, t, width }: LedgerDetailsProps) {
 
 interface LearningLedgerItem {
   count?: number
+  learned_from?: null | string
   last_used_at?: null | number
   learned_at?: null | number
   name: string
   source: string
   summary: string
   type: string
+  via?: null | string
 }
 
 interface LearningLedgerResponse {

@@ -89,6 +89,16 @@ export function SessionPanel({ info, sid, t }: SessionPanelProps) {
       </Box>
     )
   }
+  const learningLine = (() => {
+    const counts = info.learning?.counts ?? {}
+    const parts = [
+      counts.user || counts.memory ? `${(counts.user ?? 0) + (counts.memory ?? 0)} memories` : '',
+      counts.recall ? `${counts.recall} recalls` : '',
+      counts['skill-use'] ? `${counts['skill-use']} applied skills` : ''
+    ].filter(Boolean)
+
+    return parts.length ? `learned: ${parts.join(' · ')}` : ''
+  })()
 
   return (
     <Box borderColor={t.color.bronze} borderStyle="round" marginBottom={1} paddingX={2} paddingY={1}>
@@ -159,6 +169,12 @@ export function SessionPanel({ info, sid, t }: SessionPanelProps) {
           {' · '}
           <Text color={t.color.dim}>/help for commands</Text>
         </Text>
+
+        {learningLine && (
+          <Text color={t.color.cornsilk} dimColor italic>
+            {learningLine} · /learned
+          </Text>
+        )}
 
         {typeof info.update_behind === 'number' && info.update_behind > 0 && (
           <Text bold color={t.color.warn}>

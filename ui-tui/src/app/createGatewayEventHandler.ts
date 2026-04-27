@@ -269,6 +269,21 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'learning.event': {
+        const title = String(ev.payload?.title ?? '').trim()
+        const verb = String(ev.payload?.verb ?? ev.payload?.type ?? 'learned').trim()
+
+        if (title) {
+          appendMessage({
+            kind: 'learning',
+            role: 'system',
+            text: `${verb}: ${title}`
+          })
+        }
+
+        return
+      }
+
       case 'message.start':
         turnController.startMessage()
 

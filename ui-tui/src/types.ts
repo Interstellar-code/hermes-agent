@@ -108,7 +108,7 @@ export interface ClarifyReq {
 
 export interface Msg {
   info?: SessionInfo
-  kind?: 'diff' | 'intro' | 'panel' | 'slash' | 'trail'
+  kind?: 'diff' | 'intro' | 'learning' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData
   role: Role
   text: string
@@ -148,12 +148,19 @@ export interface SessionInfo {
   reasoning_effort?: string
   service_tier?: string
   release_date?: string
+  learning?: LearningSummary
   skills: Record<string, string[]>
   tools: Record<string, string[]>
   update_behind?: number | null
   update_command?: string
   usage?: Usage
   version?: string
+}
+
+export interface LearningSummary {
+  counts?: Record<string, number>
+  inventory?: { skills?: number }
+  total?: number
 }
 
 export interface Usage {

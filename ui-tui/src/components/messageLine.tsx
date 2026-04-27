@@ -100,6 +100,14 @@ export const MessageLine = memo(function MessageLine({
     (toolsMode !== 'hidden' && Boolean(msg.tools?.length)) || (thinkingMode !== 'hidden' && Boolean(thinking))
 
   const content = (() => {
+    if (msg.kind === 'learning') {
+      return (
+        <Text color={t.color.cornsilk} dimColor italic>
+          {msg.text}
+        </Text>
+      )
+    }
+
     if (msg.kind === 'slash') {
       return <Text color={t.color.dim}>{msg.text}</Text>
     }
