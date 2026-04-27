@@ -2489,7 +2489,7 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "spawn_auto_blocked", "crashed")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -2560,18 +2560,26 @@ class GatewayRunner:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "spawn_auto_blocked":
+                        elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ Kanban {sub['task_id']} auto-blocked "
+                                f"✖ Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
+                            )
+                        elif kind == "timed_out":
+                            limit = 0
+                            if ev.payload and ev.payload.get("limit_seconds"):
+                                limit = int(ev.payload["limit_seconds"])
+                            msg = (
+                                f"⏱ Kanban {sub['task_id']} timed out "
+                                f"(max_runtime={limit}s); will retry"
                             )
                         else:
                             continue

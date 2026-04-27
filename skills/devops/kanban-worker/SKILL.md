@@ -104,6 +104,16 @@ hermes kanban comment $HERMES_KANBAN_TASK "note: skipped the sqlite driver path;
 
 Comments are the inter-agent protocol. Direct IPC does not exist; the board is the only channel.
 
+## Heartbeat on long loops
+
+If your task forks a long-lived subprocess (training run, video encode, web crawl, batch upload), the dispatcher can't tell whether your Python is stuck or deliberately waiting. Call:
+
+```bash
+hermes kanban heartbeat $HERMES_KANBAN_TASK --note "epoch 12/50, loss 0.31"
+```
+
+…every few minutes during the long wait. The note is optional; the signal itself is the point. Heartbeats show up in the event stream so humans reading `hermes kanban watch` can see you're still alive. Skip heartbeats for short tasks — they're noise below a few-minute runtime.
+
 ## Do NOT
 
 - Do not call `delegate_task` as a substitute for creating kanban tasks — `delegate_task` is for short synchronous reasoning subtasks inside your own run, not for cross-agent handoffs.

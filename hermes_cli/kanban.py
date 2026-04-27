@@ -135,6 +135,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--max-runtime", default=None,
+                          help="Per-task runtime cap. Accepts seconds (300) or "
+                               "durations (90s, 30m, 2h, 1d). When exceeded, "
+                               "the dispatcher SIGTERMs (then SIGKILLs) the worker "
+                               "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
@@ -296,6 +301,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_log.add_argument("--tail", type=int, default=None,
                        help="Only print the last N bytes")
 
+    # --- heartbeat (worker liveness signal) ---
+    p_hb = sub.add_parser(
+        "heartbeat",
+        help="Emit a heartbeat event for a running task (worker liveness signal)",
+    )
+    p_hb.add_argument("task_id")
+    p_hb.add_argument("--note", default=None,
+                      help="Optional short note attached to the heartbeat event")
+
+    # --- assignees ---
+    p_asg = sub.add_parser(
+        "assignees",
+        help="List known profiles + per-profile task counts "
+             "(union of ~/.hermes/profiles/ and current assignees on the board)",
+    )
+    p_asg.add_argument("--json", action="store_true")
+
     # --- context --- (for spawned workers)
     p_ctx = sub.add_parser(
         "context",
@@ -361,6 +383,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
         "log":      _cmd_log,
+        "heartbeat": _cmd_heartbeat,
+        "assignees": _cmd_assignees,
         "notify-subscribe":   _cmd_notify_subscribe,
         "notify-list":        _cmd_notify_list,
         "notify-unsubscribe": _cmd_notify_unsubscribe,
@@ -395,9 +419,52 @@ def _profile_author() -> str:
         return "user"
 
 
+def _parse_duration(val) -> Optional[int]:
+    """Parse ``30s`` / ``5m`` / ``2h`` / ``1d`` or a raw integer → seconds.
+
+    Returns None for empty input. Raises ValueError on malformed input so
+    the CLI can surface a usage error cleanly.
+    """
+    if val is None or val == "":
+        return None
+    s = str(val).strip().lower()
+    # Bare integer → seconds.
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # Suffixed form.
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s and s[-1] in units:
+        try:
+            n = float(s[:-1])
+        except ValueError as exc:
+            raise ValueError(f"malformed duration {val!r}") from exc
+        return int(n * units[s[-1]])
+    raise ValueError(f"malformed duration {val!r} (expected 30s, 5m, 2h, 1d, or a number)")
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
+    print()
+    # Enumerate profiles on disk so the user knows what assignees are
+    # already addressable. Multica does this auto-detection on its
+    # daemon start; we do it here at init time instead because our
+    # dispatcher doesn't need to enumerate — we just pass the name
+    # through to `hermes -p <name>`.
+    try:
+        profiles = kb.list_profiles_on_disk()
+    except Exception:
+        profiles = []
+    if profiles:
+        print(f"Discovered {len(profiles)} profile(s) on disk; any of these can "
+              f"be an --assignee:")
+        for name in profiles:
+            print(f"  {name}")
+    else:
+        print("No profiles found under ~/.hermes/profiles/.")
+        print("Create one with `hermes -p <name> setup` before assigning tasks.")
     print()
     print("Next step: run the dispatcher so ready tasks actually get picked up.")
     print("  # Foreground (interactive, Ctrl-C to stop):")
@@ -410,8 +477,42 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        ok = kb.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None))
+    if not ok:
+        print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
+        return 1
+    print(f"Heartbeat recorded for {args.task_id}")
+    return 0
+
+
+def _cmd_assignees(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        data = kb.known_assignees(conn)
+    if getattr(args, "json", False):
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+    if not data:
+        print("(no assignees — create a profile with `hermes -p <name> setup`)")
+        return 0
+    # Header
+    print(f"{'NAME':20s}  {'ON DISK':8s}  COUNTS")
+    for entry in data:
+        on_disk = "yes" if entry["on_disk"] else "no"
+        counts = entry["counts"] or {}
+        count_str = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(idle)"
+        print(f"{entry['name']:20s}  {on_disk:8s}  {count_str}")
+    return 0
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     ws_kind, ws_path = _parse_workspace_flag(args.workspace)
+    try:
+        max_runtime = _parse_duration(getattr(args, "max_runtime", None))
+    except ValueError as exc:
+        print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
+        return 2
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -426,6 +527,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
+            max_runtime_seconds=max_runtime,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -682,6 +784,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(json.dumps({
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
+            "timed_out": res.timed_out,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
             "spawned": [
@@ -695,6 +798,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
         print(f"  {', '.join(res.crashed)}")
+    print(f"Timed out:    {len(res.timed_out)}")
+    if res.timed_out:
+        print(f"  {', '.join(res.timed_out)}")
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
@@ -730,13 +836,14 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if not verbose:
             return
         did_work = (
-            res.reclaimed or res.crashed or res.promoted
+            res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] "
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
+                f"timed_out={len(res.timed_out)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,

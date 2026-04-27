@@ -263,6 +263,7 @@ hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|dir:<path>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
+                                [--max-runtime 30m|2h|1d|<seconds>]
                                 [--json]
 hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived] [--json]
 hermes kanban show <id> [--json]
@@ -281,6 +282,8 @@ hermes kanban archive <id>...
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
         [--kinds completed,blocked,…] [--interval SECS]
+hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal for long ops
+hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
 hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
         [--failure-limit N] [--json]
 hermes kanban daemon [--interval SECS] [--max N]       # long-lived loop
@@ -332,7 +335,7 @@ Workers receive `$HERMES_TENANT` and namespace their memory writes by prefix. Th
 
 ## Gateway notifications
 
-When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `spawn_auto_blocked`, `crashed`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
+When you run `/kanban create …` from the gateway (Telegram, Discord, Slack, etc.), the originating chat is automatically subscribed to the new task. The gateway's background notifier polls `task_events` every few seconds and delivers one message per terminal event (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`) to that chat. Completed tasks also send the first line of the worker's `--result` so you see the outcome without having to `/kanban show`.
 
 You can manage subscriptions explicitly from the CLI — useful when a script / cron job wants to notify a chat it didn't originate from:
 
@@ -345,6 +348,45 @@ hermes kanban notify-unsubscribe t_abcd \
 ```
 
 A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+
+## Event reference
+
+Every transition appends a row to `task_events`. The kinds group into three clusters so filtering is easy (`hermes kanban watch --kinds completed,gave_up,timed_out`):
+
+**Lifecycle** (what changed about the task as a logical unit):
+
+| Kind | When |
+|---|---|
+| `created` | Task inserted. |
+| `promoted` | `todo → ready` because all parents hit `done`. |
+| `claimed` | Dispatcher atomically claimed a `ready` task for spawn. |
+| `completed` | Worker wrote `--result` and task hit `done`. |
+| `blocked` | Worker or human flipped the task to `blocked`. |
+| `unblocked` | `blocked → ready`, either manually or via `/unblock`. |
+| `archived` | Hidden from the default board. |
+
+**Edits** (human-driven changes that aren't transitions):
+
+| Kind | When |
+|---|---|
+| `assigned` | Assignee changed (including unassignment). |
+| `edited` | Title or body updated. |
+| `reprioritized` | Priority changed. |
+| `status` | Dashboard drag-drop wrote a status directly (e.g. `todo → ready`). |
+
+**Worker telemetry** (about the execution process, not the logical task):
+
+| Kind | Payload | When |
+|---|---|---|
+| `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
+| `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
+| `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
+| `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
+| `spawn_failed` | `{error, failures}` | One spawn attempt failed (missing PATH, workspace unmountable, …). Counter increments; task returns to `ready` for retry. |
+| `gave_up` | `{failures, error}` | Circuit breaker fired after N consecutive `spawn_failed`. Task auto-blocks with the last error. Default N = 5; override via `--failure-limit`. |
+
+`hermes kanban tail <id>` shows these for a single task. `hermes kanban watch` streams them board-wide.
 
 ## Out of scope
 

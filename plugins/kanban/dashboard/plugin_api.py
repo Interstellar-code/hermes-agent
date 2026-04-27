@@ -282,6 +282,7 @@ class CreateTaskBody(BaseModel):
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
+    max_runtime_seconds: Optional[int] = None
 
 
 @router.post("/tasks")
@@ -301,6 +302,7 @@ def create_task(payload: CreateTaskBody):
             parents=payload.parents,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
+            max_runtime_seconds=payload.max_runtime_seconds,
         )
         task = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(task) if task else None}
@@ -380,7 +382,7 @@ def update_task(task_id: str, payload: UpdateTaskBody):
                 )
                 conn.execute(
                     "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'priority', ?, ?)",
+                    "VALUES (?, 'reprioritized', ?, ?)",
                     (task_id, json.dumps({"priority": int(payload.priority)}),
                      int(time.time())),
                 )
@@ -568,7 +570,7 @@ def bulk_update(payload: BulkTaskBody):
                         )
                         conn.execute(
                             "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'priority', ?, ?)",
+                            "VALUES (?, 'reprioritized', ?, ?)",
                             (tid, json.dumps({"priority": int(payload.priority)}),
                              int(time.time())),
                         )
@@ -623,6 +625,22 @@ def get_stats():
     conn = _conn()
     try:
         return kanban_db.board_stats(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/assignees")
+def get_assignees():
+    """Known profiles + per-profile task counts.
+
+    Returns the union of ``~/.hermes/profiles/*`` on disk and every
+    distinct assignee currently used on the board. The dashboard uses
+    this to populate its assignee dropdown so a freshly-created profile
+    appears in the picker before it's been given any task.
+    """
+    conn = _conn()
+    try:
+        return {"assignees": kanban_db.known_assignees(conn)}
     finally:
         conn.close()
 

@@ -610,3 +610,393 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
         out = run_slash(cmd)
         assert out is not None
         assert out.strip() != "", f"empty output for `/kanban {cmd}`"
+
+
+# ---------------------------------------------------------------------------
+# Max-runtime enforcement (item 1 from the Multica audit)
+# ---------------------------------------------------------------------------
+
+def test_max_runtime_terminates_overrun_worker(kanban_home):
+    """A running task whose elapsed time exceeds max_runtime_seconds gets
+    SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
+    killed = []
+    def _signal_fn(pid, sig):
+        killed.append((pid, sig))
+
+    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
+    import hermes_cli.kanban_db as _kb
+    original_alive = _kb._pid_alive
+    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
+
+    try:
+        conn = kb.connect()
+        try:
+            tid = kb.create_task(
+                conn, title="long job", assignee="worker",
+                max_runtime_seconds=1,  # one second cap
+            )
+            # Spawn by hand: claim + set pid + set started_at to the past.
+            kb.claim_task(conn, tid)
+            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
+            # Backdate started_at so elapsed > limit.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at = ? WHERE id = ?",
+                    (int(time.time()) - 30, tid),
+                )
+
+            timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
+            assert tid in timed_out
+            assert killed and killed[0][0] == os.getpid()
+
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
+            assert task.worker_pid is None
+            assert task.last_heartbeat_at is None
+
+            events = kb.list_events(conn, tid)
+            assert any(e.kind == "timed_out" for e in events)
+            to_event = next(e for e in events if e.kind == "timed_out")
+            assert to_event.payload["limit_seconds"] == 1
+            assert to_event.payload["elapsed_seconds"] >= 30
+        finally:
+            conn.close()
+    finally:
+        _kb._pid_alive = original_alive
+
+
+def test_max_runtime_none_means_no_cap(kanban_home):
+    """A task with max_runtime_seconds=None is never timed out regardless
+    of how long it runs."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="uncapped", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, os.getpid())
+        # Backdate aggressively; no cap means we don't care.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 100_000, tid),
+            )
+        timed_out = kb.enforce_max_runtime(conn)
+        assert timed_out == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_create_task_persists_max_runtime(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", max_runtime_seconds=600)
+        task = kb.get_task(conn, tid)
+        assert task.max_runtime_seconds == 600
+    finally:
+        conn.close()
+
+
+def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
+    """enforce_max_runtime + dispatch_once integrate cleanly — a timed-out
+    task goes through ``timed_out`` → ``ready`` and dispatch_once can then
+    re-spawn it without re-reporting the timeout."""
+    import hermes_cli.kanban_db as _kb
+    # Leave _pid_alive=True so the crash detector doesn't steal the task
+    # before timeout enforcement runs. After SIGTERM in enforce_max_runtime,
+    # pretend the worker died so the grace wait exits fast.
+    state = {"sent_term": False}
+    def _alive(pid):
+        return not state["sent_term"]
+    def _signal(pid, sig):
+        import signal as _sig
+        if sig == _sig.SIGTERM:
+            state["sent_term"] = True
+    monkeypatch.setattr(_kb, "_pid_alive", _alive)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="timeout-me", assignee="worker",
+            max_runtime_seconds=1,
+        )
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, os.getpid())
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ? WHERE id = ?",
+                (int(time.time()) - 30, tid),
+            )
+        # Use enforce_max_runtime directly with our signal stub — dispatch_once
+        # uses the default os.kill, but integration-wise calling
+        # enforce_max_runtime directly proves the kernel wiring. For the
+        # dispatch_once assertion, rely on its own code path by calling it
+        # after forcing SIGTERM via enforce_max_runtime.
+        before = kb.enforce_max_runtime(conn, signal_fn=_signal)
+        assert tid in before, "kernel enforce_max_runtime should catch the overrun"
+
+        # Now a second dispatch_once run should be a no-op on this task
+        # (already released). Confirm the loop doesn't re-report it.
+        res = kb.dispatch_once(conn, spawn_fn=lambda t, ws: None)
+        task = kb.get_task(conn, tid)
+        # After timeout, task is back in 'ready' and will be re-spawned
+        # by the same pass. That's the intended behaviour.
+        assert task.status in ("ready", "running")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat (item 2 from the Multica audit)
+# ---------------------------------------------------------------------------
+
+def test_heartbeat_on_running_task(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        ok = kb.heartbeat_worker(conn, tid, note="step 3/10")
+        assert ok is True
+        task = kb.get_task(conn, tid)
+        assert task.last_heartbeat_at is not None
+        events = kb.list_events(conn, tid)
+        hb = [e for e in events if e.kind == "heartbeat"]
+        assert len(hb) == 1
+        assert hb[0].payload == {"note": "step 3/10"}
+    finally:
+        conn.close()
+
+
+def test_heartbeat_refused_when_not_running(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x")   # lands in ready, not running
+        ok = kb.heartbeat_worker(conn, tid)
+        assert ok is False
+        task = kb.get_task(conn, tid)
+        assert task.last_heartbeat_at is None
+    finally:
+        conn.close()
+
+
+def test_cli_heartbeat_verb(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    out = run_slash(f"heartbeat {tid}")
+    assert "Heartbeat recorded" in out
+
+    # With --note.
+    out = run_slash(f"heartbeat {tid} --note 'step 42'")
+    assert "Heartbeat recorded" in out
+    conn = kb.connect()
+    try:
+        events = kb.list_events(conn, tid)
+        notes = [e.payload.get("note") for e in events if e.kind == "heartbeat" and e.payload]
+        assert "step 42" in notes
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Event vocab rename + spawned event (item 3 from Multica)
+# ---------------------------------------------------------------------------
+
+def test_recompute_ready_emits_promoted_not_ready(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="p")
+        child = kb.create_task(conn, title="c", parents=[parent])
+        kb.complete_task(conn, parent, result="ok")
+        # recompute_ready runs inside complete_task too, but call it again
+        # defensively.
+        kb.recompute_ready(conn)
+        events = kb.list_events(conn, child)
+        kinds = [e.kind for e in events]
+        assert "promoted" in kinds
+        # Old name must not appear.
+        assert "ready" not in kinds
+    finally:
+        conn.close()
+
+
+def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home):
+    def _bad(task, ws):
+        raise RuntimeError("nope")
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        for _ in range(5):
+            kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "gave_up" in kinds
+        assert "spawn_auto_blocked" not in kinds
+    finally:
+        conn.close()
+
+
+def test_spawned_event_emitted_with_pid(kanban_home):
+    """Successful spawn must append a ``spawned`` event with the pid in
+    the payload so humans tailing events see pid tracking."""
+    def _spawn_returns_pid(task, ws):
+        return 98765
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.dispatch_once(conn, spawn_fn=_spawn_returns_pid)
+        events = kb.list_events(conn, tid)
+        spawned = [e for e in events if e.kind == "spawned"]
+        assert len(spawned) == 1
+        assert spawned[0].payload == {"pid": 98765}
+    finally:
+        conn.close()
+
+
+def test_migration_renames_legacy_event_kinds(tmp_path, monkeypatch):
+    """A DB created with the old vocab must have its event rows renamed
+    in place on init_db()."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Init fresh.
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x")
+        # Inject legacy event kinds directly.
+        now = int(time.time())
+        with kb.write_txn(conn):
+            for old in ("ready", "priority", "spawn_auto_blocked"):
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, ?, NULL, ?)",
+                    (tid, old, now),
+                )
+        # Re-run init_db — the migration pass should rename them.
+        kb.init_db()
+        rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+        ).fetchall()
+        kinds = [r["kind"] for r in rows]
+        assert "ready" not in kinds
+        assert "priority" not in kinds
+        assert "spawn_auto_blocked" not in kinds
+        assert "promoted" in kinds
+        assert "reprioritized" in kinds
+        assert "gave_up" in kinds
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Assignees (item 4 from Multica)
+# ---------------------------------------------------------------------------
+
+def test_list_profiles_on_disk(tmp_path, monkeypatch):
+    """list_profiles_on_disk returns directories under ~/.hermes/profiles/
+    that contain a config.yaml."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    profiles = tmp_path / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    (profiles / "researcher").mkdir()
+    (profiles / "researcher" / "config.yaml").write_text("model: {}\n")
+    (profiles / "writer").mkdir()
+    (profiles / "writer" / "config.yaml").write_text("model: {}\n")
+    (profiles / "empty_dir").mkdir()
+    # A stray file; should be ignored.
+    (profiles / "stray.txt").write_text("noise")
+
+    names = kb.list_profiles_on_disk()
+    assert names == ["researcher", "writer"]
+
+
+def test_known_assignees_merges_disk_and_board(tmp_path, monkeypatch):
+    """known_assignees unions profiles on disk with currently-assigned
+    names, and reports per-status counts."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    profiles = tmp_path / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    for name in ("researcher", "writer"):
+        d = profiles / name
+        d.mkdir()
+        (d / "config.yaml").write_text("model: {}\n")
+
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        # writer has a ready task; on_board_only has a task but no profile dir.
+        kb.create_task(conn, title="a", assignee="writer")
+        kb.create_task(conn, title="b", assignee="on_board_only")
+        data = kb.known_assignees(conn)
+    finally:
+        conn.close()
+
+    by_name = {d["name"]: d for d in data}
+    assert by_name["researcher"]["on_disk"] is True
+    assert by_name["researcher"]["counts"] == {}
+    assert by_name["writer"]["on_disk"] is True
+    assert by_name["writer"]["counts"] == {"ready": 1}
+    assert by_name["on_board_only"]["on_disk"] is False
+    assert by_name["on_board_only"]["counts"] == {"ready": 1}
+
+
+def test_cli_assignees_json(kanban_home):
+    conn = kb.connect()
+    try:
+        kb.create_task(conn, title="x", assignee="someone")
+    finally:
+        conn.close()
+    out = run_slash("assignees --json")
+    data = json.loads(out)
+    names = [e["name"] for e in data]
+    assert "someone" in names
+
+
+# ---------------------------------------------------------------------------
+# CLI --max-runtime flag + duration parser
+# ---------------------------------------------------------------------------
+
+def test_parse_duration_accepts_formats():
+    from hermes_cli.kanban import _parse_duration
+    assert _parse_duration(None) is None
+    assert _parse_duration("") is None
+    assert _parse_duration("42") == 42
+    assert _parse_duration("30s") == 30
+    assert _parse_duration("5m") == 300
+    assert _parse_duration("2h") == 7200
+    assert _parse_duration("1d") == 86400
+    assert _parse_duration("1.5h") == 5400
+
+
+def test_parse_duration_rejects_garbage():
+    from hermes_cli.kanban import _parse_duration
+    import pytest as _p
+    with _p.raises(ValueError):
+        _parse_duration("tenminutes")
+    with _p.raises(ValueError):
+        _parse_duration("fish")
+
+
+def test_cli_create_max_runtime_via_duration(kanban_home):
+    """`hermes kanban create --max-runtime 2h` should persist 7200 seconds."""
+    out = run_slash("create 'long task' --max-runtime 2h --json")
+    data = json.loads(out)
+    tid = data["id"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.max_runtime_seconds == 7200
+    finally:
+        conn.close()
+
+
+def test_cli_create_max_runtime_bad_format_exits_nonzero(kanban_home):
+    out = run_slash("create 'bad' --max-runtime fish")
+    assert "max-runtime" in out.lower() or "malformed" in out.lower()

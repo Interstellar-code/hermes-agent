@@ -88,6 +88,8 @@ class Task:
     spawn_failures: int = 0
     worker_pid: Optional[int] = None
     last_spawn_error: Optional[str] = None
+    max_runtime_seconds: Optional[int] = None
+    last_heartbeat_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -113,6 +115,12 @@ class Task:
             spawn_failures=row["spawn_failures"] if "spawn_failures" in keys else 0,
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
             last_spawn_error=row["last_spawn_error"] if "last_spawn_error" in keys else None,
+            max_runtime_seconds=(
+                row["max_runtime_seconds"] if "max_runtime_seconds" in keys else None
+            ),
+            last_heartbeat_at=(
+                row["last_heartbeat_at"] if "last_heartbeat_at" in keys else None
+            ),
         )
 
 
@@ -140,26 +148,28 @@ class Event:
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
-    id               TEXT PRIMARY KEY,
-    title            TEXT NOT NULL,
-    body             TEXT,
-    assignee         TEXT,
-    status           TEXT NOT NULL,
-    priority         INTEGER DEFAULT 0,
-    created_by       TEXT,
-    created_at       INTEGER NOT NULL,
-    started_at       INTEGER,
-    completed_at     INTEGER,
-    workspace_kind   TEXT NOT NULL DEFAULT 'scratch',
-    workspace_path   TEXT,
-    claim_lock       TEXT,
-    claim_expires    INTEGER,
-    tenant           TEXT,
-    result           TEXT,
-    idempotency_key  TEXT,
-    spawn_failures   INTEGER NOT NULL DEFAULT 0,
-    worker_pid       INTEGER,
-    last_spawn_error TEXT
+    id                  TEXT PRIMARY KEY,
+    title               TEXT NOT NULL,
+    body                TEXT,
+    assignee            TEXT,
+    status              TEXT NOT NULL,
+    priority            INTEGER DEFAULT 0,
+    created_by          TEXT,
+    created_at          INTEGER NOT NULL,
+    started_at          INTEGER,
+    completed_at        INTEGER,
+    workspace_kind      TEXT NOT NULL DEFAULT 'scratch',
+    workspace_path      TEXT,
+    claim_lock          TEXT,
+    claim_expires       INTEGER,
+    tenant              TEXT,
+    result              TEXT,
+    idempotency_key     TEXT,
+    spawn_failures      INTEGER NOT NULL DEFAULT 0,
+    worker_pid          INTEGER,
+    last_spawn_error    TEXT,
+    max_runtime_seconds INTEGER,
+    last_heartbeat_at   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -264,6 +274,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN worker_pid INTEGER")
     if "last_spawn_error" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN last_spawn_error TEXT")
+    if "max_runtime_seconds" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN max_runtime_seconds INTEGER")
+    if "last_heartbeat_at" not in cols:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_heartbeat_at INTEGER")
+
+    # One-shot event-kind rename pass. The old names ("ready", "priority",
+    # "spawn_auto_blocked") still worked but were awkward on the wire;
+    # rename them in-place so existing DBs migrate cleanly. Fires once
+    # per DB because after the UPDATE no rows match the old kinds.
+    _EVENT_RENAMES = (
+        # (old, new)
+        ("ready",              "promoted"),
+        ("priority",           "reprioritized"),
+        ("spawn_auto_blocked", "gave_up"),
+    )
+    for old, new in _EVENT_RENAMES:
+        conn.execute(
+            "UPDATE task_events SET kind = ? WHERE kind = ?",
+            (new, old),
+        )
 
 
 @contextlib.contextmanager
@@ -325,6 +355,7 @@ def create_task(
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
+    max_runtime_seconds: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -338,6 +369,10 @@ def create_task(
     same key already exists, returns the existing task's id instead of
     creating a duplicate. Useful for retried webhooks / automation that
     should not double-write.
+
+    ``max_runtime_seconds`` caps how long a worker may run before the
+    dispatcher SIGTERMs (then SIGKILLs after a grace window) and
+    re-queues the task. ``None`` means no cap (default).
     """
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -400,8 +435,8 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        tenant, idempotency_key
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        tenant, idempotency_key, max_runtime_seconds
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -416,6 +451,7 @@ def create_task(
                         workspace_path,
                         tenant,
                         idempotency_key,
+                        int(max_runtime_seconds) if max_runtime_seconds else None,
                     ),
                 )
                 for pid in parents:
@@ -726,7 +762,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                     "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                     (task_id,),
                 )
-                _append_event(conn, task_id, "ready", None)
+                _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
 
@@ -989,6 +1025,8 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    timed_out: list[str] = field(default_factory=list)
+    """Task ids whose workers exceeded ``max_runtime_seconds``."""
 
 
 def _pid_alive(pid: Optional[int]) -> bool:
@@ -1011,6 +1049,137 @@ def _pid_alive(pid: Optional[int]) -> bool:
     except OSError:
         return False
     return True
+
+
+def heartbeat_worker(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    note: Optional[str] = None,
+) -> bool:
+    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+
+    Called by long-running workers as a liveness signal orthogonal to
+    the PID check. A worker that forks a long-lived child (train loop,
+    video encode, web crawl) can have its Python still alive while the
+    actual work process is stuck; periodic heartbeats catch that.
+
+    Returns True on success, False if the task is not in a state that
+    should be heartbeating (not running, or claim expired).
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running'",
+            (now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "heartbeat",
+            {"note": note} if note else None,
+        )
+    return True
+
+
+def enforce_max_runtime(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[str]:
+    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
+
+    Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
+    ``timed_out`` event and drops the task back to ``ready`` so the next
+    dispatcher tick re-spawns it — unless the spawn-failure circuit
+    breaker has already given up, in which case the task stays blocked
+    where ``_record_spawn_failure`` parked it.
+
+    Runs host-local: only tasks claimed by this host are candidates
+    (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
+    test hook; defaults to ``os.kill`` on POSIX.
+    """
+    import signal
+    timed_out: list[str] = []
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+
+    rows = conn.execute(
+        "SELECT id, worker_pid, started_at, max_runtime_seconds, claim_lock "
+        "FROM tasks "
+        "WHERE status = 'running' AND max_runtime_seconds IS NOT NULL "
+        "  AND started_at IS NOT NULL AND worker_pid IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        elapsed = now - int(row["started_at"])
+        if elapsed < int(row["max_runtime_seconds"]):
+            continue
+
+        pid = int(row["worker_pid"])
+        tid = row["id"]
+        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
+        # want a cleaner shutdown can install their own SIGTERM handler
+        # before the grace expires.
+        killed = False
+        kill = signal_fn if signal_fn is not None else (
+            os.kill if hasattr(os, "kill") else None
+        )
+        if kill is not None:
+            try:
+                kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+            # Short polling wait — no time.sleep on the write txn.
+            for _ in range(10):
+                if not _pid_alive(pid):
+                    break
+                time.sleep(0.5)
+            if _pid_alive(pid):
+                try:
+                    kill(pid, signal.SIGKILL)
+                    killed = True
+                except (ProcessLookupError, OSError):
+                    pass
+
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running'",
+                (tid,),
+            )
+            if cur.rowcount == 1:
+                _append_event(
+                    conn, tid, "timed_out",
+                    {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": int(row["max_runtime_seconds"]),
+                        "sigkill": killed,
+                    },
+                )
+                timed_out.append(tid)
+    return timed_out
+
+
+def set_max_runtime(
+    conn: sqlite3.Connection,
+    task_id: str,
+    seconds: Optional[int],
+) -> bool:
+    """Set or clear the per-task max_runtime_seconds. Returns True on
+    success."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET max_runtime_seconds = ? WHERE id = ?",
+            (int(seconds) if seconds is not None else None, task_id),
+        )
+    return cur.rowcount == 1
 
 
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
@@ -1081,7 +1250,7 @@ def _record_spawn_failure(
                 (failures, error[:500], task_id),
             )
             _append_event(
-                conn, task_id, "spawn_auto_blocked",
+                conn, task_id, "gave_up",
                 {"failures": failures, "error": error[:500]},
             )
             blocked = True
@@ -1101,11 +1270,18 @@ def _record_spawn_failure(
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Record the spawned child's pid + emit a ``spawned`` event.
+
+    The event's payload carries the pid so a human reading ``hermes kanban
+    tail`` can correlate log lines with OS-level traces without opening
+    the drawer.
+    """
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
             (int(pid), task_id),
         )
+        _append_event(conn, task_id, "spawned", {"pid": int(pid)})
 
 
 def _clear_spawn_failures(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1147,6 +1323,7 @@ def dispatch_once(
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.crashed = detect_crashed_workers(conn)
+    result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn)
 
     ready_rows = conn.execute(
@@ -1650,3 +1827,68 @@ def read_worker_log(
         return data.decode("utf-8", errors="replace")
     except OSError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Assignee enumeration (known profiles + per-profile board stats)
+# ---------------------------------------------------------------------------
+
+def list_profiles_on_disk() -> list[str]:
+    """Return the set of named profiles discovered on disk.
+
+    Reads ``~/.hermes/profiles/`` directly so this module has no import
+    dependency on ``hermes_cli.profiles`` (which pulls in a large chunk
+    of the CLI startup path). Only returns directories that contain a
+    ``config.yaml`` — a bare dir without config isn't a real profile.
+    """
+    try:
+        home = Path.home() / ".hermes" / "profiles"
+    except Exception:
+        return []
+    if not home.is_dir():
+        return []
+    names: list[str] = []
+    try:
+        for entry in sorted(home.iterdir()):
+            if not entry.is_dir():
+                continue
+            if (entry / "config.yaml").is_file():
+                names.append(entry.name)
+    except OSError:
+        return names
+    return names
+
+
+def known_assignees(conn: sqlite3.Connection) -> list[dict]:
+    """Return every assignee name known to the board or on disk.
+
+    Each entry is ``{"name": str, "on_disk": bool, "counts": {status: n}}``.
+    A name is included when it's a configured profile on disk OR when
+    any non-archived task has it as the assignee. Used by:
+
+    - ``hermes kanban assignees`` for the terminal.
+    - The dashboard assignee dropdown (so a fresh profile appears in
+      the picker even before it's been given any task).
+    - Router-profile heuristics ("who's overloaded?") without scanning
+      the whole board.
+    """
+    on_disk = set(list_profiles_on_disk())
+
+    # Count tasks per (assignee, status), excluding archived.
+    counts: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY assignee, status"
+    ):
+        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+
+    names = sorted(on_disk | set(counts.keys()))
+    return [
+        {
+            "name": name,
+            "on_disk": name in on_disk,
+            "counts": counts.get(name, {}),
+        }
+        for name in names
+    ]
