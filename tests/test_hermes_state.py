@@ -2479,6 +2479,39 @@ class TestAutoMaintenance:
         assert (sessions_dir / "active.jsonl").exists()
 
 
+class TestEmptyGhostSessionPrune:
+    def _make_old_tui_session(self, db, session_id, ended=False):
+        db.create_session(session_id=session_id, source="tui")
+        old_started_at = time.time() - 90000
+        db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (old_started_at, session_id),
+            )
+        )
+        if ended:
+            db.end_session(session_id, "tui_close")
+
+    def test_prunes_only_closed_empty_tui_sessions(self, db):
+        self._make_old_tui_session(db, "closed-empty", ended=True)
+        self._make_old_tui_session(db, "live-empty", ended=False)
+
+        assert db.prune_empty_ghost_sessions() == 1
+        assert db.get_session("closed-empty") is None
+        assert db.get_session("live-empty") is not None
+
+    def test_prune_empty_ghost_sessions_keeps_nonempty_closed_session(self, db):
+        self._make_old_tui_session(db, "closed-with-message", ended=True)
+        db.append_message(
+            session_id="closed-with-message",
+            role="user",
+            content="hello",
+        )
+
+        assert db.prune_empty_ghost_sessions() == 0
+        assert db.get_session("closed-with-message") is not None
+
+
 # =========================================================================
 # FTS5 indexing of tool_calls / tool_name (#16751)
 # =========================================================================
@@ -2672,4 +2705,3 @@ class TestFTS5ToolCallMigration:
             assert version == 11
         finally:
             session_db.close()
-
