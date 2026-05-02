@@ -64,9 +64,18 @@ export const isCopyShortcut = (
  */
 export type VoiceRecordKeyMod = 'alt' | 'ctrl' | 'meta' | 'super'
 
+/** Named (multi-character) keys we support, matching the CLI's
+ * prompt_toolkit binding shape (``c-space``, ``c-enter``, etc.) so a
+ * config value like ``ctrl+space`` binds in both runtimes. */
+export type VoiceRecordKeyNamed = 'backspace' | 'delete' | 'enter' | 'escape' | 'space' | 'tab'
+
 export interface ParsedVoiceRecordKey {
+  /** Single character (``'b'``, ``'o'``) when ``named`` is undefined,
+   * otherwise the named-key token (``'space'``, ``'enter'``…). Kept as
+   * one field for back-compat with the v1 ``{ ch, mod, raw }`` shape. */
   ch: string
   mod: VoiceRecordKeyMod
+  named?: VoiceRecordKeyNamed
   raw: string
 }
 
@@ -90,10 +99,72 @@ const _MOD_ALIASES: Record<string, VoiceRecordKeyMod> = {
   windows: 'super'
 }
 
+/** Map config-string named tokens to the canonical name used at match time.
+ *
+ * Aliases mirror what prompt_toolkit accepts (``return`` ↔ ``enter``,
+ * ``esc`` ↔ ``escape``) so a config that round-trips through the CLI also
+ * binds in the TUI. */
+const _NAMED_KEY_ALIASES: Record<string, VoiceRecordKeyNamed> = {
+  backspace: 'backspace',
+  bs: 'backspace',
+  del: 'delete',
+  delete: 'delete',
+  enter: 'enter',
+  esc: 'escape',
+  escape: 'escape',
+  ret: 'enter',
+  return: 'enter',
+  space: 'space',
+  spc: 'space',
+  tab: 'tab'
+}
+
+interface RuntimeKeyEvent {
+  alt?: boolean
+  backspace?: boolean
+  ctrl: boolean
+  delete?: boolean
+  escape?: boolean
+  meta: boolean
+  return?: boolean
+  super?: boolean
+  tab?: boolean
+}
+
+/** Match an ink ``key`` event against a parsed named key. The ink runtime
+ * sets one boolean per named key; ``space`` is a printable char so it
+ * arrives as ``ch === ' '`` rather than a dedicated ``key.space`` flag. */
+const _matchesNamedKey = (
+  named: VoiceRecordKeyNamed,
+  key: RuntimeKeyEvent,
+  ch: string
+): boolean => {
+  switch (named) {
+    case 'backspace':
+      return key.backspace === true
+    case 'delete':
+      return key.delete === true
+    case 'enter':
+      return key.return === true
+    case 'escape':
+      return key.escape === true
+    case 'space':
+      return ch === ' '
+    case 'tab':
+      return key.tab === true
+  }
+}
+
 /**
  * Parse a config-string voice record key like ``ctrl+b`` / ``alt+r`` /
- * ``cmd+space`` into ``{mod, ch}``. Falls back to the documented Ctrl+B
- * default for empty / malformed input so a typo never silently disables
+ * ``ctrl+space`` into ``{mod, ch, named?}``. Accepts single characters
+ * AND the named tokens declared in ``_NAMED_KEY_ALIASES`` (``space``,
+ * ``enter``/``return``, ``tab``, ``escape``/``esc``, ``backspace``,
+ * ``delete``) — matching the keys prompt_toolkit accepts on the CLI
+ * side via the ``c-<name>`` rewrite in ``cli.py``.
+ *
+ * Falls back to the documented Ctrl+B default for empty input or for
+ * unrecognised multi-character tokens so a typo never silently disables
  * the shortcut.
  */
 export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
@@ -109,7 +180,7 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
     return DEFAULT_VOICE_RECORD_KEY
   }
 
-  const ch = parts[parts.length - 1]
+  const last = parts[parts.length - 1]
   const modCandidates = parts.slice(0, -1)
 
   let mod: VoiceRecordKeyMod = 'ctrl'
@@ -123,29 +194,46 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
     }
   }
 
-  // Reject multi-character chunks (e.g. "ctrl+space" → ch="space" — we
-  // only support single-character bindings, matching the Python side's
-  // prompt_toolkit binding shape).
-  if (ch.length !== 1) {
-    return DEFAULT_VOICE_RECORD_KEY
+  if (last.length === 1) {
+    return { ch: last, mod, raw: lower }
   }
 
-  return { ch, mod, raw: lower }
+  const named = _NAMED_KEY_ALIASES[last]
+
+  if (named) {
+    return { ch: named, mod, named, raw: lower }
+  }
+
+  // Unknown multi-character token (e.g. typo'd ``ctrl+spcae``) — fall back
+  // to the doc default rather than silently disabling the binding.
+  return DEFAULT_VOICE_RECORD_KEY
 }
 
-/** Render a parsed key back as ``Ctrl+B`` for status text. */
+/** Render a parsed key back as ``Ctrl+B`` / ``Ctrl+Space`` for status text. */
 export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
   const modLabel = parsed.mod === 'meta' ? 'Cmd' : parsed.mod[0].toUpperCase() + parsed.mod.slice(1)
+  // Named tokens render in title case (Ctrl+Space, Ctrl+Enter); single
+  // chars render upper-case to match the existing Ctrl+B convention.
+  const keyLabel = parsed.named
+    ? parsed.named[0].toUpperCase() + parsed.named.slice(1)
+    : parsed.ch.toUpperCase()
 
-  return `${modLabel}+${parsed.ch.toUpperCase()}`
+  return `${modLabel}+${keyLabel}`
 }
 
 export const isVoiceToggleKey = (
-  key: { alt?: boolean; ctrl: boolean; meta: boolean; super?: boolean },
+  key: RuntimeKeyEvent,
   ch: string,
   configured: ParsedVoiceRecordKey = DEFAULT_VOICE_RECORD_KEY
 ): boolean => {
-  if (ch.toLowerCase() !== configured.ch) {
+  // Match the configured key first (single-char compare or named-key
+  // event-property check). Bail out before evaluating modifier shape
+  // so the wrong key never reaches the modifier guard.
+  if (configured.named) {
+    if (!_matchesNamedKey(configured.named, key, ch)) {
+      return false
+    }
+  } else if (ch.toLowerCase() !== configured.ch) {
     return false
   }
 

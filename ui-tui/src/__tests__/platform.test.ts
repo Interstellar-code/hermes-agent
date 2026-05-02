@@ -90,13 +90,10 @@ describe('isVoiceToggleKey', () => {
 })
 
 describe('parseVoiceRecordKey (#18994)', () => {
-  it('falls back to Ctrl+B for empty / malformed input', async () => {
+  it('falls back to Ctrl+B for empty input', async () => {
     const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
 
     expect(parseVoiceRecordKey('')).toEqual(DEFAULT_VOICE_RECORD_KEY)
-    // Multi-character chunks are unsupported (CLI binds single keys), so a
-    // typo like "ctrl+space" falls back to the doc default.
-    expect(parseVoiceRecordKey('ctrl+space')).toEqual(DEFAULT_VOICE_RECORD_KEY)
   })
 
   it('parses ctrl+<letter> bindings', async () => {
@@ -116,6 +113,37 @@ describe('parseVoiceRecordKey (#18994)', () => {
     expect(parseVoiceRecordKey('super+b').mod).toBe('super')
     expect(parseVoiceRecordKey('win+b').mod).toBe('super')
   })
+
+  it('parses named keys (space, enter, tab, escape, backspace, delete)', async () => {
+    const { parseVoiceRecordKey } = await importPlatform('linux')
+
+    // Every named token from the CLI's prompt_toolkit ``c-<name>`` set is
+    // accepted with both the canonical name and its common alias.
+    expect(parseVoiceRecordKey('ctrl+space')).toEqual({
+      ch: 'space',
+      mod: 'ctrl',
+      named: 'space',
+      raw: 'ctrl+space'
+    })
+    expect(parseVoiceRecordKey('alt+enter').named).toBe('enter')
+    expect(parseVoiceRecordKey('alt+return').named).toBe('enter') // ``return`` ↔ ``enter``
+    expect(parseVoiceRecordKey('ctrl+tab').named).toBe('tab')
+    expect(parseVoiceRecordKey('ctrl+escape').named).toBe('escape')
+    expect(parseVoiceRecordKey('ctrl+esc').named).toBe('escape') // ``esc`` alias
+    expect(parseVoiceRecordKey('ctrl+backspace').named).toBe('backspace')
+    expect(parseVoiceRecordKey('ctrl+delete').named).toBe('delete')
+    expect(parseVoiceRecordKey('ctrl+del').named).toBe('delete') // ``del`` alias
+  })
+
+  it('falls back to Ctrl+B for unrecognised multi-character tokens', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // Typos / unsupported names (``ctrl+spcae``, ``ctrl+f5``, …) fall back
+    // to the documented Ctrl+B default rather than silently disabling the
+    // binding.
+    expect(parseVoiceRecordKey('ctrl+spcae')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('ctrl+f5')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+  })
 })
 
 describe('formatVoiceRecordKey (#18994)', () => {
@@ -126,6 +154,14 @@ describe('formatVoiceRecordKey (#18994)', () => {
     expect(formatVoiceRecordKey(parseVoiceRecordKey('ctrl+o'))).toBe('Ctrl+O')
     expect(formatVoiceRecordKey(parseVoiceRecordKey('alt+r'))).toBe('Alt+R')
     expect(formatVoiceRecordKey(parseVoiceRecordKey('cmd+b'))).toBe('Cmd+B')
+  })
+
+  it('renders named keys in title case (Ctrl+Space, Ctrl+Enter)', async () => {
+    const { formatVoiceRecordKey, parseVoiceRecordKey } = await importPlatform('linux')
+
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('ctrl+space'))).toBe('Ctrl+Space')
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('alt+enter'))).toBe('Alt+Enter')
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('ctrl+esc'))).toBe('Ctrl+Escape')
   })
 })
 
@@ -146,6 +182,35 @@ describe('isVoiceToggleKey honours configured record key (#18994)', () => {
     expect(isVoiceToggleKey({ alt: true, ctrl: false, meta: false, super: false }, 'r', altR)).toBe(true)
     expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'r', altR)).toBe(true)
     expect(isVoiceToggleKey({ ctrl: false, meta: false, super: false }, 'r', altR)).toBe(false)
+  })
+
+  it('binds named keys via ink event flags (space → ch === " ", enter → key.return, …)', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('linux')
+
+    const ctrlSpace = parseVoiceRecordKey('ctrl+space')
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, ' ', ctrlSpace)).toBe(true)
+    // Single-char ``b`` must NOT match a ``space``-configured binding.
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'b', ctrlSpace)).toBe(false)
+    // Space without the configured modifier must not fire either.
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: false }, ' ', ctrlSpace)).toBe(false)
+
+    const ctrlEnter = parseVoiceRecordKey('ctrl+enter')
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, return: true, super: false }, '', ctrlEnter)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, return: false, super: false }, '', ctrlEnter)).toBe(false)
+
+    const altTab = parseVoiceRecordKey('alt+tab')
+    expect(isVoiceToggleKey({ alt: true, ctrl: false, meta: false, super: false, tab: true }, '', altTab)).toBe(true)
+    expect(isVoiceToggleKey({ alt: false, ctrl: false, meta: false, super: false, tab: true }, '', altTab)).toBe(false)
+
+    const ctrlEscape = parseVoiceRecordKey('ctrl+escape')
+    expect(isVoiceToggleKey({ ctrl: true, escape: true, meta: false, super: false }, '', ctrlEscape)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: true, escape: false, meta: false, super: false }, '', ctrlEscape)).toBe(false)
+
+    const ctrlBackspace = parseVoiceRecordKey('ctrl+backspace')
+    expect(isVoiceToggleKey({ backspace: true, ctrl: true, meta: false, super: false }, '', ctrlBackspace)).toBe(true)
+
+    const ctrlDelete = parseVoiceRecordKey('ctrl+delete')
+    expect(isVoiceToggleKey({ ctrl: true, delete: true, meta: false, super: false }, '', ctrlDelete)).toBe(true)
   })
 
   it('omitted configured key falls back to ctrl+b (back-compat)', async () => {
