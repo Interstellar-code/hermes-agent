@@ -108,10 +108,21 @@ describe('parseVoiceRecordKey (#18994)', () => {
 
     expect(parseVoiceRecordKey('alt+b').mod).toBe('alt')
     expect(parseVoiceRecordKey('option+b').mod).toBe('alt')
-    expect(parseVoiceRecordKey('cmd+b').mod).toBe('meta')
-    expect(parseVoiceRecordKey('command+b').mod).toBe('meta')
+    // ``cmd``/``command`` collapse onto ``super`` — hermes-ink's ``key.meta``
+    // means Alt on most terminals, so mapping ``cmd`` to a distinct ``meta``
+    // mod would make the display lie about the actual match target.
+    expect(parseVoiceRecordKey('cmd+b').mod).toBe('super')
+    expect(parseVoiceRecordKey('command+b').mod).toBe('super')
     expect(parseVoiceRecordKey('super+b').mod).toBe('super')
     expect(parseVoiceRecordKey('win+b').mod).toBe('super')
+  })
+
+  it('treats a bare "meta+b" as unrecognised (falls back to Ctrl+B)', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // ``meta`` is ambiguous on the wire (Alt on xterm, Cmd on legacy
+    // macOS). Rather than pick the wrong one, refuse it.
+    expect(parseVoiceRecordKey('meta+b')).toEqual(DEFAULT_VOICE_RECORD_KEY)
   })
 
   it('parses named keys (space, enter, tab, escape, backspace, delete)', async () => {
@@ -219,6 +230,64 @@ describe('isVoiceToggleKey honours configured record key (#18994)', () => {
     // No third arg → DEFAULT_VOICE_RECORD_KEY → Ctrl+B behaviour.
     expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'b')).toBe(true)
     expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'o')).toBe(false)
+  })
+
+  // Regressions from Copilot review on #19835: the previous implementation
+  // accepted ``isActionMod(key)`` in the ``ctrl`` branch for every
+  // configured key, so bare Esc (which hermes-ink reports with
+  // ``key.meta`` on some macOS terminals) fired ``ctrl+escape``, and
+  // Alt+Space / Alt+Tab fired ``ctrl+space`` / ``ctrl+tab``. The fallback
+  // is now gated to the documented default (``ctrl+b``) only.
+  it('ctrl+escape does NOT fire on bare Esc via key.meta on macOS', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+    const ctrlEscape = parseVoiceRecordKey('ctrl+escape')
+
+    // Bare Esc on a legacy macOS terminal: ``key.meta: true``, ``key.escape: true``, no ctrl.
+    expect(isVoiceToggleKey({ ctrl: false, escape: true, meta: true, super: false }, '', ctrlEscape)).toBe(false)
+    // Real Ctrl+Esc still fires.
+    expect(isVoiceToggleKey({ ctrl: true, escape: true, meta: false, super: false }, '', ctrlEscape)).toBe(true)
+  })
+
+  it('ctrl+space does NOT fire on Alt+Space on macOS', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+    const ctrlSpace = parseVoiceRecordKey('ctrl+space')
+
+    // Alt+Space surfaces as ``key.meta: true`` with space char.
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, ' ', ctrlSpace)).toBe(false)
+    // Real Ctrl+Space still fires.
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, ' ', ctrlSpace)).toBe(true)
+  })
+
+  it('default ctrl+b still accepts Cmd+B on macOS (muscle-memory preserved)', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, isVoiceToggleKey } = await importPlatform('darwin')
+
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', DEFAULT_VOICE_RECORD_KEY)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'b', DEFAULT_VOICE_RECORD_KEY)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'b', DEFAULT_VOICE_RECORD_KEY)).toBe(true)
+  })
+
+  it('custom ctrl+<letter> does NOT accept Cmd fallback on macOS', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+    const ctrlO = parseVoiceRecordKey('ctrl+o')
+
+    // Only ``ctrl+b`` gets the action-modifier fallback; ``ctrl+o`` must
+    // be a literal Ctrl bit — otherwise Cmd+O would steal the shortcut.
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'o', ctrlO)).toBe(false)
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'o', ctrlO)).toBe(false)
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'o', ctrlO)).toBe(true)
+  })
+
+  it('cmd+b renders "Cmd+B" and matches key.super OR (macOS) key.meta', async () => {
+    const { formatVoiceRecordKey, isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+    const cmdB = parseVoiceRecordKey('cmd+b')
+
+    expect(formatVoiceRecordKey(cmdB)).toBe('Cmd+B')
+    // Kitty-style: key.super
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'b', cmdB)).toBe(true)
+    // Legacy macOS terminal: key.meta
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', cmdB)).toBe(true)
+    // Ctrl held at the same time → reject (different chord).
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: true }, 'b', cmdB)).toBe(false)
   })
 })
 

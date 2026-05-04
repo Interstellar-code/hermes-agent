@@ -62,7 +62,7 @@ export const isCopyShortcut = (
  * the configured letter so existing macOS muscle memory keeps working
  * alongside the documented Ctrl+<letter> shortcut.
  */
-export type VoiceRecordKeyMod = 'alt' | 'ctrl' | 'meta' | 'super'
+export type VoiceRecordKeyMod = 'alt' | 'ctrl' | 'super'
 
 /** Named (multi-character) keys we support, matching the CLI's
  * prompt_toolkit binding shape (``c-space``, ``c-enter``, etc.) so a
@@ -85,13 +85,18 @@ export const DEFAULT_VOICE_RECORD_KEY: ParsedVoiceRecordKey = {
   raw: 'ctrl+b'
 }
 
+/** Modifier aliases. ``meta`` is intentionally absent: hermes-ink sets
+ * ``key.meta`` for plain Alt/Option (and on some legacy terminals for Cmd
+ * too), so accepting a literal ``meta+b`` config would display as ``Cmd+B``
+ * but match Alt+B on the wire — the kind of lie this fix was meant to
+ * remove. Users who want the platform action modifier spell it ``cmd`` /
+ * ``command`` / ``super`` / ``win``. */
 const _MOD_ALIASES: Record<string, VoiceRecordKeyMod> = {
   alt: 'alt',
-  cmd: 'meta',
-  command: 'meta',
+  cmd: 'super',
+  command: 'super',
   control: 'ctrl',
   ctrl: 'ctrl',
-  meta: 'meta',
   option: 'alt',
   opt: 'alt',
   super: 'super',
@@ -185,13 +190,17 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
 
   let mod: VoiceRecordKeyMod = 'ctrl'
 
-  for (const cand of modCandidates) {
-    const norm = _MOD_ALIASES[cand]
+  if (modCandidates.length) {
+    const norm = _MOD_ALIASES[modCandidates[0]]
 
-    if (norm) {
-      mod = norm
-      break
+    // Unknown modifier token (e.g. bare ``meta+b`` which is ambiguous on
+    // the wire) falls back to the documented default rather than
+    // silently coercing to Ctrl and producing a misleading bind.
+    if (!norm) {
+      return DEFAULT_VOICE_RECORD_KEY
     }
+
+    mod = norm
   }
 
   if (last.length === 1) {
@@ -211,7 +220,7 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
 
 /** Render a parsed key back as ``Ctrl+B`` / ``Ctrl+Space`` for status text. */
 export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
-  const modLabel = parsed.mod === 'meta' ? 'Cmd' : parsed.mod[0].toUpperCase() + parsed.mod.slice(1)
+  const modLabel = parsed.mod === 'super' ? 'Cmd' : parsed.mod[0].toUpperCase() + parsed.mod.slice(1)
   // Named tokens render in title case (Ctrl+Space, Ctrl+Enter); single
   // chars render upper-case to match the existing Ctrl+B convention.
   const keyLabel = parsed.named
@@ -220,6 +229,9 @@ export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
 
   return `${modLabel}+${keyLabel}`
 }
+
+const _isDefaultVoiceKey = (parsed: ParsedVoiceRecordKey): boolean =>
+  parsed.raw === DEFAULT_VOICE_RECORD_KEY.raw
 
 export const isVoiceToggleKey = (
   key: RuntimeKeyEvent,
@@ -241,15 +253,21 @@ export const isVoiceToggleKey = (
     case 'alt':
       // Most terminals surface Alt as either ``alt`` or ``meta``; accept
       // both so the binding works across xterm-style and kitty-style
-      // protocols.
-      return key.alt === true || key.meta
+      // protocols. Guard against ctrl/super bits so a chord like
+      // Ctrl+Alt+<key> or Cmd+Alt+<key> doesn't spuriously fire the
+      // alt binding.
+      return (key.alt === true || key.meta) && !key.ctrl && key.super !== true
     case 'ctrl':
-      // Doc default — also accept the platform action modifier so macOS
-      // Cmd+<letter> muscle memory keeps working alongside Ctrl+<letter>.
-      return key.ctrl || isActionMod(key)
-    case 'meta':
-      return key.meta || key.super === true
+      // Only the documented default (``ctrl+b``) gets the macOS
+      // Cmd-as-action-modifier fallback. For any user-configured binding
+      // we require the literal Ctrl bit — otherwise ``ctrl+escape`` would
+      // fire on bare Esc (hermes-ink sets ``key.meta`` for bare Esc on
+      // some macOS terminals) and ``ctrl+space`` would fire on Alt+Space.
+      return key.ctrl || (_isDefaultVoiceKey(configured) && isActionMod(key))
     case 'super':
-      return key.super === true
+      // Kitty-style protocol surfaces Cmd as ``key.super``; legacy macOS
+      // terminals still surface it as ``key.meta``. Accept both but
+      // require the ctrl bit to be clear so Ctrl+Cmd+<key> doesn't match.
+      return (key.super === true || (isMac && key.meta)) && !key.ctrl
   }
 }

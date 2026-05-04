@@ -292,3 +292,48 @@ describe('applyDisplay → tui_status_indicator', () => {
     expect($uiState.get().indicatorStyle).toBe('kaomoji')
   })
 })
+
+// Regressions from Copilot review on #19835: the config-hydration path
+// for voice.record_key was untested, so a future regression in the
+// hydration or mtime-reapply wiring would slip past the suite.
+describe('applyDisplay → voice.record_key (#18994)', () => {
+  beforeEach(() => {
+    resetUiState()
+  })
+
+  it('parses voice.record_key and pushes it through the setter', () => {
+    const setBell = vi.fn()
+    const setVoiceRecordKey = vi.fn()
+
+    applyDisplay(
+      { config: { display: {}, voice: { record_key: 'ctrl+space' } } },
+      setBell,
+      setVoiceRecordKey
+    )
+
+    expect(setVoiceRecordKey).toHaveBeenCalledWith(
+      expect.objectContaining({ ch: 'space', mod: 'ctrl', named: 'space', raw: 'ctrl+space' })
+    )
+  })
+
+  it('falls back to the documented default when voice.record_key is missing', () => {
+    const setBell = vi.fn()
+    const setVoiceRecordKey = vi.fn()
+
+    applyDisplay({ config: { display: {} } }, setBell, setVoiceRecordKey)
+
+    expect(setVoiceRecordKey).toHaveBeenCalledWith(
+      expect.objectContaining({ ch: 'b', mod: 'ctrl', raw: 'ctrl+b' })
+    )
+  })
+
+  it('is a no-op when the voice setter is not passed (back-compat)', () => {
+    const setBell = vi.fn()
+
+    // applyDisplay is used in the setVoiceEnabled-less init path too;
+    // omitting the third arg must not throw.
+    expect(() =>
+      applyDisplay({ config: { display: {}, voice: { record_key: 'alt+r' } } }, setBell)
+    ).not.toThrow()
+  })
+})

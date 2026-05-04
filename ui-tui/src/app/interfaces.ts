@@ -293,6 +293,7 @@ export interface SlashHandlerContext {
   }
   voice: {
     setVoiceEnabled: StateSetter<boolean>
+    setVoiceRecordKey: (v: ParsedVoiceRecordKey) => void
   }
 }
 

@@ -226,7 +226,15 @@ export const sessionCommands: SlashCommand[] = [
           // instead of hardcoded "Ctrl+B" — the gateway response carries the
           // current value so /voice status and /voice on stay in sync with
           // both the CLI and the TUI's actual binding (#18994).
-          const recordKeyLabel = formatVoiceRecordKey(parseVoiceRecordKey(r.record_key ?? 'ctrl+b'))
+          //
+          // Copilot review on #19835 caught that rendering from the fresh
+          // backend response WITHOUT updating the frontend ``voice.recordKey``
+          // state would skew display and binding between config-edit and
+          // the next ``mtime`` poll (~5s). Parse once, push into state so
+          // ``useInputHandlers()`` picks up the new binding immediately.
+          const parsed = parseVoiceRecordKey(r.record_key ?? 'ctrl+b')
+          ctx.voice.setVoiceRecordKey(parsed)
+          const recordKeyLabel = formatVoiceRecordKey(parsed)
 
           // Match CLI's _show_voice_status / _enable_voice_mode /
           // _toggle_voice_tts output shape so users don't have to learn
