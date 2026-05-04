@@ -1,5 +1,7 @@
 """Regression tests for gateway /model support of config.yaml custom_providers."""
 
+from types import SimpleNamespace
+
 import yaml
 import pytest
 
@@ -61,3 +63,55 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
     assert "Local (127.0.0.1:4141)" in result
     assert "custom:local-(127.0.0.1:4141)" in result
     assert "rotator-openrouter-coding" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_uses_root_provider_with_string_model(tmp_path, monkeypatch):
+    """Legacy config shape must still drive provider-aware alias resolution.
+
+    BlueBubbles/gateway users can have a string-valued ``model`` plus a
+    root-level ``provider``.  The gateway ``/model`` command should pass that
+    provider into the shared switcher so ambiguous aliases like ``sonnet`` are
+    resolved on Anthropic instead of the OpenRouter default.
+    """
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": "claude-opus-4-6",
+                "provider": "anthropic",
+                "base_url": "https://api.anthropic.com",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    import gateway.run as gateway_run
+
+    seen = {}
+
+    def fake_switch_model(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            success=True,
+            new_model="claude-sonnet-4-6",
+            target_provider="anthropic",
+            api_key="",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            provider_label="Anthropic",
+            model_info=None,
+            warning_message="",
+        )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+
+    result = await _make_runner()._handle_model_command(_make_event("/model sonnet"))
+
+    assert seen["raw_input"] == "sonnet"
+    assert seen["current_model"] == "claude-opus-4-6"
+    assert seen["current_provider"] == "anthropic"
+    assert seen["current_base_url"] == "https://api.anthropic.com"
+    assert "Model switched to `claude-sonnet-4-6`" in result

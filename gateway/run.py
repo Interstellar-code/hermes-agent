@@ -998,6 +998,46 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _resolve_gateway_model_state(config: dict | None = None) -> tuple[str, str, str]:
+    """Read current model/provider/base_url from config.yaml for gateway commands.
+
+    The canonical config shape stores these values under ``model:``, but older
+    configs and migration docs may still use a string-valued ``model`` plus
+    root-level ``provider``/``base_url``.  Match the interactive CLI fallback
+    behavior so provider-aware operations such as ``/model sonnet`` resolve
+    aliases against the provider the user actually configured.
+    """
+    cfg = config if config is not None else _load_gateway_config()
+    current_model = ""
+    current_provider = "openrouter"
+    current_base_url = ""
+    has_nested_provider = False
+
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, str):
+        current_model = model_cfg
+    elif isinstance(model_cfg, dict):
+        current_model = model_cfg.get("default") or model_cfg.get("model") or ""
+        nested_provider = model_cfg.get("provider")
+        if nested_provider:
+            current_provider = nested_provider
+            has_nested_provider = True
+        current_base_url = model_cfg.get("base_url") or ""
+
+    if not current_provider:
+        current_provider = "openrouter"
+    if not has_nested_provider:
+        root_provider = cfg.get("provider")
+        if root_provider:
+            current_provider = root_provider
+    if not current_base_url:
+        root_base_url = cfg.get("base_url")
+        if root_base_url:
+            current_base_url = root_base_url
+
+    return current_model, current_provider, current_base_url
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -7881,11 +7921,9 @@ class GatewayRunner:
         try:
             cfg = _load_gateway_config()
             if cfg:
-                model_cfg = cfg.get("model", {})
-                if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
+                current_model, current_provider, current_base_url = (
+                    _resolve_gateway_model_state(cfg)
+                )
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
