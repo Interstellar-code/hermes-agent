@@ -155,6 +155,30 @@ describe('parseVoiceRecordKey (#18994)', () => {
     expect(parseVoiceRecordKey('ctrl+spcae')).toEqual(DEFAULT_VOICE_RECORD_KEY)
     expect(parseVoiceRecordKey('ctrl+f5')).toEqual(DEFAULT_VOICE_RECORD_KEY)
   })
+
+  // Round-3 Copilot review regressions on #19835.
+  it('does not throw on non-string YAML scalars — falls back instead', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // ``config.get full`` surfaces raw YAML values; ``voice.record_key: 1``
+    // or ``voice.record_key: true`` would otherwise crash ``.trim()``.
+    expect(parseVoiceRecordKey(1 as unknown as string)).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey(true as unknown as string)).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey(null as unknown as string)).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey(undefined as unknown as string)).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey({} as unknown as string)).toEqual(DEFAULT_VOICE_RECORD_KEY)
+  })
+
+  it('rejects multi-modifier chords rather than silently dropping extras', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // Previously ``ctrl+alt+r`` parsed as ``ctrl+r`` and ``cmd+ctrl+b`` as
+    // ``super+b`` — a typo silently bound a different shortcut. Now a
+    // multi-modifier spelling falls back to the documented default.
+    expect(parseVoiceRecordKey('ctrl+alt+r')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('cmd+ctrl+b')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('alt+ctrl+space')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+  })
 })
 
 describe('formatVoiceRecordKey (#18994)', () => {

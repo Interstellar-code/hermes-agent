@@ -168,12 +168,19 @@ const _matchesNamedKey = (
  * ``delete``) — matching the keys prompt_toolkit accepts on the CLI
  * side via the ``c-<name>`` rewrite in ``cli.py``.
  *
- * Falls back to the documented Ctrl+B default for empty input or for
- * unrecognised multi-character tokens so a typo never silently disables
- * the shortcut.
+ * Accepts ``unknown`` because the source is raw YAML via
+ * ``config.get full`` — a hand-edited ``voice.record_key: 1`` or
+ * ``voice.record_key: true`` would otherwise crash ``.trim()`` on a
+ * non-string scalar (Copilot round-3 review on #19835). Non-string /
+ * empty / unrecognised values fall back to the documented Ctrl+B
+ * default so a typo never silently disables the shortcut.
  */
-export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
-  const lower = (raw ?? '').trim().toLowerCase()
+export const parseVoiceRecordKey = (raw: unknown): ParsedVoiceRecordKey => {
+  if (typeof raw !== 'string') {
+    return DEFAULT_VOICE_RECORD_KEY
+  }
+
+  const lower = raw.trim().toLowerCase()
 
   if (!lower) {
     return DEFAULT_VOICE_RECORD_KEY
@@ -188,9 +195,19 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
   const last = parts[parts.length - 1]
   const modCandidates = parts.slice(0, -1)
 
+  // Reject multi-modifier chords (``ctrl+alt+r``, ``cmd+ctrl+b``) rather
+  // than silently dropping the extra modifier — the previous
+  // single-token validator made a typo bind a different shortcut than
+  // the user configured (Copilot round-3 review on #19835). The classic
+  // CLI only supports single-modifier bindings via prompt_toolkit's
+  // ``c-x`` / ``a-x`` rewrite in ``cli.py``, so this matches CLI parity.
+  if (modCandidates.length > 1) {
+    return DEFAULT_VOICE_RECORD_KEY
+  }
+
   let mod: VoiceRecordKeyMod = 'ctrl'
 
-  if (modCandidates.length) {
+  if (modCandidates.length === 1) {
     const norm = _MOD_ALIASES[modCandidates[0]]
 
     // Unknown modifier token (e.g. bare ``meta+b`` which is ambiguous on

@@ -5278,6 +5278,22 @@ def _voice_tts_enabled() -> bool:
     return os.environ.get("HERMES_VOICE_TTS", "").strip() == "1"
 
 
+def _voice_record_key() -> str:
+    """Current ``voice.record_key`` value, documented default on error.
+
+    ``_load_cfg()`` returns raw ``yaml.safe_load()`` output, so ``voice``
+    may be any scalar — a hand-edited ``voice: true`` or ``voice: cmd+b``
+    (string where a dict is expected) would break ``.get("record_key")``
+    and take every ``voice.toggle`` branch down with it (Copilot round-3
+    review on #19835). Coerce through ``isinstance`` so malformed config
+    falls back to the documented default instead of crashing /voice.
+    """
+    voice_cfg = _load_cfg().get("voice")
+    record_key = voice_cfg.get("record_key") if isinstance(voice_cfg, dict) else None
+
+    return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+b"
+
+
 @method("voice.toggle")
 def _(rid, params: dict) -> dict:
     """CLI parity for the ``/voice`` slash command.
@@ -5304,9 +5320,7 @@ def _(rid, params: dict) -> dict:
         # ignored the config (#18994).
         payload: dict = {
             "enabled": _voice_mode_enabled(),
-            "record_key": str(
-                (_load_cfg().get("voice") or {}).get("record_key") or "ctrl+b"
-            ),
+            "record_key": _voice_record_key(),
             "tts": _voice_tts_enabled(),
         }
         try:
@@ -5347,9 +5361,7 @@ def _(rid, params: dict) -> dict:
             rid,
             {
                 "enabled": enabled,
-                "record_key": str(
-                    (_load_cfg().get("voice") or {}).get("record_key") or "ctrl+b"
-                ),
+                "record_key": _voice_record_key(),
                 "tts": _voice_tts_enabled(),
             },
         )
@@ -5368,9 +5380,7 @@ def _(rid, params: dict) -> dict:
             rid,
             {
                 "enabled": True,
-                "record_key": str(
-                    (_load_cfg().get("voice") or {}).get("record_key") or "ctrl+b"
-                ),
+                "record_key": _voice_record_key(),
                 "tts": new_value,
             },
         )

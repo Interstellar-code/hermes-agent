@@ -106,6 +106,35 @@ def test_voice_toggle_returns_configured_record_key(monkeypatch):
     assert status_resp["result"]["record_key"] == "ctrl+o"
 
 
+def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
+    """Round-3 Copilot review regression on #19835.
+
+    ``_load_cfg()`` is raw ``yaml.safe_load()`` output — a hand-edited
+    ``voice: true`` / ``voice: cmd+b`` / ``voice: null`` leaves ``voice``
+    as a bool/str/None, not a dict. Previously ``.get("record_key")``
+    on a non-dict broke every ``voice.toggle`` branch. Now it falls
+    back to the documented default.
+    """
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            check_voice_requirements=lambda: {"available": True, "details": ""}
+        ),
+    )
+
+    for bad in (True, "cmd+b", None, 42, ["ctrl+b"]):
+        monkeypatch.setattr(server, "_load_cfg", lambda b=bad: {"voice": b})
+
+        status_resp = server.dispatch(
+            {"id": "voice-status", "method": "voice.toggle", "params": {"action": "status"}}
+        )
+
+        assert status_resp["result"]["record_key"] == "ctrl+b", (
+            f"voice.record_key fell back to default for voice={bad!r}"
+        )
+
+
 def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     """Round-2 Copilot review regression on #19835.
 
