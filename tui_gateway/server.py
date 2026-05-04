@@ -5281,14 +5281,18 @@ def _voice_tts_enabled() -> bool:
 def _voice_record_key() -> str:
     """Current ``voice.record_key`` value, documented default on error.
 
-    ``_load_cfg()`` returns raw ``yaml.safe_load()`` output, so ``voice``
-    may be any scalar — a hand-edited ``voice: true`` or ``voice: cmd+b``
-    (string where a dict is expected) would break ``.get("record_key")``
-    and take every ``voice.toggle`` branch down with it (Copilot round-3
-    review on #19835). Coerce through ``isinstance`` so malformed config
-    falls back to the documented default instead of crashing /voice.
+    ``_load_cfg()`` returns raw ``yaml.safe_load()`` output, so both the
+    root AND ``voice`` may be any YAML scalar / list / None. A hand-edit
+    like ``voice: true`` or ``voice: cmd+b`` (string where a dict is
+    expected) or even a malformed top-level config that parses to a
+    scalar would otherwise break ``.get("record_key")`` and take every
+    ``voice.toggle`` branch down with it (Copilot round-3/round-4
+    review on #19835). Coerce through ``isinstance`` at every level so
+    malformed config falls back to the documented default instead of
+    crashing /voice.
     """
-    voice_cfg = _load_cfg().get("voice")
+    cfg = _load_cfg()
+    voice_cfg = cfg.get("voice") if isinstance(cfg, dict) else None
     record_key = voice_cfg.get("record_key") if isinstance(voice_cfg, dict) else None
 
     return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+b"

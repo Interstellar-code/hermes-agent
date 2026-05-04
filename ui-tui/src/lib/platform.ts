@@ -58,9 +58,9 @@ export const isCopyShortcut = (
  * config.yaml default. The TUI honours the same config knob (#18994);
  * when ``voice.record_key`` is e.g. ``ctrl+o`` the TUI binds Ctrl+O.
  *
- * On macOS we additionally accept the platform action modifier (Cmd) for
- * the configured letter so existing macOS muscle memory keeps working
- * alongside the documented Ctrl+<letter> shortcut.
+ * Only the documented default (``ctrl+b``) additionally accepts the
+ * macOS action modifier (Cmd+B) — custom bindings like ``ctrl+o``
+ * require the literal Ctrl bit so Cmd+O can't steal the shortcut.
  */
 export type VoiceRecordKeyMod = 'alt' | 'ctrl' | 'super'
 
@@ -123,6 +123,14 @@ const _NAMED_KEY_ALIASES: Record<string, VoiceRecordKeyNamed> = {
   spc: 'space',
   tab: 'tab'
 }
+
+/** ``useInputHandlers()`` intercepts these before the voice check runs,
+ * so a binding like ``ctrl+c`` (interrupt), ``ctrl+d`` (quit), or
+ * ``ctrl+l`` (clear screen) would be advertised in /voice status but
+ * never actually fire push-to-talk. Reject at parse time so the user
+ * gets the documented Ctrl+B instead of a dead shortcut (Copilot
+ * round-4 review on #19835). */
+const _RESERVED_CTRL_CHARS = new Set(['c', 'd', 'l'])
 
 interface RuntimeKeyEvent {
   alt?: boolean
@@ -205,19 +213,31 @@ export const parseVoiceRecordKey = (raw: unknown): ParsedVoiceRecordKey => {
     return DEFAULT_VOICE_RECORD_KEY
   }
 
-  let mod: VoiceRecordKeyMod = 'ctrl'
+  // Require an explicit modifier. A bare ``o`` / ``space`` / ``escape``
+  // has no sensible mapping: the CLI's prompt_toolkit binds the raw
+  // key (no rewrite) so bare-char configs would silently diverge
+  // between the two runtimes (Copilot round-4 review on #19835).
+  // Fall back to the documented default.
+  if (modCandidates.length === 0) {
+    return DEFAULT_VOICE_RECORD_KEY
+  }
 
-  if (modCandidates.length === 1) {
-    const norm = _MOD_ALIASES[modCandidates[0]]
+  const norm = _MOD_ALIASES[modCandidates[0]]
 
-    // Unknown modifier token (e.g. bare ``meta+b`` which is ambiguous on
-    // the wire) falls back to the documented default rather than
-    // silently coercing to Ctrl and producing a misleading bind.
-    if (!norm) {
-      return DEFAULT_VOICE_RECORD_KEY
-    }
+  // Unknown modifier token (e.g. bare ``meta+b`` which is ambiguous on
+  // the wire) falls back to the documented default rather than
+  // silently coercing to Ctrl and producing a misleading bind.
+  if (!norm) {
+    return DEFAULT_VOICE_RECORD_KEY
+  }
 
-    mod = norm
+  const mod = norm
+
+  // Block bindings the TUI input handler intercepts before the voice
+  // check — ``ctrl+c`` / ``ctrl+d`` / ``ctrl+l`` would never actually
+  // fire push-to-talk, so advertising them in /voice status is a lie.
+  if (mod === 'ctrl' && last.length === 1 && _RESERVED_CTRL_CHARS.has(last)) {
+    return DEFAULT_VOICE_RECORD_KEY
   }
 
   if (last.length === 1) {

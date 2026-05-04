@@ -179,6 +179,34 @@ describe('parseVoiceRecordKey (#18994)', () => {
     expect(parseVoiceRecordKey('cmd+ctrl+b')).toEqual(DEFAULT_VOICE_RECORD_KEY)
     expect(parseVoiceRecordKey('alt+ctrl+space')).toEqual(DEFAULT_VOICE_RECORD_KEY)
   })
+
+  // Round-4 Copilot review regressions on #19835.
+  it('rejects bare-char configs without an explicit modifier', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // The classic CLI's prompt_toolkit binds raw-char configs to the key
+    // itself (``c-o`` requires an explicit modifier); rewriting ``o``
+    // → ``ctrl+o`` would silently diverge the two runtimes. Refuse.
+    expect(parseVoiceRecordKey('o')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('b')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('space')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('escape')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+  })
+
+  it('rejects ctrl+c / ctrl+d / ctrl+l — reserved by the TUI input handler', async () => {
+    const { DEFAULT_VOICE_RECORD_KEY, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // ``useInputHandlers()`` intercepts these before the voice check,
+    // so a binding like ``ctrl+c`` would be advertised but never fire.
+    // Fall back to the documented default instead of lying to the user.
+    expect(parseVoiceRecordKey('ctrl+c')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('ctrl+d')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    expect(parseVoiceRecordKey('ctrl+l')).toEqual(DEFAULT_VOICE_RECORD_KEY)
+    // Alt- and super-modifier versions of those letters are NOT
+    // intercepted, so they remain usable.
+    expect(parseVoiceRecordKey('alt+c').mod).toBe('alt')
+    expect(parseVoiceRecordKey('cmd+l').mod).toBe('super')
+  })
 })
 
 describe('formatVoiceRecordKey (#18994)', () => {

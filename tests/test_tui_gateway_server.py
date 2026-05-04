@@ -134,6 +134,21 @@ def test_voice_toggle_handles_non_dict_voice_cfg(monkeypatch):
             f"voice.record_key fell back to default for voice={bad!r}"
         )
 
+    # Round-4 follow-up: the YAML root itself may be a non-dict. A
+    # hand-edit that collapses config.yaml to a scalar / list would
+    # otherwise crash ``.get("voice")`` before the inner isinstance
+    # guard gets a chance to run.
+    for bad_root in (True, None, [], "ctrl+b", 42):
+        monkeypatch.setattr(server, "_load_cfg", lambda r=bad_root: r)
+
+        status_resp = server.dispatch(
+            {"id": "voice-status-root", "method": "voice.toggle", "params": {"action": "status"}}
+        )
+
+        assert status_resp["result"]["record_key"] == "ctrl+b", (
+            f"voice.record_key fell back to default for root={bad_root!r}"
+        )
+
 
 def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
     """Round-2 Copilot review regression on #19835.
