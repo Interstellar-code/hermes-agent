@@ -85,16 +85,22 @@ export const DEFAULT_VOICE_RECORD_KEY: ParsedVoiceRecordKey = {
   raw: 'ctrl+b'
 }
 
-/** Modifier aliases. ``meta`` is intentionally absent: hermes-ink sets
- * ``key.meta`` for plain Alt/Option (and on some legacy terminals for Cmd
- * too), so accepting a literal ``meta+b`` config would display as ``Cmd+B``
- * but match Alt+B on the wire — the kind of lie this fix was meant to
- * remove. Users who want the platform action modifier spell it ``cmd`` /
- * ``command`` / ``super`` / ``win``. */
+/** Modifier aliases.
+ *
+ * ``meta`` / ``cmd`` / ``command`` are intentionally absent.
+ * hermes-ink sets ``key.meta`` for plain Alt/Option on every platform
+ * AND for Cmd on some legacy macOS terminals (Terminal.app without
+ * kitty-protocol passthrough). Accepting any of those as a literal
+ * modifier would produce a display/binding mismatch — a config like
+ * ``cmd+b`` would render as ``Cmd+B`` but silently fire on Alt+B, or
+ * never fire at all on legacy terminals even though the UI advertises
+ * it (Copilot round-6 review on #19835). Users on modern kitty-style
+ * terminals (iTerm2 CSI-u, Ghostty, Kitty, WezTerm, Alacritty) spell
+ * the platform action modifier ``super`` / ``win``, which match the
+ * unambiguous ``key.super`` bit. macOS users on Terminal.app stick
+ * with the documented ``ctrl+b``. */
 const _MOD_ALIASES: Record<string, VoiceRecordKeyMod> = {
   alt: 'alt',
-  cmd: 'super',
-  command: 'super',
   control: 'ctrl',
   ctrl: 'ctrl',
   option: 'alt',
@@ -318,22 +324,27 @@ export const isVoiceToggleKey = (
       // alt binding.
       return (key.alt === true || key.meta) && !key.ctrl && key.super !== true
     case 'ctrl':
-      // Only the documented default (``ctrl+b``) gets the macOS
-      // Cmd-as-action-modifier fallback. For any user-configured binding
-      // we require the literal Ctrl bit — otherwise ``ctrl+escape`` would
-      // fire on bare Esc (hermes-ink sets ``key.meta`` for bare Esc on
-      // some macOS terminals) and ``ctrl+space`` would fire on Alt+Space.
-      return key.ctrl || (_isDefaultVoiceKey(configured) && isActionMod(key))
+      // Require the Ctrl bit AND a clear Alt/Super so a chord like
+      // Ctrl+Alt+<key> / Ctrl+Cmd+<key> doesn't spuriously match
+      // ``ctrl+<key>`` (Copilot round-6 review on #19835).
+      //
+      // The documented default (``ctrl+b``) additionally accepts the
+      // explicit ``key.super`` bit on macOS for Cmd+B muscle memory —
+      // but ONLY ``key.super`` (kitty-style), never ``key.meta``, since
+      // ``key.meta`` is hermes-ink's Alt signal and accepting it would
+      // fire the binding on Alt+B.
+      if (key.ctrl) {
+        return !key.alt && !key.meta && key.super !== true
+      }
+
+      return _isDefaultVoiceKey(configured) && isMac && key.super === true && !key.alt && !key.meta
     case 'super':
-      // Require the explicit ``key.super`` bit (kitty-style protocol).
-      // The previous ``isMac && key.meta`` fallback was intended for
-      // legacy macOS terminals that report Cmd as ``meta``, but
-      // hermes-ink also sets ``key.meta`` for plain Alt/Option and even
-      // bare Escape — so a ``cmd+b`` config silently fired on Alt+B
-      // and ``cmd+escape`` on bare Esc (Copilot round-5 review on
-      // #19835). Legacy-terminal users who want the Cmd shortcut
-      // should upgrade to a kitty-protocol terminal or bind ``alt+X``
-      // explicitly.
-      return key.super === true && !key.ctrl
+      // Require the explicit ``key.super`` bit (kitty-style protocol)
+      // AND clear Ctrl/Alt/Meta so Ctrl+Cmd+X or Alt+Cmd+X don't
+      // spuriously fire the super binding (Copilot round-6 review on
+      // #19835). Legacy-terminal users whose Cmd arrives as
+      // ``key.meta`` need a kitty-protocol terminal — see the
+      // _MOD_ALIASES doc-comment for the rationale.
+      return key.super === true && !key.ctrl && !key.alt && !key.meta
   }
 }
