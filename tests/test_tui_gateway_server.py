@@ -81,6 +81,31 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+def test_voice_toggle_returns_configured_record_key(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"voice": {"record_key": "ctrl+o"}},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            check_voice_requirements=lambda: {"available": True, "details": ""}
+        ),
+    )
+
+    on_resp = server.dispatch(
+        {"id": "voice-on", "method": "voice.toggle", "params": {"action": "on"}}
+    )
+    status_resp = server.dispatch(
+        {"id": "voice-status", "method": "voice.toggle", "params": {"action": "status"}}
+    )
+
+    assert on_resp["result"]["record_key"] == "ctrl+o"
+    assert status_resp["result"]["record_key"] == "ctrl+o"
+
+
 def test_load_enabled_toolsets_prefers_tui_env(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "web, terminal, ,memory")
 
