@@ -76,7 +76,9 @@ export interface ConfigDisplayConfig {
 }
 
 export interface ConfigVoiceConfig {
-  record_key?: string
+  // Raw `yaml.safe_load()` value from config; may be non-string if hand-edited.
+  // Callers must normalize/validate at runtime (parseVoiceRecordKey()).
+  record_key?: unknown
 }
 
 export interface ConfigFullResponse {
