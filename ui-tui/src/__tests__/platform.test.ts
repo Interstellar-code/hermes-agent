@@ -164,7 +164,10 @@ describe('formatVoiceRecordKey (#18994)', () => {
     expect(formatVoiceRecordKey(parseVoiceRecordKey('ctrl+b'))).toBe('Ctrl+B')
     expect(formatVoiceRecordKey(parseVoiceRecordKey('ctrl+o'))).toBe('Ctrl+O')
     expect(formatVoiceRecordKey(parseVoiceRecordKey('alt+r'))).toBe('Alt+R')
-    expect(formatVoiceRecordKey(parseVoiceRecordKey('cmd+b'))).toBe('Cmd+B')
+    // ``cmd``/``command``/``super``/``win`` all collapse onto the super
+    // modifier and render as ``Super`` on non-mac so the hint doesn't
+    // tell Linux/Windows users to press a Cmd key they don't have.
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('cmd+b'))).toBe('Super+B')
   })
 
   it('renders named keys in title case (Ctrl+Space, Ctrl+Enter)', async () => {
@@ -288,6 +291,37 @@ describe('isVoiceToggleKey honours configured record key (#18994)', () => {
     expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', cmdB)).toBe(true)
     // Ctrl held at the same time → reject (different chord).
     expect(isVoiceToggleKey({ ctrl: true, meta: false, super: true }, 'b', cmdB)).toBe(false)
+  })
+
+  // Round-2 Copilot review regressions on #19835.
+  it('super+b renders "Super+B" on Linux (not "Cmd+B")', async () => {
+    const { formatVoiceRecordKey, parseVoiceRecordKey } = await importPlatform('linux')
+
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('super+b'))).toBe('Super+B')
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('win+b'))).toBe('Super+B')
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('cmd+b'))).toBe('Super+B')
+  })
+
+  it('super+b still renders "Cmd+B" on macOS', async () => {
+    const { formatVoiceRecordKey, parseVoiceRecordKey } = await importPlatform('darwin')
+
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('super+b'))).toBe('Cmd+B')
+    expect(formatVoiceRecordKey(parseVoiceRecordKey('win+b'))).toBe('Cmd+B')
+  })
+
+  it('ctrl+b aliases (control+b, "ctrl + b") still accept Cmd+B fallback on macOS', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+    const controlB = parseVoiceRecordKey('control+b')
+    const spacedB = parseVoiceRecordKey('ctrl + b')
+
+    // Both parse to the documented default semantically; both must keep
+    // the macOS Cmd+B muscle-memory fallback.
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', controlB)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', spacedB)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'b', controlB)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'b', spacedB)).toBe(true)
+    // And still reject a ctrl bit on a different letter.
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'o', controlB)).toBe(false)
   })
 })
 

@@ -106,6 +106,38 @@ def test_voice_toggle_returns_configured_record_key(monkeypatch):
     assert status_resp["result"]["record_key"] == "ctrl+o"
 
 
+def test_voice_toggle_tts_branch_also_carries_record_key(monkeypatch):
+    """Round-2 Copilot review regression on #19835.
+
+    The ``tts`` branch used to omit ``record_key`` from its response, so a
+    TUI client would parse ``r.record_key ?? 'ctrl+b'`` and reset a
+    custom binding to the default on every TTS toggle. Every branch of
+    ``voice.toggle`` now carries the configured key so frontend state
+    stays authoritative.
+    """
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"voice": {"record_key": "ctrl+space"}},
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            check_voice_requirements=lambda: {"available": True, "details": ""}
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.delenv("HERMES_VOICE_TTS", raising=False)
+
+    tts_resp = server.dispatch(
+        {"id": "voice-tts", "method": "voice.toggle", "params": {"action": "tts"}}
+    )
+
+    assert tts_resp["result"]["record_key"] == "ctrl+space"
+    assert tts_resp["result"]["tts"] is True
+
+
 def test_load_enabled_toolsets_prefers_tui_env(monkeypatch):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "web, terminal, ,memory")
 

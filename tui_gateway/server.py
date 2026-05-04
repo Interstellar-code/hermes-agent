@@ -5360,7 +5360,20 @@ def _(rid, params: dict) -> dict:
         new_value = not _voice_tts_enabled()
         # Runtime-only flag (CLI parity) — see voice.toggle on/off above.
         os.environ["HERMES_VOICE_TTS"] = "1" if new_value else "0"
-        return _ok(rid, {"enabled": True, "tts": new_value})
+        # Include ``record_key`` on every branch so a /voice tts toggle
+        # doesn't reset the TUI's cached shortcut to the default when a
+        # user has a custom binding configured (Copilot review, round 2
+        # on #19835). Keeps parity with the status/on/off branches above.
+        return _ok(
+            rid,
+            {
+                "enabled": True,
+                "record_key": str(
+                    (_load_cfg().get("voice") or {}).get("record_key") or "ctrl+b"
+                ),
+                "tts": new_value,
+            },
+        )
 
     return _err(rid, 4013, f"unknown voice action: {action}")
 

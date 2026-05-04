@@ -218,9 +218,15 @@ export const parseVoiceRecordKey = (raw: string): ParsedVoiceRecordKey => {
   return DEFAULT_VOICE_RECORD_KEY
 }
 
-/** Render a parsed key back as ``Ctrl+B`` / ``Ctrl+Space`` for status text. */
+/** Render a parsed key back as ``Ctrl+B`` / ``Ctrl+Space`` for status text.
+ *
+ * Platform-aware for the ``super`` modifier: renders ``Cmd`` on macOS and
+ * ``Super`` elsewhere. Previously rendered ``Cmd`` universally, which told
+ * Linux/Windows users the wrong modifier to press (Copilot review, round
+ * 2 on #19835). */
 export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
-  const modLabel = parsed.mod === 'super' ? 'Cmd' : parsed.mod[0].toUpperCase() + parsed.mod.slice(1)
+  const modLabel =
+    parsed.mod === 'super' ? (isMac ? 'Cmd' : 'Super') : parsed.mod[0].toUpperCase() + parsed.mod.slice(1)
   // Named tokens render in title case (Ctrl+Space, Ctrl+Enter); single
   // chars render upper-case to match the existing Ctrl+B convention.
   const keyLabel = parsed.named
@@ -230,8 +236,15 @@ export const formatVoiceRecordKey = (parsed: ParsedVoiceRecordKey): string => {
   return `${modLabel}+${keyLabel}`
 }
 
+/** Whether the parsed binding is the documented default (ctrl+b).
+ *
+ * Compare on the parsed spec rather than ``raw`` so semantically-equal
+ * aliases (``control+b``, ``ctrl + b``) still get the macOS Cmd+B
+ * muscle-memory fallback (Copilot review, round 2 on #19835). */
 const _isDefaultVoiceKey = (parsed: ParsedVoiceRecordKey): boolean =>
-  parsed.raw === DEFAULT_VOICE_RECORD_KEY.raw
+  parsed.mod === DEFAULT_VOICE_RECORD_KEY.mod &&
+  parsed.ch === DEFAULT_VOICE_RECORD_KEY.ch &&
+  parsed.named === DEFAULT_VOICE_RECORD_KEY.named
 
 export const isVoiceToggleKey = (
   key: RuntimeKeyEvent,
