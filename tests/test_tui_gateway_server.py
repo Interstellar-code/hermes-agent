@@ -94,6 +94,12 @@ def test_voice_toggle_returns_configured_record_key(monkeypatch):
             check_voice_requirements=lambda: {"available": True, "details": ""}
         ),
     )
+    # ``voice.toggle`` action=on mutates ``os.environ["HERMES_VOICE"]``
+    # directly (CLI parity, runtime-only flag). Take monkeypatch
+    # ownership of the var so the change is reverted at teardown and
+    # later tests don't inherit a stale ON state (Copilot round-5
+    # review on #19835).
+    monkeypatch.setenv("HERMES_VOICE", "0")
 
     on_resp = server.dispatch(
         {"id": "voice-on", "method": "voice.toggle", "params": {"action": "on"}}

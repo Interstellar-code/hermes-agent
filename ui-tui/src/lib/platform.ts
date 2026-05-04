@@ -140,6 +140,7 @@ interface RuntimeKeyEvent {
   escape?: boolean
   meta: boolean
   return?: boolean
+  shift?: boolean
   super?: boolean
   tab?: boolean
 }
@@ -299,6 +300,15 @@ export const isVoiceToggleKey = (
     return false
   }
 
+  // The parser rejects multi-modifier configs (``ctrl+shift+b`` etc.),
+  // so at match time Shift must always be clear — otherwise
+  // ``ctrl+tab`` would also fire on Ctrl+Shift+Tab and ``alt+enter``
+  // on Alt+Shift+Enter, triggering a different chord than configured
+  // (Copilot round-5 review on #19835).
+  if (key.shift === true) {
+    return false
+  }
+
   switch (configured.mod) {
     case 'alt':
       // Most terminals surface Alt as either ``alt`` or ``meta``; accept
@@ -315,9 +325,15 @@ export const isVoiceToggleKey = (
       // some macOS terminals) and ``ctrl+space`` would fire on Alt+Space.
       return key.ctrl || (_isDefaultVoiceKey(configured) && isActionMod(key))
     case 'super':
-      // Kitty-style protocol surfaces Cmd as ``key.super``; legacy macOS
-      // terminals still surface it as ``key.meta``. Accept both but
-      // require the ctrl bit to be clear so Ctrl+Cmd+<key> doesn't match.
-      return (key.super === true || (isMac && key.meta)) && !key.ctrl
+      // Require the explicit ``key.super`` bit (kitty-style protocol).
+      // The previous ``isMac && key.meta`` fallback was intended for
+      // legacy macOS terminals that report Cmd as ``meta``, but
+      // hermes-ink also sets ``key.meta`` for plain Alt/Option and even
+      // bare Escape — so a ``cmd+b`` config silently fired on Alt+B
+      // and ``cmd+escape`` on bare Esc (Copilot round-5 review on
+      // #19835). Legacy-terminal users who want the Cmd shortcut
+      // should upgrade to a kitty-protocol terminal or bind ``alt+X``
+      // explicitly.
+      return key.super === true && !key.ctrl
   }
 }

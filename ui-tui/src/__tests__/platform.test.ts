@@ -207,6 +207,42 @@ describe('parseVoiceRecordKey (#18994)', () => {
     expect(parseVoiceRecordKey('alt+c').mod).toBe('alt')
     expect(parseVoiceRecordKey('cmd+l').mod).toBe('super')
   })
+
+  // Round-5 Copilot review regressions on #19835.
+  it('cmd+<key> does NOT fire on key.meta-only events (Alt+X false-fire guard)', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
+
+    // hermes-ink sets ``key.meta`` for Alt/Option AND for bare Esc on
+    // some macOS terminals. The super branch used to accept
+    // ``isMac && key.meta`` as a Cmd fallback, which made cmd+<key>
+    // bindings silently fire on Alt+<key> / bare Esc.
+    const cmdB = parseVoiceRecordKey('cmd+b')
+    const cmdSpace = parseVoiceRecordKey('cmd+space')
+    const cmdEscape = parseVoiceRecordKey('cmd+escape')
+
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', cmdB)).toBe(false)
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, ' ', cmdSpace)).toBe(false)
+    expect(isVoiceToggleKey({ ctrl: false, escape: true, meta: true, super: false }, '', cmdEscape)).toBe(false)
+  })
+
+  it('rejects matches when Shift is held (different chord than configured)', async () => {
+    const { isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('linux')
+
+    // Parser rejects multi-modifier configs like ``ctrl+shift+tab``,
+    // so the runtime matcher must also reject Shift-held events —
+    // otherwise ``ctrl+tab`` would fire on Ctrl+Shift+Tab.
+    const ctrlTab = parseVoiceRecordKey('ctrl+tab')
+    const altEnter = parseVoiceRecordKey('alt+enter')
+    const ctrlO = parseVoiceRecordKey('ctrl+o')
+
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, shift: true, super: false, tab: true }, '', ctrlTab)).toBe(false)
+    expect(isVoiceToggleKey({ alt: true, ctrl: false, meta: false, return: true, shift: true, super: false }, '', altEnter)).toBe(false)
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, shift: true, super: false }, 'o', ctrlO)).toBe(false)
+
+    // Sanity: same events without Shift still fire.
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, shift: false, super: false, tab: true }, '', ctrlTab)).toBe(true)
+    expect(isVoiceToggleKey({ ctrl: true, meta: false, shift: false, super: false }, 'o', ctrlO)).toBe(true)
+  })
 })
 
 describe('formatVoiceRecordKey (#18994)', () => {
@@ -332,15 +368,17 @@ describe('isVoiceToggleKey honours configured record key (#18994)', () => {
     expect(isVoiceToggleKey({ ctrl: true, meta: false, super: false }, 'o', ctrlO)).toBe(true)
   })
 
-  it('cmd+b renders "Cmd+B" and matches key.super OR (macOS) key.meta', async () => {
+  it('cmd+b renders "Cmd+B" and requires the literal key.super bit', async () => {
     const { formatVoiceRecordKey, isVoiceToggleKey, parseVoiceRecordKey } = await importPlatform('darwin')
     const cmdB = parseVoiceRecordKey('cmd+b')
 
     expect(formatVoiceRecordKey(cmdB)).toBe('Cmd+B')
-    // Kitty-style: key.super
+    // Kitty-style: key.super fires the binding.
     expect(isVoiceToggleKey({ ctrl: false, meta: false, super: true }, 'b', cmdB)).toBe(true)
-    // Legacy macOS terminal: key.meta
-    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', cmdB)).toBe(true)
+    // ``key.meta`` is NOT accepted — hermes-ink uses meta for Alt too,
+    // so accepting it here would make cmd+b silently fire on Alt+B
+    // (Copilot round-5 review on #19835).
+    expect(isVoiceToggleKey({ ctrl: false, meta: true, super: false }, 'b', cmdB)).toBe(false)
     // Ctrl held at the same time → reject (different chord).
     expect(isVoiceToggleKey({ ctrl: true, meta: false, super: true }, 'b', cmdB)).toBe(false)
   })
