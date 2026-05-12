@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
+    last_prompt_tokens INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -601,6 +602,7 @@ class SessionDB:
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
+        last_prompt_tokens: Optional[int] = None,
         absolute: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
@@ -636,7 +638,8 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = ?,
+                   last_prompt_tokens = CASE WHEN ? IS NOT NULL THEN ? ELSE last_prompt_tokens END
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -657,7 +660,8 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   api_call_count = COALESCE(api_call_count, 0) + ?,
+                   last_prompt_tokens = CASE WHEN ? IS NOT NULL THEN ? ELSE last_prompt_tokens END
                    WHERE id = ?"""
         params = (
             input_tokens,
@@ -676,6 +680,8 @@ class SessionDB:
             billing_mode,
             model,
             api_call_count,
+            last_prompt_tokens,
+            last_prompt_tokens,
             session_id,
         )
         def _do(conn):

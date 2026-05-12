@@ -12162,6 +12162,7 @@ class AIAgent:
                                     if cost_result.status == "included" else None,
                                     model=self.model,
                                     api_call_count=1,
+                                    last_prompt_tokens=getattr(self.context_compressor, "last_prompt_tokens", None),
                                 )
                             except Exception as e:
                                 # Log token persistence failures so they're
