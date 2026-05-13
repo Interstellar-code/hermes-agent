@@ -107,11 +107,13 @@ If those four work, the rest is iteration.
 
 ### Receiving side
 
-If profile `neo` runs Hermes gateway with the A2A plugin enabled, it exposes:
+If profile `neo` runs Hermes gateway with the A2A plugin enabled, it exposes (all paths per-profile per Clarification #3):
 
-- `GET /.well-known/agent.json`
-- `POST /api/plugins/a2a/rpc`
-- optionally `GET /api/plugins/a2a/tasks/{task_id}` for debugging/task inspection
+- `GET /api/plugins/a2a/neo/agent.json` — per-profile Agent Card
+- `POST /api/plugins/a2a/neo/rpc` — per-profile JSON-RPC endpoint
+- `GET /api/plugins/a2a/neo/tasks/{task_id}` — debugging/task inspection
+
+Canonical `/.well-known/agent.json` is NOT served in MVP (single-profile-default is ambiguous and discoverability hurts when more than one profile is enabled). P1 follow-up may add it as a redirect to the default profile.
 
 ### Sending side
 
@@ -121,7 +123,7 @@ A caller can send a JSON-RPC request with a task payload such as:
 {
   "jsonrpc": "2.0",
   "id": "req-123",
-  "method": "tasks/send",
+  "method": "message/send",
   "params": {
     "message": {
       "role": "user",
@@ -263,7 +265,7 @@ Every inbound A2A task must execute through the receiving profile's normal Herme
 ### MVP execution path
 
 1. Receive JSON-RPC request
-2. Validate supported method (`tasks/send` only in MVP)
+2. Validate supported method (`message/send` only in MVP)
 3. Extract incoming text from `message.parts`
 4. Build a normalized internal prompt wrapper such as:
 
@@ -284,11 +286,48 @@ Respond directly with the result. Do not explain the protocol.
 7. Write task status transitions in memory registry
 8. Return JSON-RPC result
 
-### Implementation note
+### Implementation note — runtime bridge contract (LOCKED)
 
-Prefer reusing the same code path the API server/gateway already uses for ordinary chat requests, instead of inventing a second execution path. The plugin should be as thin as possible.
+The plugin **MUST** invoke the Hermes runtime via **direct in-process Python call** to the existing session entry point (e.g. `gateway/chat_handler.py` or `run_agent.py` equivalent). Not via HTTP self-loop to the local gateway. Not via CLI subprocess.
 
-If there is no clean reusable session entry point, add a minimal helper in core runtime rather than embedding agent boot logic inside the plugin.
+Rationale:
+- Plugin runs inside the same gateway process → IPC overhead is wasted
+- Shared memory state (profile cache, model client pool) is reusable
+- Subprocess is fragile and slow
+- HTTP self-loop creates a recursive listener-on-listener pattern
+
+If the existing session entry point is not callable from plugin scope (private symbol, missing async wrapper, etc.), add a **minimal public helper** in `gateway/` named e.g. `run_oneshot_chat(profile, prompt, *, caller_meta) -> ChatResult`. The plugin imports and awaits this helper. Helper must NOT take any A2A-specific arguments — it stays generic for future callers (CLI, MCP, tests).
+
+The helper signature must satisfy:
+- input: profile name (str), prompt text (str), caller metadata dict (opt)
+- output: dataclass with `text: str`, `success: bool`, `error: str | None`, `session_key: str`, `model: str`
+- side effect: writes a real session entry into the profile's normal session store, indistinguishable from any other chat session except for caller metadata
+
+### Concurrency policy (LOCKED)
+
+MVP: **serialize per profile**. One A2A task in flight per profile at a time; additional submissions queue and block on the per-profile asyncio lock. Cross-profile concurrency is unrestricted (different profiles run in parallel).
+
+Rationale: Hermes session state per profile is not designed for concurrent writes; queuing is the safe MVP default. Document max queue depth (default 10) and overflow behavior (reject with `RESOURCE_EXHAUSTED` JSON-RPC error). Parallel-same-profile is a P1 follow-up that requires session-level reentrancy work.
+
+### Error matrix (LOCKED)
+
+Every error path returns a structured JSON-RPC error envelope. Codes follow A2A spec conventions where defined, custom -32xxx range otherwise.
+
+| Failure mode | JSON-RPC code | A2A status | HTTP code |
+|---|---|---|---|
+| Profile not found | -32004 | rejected | 404 |
+| Profile exists but A2A not enabled | -32005 | rejected | 403 |
+| Plugin globally disabled | (no route mounted — 404 at HTTP layer) | n/a | 404 |
+| Hermes runtime fails to start session | -32603 | failed | 500 |
+| Session starts, agent errors mid-execution | -32603 | failed | 200 (JSON-RPC envelope) |
+| JSON-RPC parse error | -32700 | n/a | 400 |
+| Method not in MVP allowlist (only `message/send`) | -32601 | n/a | 200 |
+| Request body exceeds size limit (default 256 KB) | -32600 | n/a | 413 |
+| Per-profile concurrency queue overflow | -32004 (resource exhausted) | rejected | 429 |
+| Duplicate `messageId` within dedup window | -32001 (idempotent replay) | (return original task) | 409 |
+| Task timeout exceeded (default 300s) | -32603 | failed | 200 |
+
+Every error envelope MUST include `data.task_id` (when assigned), `data.profile` (when relevant), and a human-readable `message`. No silent 500s.
 
 ---
 
@@ -307,7 +346,7 @@ a2a:
     - summarize_context
     - review_code
   allow_methods:
-    - tasks/send
+    - message/send
   require_localhost: true
 ```
 
@@ -374,9 +413,9 @@ Test should assert Hermes can discover the `a2a` plugin and import it successful
 
 Use minimal standalone manifest.
 
-**Step 3: Add registration stub**
+**Step 3: Add registration stub — config-gated**
 
-`register(ctx)` should install the router or whatever the plugin API requires.
+`register(ctx)` reads `a2a.enabled` from config FIRST. If `enabled=false`, log "A2A plugin disabled, skipping route registration" and return without mounting any routes. If `enabled=true`, install the router. This guarantees disabled=route-not-mounted (closes the route-mounted-but-disabled hole flagged in security review).
 
 **Step 4: Add a dummy health endpoint**
 
@@ -403,17 +442,17 @@ git commit -m "feat: add a2a plugin skeleton"
 - Modify: `plugins/a2a/server.py`
 - Test: `tests/plugins/test_a2a_agent_card.py`
 
-**Step 1: Write failing test for `GET /.well-known/agent.json` or fallback mounted path**
+**Step 1: Write failing test for `GET /api/plugins/a2a/<profile>/agent.json`**
 
-Assert response shape contains name, description, capabilities/skills, and endpoint.
+Assert response shape contains name, description, capabilities/skills, and endpoint. Test with two profiles (`neo`, `trinity`) and confirm each card advertises the correct profile-scoped `url` field.
 
 **Step 2: Implement Agent Card builder**
 
-Read profile/config values and produce deterministic JSON.
+Read profile/config values and produce deterministic JSON. Builder takes profile name as input; one card per profile.
 
-**Step 3: Serve the card endpoint**
+**Step 3: Serve the per-profile card endpoint**
 
-If direct `/.well-known/agent.json` is not possible in plugin scope, serve under `/api/plugins/a2a/agent.json` first and add a clearly marked follow-up task to expose the canonical path.
+Mount at `/api/plugins/a2a/<profile>/agent.json`. The plugin router resolves `<profile>` against the enabled-profiles allowlist; unknown profiles return 404 per error matrix. Canonical `/.well-known/agent.json` is explicitly NOT mounted in MVP.
 
 **Step 4: Validate response shape**
 
@@ -442,7 +481,7 @@ Cases:
 - missing id
 - unknown method
 - missing message text payload
-- valid `tasks/send`
+- valid `message/send`
 
 **Step 2: Implement local request/response models**
 
@@ -450,7 +489,7 @@ Return proper JSON-RPC error objects with code/message.
 
 **Step 3: Add `POST /api/plugins/a2a/rpc`**
 
-Only support `tasks/send` in MVP.
+Only support `message/send` in MVP.
 
 **Step 4: Re-run tests**
 
@@ -500,7 +539,7 @@ git add plugins/a2a tests/plugins/test_a2a_task_manager.py
 git commit -m "feat: add a2a task lifecycle manager"
 ```
 
-### Task 6: Bridge `tasks/send` into a real Hermes profile run
+### Task 6: Bridge `message/send` into a real Hermes profile run
 
 **Objective:** Execute inbound A2A tasks through the receiving profile's real Hermes runtime and return the final response.
 
@@ -538,61 +577,109 @@ git add plugins/a2a tests/plugins/test_a2a_execution.py [any shared runtime help
 git commit -m "feat: execute a2a tasks through hermes runtime"
 ```
 
-### Task 7: Add local-only guardrails and config wiring
+### Task 7: Add security guardrails and config wiring
 
-**Objective:** Prevent accidental exposure while the feature is experimental.
+**Objective:** Prevent accidental exposure + abuse while the feature is experimental.
 
 **Files:**
 - Modify: config handling path(s) for plugin config
-- Modify: `plugins/a2a/server.py`
+- Modify: `plugins/a2a/server.py`, `plugins/a2a/__init__.py`
 - Create: `tests/plugins/test_a2a_security.py`
 - Update: docs if config docs live in `website/`
 
-**Step 1: Write failing tests**
+**Step 1: Write failing tests** — cover all guardrails:
+- Remote (non-localhost) requests rejected when `require_localhost=true`
+- Plugin disabled → routes NOT mounted (404 at HTTP layer, not 403)
+- Request body > 256 KB → 413 with JSON-RPC -32600
+- Per-profile concurrent submission limit (default 10 queued) → 429 with -32004
+- Per-task timeout (default 300s) → 200 with task status `failed`, code -32603
+- Inbound prompt logging redacts message text (only logs length + sender metadata)
 
-Assert remote requests are rejected when `require_localhost=true`.
+**Step 2: Disabled = route not mounted**
 
-**Step 2: Read config and apply defaults**
+When `a2a.enabled=false` in config, plugin `register()` must early-return without calling `router.include_router(...)`. No 403/404 fallback — the route simply does not exist. This closes the route-mounted-but-disabled hole.
 
-Disabled by default. Local-only by default.
+**Step 3: Local-only bind enforcement**
 
-**Step 3: Return explicit error on disallowed origin**
+Plugin reads gateway bind address. If gateway is bound to `0.0.0.0` and `a2a.require_localhost=true` (default), plugin refuses to register routes and logs a clear error: "A2A requires localhost-bound gateway; refuse to mount routes."
 
-Message should make it obvious that this is intentional, not a crash.
+Plus: even when bound correctly, every inbound request checks `request.client.host` and rejects non-loopback with -32003 if `require_localhost=true`.
 
-**Step 4: Re-run tests**
+**Step 4: Rate limit + size cap + timeout**
 
-**Step 5: Commit**
+- Rate limit: default 30 requests/min per source IP (configurable). Exceeds → 429.
+- Body size cap: default 256 KB (configurable). Exceeds → 413 with -32600.
+- Task timeout: default 300 seconds wall-clock per task. Exceeds → status `failed`, code -32603, cancel underlying Hermes session via existing dispatcher SIGTERM path (per Clarification #11).
+
+**Step 5: PII-safe logging**
+
+Inbound prompt text MUST NOT be logged at INFO/WARN/ERROR levels. Allowed log fields: task_id, profile, caller_meta (from_agent, conversation_id), prompt_byte_length, status transitions. Full prompt only at DEBUG with explicit `a2a.log_prompts=true` opt-in.
+
+**Step 6: Re-run tests**
+
+All security tests must pass. Plus run gateway with `host=0.0.0.0` and verify plugin refuses to mount.
+
+**Step 7: Commit**
 
 ```bash
 git add plugins/a2a tests/plugins/test_a2a_security.py
-git commit -m "feat: add local-only guardrails for a2a plugin"
+git commit -m "feat: add security guardrails for a2a plugin"
 ```
 
-### Task 8: Add end-to-end manual validation instructions
+### Task 8: Add automated E2E test + manual validation docs
 
-**Objective:** Make the experiment runnable by a human without tribal knowledge.
+**Objective:** Prove two Hermes profiles can talk via A2A through an automated test (not just manual curl), plus document the manual path for humans.
 
 **Files:**
-- Update: `plugins/a2a/README.md`
-- Create: `docs/plans/` adjacent follow-up notes only if needed
-- Optionally update: website docs if worth it
+- Create: `tests/plugins/test_a2a_e2e_two_profiles.py` (automated)
+- Update: `plugins/a2a/README.md` (manual)
+- Optionally update: website docs
 
-**Step 1: Document two-profile setup**
+**Step 1: Write automated 2-profile E2E test**
+
+Test setup:
+- Spawn two test gateway instances (or one process with two profile contexts) on different ports
+- Profile A (`neo`) and profile B (`trinity`)
+- Both have `a2a.enabled=true` and `a2a.require_localhost=true`
+
+Test flow:
+1. Discover B's Agent Card from A's perspective: `GET http://127.0.0.1:<port_b>/api/plugins/a2a/trinity/agent.json`
+2. Assert card has `name="trinity"`, `capabilities.streaming=false`
+3. Submit a `message/send` from A to B with a deterministic prompt ("Say PONG and nothing else.")
+4. Assert response: valid JSON-RPC envelope, `result.task.status=completed`, `result.artifacts[0].text` contains "PONG"
+5. Verify trinity's session store now has a new entry with the caller metadata `from_agent=neo`
+6. Submit duplicate `messageId` — assert 409 with original `task.id` referenced
+
+Use pytest fixtures + a lightweight in-process gateway harness (avoid spawning real subprocesses if the gateway provides a test client). If subprocess is unavoidable, mark the test with `@pytest.mark.slow` and ensure CI runs it.
+
+**Step 2: Document two-profile manual setup in README**
 
 Example:
 - `switch` profile gateway on one port
 - `neo` profile gateway on another port
 
-**Step 2: Document discovery test**
+**Step 3: Document discovery test**
 
 ```bash
-curl http://127.0.0.1:<neo-port>/.well-known/agent.json
+curl http://127.0.0.1:<neo-port>/api/plugins/a2a/neo/agent.json
 ```
 
-**Step 3: Document task send test**
+(NOT `/.well-known/agent.json` — that path is reserved for P1 follow-up per Clarification #3.)
 
-Include a full JSON-RPC curl example.
+**Step 4: Document task send test**
+
+Include a full JSON-RPC curl example using `message/send` against `/api/plugins/a2a/<profile>/rpc`.
+
+**Step 5: Document error-path smoke tests**
+
+curl examples for: profile-not-found (404), method-not-supported (-32601), body-too-large (413), duplicate-messageId (409).
+
+**Step 6: Commit**
+
+```bash
+git add plugins/a2a tests/plugins/test_a2a_e2e_two_profiles.py
+git commit -m "feat: a2a e2e test + manual validation docs"
+```
 
 **Step 4: Document expected output and failure modes**
 
@@ -664,18 +751,168 @@ If a cleaner internal helper exists or can be added, use it. The plugin should n
 
 ---
 
+## Design Clarifications (post-review)
+
+### 1. Local-only enforced at bind, not just config
+
+The plugin listener MUST bind to `127.0.0.1` explicitly — not `0.0.0.0`. Config flag `require_localhost` is a secondary guard; the bind address is the primary enforcement. If a user passes `--host 0.0.0.0`, the plugin MUST refuse to start unless auth is implemented (not in MVP). Document this constraint explicitly in the security task (Task 7) and in `README.md`.
+
+### 2. No SSE is a documented limitation, not silent
+
+The Agent Card capabilities response MUST advertise `streaming: false`. Spec-compliant clients (LangChain, Vertex, MCP-A2A adapters) use this field to decide whether to fall back to request/response polling. MVP is intentionally degraded vs. fully spec-compliant servers — acceptable for "does the protocol work" demo, but a blocker for third-party interop. SSE is a P1 follow-up (added to roadmap below).
+
+### 3. Profile routing — pick (a): per-profile endpoint path
+
+Decision: use **per-profile endpoint path** (`/a2a/<profile>/`) rather than a single endpoint advertising the active default profile. Multi-profile interop is half the value proposition. Forward-compat rationale: a single-profile endpoint would require a breaking API change to go multi-profile later. Document the active profile in the Agent Card `url` field. MVP may implement only the default profile path; the URL structure must already be per-profile.
+
+### 4. Persistent task DB — P1 follow-up, documented
+
+MVP in-memory task table is intentionally ephemeral (lost on restart). This is explicitly a local-demo limitation and a real interop blocker for production use. P1 follow-up: SQLite-backed task table reusing existing `kanban_db.py` patterns. Add to roadmap.
+
+### 5. A2A spec version pinning
+
+Pin to `a2a-sdk` v0.3.24 (March 2026) if/when SDK is adopted. Document that v1.0 GA is expected mid-2026. Add early version negotiation: reject Agent Cards from clients claiming incompatible major versions with a clear error. For MVP hand-rolled implementation, document the targeted spec revision in `README.md`.
+
+### 6. Task ID ↔ Hermes session ID mapping contract
+
+**Decision:** 1 A2A task = 1 new Hermes session (default). A task does NOT continue an existing session unless `contextId` is provided. MVP does not implement `contextId` continuation — document as out of scope.
+
+Mapping table shape (in-memory for MVP, SQLite in P1):
+
+```python
+{
+  "a2a_task_<uuid>": {
+    "hermes_session_id": "<session-id>",
+    "status": "submitted|working|completed|failed|canceled",
+    "created_at": "<iso8601>",
+    "message_id": "<client-provided-idempotency-key>",  # if provided
+  }
+}
+```
+
+### 7. Idempotency
+
+A2A clients retry on transport errors. The task manager MUST support idempotency keys:
+
+- Client provides `messageId` field in the request params
+- If `messageId` matches a task created within the last 5 minutes, return `409` with a JSON-RPC error referencing the existing task id
+- After 5 minutes the idempotency window expires and the same `messageId` may create a new task
+- Store `messageId` in the task registry (in-memory for MVP)
+
+Add to task manager spec (Task 5).
+
+---
+
+## Upstream Awareness
+
+### 8. Plugin-first as deliberate adoption strategy
+
+Upstream issue #514 (teknium1, OPEN) classifies A2A as a TOOL (`tools/a2a_tool.py`), mirroring `tools/mcp_tool.py`. Our MVP is a **plugin** by design — this is the strategic entry path, not a divergence by accident.
+
+**Why plugin-first, then tool eventually:**
+
+1. **Distribution as an add-on, not core invasion.** Plugin can be installed alongside a stock Hermes Agent without modifying core source. Users opt in by enabling the plugin in config; no risk to their existing agent if it breaks or churns with the pre-1.0 SDK.
+
+2. **Plugin system already exposes the surfaces we need.** Hermes plugins can register custom tools, skills, routes, and config sections (see `plugins/kanban/`, `plugins/image_gen/`). The A2A plugin can offer tools to the running profile (e.g., `a2a_discover`, `a2a_call`) and accept inbound A2A tasks through the same plugin host — same execution path as future tool integration, just packaged differently.
+
+3. **Isolation = safer iteration.** Plugin failures are contained; if A2A spec changes or the SDK breaks, only A2A users notice. A core tool change ripples through every agent's startup.
+
+4. **Path to upstream is clear, not blocked.** Once the plugin proves the protocol shim works end-to-end and gathers real-world use, the same code can be refactored into `tools/a2a_tool.py` per teknium's stated direction in #514. The plugin acts as a **staging environment** for the eventual tool form. Most of the implementation — task manager, runtime bridge, agent card generation, security — stays identical; only the registration point changes (plugin host → core tool registry).
+
+5. **Avoids the upstream PR queue trap.** Multiple stalled A2A PRs upstream show the area is contested. Our plugin keeps us shipping without waiting on consensus.
+
+**Reference architecture for the eventual upgrade:** keep the plugin's `TaskStore`, `AgentExecutor`, `AgentCardBuilder` interfaces narrow enough that the tool refactor is a registration-layer swap, not a rewrite. (See item 16 — narrow seams.)
+
+### 9. RPC method names — use current spec names
+
+Use `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`.
+
+Do NOT use the legacy names `tasks/send`, `tasks/sendSubscribe` from older spec drafts. These appear in some older samples and tutorials but are not current spec. MVP only implements `message/send` (synchronous path).
+
+### 10. Agent Card discovery path
+
+Use `/.well-known/agent.json` (current spec). Do NOT use `/.well-known/agent-card.json` — this is the older path found in some samples and legacy issue #4454. Note: some spec page samples still use the old path; verify against the spec source before shipping.
+
+### 11. `tasks/cancel` wired to Hermes session interrupt
+
+Do not defer `tasks/cancel` with a streaming-only assumption. Wire `tasks/cancel` to interrupt the underlying Hermes session via the existing kanban dispatcher SIGTERM path. This satisfies the "mid-task intervention" use case without requiring SSE. MVP can implement a best-effort cancel (signal sent; status transitions to `canceled`).
+
+### 12. `AUTH_REQUIRED` state stub — reserve in state machine
+
+Reserve the `auth-required` lifecycle state in the task state machine even though MVP never emits it. This allows later auth-challenge features to land additively without breaking client state parsers that already handle the enum.
+
+State machine for MVP:
+
+```
+submitted → working → completed
+                   → failed
+                   → canceled     (via tasks/cancel)
+[auth-required]                   # reserved, never emitted in MVP
+```
+
+### 13. JWS Agent Card signing — no-op stub
+
+The A2A spec marks JWS signing optional. Ship a no-op signature stub now: Agent Card response includes an empty `signature` field (or null). Later signature support becomes additive, not breaking, for clients that start enforcing JWS.
+
+### 14. Explicit capability flags in Agent Card response
+
+MVP Agent Card MUST advertise the following capability flags explicitly:
+
+```json
+{
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false,
+    "stateTransitionHistory": false
+  },
+  "authentication": {
+    "schemes": []
+  }
+}
+```
+
+This tells third-party clients our limits up front and prevents silent fallback assumptions.
+
+### 15. What A2A does NOT solve — explicit non-goals
+
+- **Shared mutable state across agents** — A2A is message-passing, not a blackboard. Out of scope.
+- **Token-budget attribution when delegating** — the downstream agent owns its own token budget. Out of scope.
+- **Atomic state coordination (propose → validate → commit)** — distributed transaction semantics. Out of scope.
+
+Add a "Non-goals" subsection to `README.md`.
+
+### 16. Narrow seams for transport swap
+
+Structure the plugin's `TaskStore` and `AgentExecutor` as interfaces/abstract classes so a future transport binding (NATS, gRPC) can plug in without forking the module. MVP only ships HTTP+JSON-RPC. Do not hard-code transport assumptions across the whole module — isolate them at the boundary.
+
+```python
+# Suggested interface boundary
+class TaskStore(Protocol):
+    def create(self, ...) -> A2ATask: ...
+    def get(self, task_id: str) -> A2ATask | None: ...
+    def update_status(self, task_id: str, status: A2ATaskStatus) -> None: ...
+
+class AgentExecutor(Protocol):
+    async def execute(self, task: A2ATask, prompt: str) -> str: ...
+```
+
+---
+
 ## Manual acceptance criteria
 
-The MVP is good enough if all of the following are true:
+The MVP is good enough if all of the following are true (each criterion has a concrete check):
 
-1. A Hermes profile with the plugin enabled serves an Agent Card.
-2. A local POST to the plugin's RPC endpoint with `tasks/send` returns a valid JSON-RPC success or error payload.
-3. A valid `tasks/send` request causes the receiving profile to execute a real Hermes run in its own context.
-4. The response includes a stable task id and a final `completed` or `failed` status.
-5. Two Hermes profiles can be run on different ports, and one can be manually queried as the other's A2A peer.
-6. The feature is disabled by default and local-only by default.
+1. **Agent Card served** — `GET /api/plugins/a2a/<profile>/agent.json` returns 200 with a JSON body containing `name`, `description`, `url`, `capabilities`. Verify with `curl`.
+2. **RPC envelope correctness** — `POST /api/plugins/a2a/<profile>/rpc` with `message/send` returns valid JSON-RPC 2.0 envelope (matching `jsonrpc`, `id`, exactly one of `result` or `error`). Verify with `curl + jq`.
+3. **Real Hermes execution** — after a successful `message/send`, the target profile's session store (e.g. `~/.hermes/profiles/<profile>/sessions/`) contains a NEW session entry timestamped within the request window, and that session entry references the A2A caller metadata (`from_agent`, `conversation_id`). Evidence: `ls -lt` + `head` of the newest session file.
+4. **Stable task ID + final status** — response includes `result.task.id` matching `^a2a_task_[0-9a-f-]+$`, and `result.task.status` is one of `completed` or `failed`. Verify by sending one request, capturing the id, and re-fetching via `GET /api/plugins/a2a/<profile>/tasks/<id>` — must return the same task with the same final status.
+5. **Two-profile peer test (automated, not manual)** — promoted to automated E2E test in `tests/plugins/test_a2a_e2e_two_profiles.py`: spawn two test gateways with profiles `neo` and `trinity`, each on a separate localhost port; from neo's plugin, submit a task to trinity's RPC endpoint; assert the response artifact contains an output produced by trinity's real Hermes session (verifiable by checking that trinity's session log shows the inbound request).
+6. **Disabled-by-default verified** — with `a2a.enabled=false` (the default), `curl /api/plugins/a2a/<any>/agent.json` returns 404 (NOT 403). Confirms route not mounted, not just blocked.
+7. **Local-only verified** — with gateway bound to `0.0.0.0` and `a2a.require_localhost=true`, plugin refuses to mount and logs an explicit error. Additionally, with gateway bound to `127.0.0.1`, remote IP simulation (X-Forwarded-For or non-loopback request.client.host) returns -32003.
+8. **Capability flags honest** — Agent Card JSON has `capabilities.streaming=false`, `capabilities.pushNotifications=false`, `capabilities.stateTransitionHistory=false`, `authenticationSchemes=[]`. Verify with `curl | jq .capabilities`.
+9. **Error matrix smoke** — at least 4 error paths verified: profile-not-found (404), method-not-supported (-32601), body-too-large (413), duplicate-messageId (409).
 
-If we hit those six, the experiment is successful.
+If we hit all nine, the experiment is successful.
 
 ---
 
@@ -685,11 +922,15 @@ In priority order:
 
 1. **Hermes sender tool** — add an `a2a_send` tool or equivalent helper so one Hermes agent can call another without curl.
 2. **`input-required`** — enable real multi-turn back-and-forth between agents.
-3. **SSE streaming** — for long-running tasks.
-4. **Agent Card canonical route support** — if plugin mounting blocked it in MVP.
-5. **Kanban bridge** — allow A2A task completion to materialize/advance Kanban tasks.
-6. **Telegram/group routing integration** — optional human-visible operations layer.
-7. **External interoperability check** — validate against a non-Hermes A2A client/server.
+3. **SSE streaming** (`message/stream`) — for long-running tasks; required for full spec compliance and third-party interop.
+4. **Persistent task DB** — SQLite-backed task table reusing `kanban_db.py` patterns; required for production interop (tasks survive restart).
+5. **JWS Agent Card signing** — promote the no-op stub to real signing; additive, no client breakage.
+6. **`AUTH_REQUIRED` handling** — promote the reserved state to real auth-challenge flow.
+7. **NATS transport seam** — bind the `TaskStore`/`AgentExecutor` interfaces to a NATS or gRPC transport backend without forking the plugin.
+8. **Agent Card canonical route support** — if plugin mounting blocked `/.well-known/agent.json` in MVP.
+9. **Kanban bridge** — allow A2A task completion to materialize/advance Kanban tasks.
+10. **Telegram/group routing integration** — optional human-visible operations layer.
+11. **External interoperability check** — validate against a non-Hermes A2A client/server (LangChain, Vertex, MCP-A2A adapter).
 
 ---
 
