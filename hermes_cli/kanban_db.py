@@ -4072,16 +4072,44 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def _to_epoch(val) -> Optional[int]:
+    """Normalise a timestamp to unix epoch seconds.
+
+    Accepts ints (pass-through), numeric strings, and ISO-8601 strings.
+    Returns ``None`` for ``None`` / empty values.
+    """
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except (ValueError, OSError):
+        return None
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
-    age_since_created = now - int(task.created_at) if task.created_at else None
-    age_since_started = (
-        now - int(task.started_at) if task.started_at else None
-    )
+    _c = _to_epoch(task.created_at)
+    _s = _to_epoch(task.started_at)
+    _co = _to_epoch(task.completed_at)
+    age_since_created = now - _c if _c is not None else None
+    age_since_started = now - _s if _s is not None else None
     time_to_complete = (
-        int(task.completed_at) - int(task.started_at or task.created_at)
-        if task.completed_at else None
+        _co - (_s or _c) if _co is not None else None
     )
     return {
         "created_age_seconds": age_since_created,
