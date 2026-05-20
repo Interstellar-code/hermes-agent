@@ -1,0 +1,17 @@
+id: linear-test
+name: Linear Test Workflow
+description: 4 nodes run in declared order
+kind: workflow
+
+nodes:
+  - id: step1
+    bash: echo "step1"
+  - id: step2
+    bash: echo "step2"
+    depends_on: [step1]
+  - id: step3
+    bash: echo "step3"
+    depends_on: [step2]
+  - id: step4
+    bash: echo "step4"
+    depends_on: [step3]

@@ -1,0 +1,16 @@
+id: conditional-test
+name: Conditional Test
+description: Conditional skip based on when: expression
+kind: workflow
+
+nodes:
+  - id: classify
+    bash: echo "BUG"
+  - id: handle_bug
+    bash: echo "handling bug"
+    depends_on: [classify]
+    when: "$classify.output == 'BUG'"
+  - id: handle_feature
+    bash: echo "handling feature"
+    depends_on: [classify]
+    when: "$classify.output == 'FEATURE'"

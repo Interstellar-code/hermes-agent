@@ -786,6 +786,15 @@ async def get_sessions(limit: int = 20, offset: int = 0):
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
+                if "last_prompt_tokens" not in s:
+                    s["last_prompt_tokens"] = 0
+                if "context_length" not in s:
+                    try:
+                        from agent.model_metadata import get_model_context_length
+                        model_name = s.get("model") or ""
+                        s["context_length"] = get_model_context_length(model_name) if model_name else 0
+                    except Exception:
+                        s["context_length"] = 0
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
         finally:
             db.close()
@@ -994,39 +1003,9 @@ def get_model_options():
     can share the same types.
     """
     try:
-        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        cfg = load_config()
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, dict):
-            current_model = model_cfg.get("default", model_cfg.get("name", "")) or ""
-            current_provider = model_cfg.get("provider", "") or ""
-            current_base_url = model_cfg.get("base_url", "") or ""
-        else:
-            current_model = str(model_cfg) if model_cfg else ""
-            current_provider = ""
-            current_base_url = ""
-
-        user_providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
-        custom_providers = (
-            cfg.get("custom_providers")
-            if isinstance(cfg.get("custom_providers"), list)
-            else []
-        )
-
-        providers = list_authenticated_providers(
-            current_provider=current_provider,
-            current_base_url=current_base_url,
-            current_model=current_model,
-            user_providers=user_providers,
-            custom_providers=custom_providers,
-            max_models=50,
-        )
-        return {
-            "providers": providers,
-            "model": current_model,
-            "provider": current_provider,
-        }
+        return build_models_payload(load_picker_context(), max_models=50)
     except Exception:
         _log.exception("GET /api/model/options failed")
         raise HTTPException(status_code=500, detail="Failed to list model options")
@@ -2442,6 +2421,15 @@ async def get_session_detail(session_id: str):
         session = db.get_session(sid) if sid else None
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
+        if "last_prompt_tokens" not in session:
+            session["last_prompt_tokens"] = 0
+        if "context_length" not in session:
+            try:
+                from agent.model_metadata import get_model_context_length
+                model_name = session.get("model") or ""
+                session["context_length"] = get_model_context_length(model_name) if model_name else 0
+            except Exception:
+                session["context_length"] = 0
         return session
     finally:
         db.close()
@@ -4021,6 +4009,9 @@ def _get_dashboard_plugins(force_rescan: bool = False) -> list:
     global _dashboard_plugins_cache
     if _dashboard_plugins_cache is None or force_rescan:
         _dashboard_plugins_cache = _discover_dashboard_plugins()
+    elif _dashboard_plugins_cache:
+        if any(not Path(p["_dir"]).is_dir() for p in _dashboard_plugins_cache):
+            _dashboard_plugins_cache = _discover_dashboard_plugins()
     return _dashboard_plugins_cache
 
 
@@ -4432,11 +4423,33 @@ def start_server(
     if open_browser:
         import webbrowser
 
-        def _open():
-            time.sleep(1.0)
-            webbrowser.open(f"http://{host}:{port}")
+        # On headless Linux (no DISPLAY or WAYLAND_DISPLAY) some registered
+        # browsers are TUI programs (links, lynx, www-browser) that try to
+        # take over the terminal.  That can send SIGHUP to the server process
+        # and cause an immediate exit even though uvicorn bound successfully.
+        # Skip the auto-open attempt on headless systems and let the user
+        # open the URL manually.  macOS and Windows are always considered
+        # display-capable.
+        _has_display = (
+            sys.platform != "linux"
+            or bool(os.environ.get("DISPLAY"))
+            or bool(os.environ.get("WAYLAND_DISPLAY"))
+        )
 
-        threading.Thread(target=_open, daemon=True).start()
+        if _has_display:
+            def _open():
+                try:
+                    time.sleep(1.0)
+                    webbrowser.open(f"http://{host}:{port}")
+                except Exception:
+                    pass
+
+            threading.Thread(target=_open, daemon=True).start()
+        else:
+            _log.debug(
+                "Skipping browser-open: no DISPLAY or WAYLAND_DISPLAY detected "
+                "(headless Linux). Pass --no-open to suppress this detection."
+            )
 
     print(f"  Hermes Web UI → http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")

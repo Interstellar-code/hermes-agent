@@ -152,6 +152,30 @@ def _apply_doctor_tool_availability_overrides(available: list[str], unavailable:
     return updated_available, updated_unavailable
 
 
+def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool:
+    """Return True when a direct API-key probe failure is non-blocking.
+
+    Some provider families support both a direct API-key path and a separate
+    OAuth runtime path. When the OAuth path is already healthy, doctor should
+    still show a failed API-key connectivity row, but it should not promote
+    that direct-key problem into the final blocking summary.
+    """
+    try:
+        from hermes_cli.auth import (
+            get_gemini_oauth_auth_status,
+            get_minimax_oauth_auth_status,
+        )
+    except Exception:
+        return False
+
+    normalized = (provider_label or "").strip().lower()
+    if normalized in {"google / gemini", "gemini"}:
+        return bool((get_gemini_oauth_auth_status() or {}).get("logged_in"))
+    if normalized == "minimax":
+        return bool((get_minimax_oauth_auth_status() or {}).get("logged_in"))
+    return False
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -287,7 +311,8 @@ def _build_apikey_providers_list() -> list:
                 (_pp.models_url or (_pp.base_url.rstrip("/") + "/models"))
                 if _pp.base_url else None
             )
-            _static.append((_label, _key_vars, _models_url, _base_var, True))
+            _hc = getattr(_pp, "supports_health_check", True)
+            _static.append((_label, _key_vars, _models_url, _base_var, _hc))
     except Exception:
         pass
     return _static
@@ -655,15 +680,17 @@ def run_doctor(args):
         if fallback_config.exists():
             check_ok("cli-config.yaml exists (in project directory)")
         else:
-            example_config = PROJECT_ROOT / 'cli-config.yaml.example'
-            if should_fix and example_config.exists():
+            if should_fix:
                 config_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(example_config), str(config_path))
-                check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
+                example_config = PROJECT_ROOT / 'cli-config.yaml.example'
+                if example_config.exists():
+                    shutil.copy2(str(example_config), str(config_path))
+                    check_ok(f"Created {_DHH}/config.yaml from cli-config.yaml.example")
+                else:
+                    from hermes_cli.config import DEFAULT_CONFIG, save_config
+                    save_config(DEFAULT_CONFIG)
+                    check_ok(f"Created {_DHH}/config.yaml from defaults")
                 fixed_count += 1
-            elif should_fix:
-                check_warn("config.yaml not found and no example to copy from")
-                manual_issues.append(f"Create {_DHH}/config.yaml manually")
             else:
                 check_warn("config.yaml not found", "(using defaults)")
 
@@ -1046,10 +1073,20 @@ def run_doctor(args):
     if terminal_env == "ssh":
         ssh_host = os.getenv("TERMINAL_SSH_HOST")
         if ssh_host:
+            ssh_user = os.getenv("TERMINAL_SSH_USER")
+            ssh_port = os.getenv("TERMINAL_SSH_PORT")
+            ssh_key = os.getenv("TERMINAL_SSH_KEY")
+            target = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
+            cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+            if ssh_port:
+                cmd += ["-p", ssh_port]
+            if ssh_key:
+                cmd += ["-i", os.path.expanduser(ssh_key)]
+            cmd += [target, "echo ok"]
             # Try to connect
             try:
                 result = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", ssh_host, "echo ok"],
+                    cmd,
                     capture_output=True,
                     text=True,
                     timeout=15
@@ -1447,6 +1484,15 @@ def run_doctor(args):
             }
             if base_url_host_matches(base, "api.kimi.com"):
                 headers["User-Agent"] = "claude-code/0.1.0"
+            # Google's Generative Language API (generativelanguage.googleapis.com)
+            # rejects ``Authorization: Bearer <api-key>`` with 401
+            # ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` — that header is reserved for
+            # OAuth 2 access tokens, not plain API keys. Plain keys use
+            # ``x-goog-api-key`` (or ``?key=``). Without this, a perfectly valid
+            # GOOGLE_API_KEY/GEMINI_API_KEY always shows red in ``hermes doctor``.
+            if url and base_url_host_matches(url, "generativelanguage.googleapis.com"):
+                headers.pop("Authorization", None)
+                headers["x-goog-api-key"] = key
             r = httpx.get(url, headers=headers, timeout=10)
             if (
                 pname == "Alibaba/DashScope"
@@ -1591,31 +1637,12 @@ def run_doctor(args):
                 print(f"  {_glyph} {_label} {_detail}")
             else:
                 print(f"  {_glyph} {_label}")
-        for _issue in _r.issues:
+        _issues_to_add = list(_r.issues)
+        if _issues_to_add and _has_healthy_oauth_fallback_for_apikey_provider(_r.label):
+            _issues_to_add = []
+        for _issue in _issues_to_add:
             issues.append(_issue)
 
-    # =========================================================================
-    # Check: Submodules
-    # =========================================================================
-    print()
-    print(color("◆ Submodules", Colors.CYAN, Colors.BOLD))
-    
-    # tinker-atropos (RL training backend)
-    tinker_dir = PROJECT_ROOT / "tinker-atropos"
-    if tinker_dir.exists() and (tinker_dir / "pyproject.toml").exists():
-        if py_version >= (3, 11):
-            try:
-                __import__("tinker_atropos")
-                check_ok("tinker-atropos", "(RL training backend)")
-            except ImportError:
-                install_cmd = f"{_python_install_cmd()} -e ./tinker-atropos"
-                check_warn("tinker-atropos found but not installed", f"(run: {install_cmd})")
-                issues.append(f"Install tinker-atropos: {install_cmd}")
-        else:
-            check_warn("tinker-atropos requires Python 3.11+", f"(current: {py_version.major}.{py_version.minor})")
-    else:
-        check_warn("tinker-atropos not found", "(run: git submodule update --init --recursive)")
-    
     # =========================================================================
     # Check: Tool Availability
     # =========================================================================

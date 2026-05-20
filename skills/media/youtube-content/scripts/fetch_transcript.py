@@ -19,8 +19,33 @@ Install dependency:  pip install youtube-transcript-api
 
 import argparse
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+from tempfile import TemporaryDirectory
+
+
+CLOAKBROWSER_SMOKE_SCRIPT = r"""
+import { launch } from 'cloakbrowser';
+
+const videoId = process.argv[2];
+const browser = await launch({ headless: true });
+const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+const page = await context.newPage();
+let timedtext = null;
+page.on('response', async (resp) => {
+  if (timedtext) return;
+  if (resp.url().includes('/api/timedtext')) {
+    try { timedtext = await resp.json(); } catch {}
+  }
+});
+await page.goto(`https://www.youtube.com/watch?v=${videoId}`, { waitUntil: 'networkidle', timeout: 90000 });
+await page.waitForTimeout(2000);
+await browser.close();
+console.log(JSON.stringify(timedtext || null));
+"""
 
 
 def extract_video_id(url_or_id: str) -> str:
@@ -47,12 +72,70 @@ def format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def normalize_segments(segments):
+    return [
+        {"text": seg["text"], "start": seg["start"], "duration": seg["duration"]}
+        for seg in segments
+    ]
+
+
+def parse_pb3_timedtext(payload):
+    events = payload.get("events") or []
+    segments = []
+    for ev in events:
+        text = "".join((s.get("utf8") or "") for s in ev.get("segs") or []).strip()
+        if not text:
+            continue
+        start = (ev.get("tStartMs") or 0) / 1000.0
+        duration = (ev.get("dDurationMs") or 0) / 1000.0
+        segments.append({"text": text, "start": start, "duration": duration})
+    return segments
+
+
+def fetch_transcript_with_cloakbrowser(video_id: str):
+    """Try CloakBrowser first via timedtext interception."""
+    candidates = [
+        os.environ.get("HERMES_NODE_BIN"),
+        "/Users/rohits/Library/PhpWebStudy/env/node/bin/node",
+        shutil.which("node"),
+        "node",
+    ]
+    node_cmd = next((c for c in candidates if c), None)
+    if not node_cmd:
+        raise RuntimeError("node not found")
+
+    with TemporaryDirectory(prefix="yt-cloak-") as td:
+        script_path = os.path.join(td, "smoke.mjs")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(CLOAKBROWSER_SMOKE_SCRIPT)
+        proc = subprocess.run(
+            [node_cmd, script_path, video_id],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "CloakBrowser smoke failed")
+        raw = proc.stdout.strip()
+        if not raw or raw == "null":
+            raise RuntimeError("No timedtext response intercepted")
+        payload = json.loads(raw)
+        return normalize_segments(parse_pb3_timedtext(payload))
+
+
 def fetch_transcript(video_id: str, languages: list = None):
     """Fetch transcript segments from YouTube.
 
     Returns a list of dicts with 'text', 'start', and 'duration' keys.
     Compatible with youtube-transcript-api v1.x.
     """
+    # 1) Prefer CloakBrowser timedtext interception for bot-gated cases.
+    try:
+        return fetch_transcript_with_cloakbrowser(video_id)
+    except Exception:
+        pass
+
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
     except ImportError:

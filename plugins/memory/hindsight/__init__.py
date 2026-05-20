@@ -221,8 +221,11 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 def _run_sync(coro, timeout: float = _DEFAULT_TIMEOUT):
     """Schedule *coro* on the shared loop and block until done."""
+    from agent.async_utils import safe_schedule_threadsafe
     loop = _get_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    future = safe_schedule_threadsafe(coro, loop)
+    if future is None:
+        raise RuntimeError("Hindsight loop unavailable")
     return future.result(timeout=timeout)
 
 
@@ -413,7 +416,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
 
     # The embedded daemon expects OpenAI wire format for these providers.
-    daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
+    daemon_provider = "openai" if current_provider in {"openai_compatible", "openrouter"} else current_provider
 
     env_values = {
         "HINDSIGHT_API_LLM_PROVIDER": str(daemon_provider),
@@ -442,13 +445,40 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
+def _load_simple_env(path: Path) -> dict[str, str]:
+    """Load a simple KEY=VALUE env file (no comments, no quotes, no multiline)."""
+    if not path.exists():
+        return {}
+    result: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, value = line.partition("=")
+            result[key.strip()] = value.strip()
+    return result
+
+
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
-    """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    """Write the profile-scoped env file that standalone hindsight-embed uses.
+
+    Preserves any extra env vars (e.g. throttling settings) that were set via
+    ``hindsight-embed profile set-env`` or manually — only the keys managed by
+    ``_build_embedded_profile_env`` are overwritten; everything else is kept.
+    """
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
-    env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+
+    # Read existing env file to preserve user-set variables (throttling, etc.)
+    existing = _load_simple_env(profile_env)
+
+    # Managed keys from plugin config overwrite whatever was there before
+    managed = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    existing.update(managed)
+
     profile_env.write_text(
-        "".join(f"{key}={value}\n" for key, value in env_values.items()),
+        "".join(f"{key}={value}\n" for key, value in existing.items()),
         encoding="utf-8",
     )
     return profile_env
@@ -593,7 +623,7 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
-            if mode in ("local", "local_embedded"):
+            if mode in {"local", "local_embedded"}:
                 available, _ = _check_local_runtime()
                 return available
             if mode == "local_external":
@@ -885,7 +915,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in ("openai_compatible", "openrouter"):
+                if llm_provider in {"openai_compatible", "openrouter"}:
                     llm_provider = "openai"
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
                              self._config.get("profile", "hermes"), llm_provider)
@@ -1129,7 +1159,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
-        default_url = _DEFAULT_LOCAL_URL if self._mode in ("local_embedded", "local_external") else _DEFAULT_API_URL
+        default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
         self._llm_base_url = self._config.get("llm_base_url", "")
 
@@ -1149,10 +1179,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
         memory_mode = self._config.get("memory_mode", "hybrid")
-        self._memory_mode = memory_mode if memory_mode in ("context", "tools", "hybrid") else "hybrid"
+        self._memory_mode = memory_mode if memory_mode in {"context", "tools", "hybrid"} else "hybrid"
 
         prefetch_method = self._config.get("recall_prefetch_method") or self._config.get("prefetch_method", "recall")
-        self._prefetch_method = prefetch_method if prefetch_method in ("recall", "reflect") else "recall"
+        self._prefetch_method = prefetch_method if prefetch_method in {"recall", "reflect"} else "recall"
 
         # Bank options
         self._bank_mission = self._config.get("bank_mission", "")
@@ -1245,6 +1275,17 @@ class HindsightMemoryProvider(MemoryProvider):
                     client._ensure_started()
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write("\n=== Daemon started successfully ===\n")
+
+                    # Also start the Control Plane GUI so it's always available.
+                    # Port 19177 is the conventional UI port for the hermes profile.
+                    try:
+                        if not client._manager.is_ui_running(profile=profile, ui_port=19177):
+                            client._manager.start_ui(profile=profile, ui_port=19177)
+                            with open(log_path, "a", encoding="utf-8") as f:
+                                f.write("=== Hindsight UI started on :19177 ===\n")
+                    except Exception as ui_err:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(f"=== UI start skipped: {ui_err} ===\n")
                 except Exception as e:
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write(f"\n=== Daemon startup failed: {e} ===\n")

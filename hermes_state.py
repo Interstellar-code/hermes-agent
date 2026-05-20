@@ -218,6 +218,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    last_prompt_tokens INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -768,6 +769,7 @@ class SessionDB:
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
         api_call_count: int = 0,
+        last_prompt_tokens: Optional[int] = None,
         absolute: bool = False,
     ) -> None:
         """Update token counters and backfill model if not already set.
@@ -803,7 +805,8 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = ?
+                   api_call_count = ?,
+                   last_prompt_tokens = CASE WHEN ? IS NOT NULL THEN ? ELSE last_prompt_tokens END
                    WHERE id = ?"""
         else:
             sql = """UPDATE sessions SET
@@ -824,7 +827,8 @@ class SessionDB:
                    billing_base_url = COALESCE(billing_base_url, ?),
                    billing_mode = COALESCE(billing_mode, ?),
                    model = COALESCE(model, ?),
-                   api_call_count = COALESCE(api_call_count, 0) + ?
+                   api_call_count = COALESCE(api_call_count, 0) + ?,
+                   last_prompt_tokens = CASE WHEN ? IS NOT NULL THEN ? ELSE last_prompt_tokens END
                    WHERE id = ?"""
         params = (
             input_tokens,
@@ -843,6 +847,8 @@ class SessionDB:
             billing_mode,
             model,
             api_call_count,
+            last_prompt_tokens,
+            last_prompt_tokens,
             session_id,
         )
         def _do(conn):
@@ -1597,10 +1603,10 @@ class SessionDB:
         self._execute_write(_do)
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages for a session, ordered by timestamp."""
+        """Load all messages for a session, ordered by insertion order."""
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id",
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
                 (session_id,),
             )
             rows = cursor.fetchall()
@@ -1700,7 +1706,7 @@ class SessionDB:
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items "
-                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY timestamp, id",
+                f"FROM messages WHERE session_id IN ({placeholders}) ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
 

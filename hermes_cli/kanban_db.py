@@ -93,6 +93,7 @@ from toolsets import get_toolset_names
 VALID_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+_IS_WINDOWS = sys.platform == "win32"
 
 # A running task's claim is valid for 15 minutes; after that the next
 # dispatcher tick reclaims it.  Workers that outlive this window should call
@@ -606,6 +607,8 @@ class Task:
     # ``kanban.failure_limit`` config, and then to ``DEFAULT_FAILURE_LIMIT``.
     # Name matches the ``--max-retries`` CLI flag on ``kanban create``.
     max_retries: Optional[int] = None
+    # Earliest dispatch time (unix epoch seconds). NULL = no constraint.
+    scheduled_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -669,6 +672,9 @@ class Task:
             skills=skills_value,
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
+            ),
+            scheduled_at=(
+                int(row["scheduled_at"]) if "scheduled_at" in keys and row["scheduled_at"] else None
             ),
         )
 
@@ -796,7 +802,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
     -- case) falls through to the dispatcher-level ``kanban.failure_limit``
     -- config and then ``DEFAULT_FAILURE_LIMIT``.
-    max_retries          INTEGER
+    max_retries          INTEGER,
+    -- Earliest time (unix epoch seconds) at which this task may be dispatched.
+    -- NULL = no scheduling constraint. Dispatcher skips if scheduled_at > now.
+    scheduled_at         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -877,6 +886,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_run            ON task_events(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_at  ON tasks(scheduled_at) WHERE scheduled_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -1075,6 +1085,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # which is the correct default (they keep the global behaviour
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
+        _add_column_if_missing(conn, "tasks", "scheduled_at", "scheduled_at INTEGER")
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
@@ -1244,6 +1255,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    scheduled_at: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -1377,8 +1389,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         tenant, idempotency_key, max_runtime_seconds, skills,
-                        max_retries
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        max_retries, scheduled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1396,6 +1408,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        int(scheduled_at) if scheduled_at is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -1929,8 +1942,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (scheduled_at IS NULL OR scheduled_at <= ?)
             """,
-            (lock, expires, now, task_id),
+             (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
@@ -3219,18 +3233,21 @@ def enforce_max_runtime(
             except (ProcessLookupError, OSError):
                 pass
             # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+            # ``signal_fn`` is a test hook and may not deliver a real signal;
+            # avoid probing arbitrary fake PIDs through the live-system guard.
+            if signal_fn is None:
+                for _ in range(10):
+                    if not _pid_alive(pid):
+                        break
+                    time.sleep(0.5)
+                if _pid_alive(pid):
+                    try:
+                        # signal.SIGKILL doesn't exist on Windows.
+                        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+                        kill(pid, _sigkill)
+                        killed = True
+                    except (ProcessLookupError, OSError):
+                        pass
 
         with write_txn(conn):
             cur = conn.execute(
@@ -3762,10 +3779,13 @@ def dispatch_once(
             ).fetchone()[0]
         )
 
+    now_for_schedule = int(time.time())
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "AND (scheduled_at IS NULL OR scheduled_at <= ?) "
+        "ORDER BY priority DESC, created_at ASC",
+        (now_for_schedule,),
     ).fetchall()
     spawned = 0
     for row in ready_rows:
@@ -4024,6 +4044,7 @@ def _default_spawn(
             stderr=subprocess.STDOUT,
             env=env,
             start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
     except FileNotFoundError:
         log_f.close()
@@ -4333,8 +4354,8 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _safe_int(val: Optional[str]) -> Optional[int]:
-    """Parse a timestamp field to int, returning None on garbage like '%s'."""
+def _safe_int(val) -> Optional[int]:
+    """Parse an integer timestamp, returning None for missing/corrupt values."""
     if val is None:
         return None
     try:
@@ -4343,16 +4364,47 @@ def _safe_int(val: Optional[str]) -> Optional[int]:
         return None
 
 
+def _to_epoch(val) -> Optional[int]:
+    """Normalise a timestamp to unix epoch seconds.
+
+    Accepts ints (pass-through), numeric strings, and ISO-8601 strings.
+    Returns ``None`` for ``None`` / empty values.
+    """
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    # ISO-8601 fallback (e.g. '2026-05-10T15:00:00Z')
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except (ValueError, OSError):
+        return None
+
+        return None
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
-    created = _safe_int(task.created_at)
-    started = _safe_int(task.started_at)
-    completed = _safe_int(task.completed_at)
-    age_since_created = now - created if created else None
-    age_since_started = now - started if started else None
+    _c = _to_epoch(task.created_at)
+    _s = _to_epoch(task.started_at)
+    _co = _to_epoch(task.completed_at)
+    age_since_created = now - _c if _c is not None else None
+    age_since_started = now - _s if _s is not None else None
     time_to_complete = (
-        completed - (started or created) if completed else None
+        _co - (_s or _c) if _co is not None else None
+
     )
     return {
         "created_age_seconds": age_since_created,
