@@ -30,7 +30,9 @@ def check() -> bool:
     return True
 
 
-async def handler(tags: List[str] | None = None, source: str | None = None) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG001
+    tags: List[str] | None = args.get("tags")
+    source: str | None = args.get("source")
     from .._shared import get_engine  # noqa: PLC0415
 
     engine = get_engine()

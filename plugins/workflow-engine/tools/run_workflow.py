@@ -117,18 +117,17 @@ def _check_rate(session_key: Optional[str]) -> Optional[str]:
     return None
 
 
-async def handler(
-    id: str,  # noqa: A002
-    working_path: Optional[str] = None,
-    inputs: Optional[Dict[str, Any]] = None,
-    conversation_id: Optional[str] = None,
-    _session_key: Optional[str] = None,
-) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     """Start a workflow run.
 
-    _session_key is injected by the tool registry from ctx.session_key when
-    the registry supports it; ignored if absent.
+    registry.dispatch passes (args_dict, **kwargs); extract params from args.
+    _session_key may arrive via kwargs when the registry forwards session context.
     """
+    id: str = args.get("id", "")  # noqa: A001
+    working_path: Optional[str] = args.get("working_path")
+    inputs: Optional[Dict[str, Any]] = args.get("inputs")
+    conversation_id: Optional[str] = args.get("conversation_id")
+    _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")
     # working_path validation
     path_err = _check_working_path(working_path)
     if path_err:

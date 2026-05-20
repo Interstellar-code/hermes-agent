@@ -20,10 +20,19 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Engine bootstrap
 # ---------------------------------------------------------------------------
-# sys.path injection is centralised in _shared.py — never done here.
+# web_server.py loads this file via spec_from_file_location as a flat module
+# (no parent package), so relative imports fail.  We set up sys.path inline
+# and use absolute imports so this file works both as a package member and as
+# a standalone spec-loaded module.
+import sys as _sys
+from pathlib import Path as _Path
+_PLUGIN_DIR = _Path(__file__).resolve().parent.parent  # plugins/workflow-engine/
+if str(_PLUGIN_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_PLUGIN_DIR))
+del _sys, _Path
 
-from .._shared import get_engine  # noqa: E402
-from engine import WorkflowEngine  # noqa: E402 (engine already on sys.path via _shared)
+from _shared import get_engine  # noqa: E402
+from engine import WorkflowEngine  # noqa: E402
 
 _engine: WorkflowEngine = get_engine()
 

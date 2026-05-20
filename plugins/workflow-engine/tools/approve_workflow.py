@@ -55,13 +55,12 @@ def check() -> bool:
     return True
 
 
-async def handler(
-    run_id: str,
-    node_id: str,
-    decision: Literal["approve", "reject"],
-    note: Optional[str] = None,
-    _session_key: Optional[str] = None,
-) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+    run_id: str = args.get("run_id", "")
+    node_id: str = args.get("node_id", "")
+    decision: Literal["approve", "reject"] = args.get("decision", "approve")  # type: ignore[assignment]
+    note: Optional[str] = args.get("note")
+    _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")
     from .._shared import get_engine  # noqa: PLC0415
 
     engine = get_engine()

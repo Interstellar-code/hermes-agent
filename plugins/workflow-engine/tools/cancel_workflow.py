@@ -46,11 +46,10 @@ def check() -> bool:
     return True
 
 
-async def handler(
-    run_id: str,
-    reason: Optional[str] = None,
-    _session_key: Optional[str] = None,
-) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+    run_id: str = args.get("run_id", "")
+    reason: Optional[str] = args.get("reason")
+    _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")
     from .._shared import get_engine  # noqa: PLC0415
 
     engine = get_engine()

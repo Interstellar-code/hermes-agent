@@ -81,15 +81,25 @@ async def _main(args: Any) -> int:
 
 
 def _setup(sub: argparse.ArgumentParser) -> None:
-    """Configure the argparse subparser for `hermes workflow daemon`."""
-    sub.add_argument(
+    """Configure the argparse subparser for `hermes workflow`.
+
+    Registers a `daemon` sub-subcommand so the invocation is:
+        hermes workflow daemon --interval 60
+    """
+    subs = sub.add_subparsers(dest="wf_subcommand", title="subcommands")
+
+    daemon_sub = subs.add_parser(
+        "daemon",
+        help="Run the workflow scheduler (cron poller + kanban dispatcher).",
+    )
+    daemon_sub.add_argument(
         "--interval",
         type=float,
         default=60.0,
         metavar="SECONDS",
-        help="Poll interval in seconds for cron poller and kanban dispatcher (default: 60).",
+        help="Poll interval in seconds for cron poller (default: 60).",
     )
-    sub.add_argument(
+    daemon_sub.add_argument(
         "--pidfile",
         default=None,
         metavar="PATH",
@@ -108,4 +118,10 @@ def _setup(sub: argparse.ArgumentParser) -> None:
                 f.write(str(os.getpid()))
         sys.exit(asyncio.run(_main(ns)))
 
-    sub.set_defaults(func=_run)
+    daemon_sub.set_defaults(func=_run)
+
+    def _no_subcommand(ns: argparse.Namespace) -> None:
+        sub.print_help()
+        sys.exit(0)
+
+    sub.set_defaults(func=_no_subcommand)
