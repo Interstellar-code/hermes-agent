@@ -76,5 +76,15 @@ async def execute_approval_node(node, node_outputs: Dict[str, NodeOutput], ctx) 
     except Exception as exc:
         logger.error("approval_node.pause_run_failed node=%s error=%s", node.id, exc)
 
+    # Mark this node_run as paused. Without this the per-node status stays
+    # 'running' indefinitely — the workflow_run is paused but the node_run
+    # row never reflects it because the DAG only emits node_completed /
+    # node_failed / node_skipped terminal events.
+    ctx.emit_event("node_paused", {
+        "run_id": ctx.run_id,
+        "node_id": node.id,
+        "message": rendered_message,
+    })
+
     # Return completed — the between-layer status check sees 'paused' and halts.
     return NodeExecutionResult(state="completed", output="")

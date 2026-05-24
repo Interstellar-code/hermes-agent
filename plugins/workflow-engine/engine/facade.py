@@ -172,6 +172,22 @@ class WorkflowEngine:
                 event_type="workflow_resumed",
                 data={"node_id": node_id},
             )
+            # Restart DAG execution from the next layer. Without this, the
+            # run stays in 'running' status but no nodes actually execute.
+            try:
+                await self._runner.resume(run_id)
+            except Exception as exc:
+                logger.exception("approve: runner.resume failed run=%s: %s", run_id, exc)
+                self._run_store.update_workflow_run(
+                    run_id,
+                    status="failed",
+                    error=f"Resume failed: {exc}",
+                )
+                self._bus.emit(
+                    run_id=run_id,
+                    event_type="workflow_failed",
+                    data={"error": f"Resume failed: {exc}"},
+                )
         else:
             # Reject → fail the run
             self._run_store.update_workflow_run(
