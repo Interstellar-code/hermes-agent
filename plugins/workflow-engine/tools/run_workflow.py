@@ -6,6 +6,7 @@ check_fn enforces:
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections import defaultdict
@@ -117,12 +118,16 @@ def _check_rate(session_key: Optional[str]) -> Optional[str]:
     return None
 
 
-async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Start a workflow run.
 
     registry.dispatch passes (args_dict, **kwargs); extract params from args.
     _session_key may arrive via kwargs when the registry forwards session context.
     """
+    return json.dumps(await _handler_impl(args, **kwargs), ensure_ascii=False, default=str)
+
+
+async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     id: str = args.get("id", "")  # noqa: A001
     working_path: Optional[str] = args.get("working_path")
     inputs: Optional[Dict[str, Any]] = args.get("inputs")

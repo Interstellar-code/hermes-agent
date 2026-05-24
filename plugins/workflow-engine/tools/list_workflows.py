@@ -1,6 +1,7 @@
 """workflow_list — list available workflow definitions."""
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 SCHEMA: Dict[str, Any] = {
@@ -30,7 +31,11 @@ def check() -> bool:
     return True
 
 
-async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG001
+async def handler(args: Dict[str, Any], **kwargs: Any) -> str:  # noqa: ARG001
+    return json.dumps(await _handler_impl(args, **kwargs), ensure_ascii=False, default=str)
+
+
+async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG001
     tags: List[str] | None = args.get("tags")
     source: str | None = args.get("source")
     from .._shared import get_engine  # noqa: PLC0415

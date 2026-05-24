@@ -1,6 +1,7 @@
 """workflow_status — get the current status of a workflow run."""
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 SCHEMA: Dict[str, Any] = {
@@ -26,7 +27,11 @@ def check() -> bool:
     return True
 
 
-async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG001
+async def handler(args: Dict[str, Any], **kwargs: Any) -> str:  # noqa: ARG001
+    return json.dumps(await _handler_impl(args, **kwargs), ensure_ascii=False, default=str)
+
+
+async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:  # noqa: ARG001
     run_id: str = args.get("run_id", "")
     from .._shared import get_engine  # noqa: PLC0415
 
