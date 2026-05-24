@@ -682,4 +682,85 @@ async def test_e2e_list_runs_filtering(engine, working_path):
     print(f"\n[E2E-10] PASS — List Runs Filtering")
     print(f"  workflow_id: {wf_id}")
     print(f"  runs_started: {len(run_ids)}")
-    print(f"  runs_listed: {len(runs)}")
+
+
+# ── Test 11: In-process wait_for_run (Issue #2 — agent-tool orphan fix) ──────
+
+@pytest.mark.asyncio
+async def test_e2e_wait_for_run_completes(engine, working_path):
+    """``wait_for_run`` blocks until the DAG completes (the missing pump
+    that fixes the agent-tool orphan: without it, an in-process caller
+    whose event loop dies after the await chain returns leaves the
+    background _execute task starved)."""
+    wf_id = "e2e-wait-completes"
+    _seed_def(engine, wf_id, SIMPLE_BASH_YAML)
+
+    run = await engine.start_run(
+        wf_id, {}, {"working_path": working_path},
+    )
+    final = await engine.wait_for_run(run["id"], timeout=10.0)
+    assert final is not None
+    assert final["status"] == "completed", (
+        f"wait_for_run returned with status={final['status']}; "
+        "expected the run to settle inside the call"
+    )
+
+
+@pytest.mark.asyncio
+async def test_e2e_wait_for_run_returns_on_paused(engine, working_path):
+    """Paused counts as settled — otherwise an approval-gate workflow
+    triggered from the agent tool would hang the conversation loop
+    waiting on an approve() that can only arrive after the tool
+    returns."""
+    wf_id = "e2e-wait-paused"
+    _seed_def(engine, wf_id, APPROVAL_WORKFLOW_YAML)
+
+    run = await engine.start_run(
+        wf_id, {}, {"working_path": working_path},
+    )
+    final = await engine.wait_for_run(run["id"], timeout=10.0)
+    assert final is not None
+    assert final["status"] in ("paused", "completed"), (
+        f"wait_for_run returned status={final['status']}; "
+        "expected paused (approval gate) or completed (gate auto-passed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_e2e_wait_for_run_timeout_returns_current(engine, working_path):
+    """On timeout the latest row is returned regardless — callers
+    decide whether to keep polling or surface a 'still running' message
+    to the user."""
+    wf_id = "e2e-wait-timeout"
+    _seed_def(engine, wf_id, CANCEL_WORKFLOW_YAML)  # sleeps 300s
+
+    run = await engine.start_run(
+        wf_id, {}, {"working_path": working_path},
+    )
+    final = await engine.wait_for_run(run["id"], timeout=0.3)
+    assert final is not None
+    assert final["status"] == "running", (
+        "expected the run to still be running when the wait timed out"
+    )
+
+    # Cleanup so the bash sleep doesn't survive the test.
+    await engine.cancel_run(run["id"])
+
+
+@pytest.mark.asyncio
+async def test_e2e_wait_for_run_already_terminal(engine, working_path):
+    """Calling wait_for_run after the run already terminated is a no-op
+    that still returns the row — the runner's done-callback may have
+    already cleared the task slot by the time we get here."""
+    wf_id = "e2e-wait-already-done"
+    _seed_def(engine, wf_id, SIMPLE_BASH_YAML)
+
+    run = await engine.start_run(
+        wf_id, {}, {"working_path": working_path},
+    )
+    # First wait drives it to completion.
+    await engine.wait_for_run(run["id"], timeout=10.0)
+    # Second wait: slot is empty, should return immediately with the row.
+    final = await engine.wait_for_run(run["id"], timeout=10.0)
+    assert final is not None
+    assert final["status"] == "completed"

@@ -247,13 +247,25 @@ class RunStore:
         self._conn.commit()
         return cur.rowcount == 1
 
-    def pause_workflow_run(self, run_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def pause_workflow_run(
+        self, run_id: str, metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Flip the run to 'paused' only when it's still 'running'.
+
+        Returns True when the CAS took. Without the ``status='running'``
+        guard, a pause coming from an approval node could clobber a
+        ``cancelled`` status set by a concurrent ``cancel_workflow_run``
+        between the approval's get-status check and its pause write.
+        """
         now = _now_ms()
-        self._conn.execute(
-            "UPDATE workflow_runs SET status = 'paused', last_heartbeat = ?, metadata = COALESCE(?, metadata) WHERE id = ?",
+        cur = self._conn.execute(
+            "UPDATE workflow_runs SET status = 'paused', last_heartbeat = ?, "
+            "metadata = COALESCE(?, metadata) "
+            "WHERE id = ? AND status = 'running'",
             (now, json.dumps(metadata) if metadata else None, run_id),
         )
         self._conn.commit()
+        return cur.rowcount == 1
 
     def resume_workflow_run(self, run_id: str) -> None:
         now = _now_ms()

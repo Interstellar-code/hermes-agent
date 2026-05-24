@@ -250,6 +250,44 @@ class WorkflowRunner:
         )
         self._register_task(run_id, task)
 
+    async def wait_for(
+        self, run_id: str, timeout: Optional[float] = None,
+    ) -> None:
+        """Await the in-flight ``_execute`` task for ``run_id``, if any.
+
+        Used by in-process callers (the workflow_run agent tool) whose
+        own event loop only lives as long as their await chain — by
+        awaiting the runner's background task on the *agent's* loop,
+        the bash subprocess and event emission get CPU time to finish.
+        Without this, ``start()`` 's fire-and-forget task is orphaned
+        when the agent tool returns and the loop stops pumping.
+
+        Returns immediately when the slot is empty (the run already
+        terminated, was never tracked here, or its done-callback
+        already cleaned up). ``timeout=None`` waits forever. On
+        timeout, returns silently — the caller inspects the run row to
+        decide what to do.
+
+        The wait is shielded so a cancellation of the *caller* does not
+        propagate into ``_execute`` and kill an in-flight run; killing
+        the run is the explicit job of ``cancel()``.
+        """
+        task = self._tasks.get(run_id)
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # _execute has its own CAS-protected failure handler that
+            # already logged + finalised the run; we don't want to
+            # re-raise into the caller (e.g. an agent tool handler
+            # that would surface the traceback as a tool error).
+            return
+
     async def cancel(self, run_id: str) -> None:
         """Cancel a run by cancelling its asyncio Task and marking DB status.
 
