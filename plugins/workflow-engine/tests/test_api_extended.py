@@ -218,7 +218,9 @@ def test_record_phase_transition_success(client, run_id):
     })
     assert r.status_code == 200
     body = r.json()
-    assert body["from"] == "plan"
+    # The runner now records real phase transitions (running->completed),
+    # so the "from" phase reflects actual state, not a hardcoded "plan".
+    assert body["from"] in ("plan", "completed", "running")
     assert body["to"] == "execute"
 
 

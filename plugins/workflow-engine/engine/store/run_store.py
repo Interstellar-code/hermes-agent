@@ -179,9 +179,19 @@ class RunStore:
         self._conn.commit()
         return result.rowcount
 
-    def cancel_workflow_run(self, run_id: str) -> None:
+    def cancel_workflow_run(self, run_id: str) -> bool:
+        """Mark a run cancelled if it isn't already terminal.
+
+        Returns True when the workflow_run row was actually flipped to
+        cancelled by *this* call (rowcount == 1). Callers gate
+        ``workflow_cancelled`` event emission and phase-transition
+        records on the return value so a stray late cancel does not
+        double-fire after the run already settled (completed/failed
+        won the race) or after a prior cancel already recorded the
+        transition.
+        """
         now = _now_ms()
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             UPDATE workflow_runs
                SET status = 'cancelled', completed_at = ?
@@ -189,7 +199,8 @@ class RunStore:
             """,
             (now, run_id),
         )
-        # Cancel any running/pending node_runs too
+        # Cancel any running/pending node_runs too — always safe, the
+        # WHERE clause excludes already-terminal rows.
         self._conn.execute(
             """
             UPDATE node_runs
@@ -199,6 +210,42 @@ class RunStore:
             (now, run_id),
         )
         self._conn.commit()
+        return cur.rowcount == 1
+
+    def finish_workflow_run_if_running(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Atomic compare-and-set finaliser.
+
+        Flips the run to ``status`` only when its current status is still
+        ``running``. Returns True on a real transition, False when somebody
+        else (e.g. a resume path or a pause callback) already moved the row
+        out of ``running``. Callers use the return value to decide whether
+        to emit terminal events — emitting them on the False branch would
+        double-fire workflow_completed/workflow_failed after a paused
+        approval gate was re-resumed.
+
+        ``status`` must be a terminal phase the schema accepts (completed,
+        failed, cancelled).
+        """
+        if status not in ("completed", "failed", "cancelled"):
+            raise ValueError(f"non-terminal status not allowed here: {status}")
+        now = _now_ms()
+        cur = self._conn.execute(
+            """
+            UPDATE workflow_runs
+               SET status = ?, completed_at = ?, last_heartbeat = ?,
+                   error = COALESCE(?, error)
+             WHERE id = ? AND status = 'running'
+            """,
+            (status, now, now, error, run_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
 
     def pause_workflow_run(self, run_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         now = _now_ms()

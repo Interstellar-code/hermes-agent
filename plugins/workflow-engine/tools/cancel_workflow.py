@@ -6,6 +6,7 @@ check_fn enforces:
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, Optional
 
 SCHEMA: Dict[str, Any] = {
@@ -46,7 +47,11 @@ def check() -> bool:
     return True
 
 
-async def handler(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+async def handler(args: Dict[str, Any], **kwargs: Any) -> str:
+    return json.dumps(await _handler_impl(args, **kwargs), ensure_ascii=False, default=str)
+
+
+async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     run_id: str = args.get("run_id", "")
     reason: Optional[str] = args.get("reason")
     _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")

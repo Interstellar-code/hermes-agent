@@ -400,6 +400,36 @@ def _strip_images_from_messages(messages: list) -> bool:
     return found
 
 
+def _normalize_tool_message_content(messages: list) -> bool:
+    """Coerce non-string content on role=tool messages to a JSON string.
+
+    OpenAI Chat Completions spec requires `tool` message `content` to be a
+    string. Some plugin tool handlers (notably workflow-engine tools) return
+    Dict[str, Any] which gets persisted raw into chat history. Strict
+    upstreams (Z.ai/GLM error 1210, Manifest 'upstream_error' 400) reject
+    this. This normalizer runs before every outbound request so stale
+    history with dict-typed tool content is fixed in flight.
+
+    Returns True if any normalization occurred.
+    """
+    import json as _json
+    found = False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if content is None or isinstance(content, str):
+            continue
+        try:
+            msg["content"] = _json.dumps(content, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            msg["content"] = str(content)
+        found = True
+    return found
+
+
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
     """Strip non-ASCII characters from nested dict/list payloads in-place."""
     found = False
