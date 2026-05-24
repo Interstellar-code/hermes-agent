@@ -70,6 +70,25 @@ def _rate_cap() -> int:
     return int(_get_config().get("run_rate_per_session", 5))
 
 
+def _wait_timeout_s() -> Optional[float]:
+    """Seconds to block the tool waiting for the run to settle.
+
+    Settles == completed / failed / cancelled / paused. Configurable
+    via ``workflow.run_wait_timeout_seconds`` in config.yaml so long
+    workflows aren't artificially capped. ``0`` or negative disables
+    the wait entirely (legacy fire-and-forget — caller must poll).
+    Default 300s (5 min) — long enough for typical agent-triggered
+    workflows, short enough that a stuck DAG surfaces to the agent
+    as a still-running response rather than hanging the conversation.
+    """
+    raw = _get_config().get("run_wait_timeout_seconds", 300)
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 300.0
+    return v if v > 0 else None
+
+
 def check() -> bool:
     """Always return True — fine-grained auth happens inside handler via _check_request."""
     return True
@@ -158,24 +177,56 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
         inputs=inputs or {},
         trigger=trigger,
     )
+    run_id = run.get("id")
 
     # Record rate-limit timestamp
     if _session_key:
         _rate_buckets[_session_key].append(time.time())
 
     # Patch owner_session onto the run row (best-effort; schema may be pre-migration)
-    if _session_key:
+    if _session_key and run_id:
         try:
             engine.conn.execute(
                 "UPDATE workflow_runs SET owner_session=? WHERE id=?",
-                (_session_key, run["id"]),
+                (_session_key, run_id),
             )
             engine.conn.commit()
         except Exception:
             pass
 
-    return {
-        "run_id": run.get("id"),
-        "status": run.get("status"),
+    # Block until the run settles. Without this the runner's background
+    # asyncio task is orphaned the instant we return — the agent's
+    # conversation loop stops pumping after the tool handler completes,
+    # so the bash subprocess inside _execute never gets CPU time and
+    # the run sits forever in 'running' (Interstellar-code#2).
+    #
+    # wait_for_run treats 'paused' as settled so approval-gate
+    # workflows still come back promptly; the agent gets the run_id
+    # and can poll / approve out-of-band later.
+    wait_s = _wait_timeout_s()
+    final: Optional[Dict[str, Any]] = run
+    waited = False
+    if wait_s is not None and run_id:
+        # wait_for_run swallows TimeoutError + downstream exceptions
+        # itself (see facade.wait_for_run + runner.wait_for); the only
+        # propagated exception is CancelledError, which we let through
+        # to the agent loop intentionally.
+        final = await engine.wait_for_run(run_id, timeout=wait_s) or run
+        waited = True
+
+    status = (final or run).get("status")
+    # Surface the unsettled case so the agent knows to poll
+    # ``workflow_status`` instead of assuming the run failed.
+    wait_timed_out = waited and status == "running"
+    result: Dict[str, Any] = {
+        "run_id": run_id,
+        "status": status,
         "ok": True,
     }
+    if wait_timed_out:
+        result["wait_timed_out"] = True
+        result["hint"] = (
+            f"Workflow still running after {wait_s:.0f}s; poll workflow_status "
+            f"with run_id={run_id} for progress."
+        )
+    return result

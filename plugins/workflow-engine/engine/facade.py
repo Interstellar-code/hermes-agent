@@ -120,6 +120,32 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         return await self._runner.start(workflow_id, inputs, trigger)
 
+    async def wait_for_run(
+        self,
+        run_id: str,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Block until the run settles, then return its final row.
+
+        Settles == status in ``{completed, failed, cancelled, paused}``.
+        Paused counts as settled because there's nothing for the engine
+        to do until an out-of-band ``approve()`` arrives — making the
+        caller wait further would deadlock the agent tool that just
+        started the run.
+
+        Used by in-process callers (the workflow_run agent tool) whose
+        own event loop stops pumping the moment they return — without
+        this method their fire-and-forget ``start_run`` would be
+        orphaned. Dashboard callers (long-lived uvicorn loop) keep
+        using bare ``start_run`` and don't need to block.
+
+        ``timeout`` is in seconds; ``None`` waits indefinitely. On
+        timeout the latest run row is returned anyway (status will
+        still be ``running``); callers decide what to do with it.
+        """
+        await self._runner.wait_for(run_id, timeout=timeout)
+        return self._run_store.get_workflow_run(run_id)
+
     async def cancel_run(self, run_id: str) -> None:
         await self._runner.cancel(run_id)
 
