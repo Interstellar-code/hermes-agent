@@ -234,6 +234,27 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
 
+    # Plugin hook: let registered plugins rewrite the tool list before
+    # it enters the API request. First non-empty list returned wins.
+    # See ``hermes_cli/plugins.py:VALID_HOOKS`` (``transform_tools``)
+    # for the contract. Failures here must not break the call — we
+    # silently fall back to the original tools on any error.
+    if tools_for_api:
+        try:
+            from hermes_cli.plugins import invoke_hook  # noqa: PLC0415
+            hook_results = invoke_hook(
+                "transform_tools",
+                tools=tools_for_api,
+                agent=agent,
+                api_messages=api_messages,
+            )
+            for result in (hook_results or []):
+                if isinstance(result, list) and result:
+                    tools_for_api = result
+                    break
+        except Exception:
+            pass
+
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)

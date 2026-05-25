@@ -1,5 +1,7 @@
 name: mcp_lazy
-version: "0.1.0"
-description: "Lazy MCP tool schema loading — Phase 0 baseline only. Logs Anthropic prompt-cache hit-rate to ~/.hermes/mcp-lazy/cache-baseline.jsonl so we can pick a Phase 1 promotion strategy from real data. See .omc/plans/mcp-lazy-loading-v4.md for the full plan."
+version: "0.2.0"
+description: "Lazy MCP tool schema loading. Master toggle: mcp.lazy_loading in config.yaml; per-server override via mcp_servers.<name>.lazy. Stubs MCP tool schemas in the API request, promotes on demand via mcp_load_tools meta-tool. Per-session pool keeps promotion state isolated across conversations. Phase 0 baseline cache hit-rate logger ships alongside for passive telemetry."
 author: Interstellar-code
-hooks: []
+hooks:
+  - transform_tools
+  - on_session_reset
