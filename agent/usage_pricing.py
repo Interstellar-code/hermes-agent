@@ -1,18 +1,47 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
+
+
+# Observer slot — plugins register a callback that receives every
+# canonicalised usage record. Inverts the dependency direction so
+# `agent/usage_pricing.py` never imports any plugin. See
+# `.omc/plans/mcp-lazy-loading-v4.md` (Phase 0) for the consumer.
+_usage_observers: List[Callable[["CanonicalUsage"], None]] = []
+
+
+def register_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
+    """Register a callback invoked with every canonicalised usage record.
+
+    Used by observability plugins (e.g. cache hit-rate baseline) so the
+    core canonicaliser does not need to know about specific plugins.
+    Observer exceptions are swallowed and logged at debug — a misbehaving
+    observer must not break usage accounting.
+    """
+    _usage_observers.append(callback)
+
+
+def unregister_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
+    """Inverse of register_usage_observer — useful for plugin reload tests."""
+    try:
+        _usage_observers.remove(callback)
+    except ValueError:
+        pass
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
@@ -733,13 +762,25 @@ def normalize_usage(
     if output_details:
         reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
     )
+
+    # Fire observer callbacks (cache baseline plugin, etc). Failures
+    # are isolated per-observer so one bad plugin doesn't break usage
+    # accounting for every other consumer.
+    if _usage_observers:
+        for observer in _usage_observers:
+            try:
+                observer(usage)
+            except Exception:  # noqa: BLE001 — defensive isolation
+                logger.debug("usage observer raised", exc_info=True)
+
+    return usage
 
 
 def estimate_usage_cost(
