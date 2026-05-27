@@ -336,7 +336,13 @@ class WorkflowRunner:
         start_ms = int(time.time() * 1000)
         try:
             ctx = self._build_ctx(run_id, working_path, prior_completed)
-            await execute_dag(dag_nodes, ctx)
+            node_outputs = await execute_dag(dag_nodes, ctx)
+
+            failed_nodes = [
+                (node_id, output)
+                for node_id, output in node_outputs.items()
+                if getattr(output, "state", None) == "failed"
+            ]
 
             # Completed — atomic CAS so we don't clobber a status that
             # changed under us. Two known interleavings this guards:
@@ -351,6 +357,43 @@ class WorkflowRunner:
             #       finalise on this old task's behalf — let the new
             #       task's CAS win.
             end_ms = int(time.time() * 1000)
+            if failed_nodes:
+                first_failed_id, first_failed_output = failed_nodes[0]
+                error = getattr(first_failed_output, "error", "") or (
+                    f"workflow failed because node '{first_failed_id}' failed"
+                )
+                won = self._run_store.finish_workflow_run_if_running(
+                    run_id, status="failed", error=error,
+                )
+                if not won:
+                    logger.info(
+                        "run %s: failure finalization skipped — status no longer 'running'",
+                        run_id,
+                    )
+                    return
+                self._run_store.record_phase_transition(
+                    run_id=run_id,
+                    to_phase="failed",
+                    decided_by="system",
+                    decision_data={
+                        "duration_ms": end_ms - start_ms,
+                        "failed_node_id": first_failed_id,
+                        "failed_node_count": len(failed_nodes),
+                    },
+                )
+                self._bus.emit(
+                    run_id=run_id,
+                    event_type="workflow_failed",
+                    data={
+                        "workflow_id": workflow_id,
+                        "duration_ms": end_ms - start_ms,
+                        "error": error,
+                        "failed_node_id": first_failed_id,
+                        "failed_node_count": len(failed_nodes),
+                    },
+                )
+                return
+
             won = self._run_store.finish_workflow_run_if_running(
                 run_id, status="completed",
             )

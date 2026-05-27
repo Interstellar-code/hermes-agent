@@ -76,6 +76,14 @@ nodes:
     depends_on: [gate]
 """
 
+FAIL_YAML = """
+name: fail-workflow
+description: Workflow with a failing node
+nodes:
+  - id: broken
+    bash: exit 1
+"""
+
 
 @pytest.fixture()
 def runner_env():
@@ -162,3 +170,37 @@ def test_build_ctx_includes_injected_llm(runner_env):
     ctx = env["runner"]._build_ctx("run-1", "/tmp")
 
     assert ctx.llm is llm
+
+
+@pytest.mark.asyncio
+async def test_failed_node_marks_run_failed(runner_env):
+    """A node_failed result should finalize the workflow as failed, not completed."""
+    env = runner_env
+    _seed_workflow(env["def_store"], "fail-workflow", FAIL_YAML)
+
+    run = await env["runner"].start(
+        "fail-workflow",
+        {},
+        {"kind": "manual", "conversation_id": "conv-fail", "working_path": "/tmp"},
+    )
+    run_id = run["id"]
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.1)
+        refreshed = env["run_store"].get_workflow_run(run_id)
+        if refreshed and refreshed["status"] in ("completed", "failed", "cancelled"):
+            break
+
+    final = env["run_store"].get_workflow_run(run_id)
+    assert final is not None
+    assert final["status"] == "failed", (
+        f"Expected failed, got {final['status']} error={final.get('error')}"
+    )
+    assert "broken" in (final["error"] or "") or "exit" in (final["error"] or "").lower()
+
+    events = env["run_store"].list_events(run_id, limit=100)
+    event_types = {e["event_type"] for e in events}
+    assert "node_failed" in event_types
+    assert "workflow_failed" in event_types
+    assert "workflow_completed" not in event_types
