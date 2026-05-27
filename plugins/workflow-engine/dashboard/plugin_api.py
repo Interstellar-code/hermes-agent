@@ -385,8 +385,21 @@ async def cancel_run(run_id: str) -> JSONResponse:
 async def events(request: Request) -> StreamingResponse:
     params = request.query_params
     run_id: Optional[str] = params.get("runId") or params.get("run_id") or None
+    missing_run = False
+    if run_id is not None:
+        run = await _engine.get_run(run_id)
+        if run is None:
+            missing_run = True
 
     async def _generate() -> AsyncIterator[str]:
+        if missing_run:
+            yield "event: connected\ndata: {}\n\n"
+            yield (
+                "event: error\n"
+                f"data: {json.dumps({'reason': 'run_not_found', 'run_id': run_id})}\n\n"
+            )
+            return
+
         HEARTBEAT_INTERVAL = 15.0
         last_heartbeat = asyncio.get_event_loop().time()
 

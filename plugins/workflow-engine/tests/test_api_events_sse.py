@@ -61,12 +61,40 @@ def _read_sse_frames(response, max_frames: int = 5) -> list[dict]:
     return frames
 
 
+def _read_sse_frames_until(response, expected_events: set[str], max_lines: int = 50) -> list[dict]:
+    """Read SSE frames until all expected event names are seen or line budget expires."""
+    frames = []
+    current: dict = {}
+    seen: set[str] = set()
+    for idx, line in enumerate(response.iter_lines()):
+        if idx >= max_lines:
+            break
+        if not line:
+            if current:
+                frames.append(current)
+                event_name = current.get("event")
+                if event_name:
+                    seen.add(event_name)
+                current = {}
+                if expected_events.issubset(seen):
+                    break
+        elif line.startswith("event:"):
+            current["event"] = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            current["data"] = line[len("data:"):].strip()
+    return frames
+
+
 def test_events_returns_event_stream(client):
     """GET /events responds with text/event-stream content-type."""
     with client.stream("GET", "/events?runId=nonexistent") as r:
         assert r.status_code == 200
         assert "text/event-stream" in r.headers.get("content-type", "")
+        frames = _read_sse_frames_until(r, {"connected", "error"})
         r.close()
+    assert frames[0]["event"] == "connected"
+    assert frames[1]["event"] == "error"
+    assert "\"reason\": \"run_not_found\"" in frames[1]["data"]
 
 
 def test_events_for_run_emits_frames(client):
@@ -82,7 +110,7 @@ def test_events_for_run_emits_frames(client):
     # Read replayed events; the bus replays last 50 DB events.
     with client.stream("GET", f"/events?runId={run_id}") as r:
         assert r.status_code == 200
-        frames = _read_sse_frames(r, max_frames=3)
+        frames = _read_sse_frames_until(r, {"workflow_started"}, max_lines=100)
         r.close()
 
     # At minimum, workflow_started should have been emitted.
