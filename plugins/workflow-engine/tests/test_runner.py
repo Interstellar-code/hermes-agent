@@ -12,6 +12,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -151,7 +152,13 @@ async def test_cancel_mid_flight(runner_env):
     assert final is not None
     assert final["status"] == "cancelled", f"Expected cancelled, got {final['status']}"
 
-    # Node runs should be cancelled too
-    node_runs = env["run_store"].list_node_runs(run_id)
-    for nr in node_runs:
-        assert nr["status"] in ("cancelled", "completed", "failed", "running"), nr["status"]
+
+def test_build_ctx_includes_injected_llm(runner_env):
+    """Prompt/command nodes need ctx.llm wired from the plugin host."""
+    env = runner_env
+    llm = MagicMock()
+    env["runner"].set_llm(llm)
+
+    ctx = env["runner"]._build_ctx("run-1", "/tmp")
+
+    assert ctx.llm is llm

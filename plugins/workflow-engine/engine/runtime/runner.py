@@ -43,11 +43,17 @@ class WorkflowRunner:
         run_store: RunStore,
         def_store: DefinitionStore,
         bus: EventBus,
+        llm: Any = None,
     ) -> None:
         self._run_store = run_store
         self._def_store = def_store
         self._bus = bus
+        self._llm = llm
         self._tasks: Dict[str, asyncio.Task] = {}  # run_id → Task
+
+    def set_llm(self, llm: Any) -> None:
+        """Inject the host-owned PluginLlm facade used by prompt/command nodes."""
+        self._llm = llm
 
     # ------------------------------------------------------------------ #
     # Public API                                                          #
@@ -514,6 +520,7 @@ class WorkflowRunner:
             cancel_run=cancel_run,
             send_message=send_message,
             get_subgraph_yaml=get_subgraph_yaml,
+            llm=self._llm,
             log_dir=working_path,
             prior_completed=prior_completed,
         )

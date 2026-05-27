@@ -30,8 +30,15 @@ def register(ctx) -> None:  # noqa: ANN001
     from .tools.cancel_workflow import handler as cancel_handler, SCHEMA as cancel_schema, check as cancel_check  # noqa: PLC0415,E501
     from .daemon import _setup as daemon_setup  # noqa: PLC0415
 
-    # Eagerly initialize engine so first tool call isn't slow.
-    get_engine()
+    # Eagerly initialize engine so first tool call isn't slow, then wire the
+    # host-owned PluginLlm facade so prompt/command nodes can execute.
+    engine = get_engine()
+    llm = getattr(ctx, "llm", None)
+    if llm is not None:
+        try:
+            engine.set_llm(llm)
+        except Exception:
+            logger.exception("workflow-engine: failed to wire ctx.llm into engine")
 
     for name, schema, handler, is_async, check_fn in (
         ("workflow_list",    list_schema,    list_handler,    True, list_check),

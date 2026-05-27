@@ -98,6 +98,7 @@ class DagRunContext:
     cancel_run: CancelRunFn
     send_message: SendMessageFn
     get_subgraph_yaml: GetSubgraphYamlFn
+    llm: Any = None
     log_dir: Optional[str] = None
     # Map of node_id → output for nodes already completed in a prior run (resume)
     prior_completed: Optional[Dict[str, str]] = None

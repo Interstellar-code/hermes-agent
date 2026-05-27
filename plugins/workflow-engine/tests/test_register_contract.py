@@ -22,6 +22,7 @@ class FakeCtx:
     tools: List[Dict[str, Any]] = field(default_factory=list)
     hooks: List[Dict[str, Any]] = field(default_factory=list)
     cli_commands: List[Dict[str, Any]] = field(default_factory=list)
+    llm: Any = field(default_factory=MagicMock)
 
     def register_tool(
         self,
@@ -134,6 +135,21 @@ def test_register_no_include_router(monkeypatch):
         raise AssertionError(
             f"register() called ctx.include_router which does not exist: {exc}"
         ) from exc
+
+
+def test_register_wires_plugin_llm_into_engine(monkeypatch):
+    """register() should pass ctx.llm into the shared engine singleton."""
+    fake_engine = MagicMock()
+    monkeypatch.setattr(
+        "plugins.workflow_engine._shared._engine", fake_engine
+    )
+
+    ctx = FakeCtx()
+    import plugins.workflow_engine as we  # noqa: PLC0415
+
+    we.register(ctx)
+
+    fake_engine.set_llm.assert_called_once_with(ctx.llm)
 
 
 def test_all_tools_have_check_fn():

@@ -52,6 +52,10 @@ class WorkflowEngine:
         self._manifest_writer = manifest_writer
         self.boot = boot
 
+    def set_llm(self, llm: Any) -> None:
+        """Inject the host-owned PluginLlm facade into the workflow runner."""
+        self._runner.set_llm(llm)
+
     # ------------------------------------------------------------------ #
     # Definitions                                                         #
     # ------------------------------------------------------------------ #
