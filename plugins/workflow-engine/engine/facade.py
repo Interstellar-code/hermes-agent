@@ -68,11 +68,15 @@ class WorkflowEngine:
 
     async def upsert_definition(
         self,
+        definition_id: str,
         yaml_text: str,
+        source: str = "user",
         source_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         row = self._def_store.upsert_definition(
+            definition_id=definition_id,
             yaml_text=yaml_text,
+            source=source,
             source_path=source_path,
         )
         # Refresh manifest

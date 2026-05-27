@@ -9,7 +9,6 @@ import hashlib
 import json
 import time
 import sqlite3
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow import WorkflowDefinition, WorkflowSource
@@ -79,7 +78,9 @@ class DefinitionStore:
     def upsert_definition(
         self,
         *,
+        definition_id: str,
         yaml_text: str,
+        source: WorkflowSource = "user",
         source_path: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Parse yaml_text, validate, upsert, return the row dict."""
@@ -87,13 +88,12 @@ class DefinitionStore:
         if error or workflow is None:
             raise ValueError(f"Invalid workflow YAML: {error.error if error else 'unknown'}")
 
-        if workflow.id is None:
-            stem = Path(source_path).stem if source_path else "unnamed"
-            object.__setattr__(workflow, "id", stem.lower().replace(" ", "-"))
+        if not definition_id or not isinstance(definition_id, str):
+            raise ValueError("definition_id is required")
+        object.__setattr__(workflow, "id", definition_id)
 
         checksum = _sha256(yaml_text)
         now = _now_ms()
-        source: WorkflowSource = "user"
 
         existing = self._conn.execute(
             "SELECT checksum FROM workflow_definitions WHERE id = ?",

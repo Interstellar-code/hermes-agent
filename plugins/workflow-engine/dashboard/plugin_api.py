@@ -122,7 +122,12 @@ async def create_definition(request: Request) -> JSONResponse:
             return _json({"error": "tags must be a string[] when provided"}, 400)
 
     try:
-        defn = await _engine.upsert_definition(yaml_text=yaml_text, source_path=scope_path)
+        defn = await _engine.upsert_definition(
+            definition_id=body["id"],
+            yaml_text=yaml_text,
+            source=source,
+            source_path=scope_path,
+        )
     except ValueError as exc:
         return _json({"error": str(exc)}, 422)
 

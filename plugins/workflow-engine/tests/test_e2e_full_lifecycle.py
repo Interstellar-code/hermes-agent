@@ -553,7 +553,11 @@ async def test_e2e_definition_lifecycle(engine):
     upsert → get → list → parse → delete
     """
     # Upsert
-    row = await engine.upsert_definition(SIMPLE_BASH_YAML, "e2e-simple.yaml")
+    row = await engine.upsert_definition(
+        definition_id="e2e-simple-bash",
+        yaml_text=SIMPLE_BASH_YAML,
+        source_path="e2e-simple.yaml",
+    )
     assert row["name"] == "e2e-simple-bash"
 
     # Get

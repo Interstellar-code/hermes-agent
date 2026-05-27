@@ -18,6 +18,23 @@ nodes:
     prompt: Say hello
 """
 
+_NO_ID_YAML = """\
+name: Hello World
+description: A minimal test workflow
+nodes:
+  - id: greet
+    prompt: Say hello
+"""
+
+_OTHER_ID_YAML = """\
+id: yaml-id
+name: Hello World
+description: A minimal test workflow
+nodes:
+  - id: greet
+    prompt: Say hello
+"""
+
 
 @pytest.fixture()
 def client():
@@ -115,3 +132,34 @@ def test_list_definitions_after_create(client):
     assert r.status_code == 200
     defs = r.json()["definitions"]
     assert any(d["id"] == "hello-world" for d in defs)
+
+
+def test_create_definition_body_id_wins_when_yaml_has_no_id(client):
+    r = client.post("/definitions", json={
+        "id": "body-id",
+        "name": "Hello World",
+        "yaml": _NO_ID_YAML,
+        "source": "user",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["definition"]["id"] == "body-id"
+
+    r2 = client.get("/definitions/body-id")
+    assert r2.status_code == 200
+    assert r2.json()["definition"]["id"] == "body-id"
+
+
+def test_create_definition_body_id_overrides_yaml_id(client):
+    r = client.post("/definitions", json={
+        "id": "body-id",
+        "name": "Hello World",
+        "yaml": _OTHER_ID_YAML,
+        "source": "user",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["definition"]["id"] == "body-id"
+
+    missing = client.get("/definitions/yaml-id")
+    assert missing.status_code == 404

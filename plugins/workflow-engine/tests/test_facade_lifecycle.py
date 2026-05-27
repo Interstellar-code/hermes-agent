@@ -91,7 +91,11 @@ async def test_list_definitions_empty(engine):
 @pytest.mark.asyncio
 async def test_upsert_and_get_definition(engine):
     """upsert_definition stores and get_definition retrieves it."""
-    row = await engine.upsert_definition(HELLO_WORLD_YAML, "hello-world.yaml")
+    row = await engine.upsert_definition(
+        definition_id="hello-world",
+        yaml_text=HELLO_WORLD_YAML,
+        source_path="hello-world.yaml",
+    )
     assert row["id"] == "hello-world"
     assert row["name"] == "hello-world"
 
