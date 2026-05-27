@@ -1634,6 +1634,8 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     is present — so orphans from session loading or manual message
     manipulation are always caught.
     """
+    from agent.message_sanitization import _normalize_tool_message_content
+
     # --- Role allowlist: drop messages with roles the API won't accept ---
     filtered = []
     for msg in messages:
@@ -1646,6 +1648,10 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         filtered.append(msg)
     messages = filtered
+
+    # --- Tool-content normalization: strict upstreams reject raw dict/list
+    # tool payloads, but valid content-part lists must survive unchanged.
+    _normalize_tool_message_content(messages)
 
     surviving_call_ids: set = set()
     for msg in messages:

@@ -652,6 +652,28 @@ class TestRunAgentMultimodalHelpers:
 
         assert content == "analysis summary"
 
+    def test_non_multimodal_dict_result_is_stringified(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        content = agent._tool_result_content_for_active_model(
+            "list_workflows",
+            {"ok": True, "count": 1},
+        )
+
+        assert isinstance(content, str)
+        assert json.loads(content) == {"ok": True, "count": 1}
+
+    def test_non_multimodal_content_part_list_is_preserved(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        parts = [{"type": "text", "text": "hello"}]
+
+        content = agent._tool_result_content_for_active_model("some_tool", parts)
+
+        assert content is parts
+
 
 # ---------------------------------------------------------------------------
 # Universality: does the schema work without Anthropic?
