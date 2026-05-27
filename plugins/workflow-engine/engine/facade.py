@@ -125,8 +125,88 @@ class WorkflowEngine:
         workflow_id: str,
         inputs: Dict[str, Any],
         trigger: Dict[str, Any],
+        *,
+        priority: int = 0,
+        max_runtime_s: Optional[int] = None,
     ) -> Dict[str, Any]:
-        return await self._runner.start(workflow_id, inputs, trigger)
+        return await self._runner.start(
+            workflow_id, inputs, trigger,
+            priority=priority, max_runtime_s=max_runtime_s,
+        )
+
+    async def schedule_run(
+        self,
+        workflow_id: str,
+        inputs: Dict[str, Any],
+        trigger: Dict[str, Any],
+        *,
+        schedule: Optional[Dict[str, Any]] = None,
+        priority: int = 0,
+        max_runtime_s: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Dispatch a run immediately, defer it, or signal cron-not-supported.
+
+        ``schedule`` shapes::
+            None | {"type": "now"}            → start_run immediately
+            {"type": "at", "at": "<iso>"}     → insert into scheduled_runs
+            {"type": "cron", ...}             → raises NotImplementedError
+        """
+        sched_type = (schedule or {}).get("type") or "now"
+        if sched_type == "now":
+            return await self.start_run(
+                workflow_id, inputs, trigger,
+                priority=priority, max_runtime_s=max_runtime_s,
+            )
+        if sched_type == "at":
+            at_iso = (schedule or {}).get("at")
+            if not isinstance(at_iso, str) or not at_iso:
+                raise ValueError("schedule.at must be an ISO-8601 string")
+            row = self._run_store.insert_scheduled_run(
+                workflow_id=workflow_id,
+                inputs=inputs,
+                trigger=trigger,
+                run_at=at_iso,
+                priority=priority,
+                max_runtime_s=max_runtime_s,
+            )
+            return {
+                "id": row["id"],
+                "status": "scheduled",
+                "scheduled_for": at_iso,
+            }
+        if sched_type == "cron":
+            raise NotImplementedError("cron schedule not yet supported")
+        raise ValueError(f"unknown schedule.type: {sched_type!r}")
+
+    async def list_active_node_runs(self) -> List[Dict[str, Any]]:
+        return self._run_store.list_active_node_runs()
+
+    async def fire_due_scheduled_runs(self) -> int:
+        """Scheduler-tick helper: claim+fire due rows. Returns count fired."""
+        from datetime import datetime, timezone
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        due = self._run_store.list_due_scheduled_runs(now_iso)
+        fired = 0
+        for row in due:
+            if not self._run_store.claim_scheduled_run(row["id"], now_iso):
+                continue
+            try:
+                await self.start_run(
+                    row["workflow_id"],
+                    row.get("inputs") or {},
+                    row.get("trigger") or {},
+                    priority=row.get("priority") or 0,
+                    max_runtime_s=row.get("max_runtime_s"),
+                )
+                self._run_store.mark_scheduled_fired(row["id"])
+                fired += 1
+            except Exception as exc:
+                logger.exception(
+                    "fire_due_scheduled_runs: start_run failed for %s: %s",
+                    row["id"], exc,
+                )
+                self._run_store.mark_scheduled_failed(row["id"])
+        return fired
 
     async def wait_for_run(
         self,

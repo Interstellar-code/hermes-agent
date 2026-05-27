@@ -84,6 +84,9 @@ class RunStore:
         working_path: str,
         user_message: str,
         trigger: Optional[Dict[str, Any]] = None,
+        priority: int = 0,
+        max_runtime_s: Optional[int] = None,
+        scheduled_for: Optional[str] = None,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         now = _now_ms()
@@ -91,8 +94,9 @@ class RunStore:
             """
             INSERT INTO workflow_runs
               (id, workflow_id, conversation_id, working_path, user_message,
-               status, current_phase, metadata, started_at, last_heartbeat)
-            VALUES (?, ?, ?, ?, ?, 'pending', 'plan', ?, ?, ?)
+               status, current_phase, metadata, started_at, last_heartbeat,
+               priority, max_runtime_s, scheduled_for)
+            VALUES (?, ?, ?, ?, ?, 'pending', 'plan', ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -103,10 +107,140 @@ class RunStore:
                 json.dumps({"trigger": trigger} if trigger else {}),
                 now,
                 now,
+                priority,
+                max_runtime_s,
+                scheduled_for,
             ),
         )
         self._conn.commit()
         return self.get_workflow_run(run_id)  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    # Scheduled Runs                                                       #
+    # ------------------------------------------------------------------ #
+
+    def insert_scheduled_run(
+        self,
+        *,
+        workflow_id: str,
+        inputs: Dict[str, Any],
+        trigger: Dict[str, Any],
+        run_at: str,
+        priority: int = 0,
+        max_runtime_s: Optional[int] = None,
+        cron_expr: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sid = str(uuid.uuid4())
+        created_at = datetime.now(tz=timezone.utc).isoformat()
+        self._conn.execute(
+            """
+            INSERT INTO scheduled_runs
+              (id, workflow_id, inputs_json, trigger_json, run_at,
+               priority, max_runtime_s, cron_expr, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                sid,
+                workflow_id,
+                json.dumps(inputs or {}),
+                json.dumps(trigger or {}),
+                run_at,
+                priority,
+                max_runtime_s,
+                cron_expr,
+                created_at,
+            ),
+        )
+        self._conn.commit()
+        return {
+            "id": sid,
+            "workflow_id": workflow_id,
+            "run_at": run_at,
+            "priority": priority,
+            "max_runtime_s": max_runtime_s,
+            "cron_expr": cron_expr,
+            "status": "pending",
+            "created_at": created_at,
+        }
+
+    def list_due_scheduled_runs(self, now_iso: str) -> List[Dict[str, Any]]:
+        """List pending scheduled rows whose run_at is at or before now_iso."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM scheduled_runs
+             WHERE status = 'pending' AND run_at <= ?
+             ORDER BY priority DESC, run_at ASC
+            """,
+            (now_iso,),
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["inputs"] = json.loads(d.get("inputs_json") or "{}")
+            except Exception:
+                d["inputs"] = {}
+            try:
+                d["trigger"] = json.loads(d.get("trigger_json") or "{}")
+            except Exception:
+                d["trigger"] = {}
+            out.append(d)
+        return out
+
+    def claim_scheduled_run(self, scheduled_id: str, now_iso: str) -> bool:
+        """Atomic CAS: claim a pending row if still due. True iff this caller won."""
+        cur = self._conn.execute(
+            """
+            UPDATE scheduled_runs
+               SET status = 'firing'
+             WHERE id = ? AND status = 'pending' AND run_at <= ?
+            """,
+            (scheduled_id, now_iso),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def mark_scheduled_fired(self, scheduled_id: str) -> None:
+        self._conn.execute(
+            "UPDATE scheduled_runs SET status = 'fired' WHERE id = ?",
+            (scheduled_id,),
+        )
+        self._conn.commit()
+
+    def mark_scheduled_failed(self, scheduled_id: str) -> None:
+        self._conn.execute(
+            "UPDATE scheduled_runs SET status = 'failed' WHERE id = ?",
+            (scheduled_id,),
+        )
+        self._conn.commit()
+
+    def list_active_node_runs(self) -> List[Dict[str, Any]]:
+        """Return active node_runs across all workflow_runs.
+
+        Active == status in ('running', 'waiting'). Joins workflow_runs to
+        surface the workflow_id alongside each node_run.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT nr.id           AS node_run_id,
+                   nr.workflow_run_id AS run_id,
+                   nr.dag_node_id  AS dag_node_id,
+                   wr.workflow_id  AS workflow_id,
+                   nr.status       AS status,
+                   nr.started_at   AS started_at
+              FROM node_runs nr
+              JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
+             WHERE nr.status IN ('running', 'waiting')
+             ORDER BY nr.started_at ASC
+            """,
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["started_at"] = _ms_to_dt(d.get("started_at"))
+            d["worker_id"] = None  # column absent in current schema
+            out.append(d)
+        return out
 
     def get_workflow_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(

@@ -30,6 +30,7 @@ async def _main(args: Any) -> int:
     from ._shared import get_engine  # noqa: PLC0415
     from engine.cron.poller import CronPoller  # noqa: PLC0415
     from engine.dispatcher.kanban import KanbanDispatcher  # noqa: PLC0415
+    from engine.runtime.scheduler_tick import run_scheduler_tick_loop  # noqa: PLC0415
 
     engine = get_engine()
     poller = CronPoller(engine, poll_interval_s=args.interval)
@@ -59,6 +60,9 @@ async def _main(args: Any) -> int:
     tasks = [
         asyncio.create_task(poller.run_forever(), name="wf-cron-poller"),
         asyncio.create_task(dispatcher.run_forever(), name="wf-kanban-dispatcher"),
+        asyncio.create_task(
+            run_scheduler_tick_loop(engine), name="wf-scheduler-tick",
+        ),
     ]
 
     await stop.wait()

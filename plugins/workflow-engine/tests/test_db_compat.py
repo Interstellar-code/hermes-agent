@@ -29,7 +29,9 @@ SWITCHUI_REPO = Path("/Volumes/Ext-nvme/Development/hermes-switchui-a")
 # Remove an entry here once the corresponding TS migration ships.
 _PY_ONLY_ALLOWED = {
     "idx_wr_owner",    # added by 003_owner_session.sql; TS pending
-    "workflow_runs",   # 003 added owner_session column; TS schema behind Python
+    "workflow_runs",   # 003 added owner_session column; 004 added priority/max_runtime_s/scheduled_for; TS schema behind Python
+    "scheduled_runs",  # added by 004_scheduled_runs.sql; TS pending
+    "idx_sr_due",  # added by 004_scheduled_runs.sql; TS pending
 }
 
 _SKIP_TS = not SWITCHUI_REPO.exists()

@@ -264,8 +264,44 @@ async def create_run(request: Request) -> JSONResponse:
 
     inputs: Dict[str, Any] = body.get("variables") or {}
 
+    # Optional new launch fields: schedule, priority, maxRuntimeSeconds.
+    schedule = body.get("schedule")
+    if schedule is not None:
+        if not isinstance(schedule, dict):
+            return _json({"error": "schedule must be an object"}, 400)
+        sched_type = schedule.get("type")
+        if sched_type not in ("now", "at", "cron"):
+            return _json({"error": "schedule.type must be 'now' | 'at' | 'cron'"}, 400)
+        if sched_type == "at":
+            at_val = schedule.get("at")
+            if not isinstance(at_val, str) or not at_val:
+                return _json({"error": "schedule.at must be an ISO-8601 string"}, 400)
+
+    priority_raw = body.get("priority", 0)
+    if not isinstance(priority_raw, int) or isinstance(priority_raw, bool):
+        return _json({"error": "priority must be an integer"}, 400)
+    if priority_raw < -100 or priority_raw > 100:
+        return _json({"error": "priority must be in [-100, 100]"}, 400)
+    priority: int = priority_raw
+
+    max_rt_raw = body.get("maxRuntimeSeconds")
+    max_runtime_s: Optional[int] = None
+    if max_rt_raw is not None:
+        if not isinstance(max_rt_raw, int) or isinstance(max_rt_raw, bool):
+            return _json({"error": "maxRuntimeSeconds must be an integer"}, 400)
+        if max_rt_raw <= 0 or max_rt_raw > 86400:
+            return _json({"error": "maxRuntimeSeconds must be in (0, 86400]"}, 400)
+        max_runtime_s = max_rt_raw
+
     try:
-        run = await _engine.start_run(workflow_id, inputs, trigger)
+        run = await _engine.schedule_run(
+            workflow_id, inputs, trigger,
+            schedule=schedule,
+            priority=priority,
+            max_runtime_s=max_runtime_s,
+        )
+    except NotImplementedError as exc:
+        return _json({"error": str(exc) or "cron schedule not yet supported"}, 501)
     except ValueError as exc:
         return _json({"error": str(exc)}, 400)
 
@@ -483,6 +519,29 @@ async def list_node_runs(run_id: str) -> JSONResponse:
         return _json({"error": "not found"}, 404)
     node_runs = await _engine.list_node_runs(run_id)
     return _json({"nodeRuns": node_runs})
+
+
+# ---------------------------------------------------------------------------
+# Node runs — GET /node-runs/active   MUST be before /node-runs/{node_run_id}
+# ---------------------------------------------------------------------------
+
+
+@router.get("/node-runs/active")
+async def list_active_node_runs() -> JSONResponse:
+    rows = await _engine.list_active_node_runs()
+    out = [
+        {
+            "runId": r.get("run_id"),
+            "nodeRunId": r.get("node_run_id"),
+            "nodeId": r.get("dag_node_id"),
+            "workflowId": r.get("workflow_id"),
+            "status": r.get("status"),
+            "startedAt": r.get("started_at"),
+            "workerId": r.get("worker_id"),
+        }
+        for r in rows
+    ]
+    return _json({"nodeRuns": out})
 
 
 # ---------------------------------------------------------------------------

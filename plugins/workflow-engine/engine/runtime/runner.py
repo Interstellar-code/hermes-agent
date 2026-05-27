@@ -64,6 +64,9 @@ class WorkflowRunner:
         workflow_id: str,
         inputs: Dict[str, Any],
         trigger: Dict[str, Any],
+        *,
+        priority: int = 0,
+        max_runtime_s: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Create a run row, then fire the DAG executor as a background task.
@@ -96,6 +99,8 @@ class WorkflowRunner:
             working_path=working_path,
             user_message=user_message,
             trigger=trigger,
+            priority=priority,
+            max_runtime_s=max_runtime_s,
         )
         run_id = run["id"]
 
@@ -120,7 +125,10 @@ class WorkflowRunner:
 
         # 5. Fire and forget
         task = asyncio.create_task(
-            self._execute(run_id, workflow_id, dag_nodes, inputs, working_path),
+            self._execute(
+                run_id, workflow_id, dag_nodes, inputs, working_path,
+                max_runtime_s=max_runtime_s,
+            ),
             name=f"run-{run_id}",
         )
         self._register_task(run_id, task)
@@ -332,11 +340,17 @@ class WorkflowRunner:
         inputs: Dict[str, Any],
         working_path: str,
         prior_completed: Optional[Dict[str, str]] = None,
+        max_runtime_s: Optional[int] = None,
     ) -> None:
         start_ms = int(time.time() * 1000)
         try:
             ctx = self._build_ctx(run_id, working_path, prior_completed)
-            node_outputs = await execute_dag(dag_nodes, ctx)
+            if max_runtime_s is not None and max_runtime_s > 0:
+                node_outputs = await asyncio.wait_for(
+                    execute_dag(dag_nodes, ctx), timeout=float(max_runtime_s),
+                )
+            else:
+                node_outputs = await execute_dag(dag_nodes, ctx)
 
             failed_nodes = [
                 (node_id, output)
@@ -418,6 +432,31 @@ class WorkflowRunner:
                     "duration_ms": end_ms - start_ms,
                 },
             )
+        except asyncio.TimeoutError:
+            # max_runtime_s exceeded — route through the existing failure
+            # CAS path with a distinguished error string.
+            logger.warning("Run %s exceeded max_runtime_s=%s", run_id, max_runtime_s)
+            won = self._run_store.finish_workflow_run_if_running(
+                run_id, status="failed", error="max_runtime_exceeded",
+            )
+            if not won:
+                return
+            self._run_store.record_phase_transition(
+                run_id=run_id,
+                to_phase="failed",
+                decided_by="system",
+                decision_data={"reason": "max_runtime_exceeded"},
+            )
+            self._bus.emit(
+                run_id=run_id,
+                event_type="workflow_failed",
+                data={
+                    "error": "max_runtime_exceeded",
+                    "reason": "max_runtime_exceeded",
+                    "max_runtime_s": max_runtime_s,
+                },
+            )
+            return
         except asyncio.CancelledError:
             # CAS so a concurrent resume / completion can't be
             # double-finalised by this branch.
