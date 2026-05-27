@@ -70,8 +70,17 @@ async def health() -> dict:
 
 
 @router.get("/definitions")
-async def list_definitions() -> JSONResponse:
-    defs = await _engine.list_definitions()
+async def list_definitions(source: Optional[str] = None) -> JSONResponse:
+    if source not in (None, "user", "bundled", "project", "all", "system"):
+        return _json({"error": "source must be one of user|bundled|project|system|all"}, 400)
+
+    normalized_source = source
+    if normalized_source == "system":
+        normalized_source = "bundled"
+    if normalized_source == "all":
+        normalized_source = None
+
+    defs = await _engine.list_definitions(source=normalized_source)
     return _json({"definitions": defs})
 
 

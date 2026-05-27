@@ -60,8 +60,8 @@ class WorkflowEngine:
     # Definitions                                                         #
     # ------------------------------------------------------------------ #
 
-    async def list_definitions(self) -> List[Dict[str, Any]]:
-        return self._def_store.list_definitions()
+    async def list_definitions(self, *, source: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._def_store.list_definitions(source=source)
 
     async def get_definition(self, definition_id: str) -> Optional[Dict[str, Any]]:
         return self._def_store.get_definition(definition_id)

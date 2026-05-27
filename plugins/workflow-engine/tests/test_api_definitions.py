@@ -45,6 +45,7 @@ def client():
     original = api_mod._engine
     api_mod._engine = engine
     app.include_router(api_mod.router)
+    app.state.workflow_engine = engine
 
     with TestClient(app, raise_server_exceptions=True) as c:
         yield c
@@ -132,6 +133,108 @@ def test_list_definitions_after_create(client):
     assert r.status_code == 200
     defs = r.json()["definitions"]
     assert any(d["id"] == "hello-world" for d in defs)
+
+
+def test_list_definitions_source_user_filters_out_bundled(client):
+    client.post("/definitions", json={
+        "id": "user-flow",
+        "name": "User Flow",
+        "yaml": _NO_ID_YAML,
+        "source": "user",
+    })
+    client.post("/definitions", json={
+        "id": "project-flow",
+        "name": "Project Flow",
+        "yaml": _NO_ID_YAML,
+        "source": "project",
+    })
+
+    bundled_yaml = """\
+id: bundled-flow
+name: Bundled Flow
+description: bundled
+nodes:
+  - id: greet
+    prompt: Say hello
+"""
+    engine = client.app.state.workflow_engine
+    engine._def_store._conn.execute(
+        """INSERT INTO workflow_definitions
+             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+    )
+    engine._def_store._conn.commit()
+
+    r = client.get("/definitions?source=user")
+    assert r.status_code == 200
+    defs = r.json()["definitions"]
+    ids = {d["id"] for d in defs}
+    assert "user-flow" in ids
+    assert "project-flow" not in ids
+    assert "bundled-flow" not in ids
+
+
+def test_list_definitions_source_system_maps_to_bundled(client):
+    bundled_yaml = """\
+id: bundled-flow
+name: Bundled Flow
+description: bundled
+nodes:
+  - id: greet
+    prompt: Say hello
+"""
+    engine = client.app.state.workflow_engine
+    engine._def_store._conn.execute(
+        """INSERT INTO workflow_definitions
+             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+    )
+    engine._def_store._conn.commit()
+
+    r = client.get("/definitions?source=system")
+    assert r.status_code == 200
+    defs = r.json()["definitions"]
+    ids = {d["id"] for d in defs}
+    assert ids == {"bundled-flow"}
+
+
+def test_list_definitions_source_all_returns_everything(client):
+    client.post("/definitions", json={
+        "id": "user-flow",
+        "name": "User Flow",
+        "yaml": _NO_ID_YAML,
+        "source": "user",
+    })
+    bundled_yaml = """\
+id: bundled-flow
+name: Bundled Flow
+description: bundled
+nodes:
+  - id: greet
+    prompt: Say hello
+"""
+    engine = client.app.state.workflow_engine
+    engine._def_store._conn.execute(
+        """INSERT INTO workflow_definitions
+             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+    )
+    engine._def_store._conn.commit()
+
+    r = client.get("/definitions?source=all")
+    assert r.status_code == 200
+    defs = r.json()["definitions"]
+    ids = {d["id"] for d in defs}
+    assert {"user-flow", "bundled-flow"} <= ids
+
+
+def test_list_definitions_invalid_source_returns_400(client):
+    r = client.get("/definitions?source=nope")
+    assert r.status_code == 400
+    assert "source must be one of" in r.json()["error"]
 
 
 def test_create_definition_body_id_wins_when_yaml_has_no_id(client):
