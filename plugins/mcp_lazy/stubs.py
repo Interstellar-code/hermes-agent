@@ -169,9 +169,21 @@ def mix_full_and_stubs(
         # Keeping both visible reinforces a routing loop where the stub keeps
         # winning even though the concrete tools are already available. See
         # Interstellar-code/hermes-agent#18.
-        if discovery_mode == "both" and server in p_servers:
-            # Server promoted → emit tool stubs (or full if promoted) and skip
-            # the discovery stub entirely. Promoted tools provide the surface.
+        #
+        # The discovery stub must ALSO retire when individual tools of this
+        # server have been promoted without the server itself being promoted
+        # (e.g. ``pre_tool_call`` auto-promotes a single tool via
+        # ``promote_tools``, which never touches ``_promoted_servers``; a
+        # subsequent discovery_mode flip to "both" would otherwise re-surface
+        # the stub AND drop the already-promoted tool). Keying retirement on
+        # per-tool promotions as well closes that gap. See follow-up to #18.
+        has_promoted_tool = any(
+            t.get("function", {}).get("name", "") in promoted for t in srv_tools
+        )
+        if discovery_mode == "both" and (server in p_servers or has_promoted_tool):
+            # Server (or at least one of its tools) promoted → emit tool stubs
+            # (or full if promoted) and skip the discovery stub entirely.
+            # Promoted tools provide the surface.
             for tool in srv_tools:
                 name = tool.get("function", {}).get("name", "")
                 if name in promoted:
