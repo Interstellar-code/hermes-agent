@@ -773,10 +773,26 @@ async def get_action_status(name: str, lines: int = 200):
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(limit: int = 20, offset: int = 0, profile: str = None):
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        # Resolve profile name and db_path
+        try:
+            if profile is not None:
+                resolved_profile = profile
+                profile_dir = get_profile_dir(profile)
+                db_path = profile_dir / "state.db"
+                if not db_path.exists():
+                    return {"sessions": [], "total": 0, "limit": limit, "offset": offset, "profile": resolved_profile}
+                db = SessionDB(db_path=db_path)
+            else:
+                resolved_profile = get_active_profile_name() or "default"
+                db = SessionDB()
+        except Exception:
+            _log.exception("GET /api/sessions: profile resolution failed")
+            resolved_profile = "default"
+            db = SessionDB()
         try:
             sessions = db.list_sessions_rich(limit=limit, offset=offset)
             total = db.session_count()
@@ -786,6 +802,7 @@ async def get_sessions(limit: int = 20, offset: int = 0):
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
+                s["profile"] = resolved_profile
                 if "last_prompt_tokens" not in s:
                     s["last_prompt_tokens"] = 0
                 if "context_length" not in s:
@@ -795,7 +812,7 @@ async def get_sessions(limit: int = 20, offset: int = 0):
                         s["context_length"] = get_model_context_length(model_name) if model_name else 0
                     except Exception:
                         s["context_length"] = 0
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset, "profile": resolved_profile}
         finally:
             db.close()
     except Exception:
@@ -804,13 +821,29 @@ async def get_sessions(limit: int = 20, offset: int = 0):
 
 
 @app.get("/api/sessions/search")
-async def search_sessions(q: str = "", limit: int = 20):
+async def search_sessions(q: str = "", limit: int = 20, profile: str = None):
     """Full-text search across session message content using FTS5."""
     if not q or not q.strip():
         return {"results": []}
     try:
         from hermes_state import SessionDB
-        db = SessionDB()
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        # Resolve profile name and db_path
+        try:
+            if profile is not None:
+                resolved_profile = profile
+                profile_dir = get_profile_dir(profile)
+                db_path = profile_dir / "state.db"
+                if not db_path.exists():
+                    return {"results": [], "profile": resolved_profile}
+                db = SessionDB(db_path=db_path)
+            else:
+                resolved_profile = get_active_profile_name() or "default"
+                db = SessionDB()
+        except Exception:
+            _log.exception("GET /api/sessions/search: profile resolution failed")
+            resolved_profile = "default"
+            db = SessionDB()
         try:
             # Auto-add prefix wildcards so partial words match
             # e.g. "nimb" → "nimb*" matches "nimby"
@@ -836,8 +869,9 @@ async def search_sessions(q: str = "", limit: int = 20):
                         "source": m.get("source"),
                         "model": m.get("model"),
                         "session_started": m.get("session_started"),
+                        "profile": resolved_profile,
                     }
-            return {"results": list(seen.values())}
+            return {"results": list(seen.values()), "profile": resolved_profile}
         finally:
             db.close()
     except Exception:
