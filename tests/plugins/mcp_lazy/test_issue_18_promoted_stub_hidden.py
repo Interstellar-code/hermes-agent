@@ -81,6 +81,35 @@ def test_mix_hides_server_stub_when_server_promoted():
     )
 
 
+def test_mix_hides_server_stub_when_only_tool_promoted():
+    """Follow-up to #18: a server with promoted *tools* but no promoted
+    *server* (e.g. pre_tool_call auto-promote, then a discovery_mode flip to
+    "both") must still retire its discovery stub and emit the promoted tool —
+    not re-surface the stub and drop the tool."""
+    tools = _server_tools()
+    promoted = {f"mcp_{SERVER}_list_expenses"}
+    result = mix_full_and_stubs(
+        tools,
+        promoted_names=promoted,
+        lazy_servers={SERVER},
+        discovery_mode="both",
+        promoted_servers=frozenset(),  # server NOT promoted, only the tool
+    )
+    names = [t["function"]["name"] for t in result]
+    stub_name = f"{SERVER_STUB_NAME_PREFIX}{SERVER}"
+
+    assert stub_name not in names, (
+        "per-tool promotion must also retire the discovery stub"
+    )
+    assert not any(is_server_stub_schema(t) for t in result)
+    # Promoted tool survives as full; siblings stay as per-tool stubs.
+    assert f"mcp_{SERVER}_list_expenses" in names
+    assert any(
+        is_stub_schema(t) and t["function"]["name"] == f"mcp_{SERVER}_list_purchases"
+        for t in result
+    )
+
+
 def test_mix_keeps_server_stub_when_server_not_promoted():
     tools = _server_tools()
     result = mix_full_and_stubs(
