@@ -217,6 +217,38 @@ def pre_tool_call(
             return None
 
         pool = get_pool(session_id)
+
+        # Belt-and-suspenders for Interstellar-code/hermes-agent#18:
+        # ``mcp_server_<name>`` is a synthetic discovery stub, not a real MCP
+        # tool. The auto-promote path below would treat it as a tool name and
+        # record it in the pool, which is wrong on every level. Handle both
+        # cases (promoted vs unpromoted server) explicitly and never fall
+        # through to auto-promotion.
+        if tool_name.startswith("mcp_server_"):
+            server_name = tool_name[len("mcp_server_"):].strip()
+            if server_name and pool.is_server_promoted(server_name):
+                agent = _current_agent_var.get(None)
+                valid = getattr(agent, "valid_tool_names", None) or set()
+                prefix = f"mcp_{server_name}_"
+                concrete = sorted(t for t in valid if t.startswith(prefix))
+                hint = ", ".join(concrete[:8]) or "(use the mcp_{server}_<tool> names from the tool list)"
+                logger.info(
+                    "mcp_lazy: pre_tool_call rejected stale server stub %r — server already promoted",
+                    tool_name,
+                )
+                return {
+                    "action": "block",
+                    "message": (
+                        f"[mcp_lazy] `{tool_name}` is a discovery stub for an already-promoted "
+                        f"server. Call one of the concrete tools instead: {hint}"
+                    ),
+                }
+            # Server not yet promoted — let the normal dispatch surface the
+            # error (or future handler take over). Critically, do NOT fall
+            # through to the per-tool auto-promote logic; the stub name is not
+            # a real tool and must never enter the promoted pool.
+            return None
+
         if pool.is_promoted(tool_name):
             return None  # already full schema — normal dispatch
 

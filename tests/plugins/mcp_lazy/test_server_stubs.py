@@ -162,7 +162,14 @@ def test_mix_both_mode_unpromoted_server_shows_only_server_stub():
     assert "mcp_trek_search" not in names
 
 
-def test_mix_both_mode_promoted_server_shows_stub_plus_tool_stubs():
+def test_mix_both_mode_promoted_server_hides_stub_and_shows_tool_stubs():
+    """After server promotion the discovery stub must be retired.
+
+    See Interstellar-code/hermes-agent#18 — leaving ``mcp_server_<name>``
+    visible alongside the concrete tool stubs let the model keep routing
+    to the discovery stub in a loop. Promotion swaps the surface for
+    per-tool stubs (or full schemas) instead.
+    """
     tools = [_full("mcp_trek_search"), _full("mcp_trek_create")]
     result = mix_full_and_stubs(
         tools,
@@ -172,7 +179,7 @@ def test_mix_both_mode_promoted_server_shows_stub_plus_tool_stubs():
         promoted_servers=frozenset({"trek"}),
     )
     names = [t["function"]["name"] for t in result]
-    assert f"{SERVER_STUB_NAME_PREFIX}trek" in names
+    assert f"{SERVER_STUB_NAME_PREFIX}trek" not in names
     assert "mcp_trek_search" in names
     assert "mcp_trek_create" in names
     # Tool entries should be stubs (not full), since they're not in promoted_names

@@ -164,6 +164,22 @@ def mix_full_and_stubs(
 
     # Emit server stubs for each eligible server.
     for server, srv_tools in sorted(server_tool_map.items()):
+        # Once a server is promoted, retire its discovery stub so the model
+        # cannot select ``mcp_server_<name>`` alongside the promoted tools.
+        # Keeping both visible reinforces a routing loop where the stub keeps
+        # winning even though the concrete tools are already available. See
+        # Interstellar-code/hermes-agent#18.
+        if discovery_mode == "both" and server in p_servers:
+            # Server promoted → emit tool stubs (or full if promoted) and skip
+            # the discovery stub entirely. Promoted tools provide the surface.
+            for tool in srv_tools:
+                name = tool.get("function", {}).get("name", "")
+                if name in promoted:
+                    result.append(tool)
+                else:
+                    result.append(make_stub_schema(tool, max_desc=max_desc))
+            continue
+
         tool_names = [t.get("function", {}).get("name", "") for t in srv_tools]
         desc = descs.get(server) or synth_server_description(tool_names, max_chars=server_stub_max_desc)
         stub = make_server_stub_schema(
@@ -173,16 +189,7 @@ def mix_full_and_stubs(
             max_desc=server_stub_max_desc,
         )
         result.append(stub)
-
-        if discovery_mode == "both" and server in p_servers:
-            # Server promoted → emit tool stubs (or full if promoted).
-            for tool in srv_tools:
-                name = tool.get("function", {}).get("name", "")
-                if name in promoted:
-                    result.append(tool)
-                else:
-                    result.append(make_stub_schema(tool, max_desc=max_desc))
-        # In "server" mode OR unpromoted "both": tool entries omitted.
+        # In ``"server"`` mode AND unpromoted ``"both"``: tool entries omitted.
 
     return result
 
