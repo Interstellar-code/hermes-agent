@@ -21,7 +21,6 @@ from typing import Any, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from .fleet_config import load_fleet
@@ -150,13 +149,9 @@ def build_app() -> FastAPI:
         redoc_url=None,
     )
 
-    # Cross-origin from anywhere — A2A peers are off-host by design.
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    # A2A peers are server-to-server; browsers are not A2A clients.
+    # CORS middleware is intentionally omitted: wildcard CORS would be
+    # misleading and unnecessary on this surface.
 
     @app.get("/.well-known/agent-card.json")
     async def agent_card() -> JSONResponse:
@@ -169,9 +164,7 @@ def build_app() -> FastAPI:
         return {
             "ok": True,
             "version": "0.1.0",
-            "self": cfg["self"]["name"],
-            "bind": f"{cfg['self']['bind_host']}:{cfg['self']['bind_port']}",
-            "peers": list(cfg["agents"].keys()),
+            "peer_count": len(cfg["agents"]),
         }
 
     @app.post("/jsonrpc")

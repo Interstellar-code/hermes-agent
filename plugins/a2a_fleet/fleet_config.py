@@ -20,11 +20,32 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 import yaml
 
 
 SUPPORTED_HANDLERS = {"echo"}
+
+_ALLOWED_SCHEMES = {"http", "https"}
+
+
+def _validate_peer_url(url: str | None, field: str, peer_name: str, path: Path) -> None:
+    """Reject peer URLs that are missing, have no real host, or use non-http(s) schemes."""
+    if not url:
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{peer_name}.{field} is required"
+        )
+    parsed = urlparse(url)
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{peer_name}.{field} scheme must be http or https, "
+            f"got {parsed.scheme!r} in {url!r}"
+        )
+    if not parsed.hostname:
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{peer_name}.{field} must have a valid host in {url!r}"
+        )
 
 
 class FleetConfigError(ValueError):
@@ -126,9 +147,14 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
             raise FleetConfigError(
                 f"{path}: fleet.agents.{name} must be a mapping, got {type(entry).__name__}"
             )
+        peer_url = entry.get("url")
+        peer_card_url = entry.get("agent_card_url")
+        _validate_peer_url(peer_url, "url", name, path)
+        if peer_card_url:
+            _validate_peer_url(peer_card_url, "agent_card_url", name, path)
         agents_out[name] = {
-            "url": entry.get("url"),
-            "agent_card_url": entry.get("agent_card_url"),
+            "url": peer_url,
+            "agent_card_url": peer_card_url,
             "token": _resolve_token(entry.get("token_env")),
             "token_env": entry.get("token_env"),
             "description": entry.get("description", ""),
