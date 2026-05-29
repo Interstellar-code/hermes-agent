@@ -9,7 +9,9 @@ import pytest
 import yaml
 
 # Make `a2a_fleet` importable when pytest is invoked from anywhere.
-PLUGINS_DIR = Path(__file__).resolve().parents[2]
+# File is at tests/plugins/a2a_fleet/conftest.py; plugins/ is 3 levels up then down.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PLUGINS_DIR = REPO_ROOT / "plugins"
 if str(PLUGINS_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGINS_DIR))
 
