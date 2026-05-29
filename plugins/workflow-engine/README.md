@@ -33,13 +33,12 @@ plugins:
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
-| `WORKFLOW_DB_PATH` | `~/.hermes/switchui/workflow-engine.db` | SQLite database path |
-| `WORKFLOW_DEFAULTS_DIR` | `<plugin>/defaults/` | Directory of bundled default YAML files |
-| `WORKFLOW_YAML_DIR` | `~/.hermes/switchui/workflows/` | User workflow YAML search path |
-| `TOOL_CATALOG_ROOT` | (none) | Root path for tool-catalog-write workflow |
-| `WORKFLOW_POLL_INTERVAL` | `60` | Cron poller interval in seconds |
+| `WORKFLOW_DB_PATH` | `~/.hermes/switchui-workflows.db` | SQLite database path — read by `engine/wiring.py` |
+| `TOOL_CATALOG_ROOT` | (none) | Root path for the bundled tool-catalog-write workflow |
 
-**DB location:** `~/.hermes/switchui/workflow-engine.db` (SQLite, auto-migrated on startup).
+> **Note:** `WORKFLOW_DEFAULTS_DIR`, `WORKFLOW_YAML_DIR`, and `WORKFLOW_POLL_INTERVAL` are not currently read by the engine. Pass `--defaults-dir`, `--yaml-dir`, and `--interval` to the daemon CLI instead (see Background scheduler section).
+
+**DB location:** `~/.hermes/switchui-workflows.db` (SQLite, auto-migrated on startup).
 
 **Default YAML dir:** YAML files in `plugins/workflow-engine/defaults/` are copied into the user's workflow store on first enable.
 
