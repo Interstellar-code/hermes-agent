@@ -14,7 +14,6 @@ import asyncio
 import logging
 import os
 import re
-import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -130,25 +129,15 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
             cmd_parts = ["uv", "run"] + with_flags + [script_path]
         use_temp = False
     else:
-        # Inline code: write to temp file
-        use_temp = True
-        script_path = None
+        # Inline code: pass directly to interpreter
         if runtime == "bun":
             cmd_parts = ["bun", "--no-env-file", "-e", final_script]
-            use_temp = False  # pass inline via -e
         else:
             with_flags = [flag for dep in node_deps for flag in ("--with", dep)]
             cmd_parts = ["uv", "run"] + with_flags + ["python", "-c", final_script]
-            use_temp = False
+        use_temp = False
 
     try:
-        if use_temp and script_path is None:
-            ext = ".py" if runtime == "uv" else ".ts"
-            with tempfile.NamedTemporaryFile(suffix=ext, mode="w", delete=False, encoding="utf-8") as tf:
-                tf.write(final_script)
-                script_path = tf.name
-            cmd_parts = (["uv", "run"] + [flag for dep in node_deps for flag in ("--with", dep)] + [script_path]
-                         if runtime == "uv" else ["bun", "--no-env-file", "run", script_path])
 
         exec_env = dict(os.environ)
         if wf_vars.get("artifacts_dir"):
@@ -171,13 +160,6 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
             err = f"Script node '{node.id}' timed out after {timeout}s"
             ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
             return NodeExecutionResult(state="failed", error=err)
-        finally:
-            if use_temp and script_path:
-                try:
-                    os.unlink(script_path)
-                except OSError:
-                    pass
-
         stdout = stdout_b.decode("utf-8", errors="replace").strip()
         stderr = stderr_b.decode("utf-8", errors="replace").strip()
 

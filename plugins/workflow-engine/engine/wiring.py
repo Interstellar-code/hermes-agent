@@ -6,6 +6,7 @@ create_engine(db_path) is the single entry point called at plugin load time.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,11 @@ logger = logging.getLogger("workflow.wiring")
 _DEFAULT_DB_PATH = str(Path.home() / ".hermes" / "switchui-workflows.db")
 
 
+def _resolve_db_path(db_path: Optional[str]) -> str:
+    """Return db_path, falling back to WORKFLOW_DB_PATH env var, then the compiled default."""
+    return db_path or os.environ.get("WORKFLOW_DB_PATH") or _DEFAULT_DB_PATH
+
+
 def create_engine(
     db_path: Optional[str] = None,
     *,
@@ -40,7 +46,7 @@ def create_engine(
     """
     from engine.facade import WorkflowEngine
 
-    path = db_path or _DEFAULT_DB_PATH
+    path = _resolve_db_path(db_path)
     logger.info("wiring: opening DB at %s", path)
 
     # open_db is a context manager; for a long-lived engine we open manually
