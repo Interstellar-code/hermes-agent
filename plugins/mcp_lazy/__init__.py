@@ -1,7 +1,7 @@
 """mcp_lazy — lazy MCP tool schema loading.
 
 Phase 1: stub MCP tool schemas at request time, promote on demand via
-the ``mcp_load_tools`` meta-tool. Per-session pool keeps each
+the ``load_mcp_tools`` meta-tool. Per-session pool keeps each
 conversation's promoted set isolated.
 
 Phase 0 baseline logger remains active as passive telemetry (no

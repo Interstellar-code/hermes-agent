@@ -24,7 +24,7 @@ import weakref
 from typing import Dict, Optional, Set
 
 # Set by ``hook_impl.transform_tools`` on every request, so downstream
-# code paths (notably the ``mcp_load_tools`` meta-tool handler) can
+# code paths (notably the ``load_mcp_tools`` meta-tool handler) can
 # resolve the active agent's session without the tool registry having
 # to plumb agent references through ``registry.dispatch``.
 _current_agent_var: "contextvars.ContextVar[Optional[object]]" = contextvars.ContextVar(
