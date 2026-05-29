@@ -17,6 +17,14 @@ from typing import Any, Dict, List
 SERVER_LAZY_SENTINEL = "__lazy_server_stub__"
 SERVER_STUB_NAME_PREFIX = "mcp_server_"
 
+# Internal metadata key written into every server-stub schema dict so that
+# detection can use a sentinel rather than the ``mcp_server_`` name prefix.
+# A real MCP server could legitimately be named "server", which would make its
+# tools start with ``mcp_server_`` and its stub also named ``mcp_server_server``
+# — identical to our synthetic stub for a server named "server".  The sentinel
+# is the authoritative discriminator; the prefix is only cosmetic.
+_IS_SERVER_STUB_KEY = "__is_server_stub__"
+
 
 def _sanitise(name: str) -> str:
     """Sanitise a server name for use in a pseudo-tool name."""
@@ -61,11 +69,27 @@ def make_server_stub_schema(
         # if the caller strips non-standard keys; kept for routing).
         "_server_name": server_name,
         "_tool_count": tool_count,
+        # Sentinel key: authoritative marker that this dict is a server stub.
+        # Use ``is_server_stub_schema()`` rather than checking the name prefix
+        # because a real MCP server named "server" produces tool names that also
+        # start with ``mcp_server_`` — the prefix alone is ambiguous.  See #27.
+        _IS_SERVER_STUB_KEY: True,
     }
 
 
 def is_server_stub_schema(schema: Dict[str, Any]) -> bool:
-    """Return True if ``schema`` is a server stub we produced."""
+    """Return True if ``schema`` is a server stub we produced.
+
+    Uses the ``_IS_SERVER_STUB_KEY`` sentinel written at construction time
+    rather than the ``mcp_server_`` name prefix.  A real MCP server named
+    "server" has tools that also start with ``mcp_server_``, making the name
+    prefix ambiguous.  The sentinel is the authoritative discriminator.
+    See Interstellar-code/hermes-agent#27.
+    """
+    if schema.get(_IS_SERVER_STUB_KEY):
+        return True
+    # Fallback: schema built before this sentinel existed (e.g. tests that
+    # hand-craft a minimal dict).  Check the parameters sentinel as before.
     params = schema.get("function", {}).get("parameters", {})
     if not isinstance(params, dict):
         return False
