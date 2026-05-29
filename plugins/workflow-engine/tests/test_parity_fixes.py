@@ -152,6 +152,27 @@ def test_substitute_workflow_variables_base_branch_missing_raises():
         substitute_workflow_variables("branch=$BASE_BRANCH", base_branch="")
 
 
+def test_substitute_workflow_variables_backref_in_user_message():
+    """Issue #22: user_message containing \\1 must not raise re.error (backreference crash)."""
+    result, _ = substitute_workflow_variables(
+        "$USER_MESSAGE",
+        user_message=r"fix \1 and \g<name> issue",
+        base_branch="main",
+    )
+    assert result == r"fix \1 and \g<name> issue"
+
+
+def test_substitute_workflow_variables_backref_in_context():
+    """Issue #22: issue_context containing \\1 must not raise re.error."""
+    result, ctx_sub = substitute_workflow_variables(
+        "$CONTEXT",
+        base_branch="main",
+        issue_context=r"see \1 for details",
+    )
+    assert result == r"see \1 for details"
+    assert ctx_sub is True
+
+
 # ── FINDING 7: Timeout unit mismatch ──────────────────────────────────────────
 
 @pytest.mark.asyncio

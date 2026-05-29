@@ -153,28 +153,32 @@ def substitute_workflow_variables(
 
     resolved_docs_dir = docs_dir or "docs/"
 
+    def _lit(val: str):
+        """Return a re.sub replacement function that inserts val as a literal string."""
+        return lambda _m: val
+
     result = prompt
-    result = re.sub(r"\$WORKFLOW_ID", workflow_id, result)
-    result = re.sub(r"\$USER_MESSAGE", user_message, result)
-    result = re.sub(r"\$ARGUMENTS", user_message, result)
-    result = re.sub(r"\$ARTIFACTS_DIR", artifacts_dir, result)
-    result = re.sub(r"\$BASE_BRANCH", base_branch, result)
-    result = re.sub(r"\$DOCS_DIR", resolved_docs_dir, result)
-    result = re.sub(r"\$LOOP_USER_INPUT", loop_user_input or "", result)
-    result = re.sub(r"\$REJECTION_REASON", rejection_reason or "", result)
-    result = re.sub(r"\$LOOP_PREV_OUTPUT", loop_prev_output or "", result)
+    result = re.sub(r"\$WORKFLOW_ID", _lit(workflow_id), result)
+    result = re.sub(r"\$USER_MESSAGE", _lit(user_message), result)
+    result = re.sub(r"\$ARGUMENTS", _lit(user_message), result)
+    result = re.sub(r"\$ARTIFACTS_DIR", _lit(artifacts_dir), result)
+    result = re.sub(r"\$BASE_BRANCH", _lit(base_branch), result)
+    result = re.sub(r"\$DOCS_DIR", _lit(resolved_docs_dir), result)
+    result = re.sub(r"\$LOOP_USER_INPUT", _lit(loop_user_input or ""), result)
+    result = re.sub(r"\$REJECTION_REASON", _lit(rejection_reason or ""), result)
+    result = re.sub(r"\$LOOP_PREV_OUTPUT", _lit(loop_prev_output or ""), result)
 
     context_substituted = False
     if issue_context is not None:
-        result = re.sub(r"\$CONTEXT", issue_context, result)
-        result = re.sub(r"\$EXTERNAL_CONTEXT", issue_context, result)
-        result = re.sub(r"\$ISSUE_CONTEXT", issue_context, result)
+        result = re.sub(r"\$CONTEXT", _lit(issue_context), result)
+        result = re.sub(r"\$EXTERNAL_CONTEXT", _lit(issue_context), result)
+        result = re.sub(r"\$ISSUE_CONTEXT", _lit(issue_context), result)
         context_substituted = bool(issue_context)
     else:
         # Replace with empty string to avoid literal $CONTEXT reaching AI
-        result = re.sub(r"\$CONTEXT", "", result)
-        result = re.sub(r"\$EXTERNAL_CONTEXT", "", result)
-        result = re.sub(r"\$ISSUE_CONTEXT", "", result)
+        result = re.sub(r"\$CONTEXT", _lit(""), result)
+        result = re.sub(r"\$EXTERNAL_CONTEXT", _lit(""), result)
+        result = re.sub(r"\$ISSUE_CONTEXT", _lit(""), result)
 
     return result, context_substituted
 
