@@ -44,7 +44,7 @@ def fleet_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     }
     (profile_dir / "fleet.yaml").write_text(yaml.safe_dump(fleet_yaml))
     (tmp_path / "active_profile").write_text("switch")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_dir))
     monkeypatch.setenv("SWITCH_A2A_TOKEN", "tok-switch")
     monkeypatch.setenv("CONSTRUCT_A2A_TOKEN", "tok-construct")
     return tmp_path

@@ -33,6 +33,7 @@ def _simulate_config_bridge(cfg: dict, initial_env: dict | None = None):
             "backend": "TERMINAL_ENV",
             "cwd": "TERMINAL_CWD",
             "timeout": "TERMINAL_TIMEOUT",
+
             "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
             "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
             "container_cpu": "TERMINAL_CONTAINER_CPU",

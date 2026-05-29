@@ -9,6 +9,8 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 from engine.db.client import open_db
@@ -23,7 +25,7 @@ from engine.runtime.seed_defaults import seed_defaults
 
 logger = logging.getLogger("workflow.wiring")
 
-_DEFAULT_DB_PATH = str(Path.home() / ".hermes" / "switchui-workflows.db")
+_DEFAULT_DB_PATH = str(get_hermes_home() / "switchui-workflows.db")
 
 
 def _resolve_db_path(db_path: Optional[str]) -> str:

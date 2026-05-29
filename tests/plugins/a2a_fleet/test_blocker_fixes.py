@@ -14,6 +14,10 @@ import socket
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("fastapi", reason="a2a_fleet server tests require hermes-agent[web]")
+pytest.importorskip("uvicorn", reason="a2a_fleet server tests require hermes-agent[web]")
+
 import yaml
 from fastapi.testclient import TestClient
 

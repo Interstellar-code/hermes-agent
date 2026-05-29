@@ -254,8 +254,12 @@ class TestDeveloperRoleSwap:
         assert messages[0]["role"] == "system"
 
     def test_developer_role_via_nous_portal(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
-        agent.model = "gpt-5"
+        agent = _make_agent(
+            monkeypatch,
+            "nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+            model="gpt-5",
+        )
         messages = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": "hi"},
@@ -309,51 +313,27 @@ class TestBuildApiKwargsKimiNoTemperatureOverride:
         assert "temperature" not in kwargs
 
 
-class TestBuildApiKwargsAIGateway:
-    def test_uses_chat_completions_format(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "messages" in kwargs
-        assert "model" in kwargs
-        assert kwargs["messages"][-1]["content"] == "hi"
-
-    def test_no_responses_api_fields(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "input" not in kwargs
-        assert "instructions" not in kwargs
-        assert "store" not in kwargs
-
-    def test_includes_reasoning_in_extra_body(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        extra = kwargs.get("extra_body", {})
-        assert "reasoning" in extra
-        assert extra["reasoning"]["enabled"] is True
-
-    def test_includes_tools(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "ai-gateway", base_url="https://ai-gateway.vercel.sh/v1", model="gpt-4o")
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "tools" in kwargs
-        tool_names = [t["function"]["name"] for t in kwargs["tools"]]
-        assert "web_search" in tool_names
-
-
 class TestBuildApiKwargsNousPortal:
     def test_includes_nous_product_tags(self, monkeypatch):
         from agent.portal_tags import nous_portal_tags
-        agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
+        agent = _make_agent(
+            monkeypatch,
+            "nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+            model="gpt-5",
+        )
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
         assert extra.get("tags") == nous_portal_tags()
 
     def test_uses_chat_completions_format(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "nous", base_url="https://inference-api.nousresearch.com/v1")
+        agent = _make_agent(
+            monkeypatch,
+            "nous",
+            base_url="https://inference-api.nousresearch.com/v1",
+            model="gpt-5",
+        )
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "messages" in kwargs

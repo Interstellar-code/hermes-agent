@@ -5,43 +5,41 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
 
-
-# Observer slot — plugins register a callback that receives every
-# canonicalised usage record. Inverts the dependency direction so
-# `agent/usage_pricing.py` never imports any plugin. See
-# `.omc/plans/mcp-lazy-loading-v4.md` (Phase 0) for the consumer.
-_usage_observers: List[Callable[["CanonicalUsage"], None]] = []
+logger = logging.getLogger(__name__)
+_usage_observers: list[Callable[["CanonicalUsage"], None]] = []
 
 
 def register_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
-    """Register a callback invoked with every canonicalised usage record.
-
-    Used by observability plugins (e.g. cache hit-rate baseline) so the
-    core canonicaliser does not need to know about specific plugins.
-    Observer exceptions are swallowed and logged at debug — a misbehaving
-    observer must not break usage accounting.
-    """
-    _usage_observers.append(callback)
+    """Register a best-effort observer for normalized usage records."""
+    if callback not in _usage_observers:
+        _usage_observers.append(callback)
 
 
 def unregister_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
-    """Inverse of register_usage_observer — useful for plugin reload tests."""
+    """Remove a previously registered usage observer if present."""
     try:
         _usage_observers.remove(callback)
     except ValueError:
         pass
+
+
+def _notify_usage_observers(usage: "CanonicalUsage") -> None:
+    for callback in list(_usage_observers):
+        try:
+            callback(usage)
+        except Exception:
+            logger.debug("usage observer failed", exc_info=True)
+
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
 CostSource = Literal[
@@ -112,6 +110,34 @@ _UTC_NOW = lambda: datetime.now(timezone.utc)
 # Official docs snapshot entries. Models whose published pricing and cache
 # semantics are stable enough to encode exactly.
 _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
+    # ── Anthropic Claude 4.8 ─────────────────────────────────────────────
+    # Same $5/$25 base pricing as 4.6/4.7.  Fast-mode variant is a separate
+    # model ID with 2x premium (vs the 6x premium on older Opus generations).
+    # Source: https://openrouter.ai/anthropic/claude-opus-4.8
+    (
+        "anthropic",
+        "claude-opus-4-8",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("5.00"),
+        output_cost_per_million=Decimal("25.00"),
+        cache_read_cost_per_million=Decimal("0.50"),
+        cache_write_cost_per_million=Decimal("6.25"),
+        source="official_docs_snapshot",
+        source_url="https://platform.claude.com/docs/en/about-claude/pricing",
+        pricing_version="anthropic-pricing-2026-05",
+    ),
+    (
+        "anthropic",
+        "claude-opus-4-8-fast",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("10.00"),
+        output_cost_per_million=Decimal("50.00"),
+        cache_read_cost_per_million=Decimal("1.00"),
+        cache_write_cost_per_million=Decimal("12.50"),
+        source="official_docs_snapshot",
+        source_url="https://openrouter.ai/anthropic/claude-opus-4.8-fast",
+        pricing_version="anthropic-pricing-2026-05",
+    ),
     # ── Anthropic Claude 4.7 ─────────────────────────────────────────────
     # Opus 4.5/4.6/4.7 share $5/$25 pricing (new tokenizer, up to 35% more
     # tokens for the same text).
@@ -740,8 +766,8 @@ def normalize_usage(
         output_tokens = _to_int(getattr(response_usage, "completion_tokens", 0))
         details = getattr(response_usage, "prompt_tokens_details", None)
         # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
-        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Vercel
-        # AI Gateway, Cline) expose when routing Claude models — without this
+        # top-level fields that some OpenAI-compatible proxies (OpenRouter, Cline)
+        # expose when routing Claude models — without this
         # fallback, cache writes are undercounted as 0 and cache reads can be
         # missed when the proxy only surfaces them at the top level.
         # Port of cline/cline#10266.
@@ -769,17 +795,7 @@ def normalize_usage(
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
     )
-
-    # Fire observer callbacks (cache baseline plugin, etc). Failures
-    # are isolated per-observer so one bad plugin doesn't break usage
-    # accounting for every other consumer.
-    if _usage_observers:
-        for observer in _usage_observers:
-            try:
-                observer(usage)
-            except Exception:  # noqa: BLE001 — defensive isolation
-                logger.debug("usage observer raised", exc_info=True)
-
+    _notify_usage_observers(usage)
     return usage
 
 

@@ -1,9 +1,9 @@
 """Fleet config loader for the a2a_fleet plugin.
 
-Reads a standalone ``fleet.yaml`` from
-``~/.hermes/profiles/<profile>/fleet.yaml`` (not embedded in ``config.yaml``).
-The active profile is resolved from the ``HERMES_PROFILE`` env var, else
-from ``$HERMES_HOME/active_profile``.
+Reads a standalone ``fleet.yaml`` from the active Hermes home
+(``get_hermes_home() / "fleet.yaml"``).  Hermes sets ``HERMES_HOME`` to the
+active profile directory before plugin import, so no extra ``profiles/<name>``
+path segment is appended here.
 
 ``self.url`` is **never** cached at import time. The plugin api module is
 imported by ``_mount_plugin_api_routes()`` before the gateway binds, so any
@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Any, Dict
 from urllib.parse import urlparse
 
@@ -52,18 +54,13 @@ class FleetConfigError(ValueError):
     """Raised when fleet.yaml is missing, malformed, or unsupported."""
 
 
-def _hermes_home() -> Path:
-    home = os.environ.get("HERMES_HOME")
-    if home:
-        return Path(home).expanduser()
-    return Path.home() / ".hermes"
-
-
-def _active_profile() -> str:
-    profile = os.environ.get("HERMES_PROFILE")
+def _legacy_profile_name(profile: str | None = None) -> str:
     if profile:
         return profile.strip()
-    marker = _hermes_home() / "active_profile"
+    env_profile = os.environ.get("HERMES_PROFILE")
+    if env_profile:
+        return env_profile.strip()
+    marker = get_hermes_home() / "active_profile"
     if marker.is_file():
         name = marker.read_text(encoding="utf-8").strip()
         if name:
@@ -72,8 +69,22 @@ def _active_profile() -> str:
 
 
 def _fleet_yaml_path(profile: str | None = None) -> Path:
-    name = profile or _active_profile()
-    return _hermes_home() / "profiles" / name / "fleet.yaml"
+    """Return the fleet config path for the active Hermes profile.
+
+    Hermes profile selection is already reflected in ``HERMES_HOME`` by
+    ``hermes_cli.main._apply_profile_override()``.  Prefer ``fleet.yaml``
+    directly under the active Hermes home.  For compatibility with early
+    a2a_fleet checkouts, fall back to ``profiles/<name>/fleet.yaml`` only when
+    that legacy file exists below the current Hermes home.
+    """
+    home = get_hermes_home()
+    primary = home / "fleet.yaml"
+    if primary.is_file():
+        return primary
+    legacy = home / "profiles" / _legacy_profile_name(profile) / "fleet.yaml"
+    if legacy.is_file():
+        return legacy
+    return primary
 
 
 def _resolve_token(token_env: str | None) -> str | None:
@@ -127,7 +138,7 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         ) from exc
 
     out_self: Dict[str, Any] = {
-        "name": self_block.get("name") or _active_profile(),
+        "name": self_block.get("name") or _legacy_profile_name(profile),
         "token": self_token,
         "auth_required": bool(server_block.get("auth_required", True)),
         "token_env": server_block.get("token_env"),

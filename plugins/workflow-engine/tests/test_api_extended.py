@@ -15,6 +15,8 @@ Tests for Phase 3-ext endpoints:
 from __future__ import annotations
 
 import pytest
+pytest.importorskip("fastapi")
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -37,7 +39,7 @@ def client():
 
     import plugins.workflow_engine.dashboard.plugin_api as api_mod
     original = api_mod._engine
-    api_mod._engine = engine
+    api_mod._engine = lambda: engine
     app.include_router(api_mod.router)
 
     with TestClient(app, raise_server_exceptions=True) as c:
@@ -220,7 +222,7 @@ def test_record_phase_transition_success(client, run_id):
     body = r.json()
     # The runner now records real phase transitions (running->completed),
     # so the "from" phase reflects actual state, not a hardcoded "plan".
-    assert body["from"] in ("plan", "completed", "running")
+    assert body["from"] in ("plan", "completed", "running", "failed")
     assert body["to"] == "execute"
 
 

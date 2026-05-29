@@ -400,62 +400,6 @@ def _strip_images_from_messages(messages: list) -> bool:
     return found
 
 
-def _normalize_tool_message_content(messages: list) -> bool:
-    """Coerce role=tool content to a wire-valid shape.
-
-    OpenAI Chat Completions spec requires `tool` message `content` to be a
-    string or a content-parts list. Some plugin tool handlers return dicts,
-    scalars, or `None`, which can get persisted raw into chat history.
-    Strict upstreams (Z.ai/GLM error 1210, Manifest 'upstream_error' 400)
-    reject those shapes. This normalizer runs before outbound requests so
-    stale history is repaired in flight without breaking valid multimodal
-    content lists.
-
-    Returns True if any normalization occurred.
-    """
-    found = False
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "tool":
-            continue
-        content = msg.get("content")
-        normalized = _coerce_tool_message_content(content)
-        if normalized != content:
-            msg["content"] = normalized
-            found = True
-    return found
-
-
-def _coerce_tool_message_content(content: Any) -> Any:
-    """Normalize tool-message content to a wire-valid shape.
-
-    Rules:
-    - `None` -> empty string
-    - `str` -> passthrough
-    - multimodal envelope dict -> unwrap to content-part list
-    - content-part list -> passthrough
-    - anything else -> JSON string (fallback to `str()`)
-    """
-    import json as _json
-    from agent.tool_dispatch_helpers import _is_multimodal_tool_result
-
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if _is_multimodal_tool_result(content):
-        return content.get("content") or []
-    if isinstance(content, list) and content and all(
-        isinstance(part, dict) and "type" in part for part in content
-    ):
-        return content
-    try:
-        return _json.dumps(content, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return str(content)
-
-
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
     """Strip non-ASCII characters from nested dict/list payloads in-place."""
     found = False
@@ -496,7 +440,5 @@ __all__ = [
     "_sanitize_messages_non_ascii",
     "_sanitize_tools_non_ascii",
     "_strip_images_from_messages",
-    "_coerce_tool_message_content",
-    "_normalize_tool_message_content",
     "_sanitize_structure_non_ascii",
 ]

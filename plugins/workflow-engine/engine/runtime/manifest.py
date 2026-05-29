@@ -1,5 +1,5 @@
 """
-ManifestWriter — writes ~/.hermes/workflows-manifest.json on boot.
+ManifestWriter — writes HERMES_HOME/workflows-manifest.json on boot.
 
 Mirrors TS runtime/manifest.ts: lists all known workflow definitions
 and writes a compact JSON manifest for Hermes chat-based launch routing.
@@ -9,13 +9,15 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional
 
 from engine.store.definition_store import DefinitionStore
 
 logger = logging.getLogger("workflow.manifest")
 
-_MANIFEST_PATH = Path.home() / ".hermes" / "workflows-manifest.json"
+_MANIFEST_PATH = get_hermes_home() / "workflows-manifest.json"
 
 
 class ManifestWriter:

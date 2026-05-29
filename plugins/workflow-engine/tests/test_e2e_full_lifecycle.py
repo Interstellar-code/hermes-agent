@@ -2,7 +2,7 @@
 True End-to-End Test Suite for the Workflow Engine Plugin.
 
 Tests exercise the full runtime path:
-  YAML definition → DB storage → DAG execution → bash subprocess → 
+  YAML definition → DB storage → DAG execution → bash subprocess →
   status/events in DB → approval lifecycle → Kanban dispatcher wiring.
 
 NOT scaffolded — every test starts a real asyncio event loop with real bash
@@ -269,7 +269,7 @@ async def test_e2e_simple_bash_workflow(engine, working_path):
 @pytest.mark.asyncio
 async def test_e2e_multi_step_dag(engine, working_path):
     """
-    E2E TEST 2: 5-node DAG with fan-out (init → branch-a, branch-b) 
+    E2E TEST 2: 5-node DAG with fan-out (init → branch-a, branch-b)
     and fan-in (branch-a + branch-b → join → finalize).
     """
     wf_id = "e2e-multi-step-dag"

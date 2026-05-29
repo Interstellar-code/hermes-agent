@@ -30,17 +30,6 @@ def _clear_provider_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def _clear_vercel_env(monkeypatch):
-    for key in (
-        "TERMINAL_VERCEL_RUNTIME",
-        "VERCEL_OIDC_TOKEN",
-        "VERCEL_TOKEN",
-        "VERCEL_PROJECT_ID",
-        "VERCEL_TEAM_ID",
-    ):
-        monkeypatch.delenv(key, raising=False)
-
-
 def _stub_tts(monkeypatch):
     """Stub out TTS prompts so setup_model_provider doesn't block."""
     monkeypatch.setattr("hermes_cli.setup.prompt_choice", lambda q, c, d=0: (
@@ -494,9 +483,9 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
     assert config["terminal"]["modal_mode"] == "direct"
 
 
+
 def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _clear_vercel_env(monkeypatch)
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "old-oidc")
     monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
     config = load_config()
@@ -527,7 +516,6 @@ def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
 
 def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _clear_vercel_env(monkeypatch)
     project_root = tmp_path / "project"
     nested = project_root / "app" / "src"
     nested.mkdir(parents=True)
@@ -571,6 +559,10 @@ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeyp
     assert os.environ["VERCEL_TEAM_ID"] == "linked-team"
     assert defaults["    Vercel project ID"] == "linked-project"
     assert defaults["    Vercel team ID"] == "linked-team"
+
+
+def test_resolve_hermes_chat_argv_prefers_which(monkeypatch):
+    from hermes_cli import setup as setup_mod
 
 
 def test_setup_slack_saves_home_channel(monkeypatch):

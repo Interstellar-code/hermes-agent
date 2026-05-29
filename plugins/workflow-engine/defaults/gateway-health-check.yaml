@@ -11,4 +11,3 @@ nodes:
     depends_on:
       - check-gateway
     prompt: Send the gateway health report from the previous step to the Telegram channel. Format it concisely — errors first, then warnings, then a brief status line if all clear.
-

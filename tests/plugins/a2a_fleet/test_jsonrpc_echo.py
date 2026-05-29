@@ -1,6 +1,11 @@
 """US-003: JSON-RPC SendMessage echo + bearer auth + error codes."""
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("fastapi", reason="a2a_fleet server tests require hermes-agent[web]")
+pytest.importorskip("uvicorn", reason="a2a_fleet server tests require hermes-agent[web]")
+
 from pathlib import Path
 
 import yaml

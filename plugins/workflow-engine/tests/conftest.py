@@ -22,6 +22,12 @@ _REPO_ROOT = _PLUGINS_DIR.parent                              # repo root
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Runtime modules use top-level imports like ``from engine.facade import ...``
+# when loaded from the hyphenated plugin directory.  Add the plugin root so
+# those imports resolve under direct pytest collection too.
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
+
 # Register `plugins.workflow_engine` → the hyphenated directory.
 def _register(dotted: str, path: Path) -> None:
     if dotted in sys.modules:
