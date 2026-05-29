@@ -67,6 +67,19 @@ def register(ctx) -> None:  # noqa: ANN001
         description="Run the workflow scheduler (cron poller + kanban dispatcher).",
     )
 
+    # Plugin-scoped skill: end-to-end procedure for running/verifying a workflow.
+    # Resolvable as 'workflow-engine:test-workflow' via explicit load only.
+    if hasattr(ctx, "register_skill"):
+        from pathlib import Path  # noqa: PLC0415
+        try:
+            ctx.register_skill(
+                name="test-workflow",
+                path=Path(__file__).parent / "skills" / "test-workflow" / "SKILL.md",
+                description="Run and verify a workflow DAG end-to-end (preconditions, trigger, monitor, approve, cancel).",
+            )
+        except Exception:
+            logger.debug("workflow-engine: register_skill failed", exc_info=True)
+
     logger.info(
         "workflow-engine plugin loaded — 5 tools + 1 CLI command registered; "
         "dashboard router auto-mounted by web_server; "

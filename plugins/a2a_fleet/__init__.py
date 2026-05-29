@@ -154,6 +154,19 @@ def register(ctx) -> None:
         description="Send a message to a fleet peer agent via A2A and return the reply.",
         emoji="🤝",
     )
+    # Plugin-scoped skill: end-to-end fleet bring-up + ping/pong verification.
+    # Resolvable as 'a2a_fleet:deploy-fleet' via explicit load only.
+    if hasattr(ctx, "register_skill"):
+        from pathlib import Path  # noqa: PLC0415,WPS433
+        try:
+            ctx.register_skill(
+                name="deploy-fleet",
+                path=Path(__file__).parent / "skills" / "deploy-fleet" / "SKILL.md",
+                description="Bring up an A2A fleet node and test peer communication (config, tokens, server verify, ping/pong).",
+            )
+        except Exception:
+            logger.debug("a2a_fleet: register_skill failed", exc_info=True)
+
     _start_server_in_thread()
     atexit.register(_atexit_stop)
     logger.info("a2a_fleet: registered fleet_send tool + spawned A2A server thread")
