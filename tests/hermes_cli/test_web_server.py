@@ -377,6 +377,12 @@ class TestBuildSchemaFromConfig:
             assert entry["type"] == "select"
             assert "options" in entry
             assert "local" in entry["options"]
+            assert "vercel_sandbox" in entry["options"]
+        runtime_entry = CONFIG_SCHEMA["terminal.vercel_runtime"]
+        assert runtime_entry["type"] == "select"
+        assert "node24" in runtime_entry["options"]
+        assert "python3.13" in runtime_entry["options"]
+        assert len(runtime_entry["options"]) >= 3
 
     def test_empty_prefix_produces_correct_keys(self):
         from hermes_cli.web_server import _build_schema_from_config
@@ -2075,6 +2081,9 @@ class TestPtyWebSocket:
         from starlette.testclient import TestClient
 
         import hermes_cli.web_server as ws
+
+        if not ws._PTY_BRIDGE_AVAILABLE or not ws.PtyBridge.is_available():
+            pytest.skip("PTY bridge dependency unavailable")
 
         # Avoid exec'ing the actual TUI in tests: every test below installs
         # its own fake argv via ``ws._resolve_chat_argv``.
