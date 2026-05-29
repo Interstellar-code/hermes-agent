@@ -67,6 +67,7 @@ async def execute_bash_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
                 proc.kill()
             except ProcessLookupError:
                 pass
+            await proc.wait()
             err_msg = f"Bash node '{node.id}' timed out after {timeout}s"
             logger.error("dag_node_failed node=%s type=bash error=%s", node.id, err_msg)
             ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err_msg})
