@@ -1,0 +1,84 @@
+name: archon-plan-to-pr
+description: |
+  Use when: an existing plan file should be executed end-to-end —
+  implement, validate, open PR, run the 5-agent review, auto-fix.
+  Triggers: "plan to pr", "execute plan", "ship this plan",
+            "implement and review", "plan implement and ship".
+  Input: path to a markdown plan via $USER_MESSAGE.
+  NOT for: creating plans from scratch (use idea-to-pr).
+
+nodes:
+  - id: read-plan
+    bash: |
+      PLAN_PATH=$(echo "$USER_MESSAGE" | grep -oE '[A-Za-z0-9_./-]+\\.md' | head -1)
+      if [ -z "$PLAN_PATH" ] || [ ! -f "$PLAN_PATH" ]; then
+        echo "No plan file found in: $USER_MESSAGE" >&2
+        exit 1
+      fi
+      echo "$PLAN_PATH"
+    phase: Scope
+
+  - id: implement
+    hermes_task:
+      skills:
+        - coding
+        - testing
+      agent_hint: neo
+    prompt: |
+      Implement the plan at $read-plan.output.
+      1. Read the entire plan first; do not skim.
+      2. Work section by section. Do NOT invent scope.
+      3. Write tests alongside code; run them after each chunk.
+      4. Commit each logical chunk locally with a clear message.
+      5. Do NOT push.
+      Output: files changed, tests added, commands run to verify, items deferred.
+    depends_on:
+      - read-plan
+    context: fresh
+    phase: Implement
+
+  - id: validate
+    hermes_task:
+      skills:
+        - testing
+      agent_hint: trinity
+    prompt: |
+      Run the repo's validation pipeline (lint, typecheck, tests) and fix obvious
+      regressions introduced by $implement.output. Flag pre-existing failures.
+      Output: pass/fail summary + diagnostics on real failures.
+    depends_on:
+      - implement
+    phase: Verify
+
+  - id: create-pr
+    hermes_task:
+      skills:
+        - git
+        - github
+      agent_hint: switch
+    prompt: |
+      Push the branch and open a PR for the work in $implement.output.
+      - Title derived from the plan heading or commit summary.
+      - Body: bullet list of changes + a test plan section.
+      - Base: $BASE_BRANCH if set, else repo default branch.
+      Refuse to push if the working tree is dirty. Do NOT --force.
+      Output: PR URL.
+    depends_on:
+      - validate
+    context: fresh
+    phase: Publish
+
+  - id: pr-number
+    bash: gh pr view --json number -q '.number'
+    depends_on:
+      - create-pr
+    phase: Publish
+
+  - id: review
+    subgraph:
+      ref: pr-review-5agents
+      inputs:
+        pr_number: $pr-number.output
+    depends_on:
+      - pr-number
+    phase: Analyze

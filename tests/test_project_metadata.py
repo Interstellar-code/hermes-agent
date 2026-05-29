@@ -119,6 +119,9 @@ def test_dashboard_plugin_manifests_and_assets_are_packaged():
     package_data = _load_package_data()
     plugin_data = package_data["plugins"]
 
+    assert "*/plugin.yaml" in plugin_data
     assert "*/dashboard/manifest.json" in plugin_data
     assert "*/dashboard/dist/*" in plugin_data
     assert "*/dashboard/dist/**/*" in plugin_data
+    assert "workflow-engine/defaults/*.yaml" in plugin_data
+    assert "workflow-engine/engine/db/migrations/*.sql" in plugin_data

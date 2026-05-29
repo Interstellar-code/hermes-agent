@@ -1,0 +1,155 @@
+kind: subgraph
+id: pr-review-5agents
+name: PR review (5-agent fan-out)
+description: |
+  Reusable PR-review subgraph: five specialist review agents run in parallel,
+  a synthesizer consolidates findings, an auto-fixer applies CRITICAL/HIGH
+  patches locally. Consumers (smart-pr-review, fix-github-issue, plan-to-pr,
+  idea-to-pr) reference this subgraph rather than inlining the eight nodes.
+inputs:
+  - name: pr_number
+    type: string
+    required: true
+    description: PR number to review (e.g. "709").
+  - name: base_branch
+    type: string
+    required: false
+    description: Base branch for the review. Defaults to repo default branch.
+outputs:
+  - name: synthesis
+    from: synthesize.output
+    description: Consolidated review findings + verdict.
+  - name: fix_summary
+    from: implement-fixes.output
+    description: List of auto-applied fixes and remaining issues.
+nodes:
+  - id: scope
+    hermes_task:
+      skills:
+        - review
+      agent_hint: trinity
+    prompt: |
+      Scope the PR for review.
+      PR: #$INPUTS.pr_number on base $INPUTS.base_branch (or repo default).
+      1. Fetch PR diff via `gh pr diff $INPUTS.pr_number`.
+      2. Classify files by area: code, tests, docs, config.
+      3. Estimate complexity (trivial/small/medium/large).
+      4. Output scope summary suitable for review-agent context.
+
+  - id: code-review
+    hermes_task:
+      skills:
+        - review
+        - code
+      agent_hint: trinity
+    depends_on:
+      - scope
+    prompt: |
+      Review the PR for correctness, style, and architectural concerns.
+      PR scope:
+      $scope.output
+      Use `gh pr diff $INPUTS.pr_number` to read the diff.
+      Output a markdown table: severity (CRITICAL|HIGH|MED|LOW) | file:line | finding.
+
+  - id: error-handling
+    hermes_task:
+      skills:
+        - review
+        - error-handling
+      agent_hint: trinity
+    depends_on:
+      - scope
+    prompt: |
+      Review error handling: try/catch coverage, error propagation, async paths.
+      PR scope:
+      $scope.output
+      Output a markdown table: severity | file:line | finding + suggested fix.
+
+  - id: test-coverage
+    hermes_task:
+      skills:
+        - review
+        - testing
+      agent_hint: trinity
+    depends_on:
+      - scope
+    prompt: |
+      Review test coverage of the PR: missing cases, untested branches, brittle assertions.
+      PR scope:
+      $scope.output
+      Output a markdown table: severity | file:line | finding.
+
+  - id: comment-quality
+    hermes_task:
+      skills:
+        - review
+      agent_hint: trinity
+    depends_on:
+      - scope
+    prompt: |
+      Review comments and docstrings added or modified by the PR.
+      Flag misleading, stale, or AI-slop comments. Suggest deletions.
+      PR scope:
+      $scope.output
+
+  - id: docs-impact
+    hermes_task:
+      skills:
+        - review
+        - docs
+      agent_hint: trinity
+    depends_on:
+      - scope
+    prompt: |
+      Identify user-facing changes (new APIs, CLI flags, env vars, commands) that
+      need README / docs updates. Output a checklist of missing doc updates.
+      PR scope:
+      $scope.output
+
+  - id: synthesize
+    hermes_task:
+      skills:
+        - planning
+        - writing
+      agent_hint: morpheus
+    depends_on:
+      - code-review
+      - error-handling
+      - test-coverage
+      - comment-quality
+      - docs-impact
+    trigger_rule: one_success
+    prompt: |
+      Consolidate the five review outputs into a single synthesis.
+      Inputs:
+      - Code review: $code-review.output
+      - Error handling: $error-handling.output
+      - Test coverage: $test-coverage.output
+      - Comment quality: $comment-quality.output
+      - Docs impact: $docs-impact.output
+
+      Produce:
+      1. Overall verdict: APPROVE | REQUEST_CHANGES | NEEDS_REWORK
+      2. Top-N issues sorted by severity (CRITICAL first)
+      3. Findings that the auto-fixer should attempt
+      4. Findings that need human judgement (out of scope for auto-fix)
+
+  - id: implement-fixes
+    hermes_task:
+      skills:
+        - coding
+        - testing
+      agent_hint: neo
+    depends_on:
+      - synthesize
+    prompt: |
+      Apply the CRITICAL and HIGH severity fixes flagged by the synthesizer.
+      Synthesis:
+      $synthesize.output
+      Rules:
+      - Only fix items flagged as "auto-fixable" in the synthesis.
+      - Run the repo's lint/typecheck/test commands after each edit.
+      - Commit each logical fix with a clear message; do NOT push.
+      - Skip items that need human judgement — list them in your summary.
+
+      Output: list of fixes applied + commits made + items deferred to human.

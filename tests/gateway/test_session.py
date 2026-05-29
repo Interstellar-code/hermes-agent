@@ -571,6 +571,32 @@ class TestLoadTranscriptDBOnly:
         assert result[0]["content"] == "db-q"
         assert result[1]["content"] == "db-a"
 
+    def test_load_transcript_prefers_longer_legacy_jsonl(self, tmp_path, monkeypatch):
+        import json
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        sid = "legacy_jsonl_session"
+        store._db.create_session(session_id=sid, source="gateway", model="m")
+        store._db.append_message(session_id=sid, role="assistant", content="new-db-only")
+
+        with store.get_transcript_path(sid).open("w", encoding="utf-8") as f:
+            for msg in [
+                {"role": "user", "content": "old-jsonl-1"},
+                {"role": "assistant", "content": "old-jsonl-2"},
+                {"role": "user", "content": "old-jsonl-3"},
+            ]:
+                f.write(json.dumps(msg) + "\n")
+
+        result = store.load_transcript(sid)
+        assert [m["content"] for m in result] == [
+            "old-jsonl-1",
+            "old-jsonl-2",
+            "old-jsonl-3",
+        ]
+
 
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""

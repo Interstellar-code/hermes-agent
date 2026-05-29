@@ -1,0 +1,13 @@
+name: Gateway Health Check
+description: Delegate to Neo to check the Hermes gateway for errors and report findings to Telegram.
+nodes:
+  - id: check-gateway
+    phase: investigate
+    hermes_task:
+      agent_hint: neo
+    prompt: Check the Hermes gateway for any errors, warnings, or anomalies. Look at recent logs, error rates, and response times. Summarize your findings clearly.
+  - id: report-telegram
+    phase: report
+    depends_on:
+      - check-gateway
+    prompt: Send the gateway health report from the previous step to the Telegram channel. Format it concisely — errors first, then warnings, then a brief status line if all clear.
