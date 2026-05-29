@@ -100,6 +100,12 @@ class KanbanDispatcher:
             body_suffix = f"\n\n_workflow_run_id: {run_id}_"
             payload["body"] = (payload.get("body") or "") + body_suffix
 
+        # No Authorization header is added here.  The kanban endpoint is on
+        # localhost (127.0.0.1:8642) and is only reachable by processes on the
+        # same host, so network-level isolation is the security boundary.  If
+        # the gateway ever requires session-token auth for inter-plugin calls,
+        # pass `headers={"Authorization": f"Bearer {token}"}` and source the
+        # token from the HERMES_SESSION_TOKEN env var or a shared secret store.
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(self._kanban_url, json=payload)
             resp.raise_for_status()

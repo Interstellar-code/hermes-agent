@@ -41,7 +41,11 @@ def test_start_and_stop_server(fleet_home: Path) -> None:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"http://127.0.0.1:{port}/health")
         assert response.status_code == 200
-        assert response.json()["self"] == "switch"
+        body = response.json()
+        assert body["ok"] is True
+        assert "peer_count" in body
+        assert "self" not in body
+        assert "peers" not in body
 
         info = await stop_server()
         assert info["stopped"] is True

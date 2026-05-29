@@ -35,7 +35,16 @@ async def _run_until_bash(script: str, cwd: Optional[str] = None) -> bool:
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
         )
-        await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            logger.warning("loop_node.until_bash_timeout script timed out after 30s")
+            return False
         return proc.returncode == 0
     except Exception as exc:
         logger.warning("loop_node.until_bash_exec_error error=%s", exc)

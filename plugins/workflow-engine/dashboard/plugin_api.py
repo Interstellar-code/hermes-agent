@@ -34,7 +34,11 @@ del _sys, _Path
 from _shared import get_engine  # noqa: E402
 from engine import WorkflowEngine  # noqa: E402
 
-_engine: WorkflowEngine = get_engine()
+# Engine is initialized lazily on first request via get_engine(); do not call
+# it at module load time so that importing this file (e.g. during plugin
+# discovery) does not trigger SQLite migrations, seed I/O, or manifest writes.
+def _engine() -> WorkflowEngine:  # type: ignore[return]  # noqa: N802
+    return get_engine()
 
 router = APIRouter()
 
@@ -80,7 +84,7 @@ async def list_definitions(source: Optional[str] = None) -> JSONResponse:
     if normalized_source == "all":
         normalized_source = None
 
-    defs = await _engine.list_definitions(source=normalized_source)
+    defs = await _engine().list_definitions(source=normalized_source)
     return _json({"definitions": defs})
 
 
@@ -131,7 +135,7 @@ async def create_definition(request: Request) -> JSONResponse:
             return _json({"error": "tags must be a string[] when provided"}, 400)
 
     try:
-        defn = await _engine.upsert_definition(
+        defn = await _engine().upsert_definition(
             definition_id=body["id"],
             yaml_text=yaml_text,
             source=source,
@@ -150,7 +154,7 @@ async def create_definition(request: Request) -> JSONResponse:
 
 @router.get("/definitions/{def_id}")
 async def get_definition(def_id: str) -> JSONResponse:
-    defn = await _engine.get_definition(def_id)
+    defn = await _engine().get_definition(def_id)
     if defn is None:
         return _json({"error": "not found"}, 404)
     return _json({"definition": defn})
@@ -163,7 +167,7 @@ async def get_definition(def_id: str) -> JSONResponse:
 
 @router.get("/definitions/{def_id}/parsed")
 async def get_definition_parsed(def_id: str) -> JSONResponse:
-    result = await _engine.parse_definition(def_id)
+    result = await _engine().parse_definition(def_id)
     if result is None:
         return _json({"error": "not found"}, 404)
     if "error" in result:
@@ -183,7 +187,7 @@ async def list_runs(request: Request) -> JSONResponse:
     status_csv: Optional[str] = params.get("status") or None
     statuses: Optional[List[str]] = status_csv.split(",") if status_csv else None
 
-    rows = await _engine.list_runs(workflow_id=workflow_id)
+    rows = await _engine().list_runs(workflow_id=workflow_id)
     if statuses:
         rows = [r for r in rows if r.get("status") in statuses]
     return _json({"runs": rows})
@@ -197,7 +201,7 @@ async def list_runs(request: Request) -> JSONResponse:
 @router.get("/runs/active")
 async def get_active_run(request: Request) -> JSONResponse:
     scope_path = request.query_params.get("scope_path") or ""
-    run = await _engine.get_active_run_by_path(scope_path)
+    run = await _engine().get_active_run_by_path(scope_path)
     return _json({"run": run})
 
 
@@ -208,7 +212,7 @@ async def get_active_run(request: Request) -> JSONResponse:
 
 @router.get("/runs/by-conversation/{conv_id}")
 async def find_run_by_conversation(conv_id: str) -> JSONResponse:
-    run = await _engine.find_run_by_conversation_id(conv_id)
+    run = await _engine().find_run_by_conversation_id(conv_id)
     if run is None:
         return _json({"run": None})
     return _json({"run": run})
@@ -247,7 +251,7 @@ async def create_run(request: Request) -> JSONResponse:
             return _json({"error": "working_path must be an absolute path with no .. segments"}, 400)
 
     # Check definition exists
-    defn = await _engine.get_definition(workflow_id)
+    defn = await _engine().get_definition(workflow_id)
     if defn is None:
         return _json({"error": f"unknown workflow_id '{workflow_id}'"}, 404)
 
@@ -294,7 +298,7 @@ async def create_run(request: Request) -> JSONResponse:
         max_runtime_s = max_rt_raw
 
     try:
-        run = await _engine.schedule_run(
+        run = await _engine().schedule_run(
             workflow_id, inputs, trigger,
             schedule=schedule,
             priority=priority,
@@ -315,13 +319,13 @@ async def create_run(request: Request) -> JSONResponse:
 
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
 
     # Include node_runs and recent events for UI detail view
-    node_runs = _engine._run_store.list_node_runs(run_id)
-    events = _engine._run_store.list_recent_events(run_id, limit=50)
+    node_runs = _engine()._run_store.list_node_runs(run_id)
+    events = _engine()._run_store.list_recent_events(run_id, limit=50)
 
     return _json({
         "run": run,
@@ -337,7 +341,7 @@ async def get_run(run_id: str) -> JSONResponse:
 
 @router.post("/runs/{run_id}/approve")
 async def approve_run(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "workflow_run not found"}, 404)
 
@@ -358,7 +362,7 @@ async def approve_run(run_id: str, request: Request) -> JSONResponse:
         response_text = ""
 
     # Look up node_run by ID to get the DAG node_id
-    node_run = _engine._run_store.get_node_run(node_run_id)
+    node_run = _engine()._run_store.get_node_run(node_run_id)
     if node_run is None:
         return _json({"error": "node_run not found"}, 404)
     if node_run.get("workflow_run_id") != run_id:
@@ -369,7 +373,7 @@ async def approve_run(run_id: str, request: Request) -> JSONResponse:
     dag_node_id: str = node_run["dag_node_id"]
 
     try:
-        await _engine.approve(
+        await _engine().approve(
             run_id=run_id,
             node_id=dag_node_id,
             decision=py_decision,  # type: ignore[arg-type]
@@ -397,7 +401,7 @@ async def cancel_run(run_id: str) -> JSONResponse:
     Note: cross-session ownership is NOT enforced — hermes-switchui is a
     single-user dev tool. Any caller with gateway auth may cancel any run.
     """
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "workflow_run not found"}, 404)
 
@@ -405,7 +409,7 @@ async def cancel_run(run_id: str) -> JSONResponse:
         return _json({"error": f"run already terminal: {run.get('status')}"}, 409)
 
     try:
-        await _engine.cancel_run(run_id)
+        await _engine().cancel_run(run_id)
     except ValueError as exc:
         return _json({"error": str(exc)}, 404)
 
@@ -423,7 +427,7 @@ async def events(request: Request) -> StreamingResponse:
     run_id: Optional[str] = params.get("runId") or params.get("run_id") or None
     missing_run = False
     if run_id is not None:
-        run = await _engine.get_run(run_id)
+        run = await _engine().get_run(run_id)
         if run is None:
             missing_run = True
 
@@ -440,7 +444,7 @@ async def events(request: Request) -> StreamingResponse:
         last_heartbeat = asyncio.get_event_loop().time()
 
         try:
-            async for evt in _engine.subscribe_events(run_id):
+            async for evt in _engine().subscribe_events(run_id):
                 # Check client disconnect
                 if await request.is_disconnected():
                     break
@@ -482,12 +486,12 @@ async def events(request: Request) -> StreamingResponse:
 
 @router.delete("/definitions/{def_id}")
 async def delete_definition(def_id: str) -> JSONResponse:
-    defn = await _engine.get_definition(def_id)
+    defn = await _engine().get_definition(def_id)
     if defn is None:
         return _json({"error": "not found"}, 404)
     if defn.get("source") == "bundled":
         return _json({"error": "bundled definitions are read-only"}, 403)
-    rows = await _engine.delete_definition(def_id)
+    rows = await _engine().delete_definition(def_id)
     if rows == 0:
         return _json({"error": "not found"}, 404)
     return _json({"ok": True})
@@ -500,10 +504,10 @@ async def delete_definition(def_id: str) -> JSONResponse:
 
 @router.post("/runs/{run_id}/resume")
 async def resume_run(run_id: str) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
-    updated = await _engine.resume_run(run_id)
+    updated = await _engine().resume_run(run_id)
     return _json({"run": updated})
 
 
@@ -514,10 +518,10 @@ async def resume_run(run_id: str) -> JSONResponse:
 
 @router.get("/runs/{run_id}/nodes")
 async def list_node_runs(run_id: str) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
-    node_runs = await _engine.list_node_runs(run_id)
+    node_runs = await _engine().list_node_runs(run_id)
     return _json({"nodeRuns": node_runs})
 
 
@@ -528,7 +532,7 @@ async def list_node_runs(run_id: str) -> JSONResponse:
 
 @router.get("/node-runs/active")
 async def list_active_node_runs() -> JSONResponse:
-    rows = await _engine.list_active_node_runs()
+    rows = await _engine().list_active_node_runs()
     out = [
         {
             "runId": r.get("run_id"),
@@ -551,7 +555,7 @@ async def list_active_node_runs() -> JSONResponse:
 
 @router.get("/node-runs/{node_run_id}")
 async def find_node_run_by_id(node_run_id: str) -> JSONResponse:
-    nr = await _engine.find_node_run_by_id(node_run_id)
+    nr = await _engine().find_node_run_by_id(node_run_id)
     if nr is None:
         return _json({"error": "not found"}, 404)
     return _json({"nodeRun": nr})
@@ -564,7 +568,7 @@ async def find_node_run_by_id(node_run_id: str) -> JSONResponse:
 
 @router.post("/runs/{run_id}/events")
 async def append_event(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
     try:
@@ -574,7 +578,7 @@ async def append_event(run_id: str, request: Request) -> JSONResponse:
     if not isinstance(body.get("event_type"), str) or not body["event_type"]:
         return _json({"error": "event_type is required"}, 400)
     body["workflow_run_id"] = run_id
-    await _engine.append_workflow_event(body)
+    await _engine().append_workflow_event(body)
     return _json({"ok": True})
 
 
@@ -585,7 +589,7 @@ async def append_event(run_id: str, request: Request) -> JSONResponse:
 
 @router.get("/runs/{run_id}/events")
 async def list_run_events(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
     try:
@@ -593,7 +597,7 @@ async def list_run_events(run_id: str, request: Request) -> JSONResponse:
     except ValueError:
         limit = 200
     limit = max(1, min(limit, 1000))
-    events_list = await _engine.list_recent_workflow_events(run_id, limit=limit)
+    events_list = await _engine().list_recent_workflow_events(run_id, limit=limit)
     return _json({"events": events_list})
 
 
@@ -604,7 +608,7 @@ async def list_run_events(run_id: str, request: Request) -> JSONResponse:
 
 @router.post("/runs/{run_id}/phase-transitions")
 async def record_phase_transition(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
     try:
@@ -618,7 +622,7 @@ async def record_phase_transition(run_id: str, request: Request) -> JSONResponse
     if not isinstance(decided_by, str) or not decided_by:
         return _json({"error": "decidedBy is required"}, 400)
     try:
-        result = await _engine.record_phase_transition(
+        result = await _engine().record_phase_transition(
             run_id=run_id,
             to_phase=to_phase,
             decided_by=decided_by,
@@ -636,10 +640,10 @@ async def record_phase_transition(run_id: str, request: Request) -> JSONResponse
 
 @router.get("/runs/{run_id}/phase-transitions")
 async def list_phase_transitions(run_id: str) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
-    transitions = await _engine.list_phase_transitions(run_id)
+    transitions = await _engine().list_phase_transitions(run_id)
     return _json({"phaseTransitions": transitions})
 
 
@@ -650,7 +654,7 @@ async def list_phase_transitions(run_id: str) -> JSONResponse:
 
 @router.post("/runs/{run_id}/approval-claim")
 async def try_claim_approval_for_resume(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine.get_run(run_id)
+    run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
     try:
@@ -664,7 +668,7 @@ async def try_claim_approval_for_resume(run_id: str, request: Request) -> JSONRe
         return _json({"error": "nodeRunId is required"}, 400)
     if decision not in ("approved", "rejected"):
         return _json({"error": "decision must be 'approved' or 'rejected'"}, 400)
-    result = await _engine.try_claim_approval_for_resume(
+    result = await _engine().try_claim_approval_for_resume(
         node_run_id, decision, approval_response  # type: ignore[arg-type]
     )
     return _json(result)

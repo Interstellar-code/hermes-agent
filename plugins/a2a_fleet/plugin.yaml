@@ -2,3 +2,20 @@ name: a2a_fleet
 version: "0.1.0"
 description: "A2A fleet plugin — agent-to-agent communication over JSON-RPC. v0.1 echo handler."
 author: Interstellar-code
+kind: standalone
+
+# Tool this plugin registers with the Hermes agent.
+provides_tools:
+  - fleet_send
+
+# Environment variables read at runtime.
+# Token env names are dynamic: each peer's token_env key in fleet.yaml names the
+# environment variable that holds that peer's pre-shared bearer token.
+# Convention: use <PEER_NAME>_A2A_TOKEN (e.g. CONSTRUCT_A2A_TOKEN, SWITCH_A2A_TOKEN).
+# The self-server token_env (fleet.server.token_env) follows the same pattern.
+# Example required env vars for a two-peer fleet:
+#   SWITCH_A2A_TOKEN    — bearer token for this node's inbound requests
+#   CONSTRUCT_A2A_TOKEN — bearer token this node uses to call the "construct" peer
+# No variables are hard-coded here because each deployment's fleet.yaml determines
+# which names are active.
+requires_env: []

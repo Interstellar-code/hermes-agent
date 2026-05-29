@@ -157,10 +157,16 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     if path_err:
         return {"error": path_err, "ok": False}
 
-    # rate cap
+    # rate cap — reserve the slot *before* the await to prevent TOCTOU races
     rate_err = _check_rate(_session_key)
     if rate_err:
         return {"error": rate_err, "ok": False}
+
+    # Append timestamp now (slot reserved); roll back on failure below.
+    reserved_ts: Optional[float] = None
+    if _session_key:
+        reserved_ts = time.time()
+        _rate_buckets[_session_key].append(reserved_ts)
 
     from .._shared import get_engine  # noqa: PLC0415
 
@@ -172,16 +178,22 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     if conversation_id:
         trigger["conversation_id"] = conversation_id
 
-    run = await engine.start_run(
-        workflow_id=id,
-        inputs=inputs or {},
-        trigger=trigger,
-    )
-    run_id = run.get("id")
+    try:
+        run = await engine.start_run(
+            workflow_id=id,
+            inputs=inputs or {},
+            trigger=trigger,
+        )
+    except Exception:
+        # Roll back the reserved slot so a transient failure doesn't burn a rate token.
+        if _session_key and reserved_ts is not None:
+            try:
+                _rate_buckets[_session_key].remove(reserved_ts)
+            except ValueError:
+                pass
+        raise
 
-    # Record rate-limit timestamp
-    if _session_key:
-        _rate_buckets[_session_key].append(time.time())
+    run_id = run.get("id")
 
     # Patch owner_session onto the run row (best-effort; schema may be pre-migration)
     if _session_key and run_id:
