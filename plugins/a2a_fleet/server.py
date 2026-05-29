@@ -10,6 +10,13 @@ Routes:
 * ``GET  /.well-known/agent-card.json`` — PUBLIC discovery (RFC 8615)
 * ``POST /jsonrpc``                     — A2A JSON-RPC 2.0 SendMessage endpoint
 * ``GET  /health``                      — diagnostic
+
+Security note: ``auth_required`` defaults to ``True`` in fleet_config so that
+newly-created profiles opt into bearer-token protection automatically.  Sending
+a plaintext bearer token over a non-loopback HTTP connection is inadvisable;
+operators binding to a non-loopback address should terminate TLS in front of
+this server.  The ``/jsonrpc`` endpoint checks the token via a constant-time
+HMAC comparison to resist timing attacks.
 """
 from __future__ import annotations
 
@@ -110,19 +117,17 @@ def _check_bearer(request: Request, cfg: Dict[str, Any]) -> Optional[JSONRespons
         return None
     expected = self_block.get("token")
     if not expected:
-        # Misconfiguration: auth required but no token resolved. Return a
-        # JSON-RPC error envelope so spec-compliant peers see a valid error
-        # rather than a plain HTTP 500 body.
+        # Misconfiguration: auth_required=true but token_env not set or the
+        # env var is empty.  Return 503 with a generic message — do NOT leak
+        # the configuration detail (token_env name) to the caller.
+        log.error(
+            "a2a_fleet: auth_required=true but no token resolved from token_env=%r; "
+            "refusing request to avoid unauthenticated access",
+            self_block.get("token_env"),
+        )
         return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {
-                    "code": -32603,
-                    "message": "Internal error: auth_required=true but token_env is unset on this peer.",
-                },
-            },
-            status_code=500,
+            {"error": "service unavailable: authentication misconfigured"},
+            status_code=503,
         )
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
@@ -353,3 +358,18 @@ async def stop_server() -> Dict[str, Any]:
 
 def is_running() -> bool:
     return _server_instance is not None and not _server_instance.should_exit
+
+
+def stop_server_sync() -> None:
+    """Synchronous best-effort stop for use from atexit handlers and daemon threads.
+
+    Signals uvicorn to exit without awaiting task completion — the daemon
+    thread's event loop will drain naturally as the process shuts down.
+    """
+    global _server_instance, _server_task
+
+    if _server_instance is not None:
+        _server_instance.should_exit = True
+        log.info("a2a_fleet: stop_server_sync: signalled server to exit")
+    _server_instance = None
+    _server_task = None
