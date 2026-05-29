@@ -3,7 +3,7 @@ Workflow YAML discovery — finds and loads workflow YAML files from disk.
 
 Search order (later wins on name collision):
   1. plugins/workflow-engine/defaults/*.yaml  (bundled, read-only)
-  2. ~/.hermes/workflows/*.yaml               (user)
+  2. HERMES_HOME/workflows/*.yaml             (user)
 
 Each file:
   1. Parse YAML
@@ -20,6 +20,8 @@ import hashlib
 import sqlite3
 import time
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 from engine.schemas.workflow import WorkflowDefinition, WorkflowLoadError, WorkflowWithSource, WorkflowSource
@@ -32,7 +34,7 @@ _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
 _BUNDLED_DEFAULTS_DIR = _PLUGIN_DIR / "defaults"
 
 # User workflows directory
-_USER_WORKFLOWS_DIR = Path.home() / ".hermes" / "workflows"
+_USER_WORKFLOWS_DIR = get_hermes_home() / "workflows"
 
 
 def _sha256(content: str) -> str:

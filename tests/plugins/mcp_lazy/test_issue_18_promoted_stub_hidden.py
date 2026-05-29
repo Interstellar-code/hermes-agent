@@ -200,6 +200,10 @@ def test_pre_tool_call_passes_through_unpromoted_server_stub(monkeypatch):
         hook_impl._current_agent_var.reset(token)
         pool.clear()
 
-    # Server not promoted → no early reject; the function should not return a
-    # block dict (it falls through to normal dispatch / None).
-    assert result is None or result.get("action") != "block"
+    # Server discovery stubs are never callable tools.  Even before a server is
+    # promoted, direct calls should block with guidance instead of falling
+    # through to registry dispatch and producing a confusing unknown-tool error.
+    assert isinstance(result, dict)
+    assert result["action"] == "block"
+    assert "server discovery stub" in result["message"]
+    assert "load_mcp_server" in result["message"]

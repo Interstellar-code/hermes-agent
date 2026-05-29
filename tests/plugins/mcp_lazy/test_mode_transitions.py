@@ -23,15 +23,11 @@ def _full(name: str):
 @pytest.fixture(autouse=True)
 def reset():
     _reset_for_tests()
-    # Also clear the _prev_mode cache in hook_impl
-    from plugins.mcp_lazy import hook_impl
-    hook_impl._prev_mode.clear()
     yield
     _reset_for_tests()
-    hook_impl._prev_mode.clear()
 
 
-def test_tool_to_both_mode_pool_state_preserved(caplog):
+def test_tool_to_both_mode_pool_state_preserved(caplog, monkeypatch):
     """Q11: switching tool→both mid-session logs WARNING; pool state preserved."""
     from plugins.mcp_lazy import hook_impl
 
@@ -49,23 +45,21 @@ def test_tool_to_both_mode_pool_state_preserved(caplog):
         session_id = "mode-flip-test"
         valid_tool_names = {"mcp_trek_search"}
 
-    # Simulate first call with "tool" mode
-    hook_impl._prev_mode["mode-flip-test"] = "tool"
+    tools = [_full("mcp_trek_search")]
+    agent = _Agent()
+    pool = get_pool(agent.session_id)
 
+    monkey_cfg = {"lazy_loading": True, "discovery_mode": "tool"}
+    monkeypatch.setattr(hook_impl, "_load_config", lambda: monkey_cfg)
+    hook_impl.transform_tools(tools, agent=agent)
+    assert pool._prev_mode == "tool"
+
+    monkey_cfg["discovery_mode"] = "both"
     with caplog.at_level(logging.WARNING, logger="plugins.mcp_lazy.hook_impl"):
-        # Manually trigger the mode-flip warning logic
-        session_id = "mode-flip-test"
-        discovery_mode = "both"
-        prev = hook_impl._prev_mode.get(session_id)
-        if prev is not None and prev != discovery_mode:
-            import logging as _logging
-            logger = _logging.getLogger("plugins.mcp_lazy.hook_impl")
-            logger.warning(
-                "mcp_lazy: discovery_mode changed mid-session %s: %r -> %r",
-                session_id, prev, discovery_mode,
-            )
+        hook_impl.transform_tools(tools, agent=agent)
 
     assert any("discovery_mode" in r.message for r in caplog.records)
+    assert pool._prev_mode == "both"
 
 
 def test_server_mode_output_changes_when_server_promoted():

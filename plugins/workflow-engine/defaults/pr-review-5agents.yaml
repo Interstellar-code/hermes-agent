@@ -153,4 +153,3 @@ nodes:
       - Skip items that need human judgement — list them in your summary.
 
       Output: list of fixes applied + commits made + items deferred to human.
-

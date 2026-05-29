@@ -69,15 +69,16 @@ def test_concurrent_tool_and_server_promotion():
     assert "mcp_trek_search" in pool.snapshot()
 
 
-def test_promote_server_last_writer_wins_logs_warning(caplog):
-    """Second promote_server call with different eager flag logs a warning."""
+def test_promote_server_eager_flag_is_idempotent_without_warning(caplog):
+    """The eager flag is handled by promote_server_tools, not persisted in the pool."""
     import logging
     pool = get_pool("last-writer-test")
     with caplog.at_level(logging.WARNING, logger="plugins.mcp_lazy.pool"):
         pool.promote_server("trek", eager=False)
-        pool.promote_server("trek", eager=True)  # second call — should warn
+        pool.promote_server("trek", eager=True)
 
-    assert any("promote_server" in r.message or "trek" in r.message for r in caplog.records)
+    assert pool.is_server_promoted("trek")
+    assert not caplog.records
 
 
 def test_clear_servers_drops_all():

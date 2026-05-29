@@ -21,6 +21,7 @@ def _clear_terminal_env(monkeypatch):
         "TERMINAL_SSH_PORT",
         "TERMINAL_SSH_USER",
         "TERMINAL_TIMEOUT",
+
         "TERMINAL_VERCEL_RUNTIME",
         "MODAL_TOKEN_ID",
         "MODAL_TOKEN_SECRET",
@@ -170,7 +171,7 @@ def test_modal_backend_managed_mode_does_not_fall_back_to_direct(monkeypatch, ca
 
     assert ok is False
     assert any(
-        "paid Nous subscription is required" in record.getMessage()
+        "Nous Tool Gateway access is not currently available" in record.getMessage()
         for record in caplog.records
     )
 
@@ -188,7 +189,7 @@ def test_modal_backend_managed_mode_without_feature_flag_logs_clear_error(monkey
 
     assert ok is False
     assert any(
-        "paid Nous subscription is required" in record.getMessage()
+        "Nous Tool Gateway access is not currently available" in record.getMessage()
         for record in caplog.records
     )
 

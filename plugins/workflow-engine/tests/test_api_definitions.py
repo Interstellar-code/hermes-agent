@@ -4,6 +4,8 @@ Tests for GET/POST /definitions and GET /definitions/{id}/parsed.
 from __future__ import annotations
 
 import pytest
+pytest.importorskip("fastapi")
+
 from fastapi.testclient import TestClient
 from fastapi import FastAPI
 
@@ -43,7 +45,7 @@ def client():
 
     import plugins.workflow_engine.dashboard.plugin_api as api_mod
     original = api_mod._engine
-    api_mod._engine = engine
+    api_mod._engine = lambda: engine
     app.include_router(api_mod.router)
     app.state.workflow_engine = engine
 

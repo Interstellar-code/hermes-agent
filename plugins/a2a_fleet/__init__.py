@@ -9,6 +9,7 @@ See ``README.md`` for the full architecture and roadmap.
 from __future__ import annotations
 
 import atexit
+import importlib.util
 import logging
 import threading
 
@@ -18,6 +19,22 @@ logger = logging.getLogger("a2a_fleet.plugin")
 # reference so that _start_server_in_thread() is idempotent.
 _server_thread: threading.Thread | None = None
 _server_thread_lock = threading.Lock()
+
+
+def _server_dependencies_available() -> bool:
+    """Return True when optional inbound A2A server dependencies are installed."""
+    missing = [
+        name
+        for name in ("fastapi", "uvicorn")
+        if importlib.util.find_spec(name) is None
+    ]
+    if missing:
+        logger.warning(
+            "a2a_fleet: inbound server disabled; missing optional dependencies: %s",
+            ", ".join(missing),
+        )
+        return False
+    return True
 
 
 def _run_server_in_own_loop() -> None:
@@ -105,6 +122,13 @@ def register(ctx) -> None:
 
     if not cfg.get("enabled", True):
         logger.info("a2a_fleet: fleet.enabled is false; skipping tool + server registration.")
+        return
+
+    if not _server_dependencies_available():
+        logger.warning(
+            "a2a_fleet: plugin idle for this profile; install hermes-agent[web] "
+            "to enable the embedded A2A server."
+        )
         return
 
     ctx.register_tool(

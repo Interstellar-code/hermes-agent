@@ -8,6 +8,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+pytest.importorskip("fastapi", reason="a2a_fleet server tests require hermes-agent[web]")
+pytest.importorskip("uvicorn", reason="a2a_fleet server tests require hermes-agent[web]")
+
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

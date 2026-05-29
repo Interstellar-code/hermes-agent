@@ -4,6 +4,8 @@ Tests for GET/POST /runs and GET /runs/{run_id}.
 from __future__ import annotations
 
 import pytest
+pytest.importorskip("fastapi")
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -26,7 +28,7 @@ def client():
 
     import plugins.workflow_engine.dashboard.plugin_api as api_mod
     original = api_mod._engine
-    api_mod._engine = engine
+    api_mod._engine = lambda: engine
     app.include_router(api_mod.router)
 
     with TestClient(app, raise_server_exceptions=True) as c:

@@ -11,6 +11,8 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional
 
 SCHEMA: Dict[str, Any] = {
@@ -58,7 +60,7 @@ def _get_config() -> Dict[str, Any]:
 
 def _allowed_roots() -> List[Path]:
     cfg = _get_config()
-    raw = cfg.get("allowed_roots", ["~", os.environ.get("HERMES_HOME", "~/.hermes")])
+    raw = cfg.get("allowed_roots", ["~", str(get_hermes_home())])
     roots = []
     for r in raw:
         expanded = os.path.expandvars(os.path.expanduser(str(r)))

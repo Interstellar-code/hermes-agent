@@ -61,3 +61,28 @@ def test_get_agent_unknown_raises(fleet_home: Path) -> None:
 
     with pytest.raises(KeyError):
         get_agent("nonexistent")
+
+
+def test_profile_home_reads_fleet_yaml_without_nested_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Profile-mode HERMES_HOME already points at the active profile directory."""
+    from a2a_fleet.fleet_config import load_fleet
+
+    profile_home = tmp_path / ".hermes" / "profiles" / "switch"
+    profile_home.mkdir(parents=True)
+    fleet_yaml = {
+        "fleet": {
+            "enabled": True,
+            "self": {"name": "switch"},
+            "server": {"bind_host": "127.0.0.1", "bind_port": 9319},
+            "response_handler": "echo",
+            "agents": {},
+        }
+    }
+    (profile_home / "fleet.yaml").write_text(yaml.safe_dump(fleet_yaml))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_PROFILE", "switch")
+
+    cfg = load_fleet()
+
+    assert cfg["self"]["name"] == "switch"
+    assert cfg["self"]["bind_port"] == 9319

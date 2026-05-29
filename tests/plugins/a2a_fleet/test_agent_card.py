@@ -1,6 +1,11 @@
 """US-002: Agent Card endpoint shape, security, public access."""
 from __future__ import annotations
 
+import pytest
+
+pytest.importorskip("fastapi", reason="a2a_fleet server tests require hermes-agent[web]")
+pytest.importorskip("uvicorn", reason="a2a_fleet server tests require hermes-agent[web]")
+
 from fastapi.testclient import TestClient
 
 

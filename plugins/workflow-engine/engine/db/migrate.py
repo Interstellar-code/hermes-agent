@@ -7,7 +7,7 @@ Mirrors the TS migrate.ts logic exactly:
 - Each migration runs in a transaction; schema_version is upserted after
 
 Cross-process safety: ensure_schema() acquires an OS-level file lock
-(~/.hermes/switchui-workflows.db.migrate.lock) and a SQLite BEGIN EXCLUSIVE
+(HERMES_HOME/switchui-workflows.db.migrate.lock) and a SQLite BEGIN EXCLUSIVE
 around the schema check+apply. This prevents races between the dashboard
 process and the workflow daemon both calling ensure_schema() on first boot
 or after an upgrade.
@@ -25,10 +25,12 @@ import re
 import sqlite3
 import sys
 from pathlib import Path
+
+from hermes_constants import get_hermes_home
 from typing import Optional
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-_DEFAULT_LOCK_PATH = Path.home() / ".hermes" / "switchui-workflows.db.migrate.lock"
+_DEFAULT_LOCK_PATH = get_hermes_home() / "switchui-workflows.db.migrate.lock"
 
 
 def _migration_version(filename: str) -> int:
