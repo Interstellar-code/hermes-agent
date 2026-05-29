@@ -108,7 +108,7 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
     out_self: Dict[str, Any] = {
         "name": self_block.get("name") or _active_profile(),
         "token": self_token,
-        "auth_required": bool(server_block.get("auth_required", False)),
+        "auth_required": bool(server_block.get("auth_required", True)),
         "token_env": server_block.get("token_env"),
         "bind_host": bind_host,
         "bind_port": bind_port,
