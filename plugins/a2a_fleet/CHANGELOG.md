@@ -34,6 +34,6 @@ Initial release. Echo-only Agent-to-Agent (A2A v1.0) communication over JSON-RPC
 - Optional upstream Hermes patch for third-party A2A client discovery (current fleet is closed-discovery via `agent_card_url` in `fleet.yaml`)
 
 ### Security notes
-- v0.1 defaults `auth_required: false` for ease of local bring-up. Set it to `true` and configure `token_env` on any peer reachable outside loopback.
-- CORS is open (`allow_origins=["*"]`) because A2A peers are off-host by design. Combine with `auth_required: true` for any non-localhost deployment.
+- v0.1 defaults `auth_required: true` — inbound `/jsonrpc` requires a bearer token unless explicitly disabled. Configure `token_env` for the self-server and each peer. Bearer comparison is constant-time (`hmac.compare_digest`).
+- No CORS middleware: A2A is server-to-server (browsers are not A2A clients), so wildcard CORS would be misleading and is intentionally omitted.
 - The Hermes dashboard gateway and the a2a_fleet uvicorn are two independent surfaces — disabling one does not affect the other.

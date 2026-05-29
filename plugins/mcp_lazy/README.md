@@ -1,6 +1,13 @@
 # mcp_lazy
 
+Version: `0.2.0`
+
 Lazy MCP tool schema loading for Hermes Agent. Cuts ~80% of per-turn token overhead from large MCP tool catalogs by sending stub schemas in the API request and promoting full schemas on demand.
+
+Two discovery modes:
+
+- **tool mode** (default) — one stub per MCP tool; promote individual tools with `load_mcp_tools`.
+- **server mode** — one stub per MCP *server*; promote a server's whole tool set with `load_mcp_server`, then optionally drill into individual tools. Cuts the stub list further (one stub per server instead of per tool).
 
 Tracks issue [Interstellar-code/hermes-agent#5](https://github.com/Interstellar-code/hermes-agent/issues/5).
 
@@ -72,6 +79,15 @@ This plugin replaces MCP tool schemas with lightweight stubs (~80 tokens each, n
 
 ## Architecture
 
+### Two interception points
+
+The plugin hooks the tool-list pipeline at two stages:
+
+1. **`transform_tools`** — pre-request stubbing. Rewrites `agent.tools` before it enters the API call (chokepoint below).
+2. **`pre_tool_call`** — mid-dispatch auto-promote. Fires when the model calls an MCP tool. If the tool is still a stub, it promotes the single tool and **blocks** dispatch with a "schema promoted; retry next turn" message instead of letting the stub call hit the MCP server and fail schema validation.
+
+A third hook, **`on_session_reset`**, drops per-session pool state on `/new` / `/reset`.
+
 ### Single hook chokepoint
 
 `agent/chat_completion_helpers.py:build_api_kwargs()` is the only place `agent.tools` flows into an API request (covers Anthropic / Bedrock / Codex / chat_completions transports). The plugin registers a `transform_tools` hook that fires here on every request:
@@ -124,6 +140,12 @@ stub_params = {
 
 `registry.dispatch` does not natively forward the agent reference to tool handlers. The plugin works around this with a `ContextVar` (`pool._current_agent_var`) set in `transform_tools` and read by `load_mcp_tools.handler`. ContextVars propagate through `asyncio` tasks and `contextvars.copy_context()`, so the value is visible when the tool fires later in the same turn.
 
+### Server-level stubs (server / both modes)
+
+When `mcp.discovery_mode` is `"server"` or `"both"`, `server_stubs.py` collapses each MCP server into a single `mcp_server_<name>` stub instead of one stub per tool. `load_mcp_server` then promotes the server, which surfaces its per-tool stubs (or full schemas, with `eager=true`) on the next turn.
+
+Stub discrimination uses a sentinel key (`__is_server_stub__`), **not** the name prefix. A real MCP server literally named `server` produces concrete tools like `mcp_server_foo` that also start with `mcp_server_` (issue #27); the sentinel is the authoritative discriminator and `valid_tool_names` membership disambiguates real tools from synthetic stubs.
+
 ---
 
 ## Configuration
@@ -133,8 +155,19 @@ stub_params = {
 ```yaml
 mcp:
   lazy_loading: true              # default false (opt-in)
-  lazy_stub_max_desc: 200         # max chars of description per stub
+  lazy_stub_max_desc: 200         # max chars of description per TOOL stub
+  discovery_mode: tool            # tool | server | both (default tool)
+  server_stub_max_desc: 150       # max chars of description per SERVER stub
+  server_eager_token_threshold: 1500  # eager load_mcp_server above this cost degrades to tool stubs
 ```
+
+| Key | Default | Purpose |
+|---|---|---|
+| `mcp.lazy_loading` | `false` | Master toggle. Off → hook returns `None`, tools flow through unchanged. |
+| `mcp.lazy_stub_max_desc` | `200` | Max description chars per per-tool stub. |
+| `mcp.discovery_mode` | `"tool"` | `tool` = per-tool stubs; `server` = per-server stubs; `both` = both meta-tools registered. Invalid values fall back to `tool`. |
+| `mcp.server_stub_max_desc` | `150` | Max description chars per server stub (server / both modes). |
+| `mcp.server_eager_token_threshold` | `1500` | When `load_mcp_server(eager=true)` would cost more than this many tokens of full schemas, it silently degrades to tool stubs. |
 
 ### Per-server override
 
@@ -147,9 +180,15 @@ mcp_servers:
     lazy: false
     command: npx
     args: [-y, '@gmail/mcp-server']
+  dart:                           # custom server-stub description (server/both modes)
+    description: "Task & doc management"
+    command: npx
+    args: [-y, '@dart/mcp-server']
 ```
 
-`lazy: false` on a per-server entry opts that server's tools OUT of stubbing — they always get full schemas.
+`lazy: false` on a per-server entry opts that server's tools OUT of stubbing — they always get full schemas. A `description:` set on a `lazy: false` server is ignored (logged at INFO).
+
+`mcp_servers.<name>.description` supplies the text shown in that server's `mcp_server_<name>` stub when `discovery_mode` is `server` or `both`.
 
 ### Phase 0 baseline logger toggle
 
@@ -200,6 +239,47 @@ Names not present in `agent.valid_tool_names` are silently dropped (returned in 
 
 ---
 
+## The `load_mcp_server` meta-tool
+
+Registered **only** when `mcp.discovery_mode` is `"server"` or `"both"`. Promotes one or more MCP servers by name; the next turn shows that server's per-tool stubs (or full schemas, with `eager=true`). Schema:
+
+```json
+{
+  "name": "load_mcp_server",
+  "description": "Load tool stubs for one or more MCP servers by name. Use when you see a server stub (mcp_server_<name>) and need to access its tools. After this call the next turn will show tool stubs for each promoted server. Pass eager=true to load full schemas immediately (use only when you need many tools from one server).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "server_names": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "List of MCP server names to expand (e.g. ['trek', 'gmail'])."
+      },
+      "eager": {
+        "type": "boolean",
+        "description": "When true, promote to full schemas instead of tool stubs. Default false."
+      }
+    },
+    "required": ["server_names"]
+  }
+}
+```
+
+Returns JSON:
+```json
+{
+  "ok": true,
+  "promoted": ["trek", "gmail"],
+  "rejected": ["typo_server"],
+  "available_next_turn": true,
+  "note": "Tool stubs for the promoted servers will be visible on the next turn..."
+}
+```
+
+`eager=true` is gated by `mcp.server_eager_token_threshold` (default 1500). If the server's full-schema cost exceeds the threshold, eager silently degrades to tool stubs — the server still promotes, just not to full schemas.
+
+---
+
 ## Token economics
 
 Counts are approximate; real numbers depend on tokenizer and per-tool description length.
@@ -221,6 +301,10 @@ Per-conversation impact:
 
 Real conversations promote 2-5 tools per session → ~60% reduction holds steady.
 
+### Server mode (`discovery_mode: server`)
+
+Server mode collapses the baseline further: one stub per *server* (~80–150 tokens) instead of one per tool. For a 10-server / ~300-tool deployment that's roughly **~800–1,500 tokens total** for the resting stub list, versus ~24,000 in tool mode and ~68,000 eager. The model expands a server with `load_mcp_server` only when it needs that server's tools.
+
 ---
 
 ## Files
@@ -230,9 +314,11 @@ Real conversations promote 2-5 tools per session → ~60% reduction holds steady
 | `__init__.py` | Plugin entry point; `register(ctx)` registers meta-tool + hooks; Phase 0 baseline logger installs at import |
 | `pool.py` | `DeferredToolPool`, `get_pool(session_id)`, `evict(session_id)`, `_current_agent_var` ContextVar |
 | `stubs.py` | `LAZY_SENTINEL`, `make_stub_schema`, `is_stub_schema`, `is_mcp_tool`, `mix_full_and_stubs` |
-| `promote.py` | `promote_tools(agent, names)` — adds to pool with `valid_tool_names` filter |
-| `meta_tool.py` | `SCHEMA` + `handler` for `load_mcp_tools` tool |
-| `hook_impl.py` | `transform_tools` callback + `on_session_reset` callback + `_eligible_servers` config reader |
+| `server_stubs.py` | Server-level stub construction, `__is_server_stub__` sentinel detection, tool-name derivation |
+| `promote.py` | `promote_tools(agent, names)` + `promote_server_tools(agent, servers, eager=)` — pool promotion with `valid_tool_names` filter |
+| `meta_tool.py` | `SCHEMA` + `handler` for `load_mcp_tools` |
+| `meta_tool_server.py` | `SCHEMA` + `handler` for `load_mcp_server` (registered in server/both modes) |
+| `hook_impl.py` | `transform_tools` + `pre_tool_call` + `on_session_reset` callbacks; `_eligible_servers` / `_server_descriptions` config readers |
 | `baseline_patch.py` | Phase 0 cache hit-rate logger — appends to `~/.hermes/mcp-lazy/cache-baseline.jsonl` |
 | `scripts/cache_report.py` | Summariser CLI for the baseline log |
 | `plugin.yaml` | Hermes plugin manifest |
@@ -295,6 +381,7 @@ Add to `config.yaml`:
 ```yaml
 mcp:
   lazy_loading: true
+  # discovery_mode: server   # optional — per-server stubs + load_mcp_server
 ```
 Restart:
 ```
@@ -303,14 +390,15 @@ hermes gateway restart
 
 Look for in `~/.hermes/profiles/<profile>/logs/agent.log`:
 ```
-INFO hermes_plugins.mcp_lazy: mcp_lazy: registered meta-tool + transform_tools/on_session_reset hooks
+INFO hermes_plugins.mcp_lazy: mcp_lazy: discovery_mode='tool', registered: ['load_mcp_tools']
 ```
+In server / both mode the registered list also includes `load_mcp_server`.
 
 ### Verify in a live session
 
 Watch agent.log during a conversation:
 ```
-grep -E "load_mcp_tools|mcp_lazy|tool .*(completed|started)" \
+grep -E "load_mcp_tools|load_mcp_server|mcp_lazy|tool .*(completed|started)" \
      ~/.hermes/profiles/<profile>/logs/agent.log | tail -20
 ```
 
@@ -346,7 +434,16 @@ hermes plugins disable mcp_lazy
 ## Edge cases & known behaviour
 
 ### Model calls a stub directly without promoting first
-The model's tool call args won't match the real MCP schema (model only saw the stub). MCP server returns a schema-validation error. The model typically recovers by calling `load_mcp_tools` and retrying. **Acceptable for v1**; a future Phase 1.1 could auto-promote + return a "please retry" message from the dispatch layer.
+Handled by the `pre_tool_call` hook (CRITICAL #1). When the model calls a stubbed MCP tool, the hook auto-promotes that **single** tool (not the whole server) and blocks dispatch with `[mcp_lazy] Tool ... was a stub — full schema promoted. Reissue the call on the next turn`. The stub call never reaches the MCP server, so there is no schema-validation error to recover from.
+
+### `mcp_server_<name>` prefix collision (#27)
+A real MCP server named `server` produces concrete tools (`mcp_server_foo`) whose names start with `mcp_server_`, colliding with synthetic server-stub names. The plugin checks `valid_tool_names` membership — names present there are real tools and fall through to normal per-tool handling; names absent are treated as discovery stubs.
+
+### Calling a server stub after the server is already promoted
+If the model calls `mcp_server_<name>` after that server was promoted, `pre_tool_call` blocks with a message listing the concrete `mcp_<server>_<tool>` names to use instead (stale-stub guard, #31).
+
+### Mid-session `discovery_mode` flip
+If `discovery_mode` changes while a session is live, `transform_tools` logs a WARNING and preserves promoted-server state. The previous mode is tracked on the pool (`_prev_mode`) so it clears on session evict — no module-level leak (#29).
 
 ### Model promotes too aggressively
 Each promoted tool stays full for the rest of the session. A model that calls `load_mcp_tools` with every visible name effectively disables the savings. Mitigated by the description ending in: "After this call returns, the next turn will see the full parameter spec" — encourages targeted promotion.
@@ -361,6 +458,15 @@ Currently subagents inherit the parent's `session_id`, which means they share th
 `load_mcp_tools(tool_names=[a, b, c])` is fully supported. All three promote in the same pool call; all three appear full on the next turn.
 
 ---
+
+## Tests
+
+The suite lives at `tests/plugins/mcp_lazy/` (repo `tests/` tree, not in the plugin directory) — 19 test modules covering pool isolation, concurrent promotion, stub mixing, server stubs, mode transitions, eager threshold, config validation, and regression tests for issues #18 / #27 / #29 / #30 / #31.
+
+```
+cd ~/.hermes/hermes-agent
+venv/bin/python -m pytest tests/plugins/mcp_lazy/ -q
+```
 
 ## Plan history
 
@@ -379,7 +485,8 @@ Final plan at `.omc/plans/mcp-lazy-loading-v4.md` (in repo root, not committed b
 |---|---|---|
 | 0 | ✅ shipped (#6) | Baseline cache hit-rate instrumentation |
 | 1 | ✅ shipped (#7) | Two-pass MVP: stub schemas + `load_mcp_tools` meta-tool |
-| 2 | planned | BM25 pre-selection on top of stubs — skips the round-trip for most turns |
-| 3 | descoped | Anthropic native `tool_search_tool_bm25_20251119` — fork-local experiment only |
+| 2 | ✅ shipped | Server-level discovery: `discovery_mode` (tool/server/both), `mcp_server_<name>` stubs, `load_mcp_server` meta-tool, `pre_tool_call` auto-promote |
+| 3 | planned | BM25 pre-selection on top of stubs — skips the round-trip for most turns |
+| 4 | descoped | Anthropic native `tool_search_tool_bm25_20251119` — fork-local experiment only |
 
 Upstream plan: one standalone PR adding the generic `transform_tools` hook surface to NousResearch/hermes-agent. Plugin itself stays fork-local indefinitely if upstream doesn't merge.

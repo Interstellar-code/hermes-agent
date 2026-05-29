@@ -1,14 +1,17 @@
 # After Install — workflow-engine
 
 1. Restart the Hermes dashboard: `hermes dashboard restart`
-2. Open the dashboard — a **Workflows** entry should appear in the sidebar.
+2. This plugin is **API-only** in the Hermes dashboard — its manifest sets
+   `tab.hidden: true`, so **no Workflows entry appears in the dashboard sidebar**.
+   The workflows UI lives in the separate **hermes-switchui** app. Enabling the
+   plugin only gives you the backend API below.
 3. Verify the health endpoint:
    ```bash
    curl http://127.0.0.1:8642/api/plugins/workflow-engine/health
    # → {"ok":true,"version":"0.1.0"}
    ```
-4. Place workflow YAML files in `~/.hermes/workflows/` (created automatically
-   on first run in Phase 2a).
+4. Place workflow YAML files in `~/.hermes/switchui/workflows/` (created
+   automatically on first enable from the bundled `defaults/`).
 
 No environment variables are required for Phase 1.
 
