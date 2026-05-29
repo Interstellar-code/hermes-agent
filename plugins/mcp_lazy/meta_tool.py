@@ -22,7 +22,8 @@ from .promote import promote_tools
 SCHEMA: Dict[str, Any] = {
     # Name deliberately does NOT start with ``mcp_`` so the stub
     # filter in ``stubs.is_mcp_tool`` never collapses this tool to
-    # a stub. If it were ``mcp_load_tools`` it would target itself.
+    # a stub. If it were named ``mcp_load_tools`` it would match the
+    # ``mcp_`` prefix filter and stub itself out.
     "name": "load_mcp_tools",
     "description": (
         "Load full parameter schemas for MCP tools by name. Use when "
@@ -77,7 +78,7 @@ async def handler(args: Dict[str, Any], **kwargs: Any) -> str:
     if agent is None:
         return json.dumps({
             "ok": False,
-            "error": "mcp_load_tools: agent context unavailable",
+            "error": "load_mcp_tools: agent context unavailable",
         })
 
     accepted: List[str] = promote_tools(agent, raw_names)
