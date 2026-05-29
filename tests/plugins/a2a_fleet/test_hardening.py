@@ -17,8 +17,8 @@ import yaml
 # Auth-default behaviour (#34 / #38)
 # ---------------------------------------------------------------------------
 
-def test_auth_required_defaults_false(fleet_home: Path) -> None:
-    """When auth_required is omitted from fleet.yaml it must default to False."""
+def test_auth_required_defaults_true(fleet_home: Path) -> None:
+    """When auth_required is omitted from fleet.yaml it must default to True (secure default)."""
     from a2a_fleet.fleet_config import load_fleet
 
     fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
@@ -28,8 +28,8 @@ def test_auth_required_defaults_false(fleet_home: Path) -> None:
     fleet_yaml.write_text(yaml.safe_dump(data))
 
     cfg = load_fleet()
-    assert cfg["self"]["auth_required"] is False, (
-        "auth_required must default to False when omitted from fleet.yaml"
+    assert cfg["self"]["auth_required"] is True, (
+        "auth_required must default to True when omitted from fleet.yaml"
     )
 
 
