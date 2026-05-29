@@ -44,12 +44,17 @@ class DeferredToolPool:
     """
 
     # ``__weakref__`` is required so WeakValueDictionary can hold us.
-    __slots__ = ("session_id", "_promoted", "_promoted_servers", "_lock", "__weakref__")
+    __slots__ = ("session_id", "_promoted", "_promoted_servers", "_prev_mode", "_lock", "__weakref__")
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         self._promoted: Set[str] = set()
         self._promoted_servers: Set[str] = set()
+        # Tracks the last-seen discovery_mode for this session so hook_impl
+        # can detect mid-session flips without a module-level dict that leaks
+        # across sessions.  Stored here so evict() clears it automatically.
+        # Fixes Interstellar-code/hermes-agent#29.
+        self._prev_mode: Optional[str] = None
         self._lock = threading.RLock()
 
     def promote(self, names) -> None:
@@ -83,20 +88,17 @@ class DeferredToolPool:
     def promote_server(self, name: str, eager: bool = False) -> None:
         """Mark a server as promoted in this session.
 
-        Idempotent; last-writer-wins for the ``eager`` flag.  If two
-        concurrent callers disagree on ``eager``, the second call wins
-        and a WARNING is emitted so the conflict is visible in logs.
+        Idempotent.  The ``eager`` flag is accepted for API compatibility but
+        is NOT stored here — eager-vs-stub behaviour is handled at call time in
+        ``promote.promote_server_tools`` by directly promoting individual tools
+        into ``_promoted`` when eager=True.  Storing it here was a no-op and
+        produced a spurious WARNING on benign idempotent re-promotion.
+        See Interstellar-code/hermes-agent#28.
         """
         name = name.strip()
         if not name:
             return
         with self._lock:
-            if name in self._promoted_servers:
-                # Already promoted — last-writer-wins.
-                logger.warning(
-                    "mcp_lazy: promote_server('%s') called again (eager=%r); last-writer-wins",
-                    name, eager,
-                )
             self._promoted_servers.add(name)
 
     def is_server_promoted(self, name: str) -> bool:
@@ -114,10 +116,11 @@ class DeferredToolPool:
             self._promoted_servers.clear()
 
     def clear(self) -> None:
-        """Drop all promoted tools and servers — used by explicit session reset."""
+        """Drop all promoted tools, servers, and prev_mode — used by explicit session reset."""
         with self._lock:
             self._promoted.clear()
             self._promoted_servers.clear()
+            self._prev_mode = None
 
 
 # Module-level registry. WeakValueDictionary so dropped sessions GC
@@ -138,6 +141,13 @@ def get_pool(session_id: str) -> DeferredToolPool:
 
     Called from the lazy-loading hook on every relevant request, so
     must be cheap.
+
+    Uses double-checked locking to avoid a check-then-set race where two
+    concurrent calls both see ``_pools.get()`` return None and both create
+    a new pool — with the second silently clobbering the first's promotions.
+    The outer check is a fast unlocked read for the common already-exists
+    case; the inner check under the lock handles the race.
+    See Interstellar-code/hermes-agent#30.
     """
     if not session_id:
         # Unknown / unset session — use a single shared "unattributed"
@@ -145,12 +155,15 @@ def get_pool(session_id: str) -> DeferredToolPool:
         # isolation degrades.
         session_id = "__unattributed__"
     pool = _pools.get(session_id)
-    if pool is None:
-        pool = DeferredToolPool(session_id)
-        _pools[session_id] = pool
-        # Keep a brief strong-ref window so the weak dict doesn't lose
-        # us before the caller attaches the pool to the agent.
-        with _strong_recent_lock:
+    if pool is not None:
+        return pool
+    with _strong_recent_lock:
+        # Re-check under the lock — another thread may have created it
+        # between our unlocked read and acquiring the lock.
+        pool = _pools.get(session_id)
+        if pool is None:
+            pool = DeferredToolPool(session_id)
+            _pools[session_id] = pool
             _strong_recent.append(pool)
             if len(_strong_recent) > _STRONG_RECENT_MAX:
                 _strong_recent.pop(0)

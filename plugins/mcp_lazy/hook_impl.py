@@ -16,8 +16,10 @@ from .server_stubs import is_server_stub_schema
 
 logger = logging.getLogger(__name__)
 
-# Track previous discovery_mode per session to detect mid-session flips (Q11).
-_prev_mode: Dict[str, str] = {}
+# NOTE: _prev_mode tracking has been moved into DeferredToolPool._prev_mode so
+# that it is cleared automatically when the session pool is evicted.  The
+# module-level dict that existed here leaked entries across sessions and was
+# never cleaned up on evict().  See Interstellar-code/hermes-agent#29.
 
 
 def _load_config() -> Dict[str, Any]:
@@ -131,14 +133,16 @@ def transform_tools(
             discovery_mode = "tool"
 
         # Q11: detect mid-session mode flip and log WARNING.
-        prev = _prev_mode.get(session_id)
+        # _prev_mode is stored on the pool so it is cleared on session evict
+        # (avoids the module-level dict leak fixed in #29).
+        prev = pool._prev_mode
         if prev is not None and prev != discovery_mode:
             logger.warning(
                 "mcp_lazy: discovery_mode changed mid-session %s: %r -> %r "
                 "(promoted_servers state preserved in pool)",
                 session_id, prev, discovery_mode,
             )
-        _prev_mode[session_id] = discovery_mode
+        pool._prev_mode = discovery_mode
 
         mcp_count = sum(1 for t in tools if t.get("function", {}).get("name", "").startswith("mcp_"))
         sample = next((t for t in tools if t.get("function", {}).get("name", "").startswith("mcp_")), None)
@@ -218,36 +222,56 @@ def pre_tool_call(
 
         pool = get_pool(session_id)
 
-        # Belt-and-suspenders for Interstellar-code/hermes-agent#18:
-        # ``mcp_server_<name>`` is a synthetic discovery stub, not a real MCP
-        # tool. The auto-promote path below would treat it as a tool name and
-        # record it in the pool, which is wrong on every level. Handle both
-        # cases (promoted vs unpromoted server) explicitly and never fall
-        # through to auto-promotion.
+        # Belt-and-suspenders for Interstellar-code/hermes-agent#18 and #27:
+        # ``mcp_server_<name>`` *may* be a synthetic discovery stub, but a real
+        # MCP server named "server" also produces tool names that start with
+        # ``mcp_server_``.  We cannot rely on the name prefix alone — we must
+        # check whether the tool is registered as a valid tool name on the agent
+        # (concrete tools are in valid_tool_names; discovery stubs are NOT).
+        # See #27 for the full collision analysis.
         if tool_name.startswith("mcp_server_"):
-            server_name = tool_name[len("mcp_server_"):].strip()
-            if server_name and pool.is_server_promoted(server_name):
-                agent = _current_agent_var.get(None)
-                valid = getattr(agent, "valid_tool_names", None) or set()
-                prefix = f"mcp_{server_name}_"
-                concrete = sorted(t for t in valid if t.startswith(prefix))
-                hint = ", ".join(concrete[:8]) or "(use the mcp_{server}_<tool> names from the tool list)"
+            agent = _current_agent_var.get(None)
+            valid = getattr(agent, "valid_tool_names", None) or set()
+            # If this name appears in valid_tool_names it IS a real MCP tool
+            # (e.g. a tool from a server named "server"); fall through to the
+            # normal per-tool auto-promote logic below.
+            if valid and tool_name in valid:
+                pass  # real concrete tool — fall through
+            else:
+                # This is a discovery stub.  Extract server name and handle
+                # promoted vs unpromoted cases explicitly.
+                server_name = tool_name[len("mcp_server_"):].strip()
+                if server_name and pool.is_server_promoted(server_name):
+                    prefix = f"mcp_{server_name}_"
+                    concrete = sorted(t for t in valid if t.startswith(prefix))
+                    hint = ", ".join(concrete[:8]) or "(use the mcp_{server}_<tool> names from the tool list)"
+                    logger.info(
+                        "mcp_lazy: pre_tool_call rejected stale server stub %r — server already promoted",
+                        tool_name,
+                    )
+                    return {
+                        "action": "block",
+                        "message": (
+                            f"[mcp_lazy] `{tool_name}` is a discovery stub for an already-promoted "
+                            f"server. Call one of the concrete tools instead: {hint}"
+                        ),
+                    }
+                # Server not yet promoted — block with a directive to use
+                # load_mcp_server (fixes #31: was returning None, falling through
+                # to dispatch which then errored on the stub).  Do NOT fall through
+                # to per-tool auto-promote; stub names must never enter the pool.
                 logger.info(
-                    "mcp_lazy: pre_tool_call rejected stale server stub %r — server already promoted",
+                    "mcp_lazy: pre_tool_call blocked unpromoted server stub %r — directing model to load_mcp_server",
                     tool_name,
                 )
                 return {
                     "action": "block",
                     "message": (
-                        f"[mcp_lazy] `{tool_name}` is a discovery stub for an already-promoted "
-                        f"server. Call one of the concrete tools instead: {hint}"
+                        f"[mcp_lazy] `{tool_name}` is a server discovery stub, not a callable tool. "
+                        "Call `load_mcp_server` with the server name to expand its tools, "
+                        "then retry with a concrete tool."
                     ),
                 }
-            # Server not yet promoted — let the normal dispatch surface the
-            # error (or future handler take over). Critically, do NOT fall
-            # through to the per-tool auto-promote logic; the stub name is not
-            # a real tool and must never enter the promoted pool.
-            return None
 
         if pool.is_promoted(tool_name):
             return None  # already full schema — normal dispatch
