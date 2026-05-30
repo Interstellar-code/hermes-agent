@@ -22,7 +22,7 @@ class HandlerResult:
     kind: str = field(default="message")
 
 
-async def echo_handler(text: str, context_id: str) -> HandlerResult:
+async def echo_handler(text: str, context_id: str, cfg: dict | None = None) -> HandlerResult:
     """Return ``pong`` for ``ping``; otherwise echo the input verbatim."""
     if text.strip().lower() == "ping":
         reply = "pong"

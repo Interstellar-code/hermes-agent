@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import yaml
 
 
-SUPPORTED_HANDLERS = {"echo"}
+SUPPORTED_HANDLERS = {"echo", "llm"}
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
@@ -115,7 +115,7 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
     handler = (fleet.get("response_handler") or "echo").strip()
     if handler not in SUPPORTED_HANDLERS:
         raise FleetConfigError(
-            f"response_handler {handler!r} not supported in v0.1, "
+            f"response_handler {handler!r} not supported, "
             f"only {sorted(SUPPORTED_HANDLERS)} are implemented."
         )
 
@@ -171,11 +171,23 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
             "description": entry.get("description", ""),
         }
 
+    # Optional llm block — system_prompt / system_prompt_file, max_tokens, temperature.
+    # Provider/api_key are intentionally NOT read here; those come from the active
+    # profile via resolve_provider_client("auto").
+    llm_raw = fleet.get("llm") or {}
+    llm_block: Dict[str, Any] = {
+        "system_prompt": llm_raw.get("system_prompt"),
+        "system_prompt_file": llm_raw.get("system_prompt_file"),
+        "max_tokens": int(llm_raw.get("max_tokens", 2048)),
+        "temperature": float(llm_raw.get("temperature", 0.7)),
+    }
+
     return {
         "enabled": bool(fleet.get("enabled", True)),
         "response_handler": handler,
         "self": out_self,
         "agents": agents_out,
+        "llm": llm_block,
     }
 
 

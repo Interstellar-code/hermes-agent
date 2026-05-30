@@ -32,7 +32,11 @@ from fastapi.responses import JSONResponse, Response
 
 from .context_store import generate_context_id
 from .fleet_config import load_fleet
+from .llm_handler import A2AHandlerError, llm_handler
 from .response_handler import HandlerResult, echo_handler
+
+# Immutable handler registry — looked up per request by response_handler config key.
+HANDLERS = {"echo": echo_handler, "llm": llm_handler}
 
 log = logging.getLogger("a2a_fleet.server")
 
@@ -197,7 +201,11 @@ def build_app() -> FastAPI:
         if method in {"SendMessage", "message/send"}:
             text = _extract_text(params)
             context_id = _context_id(params)
-            result: HandlerResult = await echo_handler(text, context_id)
+            handler = HANDLERS.get(cfg["response_handler"], echo_handler)
+            try:
+                result: HandlerResult = await handler(text, context_id, cfg)
+            except (A2AHandlerError, Exception) as exc:
+                return _rpc_error(rpc_id, -32000, f"Server error: {exc}")
             return JSONResponse({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
