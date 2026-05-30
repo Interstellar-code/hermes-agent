@@ -31,7 +31,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from .fleet_config import load_fleet
-from .response_handler import echo_handler
+from .response_handler import HandlerResult, echo_handler
 
 log = logging.getLogger("a2a_fleet.server")
 
@@ -196,16 +196,16 @@ def build_app() -> FastAPI:
         if method in {"SendMessage", "message/send"}:
             text = _extract_text(params)
             context_id = _context_id(params)
-            reply = await echo_handler(text, context_id)
+            result: HandlerResult = await echo_handler(text, context_id)
             return JSONResponse({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
                 "result": {
-                    "kind": "message",
+                    "kind": result.kind,
                     "message": {
                         "role": "agent",
-                        "parts": [{"text": reply}],
-                        "contextId": context_id,
+                        "parts": [{"text": result.text}],
+                        "contextId": result.context_id,
                     },
                 },
             })

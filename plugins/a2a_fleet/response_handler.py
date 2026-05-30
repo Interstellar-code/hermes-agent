@@ -6,9 +6,26 @@ matching the plan's "no premature abstraction" rule.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 
-async def echo_handler(text: str, context_id: str) -> str:
+
+@dataclass
+class HandlerResult:
+    """Internal result type returned by all inbound A2A handlers.
+
+    ``kind`` is reserved for future use (e.g. ``"task"`` in the async phase).
+    ``Turn`` shape and task fields are intentionally omitted until needed.
+    """
+
+    text: str
+    context_id: str
+    kind: str = field(default="message")
+
+
+async def echo_handler(text: str, context_id: str) -> HandlerResult:
     """Return ``pong`` for ``ping``; otherwise echo the input verbatim."""
     if text.strip().lower() == "ping":
-        return "pong"
-    return text
+        reply = "pong"
+    else:
+        reply = text
+    return HandlerResult(text=reply, context_id=context_id)
