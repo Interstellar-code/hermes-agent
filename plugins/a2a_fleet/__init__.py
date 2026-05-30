@@ -175,6 +175,20 @@ def register(ctx) -> None:
         except Exception:
             logger.debug("a2a_fleet: register_skill failed", exc_info=True)
 
+    if hasattr(ctx, "register_platform"):
+        from . import adapter as _adapter  # noqa: WPS433 — lazy import is the contract.
+        try:
+            ctx.register_platform(
+                name="a2a_fleet",
+                label="A2A Fleet",
+                adapter_factory=lambda cfg: _adapter.A2AFleetAdapter(cfg),
+                check_fn=lambda: True,
+                emoji="🤝",
+            )
+            logger.info("a2a_fleet: registered platform adapter with gateway")
+        except Exception:
+            logger.debug("a2a_fleet: register_platform failed (non-gateway context)", exc_info=True)
+
     _start_server_in_thread()
     atexit.register(_atexit_stop)
     logger.info("a2a_fleet: registered fleet_send tool + spawned A2A server thread")

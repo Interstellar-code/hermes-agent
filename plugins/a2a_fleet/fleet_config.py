@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 import yaml
 
 
-SUPPORTED_HANDLERS = {"echo", "llm"}
+SUPPORTED_HANDLERS = {"echo", "llm", "agent"}
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
@@ -182,12 +182,19 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         "temperature": float(llm_raw.get("temperature", 0.7)),
     }
 
+    # Optional agent block — timeout_s for synchronous Route B dispatch.
+    agent_raw = fleet.get("agent") or {}
+    agent_block: Dict[str, Any] = {
+        "timeout_s": int(agent_raw.get("timeout_s", 120)),
+    }
+
     return {
         "enabled": bool(fleet.get("enabled", True)),
         "response_handler": handler,
         "self": out_self,
         "agents": agents_out,
         "llm": llm_block,
+        "agent": agent_block,
     }
 
 
