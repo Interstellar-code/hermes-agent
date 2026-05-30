@@ -30,6 +30,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from .context_store import generate_context_id
 from .fleet_config import load_fleet
 from .response_handler import HandlerResult, echo_handler
 
@@ -108,7 +109,7 @@ def _context_id(params: Dict[str, Any]) -> str:
     ctx = message.get("contextId")
     if isinstance(ctx, str) and ctx:
         return ctx
-    return "ctx-anon"
+    return generate_context_id()
 
 
 def _check_bearer(request: Request, cfg: Dict[str, Any]) -> Optional[JSONResponse]:
