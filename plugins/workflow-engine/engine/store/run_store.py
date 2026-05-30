@@ -299,9 +299,38 @@ class RunStore:
         )
         self._conn.commit()
 
-    def mark_crashed_runs(self) -> int:
-        """Mark any pending/running runs as crashed (resume policy: no auto-resume)."""
+    def mark_crashed_runs(self, *, boot_pid: Optional[int] = None) -> int:
+        """Mark stale pending/running runs as crashed (resume policy: no auto-resume).
+
+        Distinguishes a genuine process restart from an in-process plugin
+        re-initialization. The boot PID is persisted in ``schema_meta``; when
+        the current PID matches the stored one, the plugin was re-initialized
+        inside the *same* process (gateway session compression, tool-loop
+        protection, new agent session). The fire-and-forget asyncio run tasks
+        are still alive on the shared event loop and will finalize themselves,
+        so leaving their rows ``running`` is correct — marking them crashed
+        produces the false failures in #49.
+
+        Only a different (or first-seen) PID means the prior process died,
+        taking its in-flight tasks with it; those rows are the real crashes.
+        When ``boot_pid`` is None the legacy unconditional behaviour applies.
+        """
         now = _now_ms()
+        if boot_pid is not None:
+            row = self._conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'boot_pid'"
+            ).fetchone()
+            prev_pid = row[0] if row else None
+            # Record current PID for the next boot regardless of outcome.
+            self._conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('boot_pid', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(boot_pid),),
+            )
+            if prev_pid is not None and prev_pid == str(boot_pid):
+                # Same process — in-process reinit, live tasks still running.
+                self._conn.commit()
+                return 0
         result = self._conn.execute(
             """
             UPDATE workflow_runs
