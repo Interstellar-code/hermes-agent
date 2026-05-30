@@ -43,6 +43,34 @@ To regenerate this table after adding/removing files, list the directory and re-
 ls plugins/workflow-engine/defaults/*.yaml
 ```
 
+## How bundled workflows reach the engine
+
+These YAMLs are the **source of truth**. The runtime registry is the
+`workflow_definitions` table in `~/.hermes/switchui-workflows.db`. They sync as
+follows:
+
+- On **every engine boot**, `seed_defaults` upserts each `defaults/*.yaml` into
+  the DB with `source = "bundled"` (`engine/runtime/seed_defaults.py` →
+  `DefinitionStore.seed_bundled`).
+- Sync is **idempotent via SHA-256 checksum**: an unchanged YAML is skipped; a
+  changed YAML triggers an `UPDATE` of the existing row. You do **not** need to
+  manually re-upsert — edit the YAML, restart, and the change re-seeds itself.
+- The `source` column marks provenance: `bundled` (from this dir), `user`
+  (created at runtime, default for `create_definition`), or other scopes.
+
+### Customizing a bundled workflow
+
+Editing a bundled file in place works, but a plugin **git update** will
+overwrite your edit (and a checksum change re-seeds it as `bundled`). To keep a
+customization durable:
+
+1. Copy the YAML to a **new `id`/filename** (e.g. `repo-review-telegram.yaml`).
+2. Put it in `~/.hermes/switchui/workflows/` (user store) or register it via the
+   API/tool with `source: user`.
+
+A distinct id is never touched by reseed — it is independent of the bundled
+definition, not a "shadow" of it.
+
 ## Notes
 
 - No hardcoded paths. `TOOL_CATALOG_ROOT` controls the catalog location for tool-catalog workflows.
