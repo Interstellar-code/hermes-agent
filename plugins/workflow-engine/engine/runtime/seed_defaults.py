@@ -26,8 +26,9 @@ def seed_defaults(def_store: "DefinitionStore") -> Dict[str, Any]:
     """
     result = def_store.seed_bundled(_BUNDLED_DEFAULTS_DIR)
     logger.info(
-        "seed_defaults: inserted=%d skipped=%d errors=%d from %s",
+        "seed_defaults: inserted=%d updated=%d skipped=%d errors=%d from %s",
         result["inserted"],
+        result.get("updated", 0),
         result["skipped"],
         result["errors"],
         _BUNDLED_DEFAULTS_DIR,

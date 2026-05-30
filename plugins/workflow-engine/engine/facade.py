@@ -72,12 +72,14 @@ class WorkflowEngine:
         yaml_text: str,
         source: str = "user",
         source_path: Optional[str] = None,
+        expected_checksum: Optional[str] = None,
     ) -> Dict[str, Any]:
         row = self._def_store.upsert_definition(
             definition_id=definition_id,
             yaml_text=yaml_text,
             source=source,
             source_path=source_path,
+            expected_checksum=expected_checksum,
         )
         # Refresh manifest
         self._manifest_writer.write()
@@ -321,6 +323,29 @@ class WorkflowEngine:
     # ------------------------------------------------------------------ #
     # Extended definitions                                                #
     # ------------------------------------------------------------------ #
+
+    async def mark_user_edit(
+        self,
+        definition_id: str,
+        yaml_text: str,
+        expected_checksum: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Edit a bundled workflow in-place; keeps source='bundled', sets user_modified=1."""
+        row = self._def_store.mark_user_edit(
+            definition_id, yaml_text, expected_checksum=expected_checksum
+        )
+        self._manifest_writer.write()
+        return row
+
+    async def reset_to_factory(
+        self,
+        definition_id: str,
+        factory_yaml: str,
+    ) -> Dict[str, Any]:
+        """Reset a bundled workflow to factory yaml; clears user_modified."""
+        row = self._def_store.reset_to_factory(definition_id, factory_yaml)
+        self._manifest_writer.write()
+        return row
 
     async def delete_definition(self, definition_id: str) -> int:
         """Delete a non-bundled definition. Returns rows deleted."""

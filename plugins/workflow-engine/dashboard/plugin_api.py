@@ -33,6 +33,7 @@ del _sys, _Path
 
 from _shared import get_engine  # noqa: E402
 from engine import WorkflowEngine  # noqa: E402
+from engine.store.definition_store import ConflictError  # noqa: E402
 
 # Engine is initialized lazily on first request via get_engine(); do not call
 # it at module load time so that importing this file (e.g. during plugin
@@ -117,8 +118,6 @@ async def create_definition(request: Request) -> JSONResponse:
     source = body.get("source", "project")
     if source not in ("project", "user", "bundled"):
         return _json({"error": "source must be 'project' | 'user' | 'bundled'"}, 400)
-    if source == "bundled":
-        return _json({"error": "source='bundled' is read-only"}, 403)
     # Validate scope_path
     scope_path = body.get("scope_path")
     if scope_path is not None:
@@ -133,6 +132,28 @@ async def create_definition(request: Request) -> JSONResponse:
     if tags is not None:
         if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
             return _json({"error": "tags must be a string[] when provided"}, 400)
+    # Optional optimistic-concurrency checksum (CR-1)
+    expected_checksum: Optional[str] = body.get("expected_checksum") or None
+
+    # Check if target row is an existing bundled row — route to mark_user_edit
+    existing = await _engine().get_definition(body["id"])
+    if existing is not None and existing.get("source") == "bundled":
+        # Edit-in-place: keep source='bundled', set user_modified=1
+        try:
+            defn = await _engine().mark_user_edit(
+                body["id"],
+                yaml_text,
+                expected_checksum=expected_checksum,
+            )
+        except ConflictError as exc:
+            return _json({"error": str(exc)}, 409)
+        except ValueError as exc:
+            return _json({"error": str(exc)}, 422)
+        return _json({"definition": defn}, 200)
+
+    # New or non-bundled row: reject explicit source='bundled' creates
+    if source == "bundled":
+        return _json({"error": "source='bundled' is read-only"}, 403)
 
     try:
         defn = await _engine().upsert_definition(
@@ -140,7 +161,10 @@ async def create_definition(request: Request) -> JSONResponse:
             yaml_text=yaml_text,
             source=source,
             source_path=scope_path,
+            expected_checksum=expected_checksum,
         )
+    except ConflictError as exc:
+        return _json({"error": str(exc)}, 409)
     except ValueError as exc:
         return _json({"error": str(exc)}, 422)
 
@@ -495,6 +519,63 @@ async def delete_definition(def_id: str) -> JSONResponse:
     if rows == 0:
         return _json({"error": "not found"}, 404)
     return _json({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Definitions — POST /definitions/{id}/reset-factory
+# ---------------------------------------------------------------------------
+
+_BUNDLED_DEFAULTS_DIR = None  # resolved lazily below
+
+
+def _get_bundled_defaults_dir():
+    """Return the bundled defaults directory (same path used by seed_defaults)."""
+    from pathlib import Path as _P
+    return _P(__file__).resolve().parent.parent / "defaults"
+
+
+def _find_factory_yaml(def_id: str):
+    """Locate the factory YAML file for def_id in the bundled defaults dir.
+
+    Re-derives the id from each file's parsed workflow or stem to match how
+    seed_bundled() computes ids.  Returns (path, content) or (None, None).
+    """
+    from engine.discovery.validator import validate_workflow_yaml as _vwf
+    defaults_dir = _get_bundled_defaults_dir()
+    if not defaults_dir.exists():
+        return None, None
+    for yaml_file in sorted(defaults_dir.glob("*.yaml")):
+        try:
+            content = yaml_file.read_text(encoding="utf-8")
+            workflow, error = _vwf(content, yaml_file.name)
+            if error or not workflow:
+                continue
+            fid = workflow.id if workflow.id else yaml_file.stem.lower().replace(" ", "-")
+            if fid == def_id:
+                return yaml_file, content
+        except Exception:
+            continue
+    return None, None
+
+
+@router.post("/definitions/{def_id}/reset-factory")
+async def reset_definition_to_factory(def_id: str) -> JSONResponse:
+    defn = await _engine().get_definition(def_id)
+    if defn is None:
+        return _json({"error": "not found"}, 404)
+    if defn.get("source") != "bundled":
+        return _json({"error": "only bundled definitions can be reset to factory"}, 403)
+
+    _yaml_file, factory_yaml = _find_factory_yaml(def_id)
+    if factory_yaml is None:
+        return _json({"error": f"no factory file found for id {def_id!r}"}, 404)
+
+    try:
+        updated = await _engine().reset_to_factory(def_id, factory_yaml)
+    except ValueError as exc:
+        return _json({"error": str(exc)}, 422)
+
+    return _json({"definition": updated})
 
 
 # ---------------------------------------------------------------------------
