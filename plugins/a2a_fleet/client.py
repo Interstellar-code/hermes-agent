@@ -26,22 +26,23 @@ def _peer_jsonrpc_url(agent_entry: Dict[str, Any]) -> str:
     return f"{base}/jsonrpc"
 
 
-def _send_message_payload(text: str) -> Dict[str, Any]:
+def _send_message_payload(text: str, context_id: Optional[str] = None) -> Dict[str, Any]:
+    message: Dict[str, Any] = {
+        "role": "user",
+        "parts": [{"text": text}],
+    }
+    if context_id is not None:
+        message["contextId"] = context_id
     return {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
         "method": "SendMessage",
-        "params": {
-            "message": {
-                "role": "user",
-                "parts": [{"text": text}],
-                "contextId": str(uuid.uuid4()),
-            },
-        },
+        "params": {"message": message},
     }
 
 
-def _extract_reply(body: Dict[str, Any]) -> str:
+def _extract_reply(body: Dict[str, Any]) -> Dict[str, str]:
+    """Return ``{"reply": ..., "context_id": ...}`` from a JSON-RPC response body."""
     if "error" in body and body["error"]:
         err = body["error"]
         raise FleetClientError(
@@ -57,7 +58,10 @@ def _extract_reply(body: Dict[str, Any]) -> str:
     parts = message.get("parts") or []
     for part in parts:
         if isinstance(part, dict) and isinstance(part.get("text"), str):
-            return part["text"]
+            return {
+                "reply": part["text"],
+                "context_id": message.get("contextId", ""),
+            }
     raise FleetClientError("peer message has no text part")
 
 
@@ -65,21 +69,25 @@ async def send_message(
     agent_name: str,
     text: str,
     *,
+    context_id: Optional[str] = None,
     timeout: float = 30.0,
     client: Optional[httpx.AsyncClient] = None,
-) -> str:
-    """Send ``text`` to the named peer and return the agent's reply text.
+) -> Dict[str, str]:
+    """Send ``text`` to the named peer and return ``{"reply": ..., "context_id": ...}``.
+
+    When ``context_id`` is given it is included in ``params.message.contextId``.
+    When omitted the server generates one and returns it in the response.
 
     Raises ``FleetClientError`` on auth failure, network failure, or unexpected
     response shape. The agent-side ``fleet_send`` tool wraps this in a
-    ``{reply}|{error}`` dict so the agent never sees a raised exception.
+    ``{reply, context_id}|{error}`` dict so the agent never sees a raised exception.
     """
     try:
         entry = get_agent(agent_name)
     except KeyError as exc:
         raise FleetClientError(exc.args[0] if exc.args else "unknown agent") from exc
     url = _peer_jsonrpc_url(entry)
-    payload = _send_message_payload(text)
+    payload = _send_message_payload(text, context_id=context_id)
     headers: Dict[str, str] = {"content-type": "application/json"}
     token = entry.get("token")
     if token:
@@ -123,11 +131,11 @@ async def _amain(argv: list[str]) -> int:
     agent_name = argv[1]
     text = " ".join(argv[2:])
     try:
-        reply = await send_message(agent_name, text)
+        result = await send_message(agent_name, text)
     except FleetClientError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    print(reply)
+    print(result["reply"])
     return 0
 
 
