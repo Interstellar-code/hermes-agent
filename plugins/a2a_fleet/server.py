@@ -193,7 +193,7 @@ def build_app() -> FastAPI:
         if not isinstance(params, dict):
             return _rpc_error(rpc_id, -32602, "Invalid params: expected object")
 
-        if method == "SendMessage":
+        if method in {"SendMessage", "message/send"}:
             text = _extract_text(params)
             context_id = _context_id(params)
             reply = await echo_handler(text, context_id)
@@ -212,6 +212,7 @@ def build_app() -> FastAPI:
 
         known_unimplemented = {
             "SendStreamingMessage",
+            "message/stream",
             "tasks.get",
             "tasks.list",
             "tasks.cancel",
