@@ -347,3 +347,26 @@ class TestEchoLlmRegression:
         assert response.status_code == 200
         body = response.json()
         assert body["result"]["message"]["parts"][0]["text"] == "hello fleet"
+
+
+# ---------------------------------------------------------------------------
+# Reasoning preamble stripping (agent replies must not leak the display block)
+# ---------------------------------------------------------------------------
+
+class TestStripReasoningPreamble:
+    def test_strips_reasoning_block(self) -> None:
+        from a2a_fleet.adapter import _strip_reasoning_preamble
+
+        raw = "💭 **Reasoning:**\n```\nthinking\nmore\n```\n\nFinal answer."
+        assert _strip_reasoning_preamble(raw) == "Final answer."
+
+    def test_noop_when_absent(self) -> None:
+        from a2a_fleet.adapter import _strip_reasoning_preamble
+
+        plain = "Just the answer, no reasoning block."
+        assert _strip_reasoning_preamble(plain) == plain
+
+    def test_empty_string(self) -> None:
+        from a2a_fleet.adapter import _strip_reasoning_preamble
+
+        assert _strip_reasoning_preamble("") == ""

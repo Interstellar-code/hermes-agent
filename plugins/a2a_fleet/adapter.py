@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,22 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+
+# The gateway prepends a human-facing reasoning block to replies when
+# display.show_reasoning is on (gateway/run.py:8906):
+#   "💭 **Reasoning:**\n```\n<reasoning>\n```\n\n<answer>"
+# A2A peers want the final answer only, not the agent's internal trace, so
+# strip a leading reasoning preamble before returning over the wire. No-op
+# when absent (e.g. show_reasoning off).
+_REASONING_PREAMBLE_RE = re.compile(
+    r"^💭 \*\*Reasoning:\*\*\n```\n.*?\n```\n\n",
+    re.DOTALL,
+)
+
+
+def _strip_reasoning_preamble(text: str) -> str:
+    return _REASONING_PREAMBLE_RE.sub("", text, count=1)
+
 
 def _a2a_fleet_adapter_factory(cfg: PlatformConfig) -> "A2AFleetAdapter":
     return A2AFleetAdapter(cfg)
@@ -175,6 +192,6 @@ class A2AFleetAdapter(BasePlatformAdapter):
                 self._gateway_loop,
             )
             result = fut.result(timeout=timeout)
-            return result or ""
+            return _strip_reasoning_preamble(result or "")
         finally:
             lock.release()
