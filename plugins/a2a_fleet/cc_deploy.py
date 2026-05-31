@@ -111,10 +111,14 @@ def canonicalize_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str
 
     Returns ``(canonical_path, None)`` on success, or ``(None, error_message)``.
 
-    Rejects: empty input, non-existent paths, non-directories, and paths whose
-    realpath differs from a plain abspath in their existing components (symlink
-    escape / non-canonical components). The realpath is the pinned cwd written
-    into the receiver config, so it must be the true on-disk location.
+    Resolves symlinks and ``..`` to the TRUE on-disk location (``realpath``) and
+    returns that — which becomes the pinned cwd written into the receiver config.
+    Resolving (rather than rejecting) is what makes this safe: the receiver only
+    ever operates in the real canonical directory, so a symlinked input path
+    (common on macOS: ``/tmp`` -> ``/private/tmp``, ``/Volumes`` mounts) is
+    accepted and pinned to its real target, not treated as an escape.
+
+    Rejects only: empty input, non-existent paths, and non-directories.
     """
     if not repo_path or not str(repo_path).strip():
         return None, "repo_path is empty"
@@ -126,16 +130,7 @@ def canonicalize_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str
         return None, f"repo_path does not exist: {raw}"
     if not os.path.isdir(real):
         return None, f"repo_path is not a directory: {raw}"
-    # Symlink-escape / non-canonical guard: the user-supplied path's lexical
-    # absolute form must resolve to itself. If realpath rewrote it (a symlink
-    # component pointed elsewhere), refuse — we will only write into the TRUE
-    # canonical location and the caller must name it directly.
-    abspath = os.path.abspath(expanded)
-    if os.path.realpath(abspath) != real or abspath != real:
-        return None, (
-            f"repo_path is not canonical (symlink or non-canonical components): "
-            f"{raw} -> {real}"
-        )
+    # ``real`` is the true canonical location; pin everything to it.
     return Path(real), None
 
 

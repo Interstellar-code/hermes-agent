@@ -88,14 +88,17 @@ def test_canonicalize_rejects_non_dir(tmp_path: Path):
     assert "not a directory" in err
 
 
-def test_canonicalize_rejects_symlink_escape(tmp_path: Path):
+def test_canonicalize_resolves_symlink_to_real_target(tmp_path: Path):
+    # A symlinked path (e.g. macOS /tmp -> /private/tmp, /Volumes mounts) is
+    # RESOLVED to its real on-disk target and accepted — not rejected. Security
+    # is preserved because the receiver's cwd is pinned to the real path.
     real = tmp_path / "real_repo"
     real.mkdir()
     link = tmp_path / "link_repo"
     link.symlink_to(real, target_is_directory=True)
     path, err = cc_deploy.canonicalize_repo_path(str(link))
-    assert path is None
-    assert "canonical" in err
+    assert err is None
+    assert path == Path(os.path.realpath(str(real)))
 
 
 def test_canonicalize_accepts_real_dir(tmp_path: Path):
