@@ -140,6 +140,11 @@ def canonicalize_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str
 
     Rejects only: empty input, non-existent paths, and non-directories.
     """
+    # Defensive: weaker tool-calling models sometimes NEST the argument as
+    # {"repo_path": "..."} (or {"path": "..."}) instead of passing the bare
+    # string. Unwrap one level so the tool doesn't dead-end on a model quirk.
+    if isinstance(repo_path, dict):
+        repo_path = repo_path.get("repo_path") or repo_path.get("path") or ""
     if not repo_path or not str(repo_path).strip():
         return None, "repo_path is empty"
     raw = str(repo_path).strip()
