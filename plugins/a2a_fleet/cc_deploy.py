@@ -715,6 +715,26 @@ async def deploy_cc_receiver_handler(
     except OSError as exc:
         warnings.append(f"could not write .hermes/.gitignore: {exc}")
 
+    # 12. Auto-wire the fleet.yaml peer (comment-preserving) so fleet_send can
+    # reach this receiver immediately — no hand-editing, no 401. When a token was
+    # provisioned the peer is written managed/claude_code/repo_path so a gateway
+    # restart re-provisions the SAME token via boot-reconcile. Never fatal: a
+    # config-write hiccup is surfaced as a warning, the receiver is already live.
+    peer_wiring: Optional[Dict[str, Any]] = None
+    try:
+        from . import fleet_yaml_io  # noqa: PLC0415,WPS433 — lazy import is the contract.
+
+        peer_url = f"http://127.0.0.1:{int(bind_port)}"
+        peer_wiring = fleet_yaml_io.upsert_cc_peer(
+            repo_path=str(repo),
+            url=peer_url,
+            token_env=receiver_token_env,  # "" on no_auth -> plain url peer
+        )
+        if isinstance(peer_wiring, dict) and peer_wiring.get("error"):
+            warnings.append(f"fleet.yaml peer not auto-wired: {peer_wiring['error']}")
+    except Exception as exc:  # noqa: BLE001 — never let config-wiring fail the deploy.
+        warnings.append(f"fleet.yaml peer not auto-wired: {exc}")
+
     result: Dict[str, Any] = {
         "deployed": True,
         "repo_path": str(repo),
@@ -724,6 +744,8 @@ async def deploy_cc_receiver_handler(
         "claude_md": claude_md_status,
         "warnings": warnings,
     }
+    if isinstance(peer_wiring, dict) and not peer_wiring.get("error"):
+        result["fleet_peer"] = peer_wiring
     # Surface the provisioned inbound token so Hermes can wire fleet_send to send
     # it (Phase 3). Present only when auth was provisioned.
     if receiver_token is not None:
