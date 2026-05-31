@@ -248,7 +248,7 @@ The answering behavior depends on `response_handler` (echo / llm / agent above).
 
 ---
 
-## v0.3 — Claude Code as a repo-scoped A2A executor (planned / in progress)
+## v0.3 — Claude Code as a repo-scoped A2A executor (shipped)
 
 > **Status: planned.** The pieces below are the v0.3 direction, NOT shipped yet.
 > Treat this section as the roadmap the orchestrator should plan around, not as
@@ -308,6 +308,56 @@ restart backoff, idle cap). Deploy only to repos the user has authorized.
 
 See `skills/deploy-cc-receiver/SKILL.md` for the orchestration procedure and
 `.omc/plans/a2a-fleet-v0.3-plan.md` for the full design.
+
+### How it works (end-to-end flow)
+
+Hermes is the **orchestrator** (its own LLM); Claude Code is the **executor**
+(the full harness of the target repo). They talk over A2A, keyed by `context_id`.
+
+```
+┌──────────────┐   chat    ┌─────────────────────────────────────────────┐
+│   USER        │◄─────────►│        HERMES AGENT  (orchestrator)         │
+│ (Telegram/…)  │           │  its own LLM · inbound A2A node :9219       │
+└──────────────┘           │  tools: deploy_cc_receiver · fleet_send ·   │
+                           │         cc_receiver_status / _stop          │
+                           └──────┬───────────────────────────▲──────────┘
+                       deploy +   │ fleet_send(msg, context_id) │ reply POST
+                       fleet_send │ + Bearer token              │ (same context_id)
+                                  ▼                             │
+                       ┌────────────────────────────────────────────────┐
+                       │  cc_receiver.py  (deployed in <repo>/.hermes/)  │
+                       │  A2A server :93xx · bearer auth · inbox/queue   │
+                       │  per-contextId lock · idle-timeout teardown     │
+                       └──────────────┬─────────────────────────────────┘
+                            spawn     │ cwd=<repo>
+                            claude -p │ --session-id=uuid5(context_id) / --resume
+                                      ▼
+                       ┌────────────────────────────────────────────────┐
+                       │  CLAUDE CODE  (executor) — a `claude -p` turn   │
+                       │  FULL repo harness: skills, MCP, CLAUDE.md      │
+                       │  role injected via .hermes/A2A.md (@import)     │
+                       │  memory: ~/.claude session files per context_id │
+                       └────────────────────────────────────────────────┘
+```
+
+**① Setup** — `deploy_cc_receiver("<repo>")` copies `cc_receiver.py` into
+`<repo>/.hermes/`, writes the executor role to `<repo>/.hermes/A2A.md` and adds
+`@import .hermes/A2A.md` to `<repo>/CLAUDE.md`, provisions a bearer token
+(`.token`, 0600, gitignored), launches the daemon, and health-checks it.
+
+**② Handshake (the initial message)** — Hermes sends one `fleet_send` on a
+reserved `context_id` (`handshake:<repo>`) declaring its role, the bound repo,
+the comm contract (same `context_id` = same session), and the purpose. The
+receiver spawns `claude -p` (cwd=repo); `CLAUDE.md` + `A2A.md` load, so Claude
+**knows it is the executor** and replies with role / cwd / harness inventory /
+ready. Both sides now share a contract before any real work.
+
+**③ Work** — per task, Hermes calls `fleet_send(message, context_id)`; the
+receiver runs `claude -p --resume uuid5(context_id)` in the repo (tools live);
+the reply is POSTed back to Hermes `:9219` with the same `context_id`. Reusing a
+`context_id` continues that Claude session — context accumulates; a new one
+starts a fresh thread. Hermes does **not** auto-loop: it summarizes each reply to
+the user and awaits direction (anti-loop guardrail).
 
 ---
 
