@@ -14,8 +14,8 @@ log = logging.getLogger("a2a_fleet.tools")
 
 
 async def fleet_send_handler(
-    agent: str,
-    message: str,
+    agent: Any = "",
+    message: str = "",
     context_id: str = "",
     **_injected: Any,  # absorb gateway-injected kwargs (e.g. task_id)
 ) -> Dict[str, Any]:
@@ -26,7 +26,24 @@ async def fleet_send_handler(
 
     On any failure returns ``{"error": "..."}`` rather than raising — the calling
     agent can surface the string verbatim in chat without exception handling.
+
+    Dispatch shape: ``registry.dispatch()`` calls ``handler(args, **kwargs)`` —
+    the WHOLE args dict lands in the first positional (``agent``) and ``task_id``
+    is injected as a kwarg. Unwrap that dict here (mirrors the cc handlers'
+    ``canonicalize_repo_path`` unwrap) so the tool works on the live gateway path,
+    while still tolerating direct kwarg-style calls (tests / internal callers).
     """
+    if isinstance(agent, dict):
+        _params = agent
+        agent = _params.get("agent", "") or ""
+        message = _params.get("message", "") or message
+        context_id = _params.get("context_id", "") or context_id
+
+    if not isinstance(agent, str) or not isinstance(message, str):
+        return {"error": "fleet_send requires 'agent' and 'message' to be strings"}
+    if not agent or not message:
+        return {"error": "fleet_send requires both 'agent' and 'message'"}
+
     try:
         result = await send_message(
             agent,

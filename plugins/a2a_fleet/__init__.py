@@ -132,6 +132,18 @@ def register(ctx) -> None:
     """
     from . import fleet_config  # noqa: WPS433 — lazy.
     from . import fleet_tools  # noqa: WPS433 — lazy.
+    from . import fleet_yaml_io  # noqa: WPS433 — lazy.
+
+    # First-enable scaffold: on a fresh profile there is no fleet.yaml, so
+    # load_fleet() below would raise FleetConfigError and the plugin would go
+    # silently idle. Write a commented example (enabled, response_handler: agent,
+    # server block, empty peers) if absent so the node actually comes up with
+    # documented, editable config instead of a dead log line. Idempotent + never
+    # raises (a read-only home just leaves it absent and we fall through to idle).
+    try:
+        fleet_yaml_io.ensure_example_fleet_yaml()
+    except Exception:  # noqa: BLE001 — scaffolding must never break plugin load.
+        logger.debug("a2a_fleet: example fleet.yaml scaffold failed", exc_info=True)
 
     try:
         cfg = fleet_config.load_fleet()

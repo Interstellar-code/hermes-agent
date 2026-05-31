@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.2.x` · v0.3 in progress
+Version: `0.4.x` · v0.3 executor + v0.4 config bootstrap shipped
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -180,6 +180,27 @@ fleet:
 - Tokens are never stored in `fleet.yaml`. Each `token_env` names an environment
   variable holding the actual pre-shared bearer token. Convention:
   `<PEER>_A2A_TOKEN`.
+
+### Config bootstrap (v0.4 — shipped)
+
+You no longer hand-write `fleet.yaml` from scratch, and you no longer hand-wire a
+deployed receiver's peer entry:
+
+- **First-enable scaffold.** When a profile enables the plugin and no `fleet.yaml`
+  exists, `register()` writes a commented example (`enabled: true`,
+  `response_handler: agent`, a `server` block, and an empty `agents: {}`) to
+  `$HERMES_HOME/fleet.yaml`. The node comes up immediately instead of going
+  silently idle. The write is idempotent and never clobbers an existing file.
+- **Auto-wired peer.** `deploy_cc_receiver` upserts the receiver's peer into
+  `fleet.yaml` **surgically** (ruamel round-trip — your comments and formatting are
+  preserved). With auth it writes a **managed `claude_code`** peer
+  (`url` + `token_env` + `managed: true` + `mode: claude_code` + `repo_path`), so
+  `fleet_send` resolves the bearer automatically (no more 401) and boot-reconcile
+  re-provisions the same token across a gateway restart. A `no_auth` deploy gets a
+  plain `url` peer. A second repo reusing the default `claude-code` name gets a
+  distinct `claude-code-<repo>` peer name. The upsert result is returned under
+  `fleet_peer`; a config-write hiccup is a non-fatal warning (the receiver is
+  already healthy).
 
 ### Auth behavior
 
