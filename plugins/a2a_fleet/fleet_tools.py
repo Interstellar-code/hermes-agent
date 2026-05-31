@@ -17,6 +17,7 @@ async def fleet_send_handler(
     agent: str,
     message: str,
     context_id: str = "",
+    **_injected: Any,  # absorb gateway-injected kwargs (e.g. task_id)
 ) -> Dict[str, Any]:
     """Send ``message`` to the named fleet peer and return ``{"reply": ..., "context_id": ...}``.
 

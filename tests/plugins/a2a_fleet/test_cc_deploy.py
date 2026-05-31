@@ -977,3 +977,20 @@ def test_reconcile_in_thread_singleton(monkeypatch: pytest.MonkeyPatch):
     if t is not None:
         t.join(timeout=2.0)
     assert spawned["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Gateway dispatch injects task_id via **kwargs — handlers must absorb it
+# ---------------------------------------------------------------------------
+
+def test_handlers_absorb_injected_task_id(tmp_path: Path):
+    """registry.dispatch() calls handler(args, task_id=...). The cc handlers
+    must tolerate the injected task_id (and any future injected kwargs) rather
+    than raising TypeError before their own logic runs."""
+    repo = _make_repo(tmp_path)
+    # status/stop are side-effect-light (no live process) — they must not raise
+    # TypeError on the injected kwarg; they return a normal result dict.
+    res_status = _run(cc_deploy.cc_receiver_status_handler(str(repo), task_id="t-1"))
+    assert isinstance(res_status, dict) and "running" in res_status
+    res_stop = _run(cc_deploy.cc_receiver_stop_handler(str(repo), task_id="t-1"))
+    assert isinstance(res_stop, dict)

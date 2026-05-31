@@ -547,6 +547,7 @@ async def deploy_cc_receiver_handler(
     model: Optional[str] = None,
     no_auth: bool = False,
     hermes_auth_token_env: str = "",
+    **_injected: Any,  # absorb gateway-injected kwargs (e.g. task_id)
 ) -> Dict[str, Any]:
     """Deploy + launch a Claude Code A2A receiver in ``repo_path``.
 
@@ -717,7 +718,7 @@ async def deploy_cc_receiver_handler(
     return result
 
 
-async def cc_receiver_status_handler(repo_path: str) -> Dict[str, Any]:
+async def cc_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
     """Report receiver liveness: PID-alive AND ``/health`` (both required).
 
     Never raises; returns ``{"error": ...}`` for an invalid repo_path.
@@ -753,7 +754,7 @@ async def cc_receiver_status_handler(repo_path: str) -> Dict[str, Any]:
     }
 
 
-async def cc_receiver_stop_handler(repo_path: str) -> Dict[str, Any]:
+async def cc_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
     """Stop the receiver via its PID file (SIGTERM, SIGKILL fallback), remove pidfile.
 
     Never raises; returns ``{"error": ...}`` for an invalid repo_path.
