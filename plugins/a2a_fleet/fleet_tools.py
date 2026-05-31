@@ -39,6 +39,8 @@ async def fleet_send_handler(
         message = _params.get("message", "") or message
         context_id = _params.get("context_id", "") or context_id
 
+    if not isinstance(agent, str) or not isinstance(message, str):
+        return {"error": "fleet_send requires 'agent' and 'message' to be strings"}
     if not agent or not message:
         return {"error": "fleet_send requires both 'agent' and 'message'"}
 

@@ -105,3 +105,19 @@ def test_missing_agent_returns_error_dict(monkeypatch):
 
     assert "error" in res
     assert captured == {}
+
+
+def test_non_str_agent_returns_error_dict(monkeypatch):
+    """A doubly-wrapped / malformed agent value must not reach send_message as a
+    non-string and blow up downstream — caught with a clean error dict."""
+    captured: Dict[str, Any] = {}
+    _patch_send(monkeypatch, captured)
+
+    res = _run(
+        fleet_tools.fleet_send_handler(
+            {"agent": {"nested": "bad"}, "message": "hi"}, task_id="t-1"
+        )
+    )
+
+    assert "error" in res and "string" in res["error"]
+    assert captured == {}

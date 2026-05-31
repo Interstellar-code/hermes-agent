@@ -99,10 +99,29 @@ fleet:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically (temp in same dir + os.replace)."""
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)  # atomic on POSIX
+    """Write ``text`` to ``path`` atomically (unique temp in same dir + os.replace).
+
+    A UNIQUE temp name (mkstemp) avoids two near-simultaneous writers colliding on
+    a shared ``fleet.yaml.tmp``. Note: this makes the *write* atomic, but the
+    read-modify-write of upsert_cc_peer is NOT locked — concurrent deploys against
+    the same profile's fleet.yaml are not safe (last writer wins). Hermes serializes
+    deploys, so this is acceptable; revisit with an flock if that changes.
+    """
+    import tempfile  # noqa: PLC0415 — stdlib, lazy keeps import surface small.
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)  # atomic on POSIX
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def ensure_example_fleet_yaml(profile: str | None = None) -> Tuple[Path, bool]:
@@ -227,10 +246,12 @@ def upsert_cc_peer(
         peer["mode"] = "claude_code"
         peer["repo_path"] = canon
     else:
-        # no_auth deploy: plain url peer; strip any stale managed markers.
-        for k in ("token_env", "managed", "mode"):
+        # no_auth deploy: plain url peer; strip ALL managed markers including
+        # repo_path. load_fleet only reads repo_path for a managed claude_code peer
+        # (the token_env invariant + boot-reconcile); on a non-managed peer it is
+        # dead weight and would couple correctness to load_fleet's guard order.
+        for k in ("token_env", "managed", "mode", "repo_path"):
             peer.pop(k, None)
-        peer["repo_path"] = canon
     peer["description"] = description or f"Claude Code executor receiver (repo: {canon})"
 
     agents[chosen] = peer

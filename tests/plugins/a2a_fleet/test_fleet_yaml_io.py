@@ -134,6 +134,21 @@ def test_upsert_no_auth_writes_plain_peer(home: Path, tmp_path: Path):
     assert peer["url"] == "http://127.0.0.1:9300"
     assert peer["managed"] is False
     assert peer["token_env"] is None
+    assert peer["repo_path"] is None  # no_auth peer carries no managed markers
+
+
+def test_upsert_idempotent_across_disk_reload(home: Path, tmp_path: Path):
+    """Each upsert re-reads fleet.yaml from disk; a re-upsert of identical managed
+    data must report 'unchanged' (ruamel round-trip types compare equal to the
+    freshly-assigned plain values) so the file mtime/comments don't churn."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    token_env = _stable_env(repo)
+    fyio.upsert_cc_peer(repo_path=str(repo), url="http://127.0.0.1:9300", token_env=token_env)
+    body_after_first = (home / "fleet.yaml").read_text()
+    res2 = fyio.upsert_cc_peer(repo_path=str(repo), url="http://127.0.0.1:9300", token_env=token_env)
+    assert res2["action"] == "unchanged"
+    assert (home / "fleet.yaml").read_text() == body_after_first  # byte-identical
 
 
 def test_upsert_distinct_name_for_second_repo(home: Path, tmp_path: Path):
