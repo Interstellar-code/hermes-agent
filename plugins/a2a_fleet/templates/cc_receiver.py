@@ -45,6 +45,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -56,8 +57,30 @@ from typing import Any, Dict, List, Optional, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "a2a_receiver.json"
 INBOX_PATH = SCRIPT_DIR / "a2a-inbox.jsonl"
+INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-inbox.offset"
 TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-transcript.jsonl"
 PID_PATH = SCRIPT_DIR / "cc_receiver.pid"
+
+# Cap on a single inbound JSON-RPC body (DoS guard) and the prompt we hand to
+# claude. 1 MiB body is generous for text tasks; oversized bodies are rejected
+# with HTTP 413 before allocation.
+MAX_BODY_BYTES = 1 * 1024 * 1024
+MAX_PROMPT_CHARS = 256 * 1024
+# Cap claude stdout we buffer in memory (defensive — runaway tool output).
+MAX_STDOUT_BYTES = 8 * 1024 * 1024
+
+# A signal in a result frame / stderr that a session genuinely does not exist
+# (the ONLY condition under which we retry the other session mode — see
+# ``run_claude_turn``). Kept narrow on purpose: this receiver runs autonomously
+# with ``--permission-mode bypassPermissions``, so a spurious retry can
+# double-execute a side-effecting turn.
+SESSION_NOT_FOUND_SIGNALS = (
+    "no conversation found",
+    "session not found",
+    "no session found",
+    "could not find session",
+    "no such session",
+)
 
 # uuid5 namespace for deterministic session ids derived from contextId.
 SESSION_NAMESPACE = uuid.NAMESPACE_URL
@@ -80,6 +103,9 @@ DEFAULTS: Dict[str, Any] = {
     "poll_interval_s": 2.0,
     "claude_timeout_s": 300,
     "context_lock_wait_s": 600.0,  # how long a queued same-context turn waits for the lock
+    "max_concurrent_turns": 3,     # global cap on simultaneous claude subprocesses
+    "max_tracked_contexts": 1024,  # bound on the per-context lock + seen registries
+    "idle_timeout_s": 1800,        # self-teardown after this many idle seconds (0 = disabled)
 }
 
 log = logging.getLogger("cc_receiver")
@@ -287,16 +313,23 @@ def _assistant_text(frame: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 class ContextLocks:
-    """Hand out one ``threading.Lock`` per contextId.
+    """Hand out one ``threading.Lock`` per contextId, with bounded eviction.
 
     Same contextId -> same lock (so its turns serialize). Different contextIds
     -> different locks (so they run concurrently). A registry mutex guards lock
-    creation only; it is never held while a turn runs.
+    creation / eviction only; it is NEVER held while a turn runs.
+
+    The registry is bounded to ``max_entries`` via LRU eviction. A lock is only
+    evicted if it is NOT currently held (``lock.locked()`` is False) — evicting a
+    held lock would let a concurrent same-context turn create a fresh lock and
+    race ``--resume`` on the same session. If every candidate is held we exceed
+    the bound temporarily rather than corrupt serialization.
     """
 
-    def __init__(self) -> None:
-        self._registry: Dict[str, threading.Lock] = {}
+    def __init__(self, max_entries: int = 1024) -> None:
+        self._registry: "OrderedDict[str, threading.Lock]" = OrderedDict()
         self._mutex = threading.Lock()
+        self._max_entries = max(1, int(max_entries))
 
     def get(self, context_id: str) -> threading.Lock:
         with self._mutex:
@@ -304,26 +337,81 @@ class ContextLocks:
             if lock is None:
                 lock = threading.Lock()
                 self._registry[context_id] = lock
+            self._registry.move_to_end(context_id)  # mark most-recently-used
+            self._evict_locked()
             return lock
+
+    def _evict_locked(self) -> None:
+        """Evict least-recently-used UNHELD locks until within the bound.
+
+        Caller must hold ``self._mutex``. Held locks are skipped (never evicted),
+        so the registry may briefly exceed ``max_entries`` if all overflow
+        candidates are actively running.
+        """
+        if len(self._registry) <= self._max_entries:
+            return
+        overflow = len(self._registry) - self._max_entries
+        evicted = 0
+        # Iterate oldest-first; skip held locks.
+        for cid in list(self._registry.keys()):
+            if evicted >= overflow:
+                break
+            lk = self._registry[cid]
+            if lk.locked():
+                continue
+            del self._registry[cid]
+            evicted += 1
+
+    def size(self) -> int:
+        with self._mutex:
+            return len(self._registry)
 
 
 # ---------------------------------------------------------------------------
 # Turn execution
 # ---------------------------------------------------------------------------
 
-# Tracks which contextIds already started a session (so we know resume vs first).
-_seen_contexts: set[str] = set()
-_seen_mutex = threading.Lock()
+class SeenContexts:
+    """Bounded set of contextIds that already started a claude session.
+
+    Used to pick ``--resume`` vs ``--session-id`` (first turn). Bounded via LRU
+    so it cannot grow without limit on a long-lived receiver. Eviction here is
+    safe regardless of held state: a wrongly-evicted context simply gets treated
+    as a first turn, which the narrowed session-retry (see ``run_claude_turn``)
+    corrects on a genuine not-found signal.
+    """
+
+    def __init__(self, max_entries: int = 1024) -> None:
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
+        self._mutex = threading.Lock()
+        self._max_entries = max(1, int(max_entries))
+
+    def has(self, context_id: str) -> bool:
+        with self._mutex:
+            if context_id in self._seen:
+                self._seen.move_to_end(context_id)
+                return True
+            return False
+
+    def mark(self, context_id: str) -> None:
+        with self._mutex:
+            self._seen[context_id] = None
+            self._seen.move_to_end(context_id)
+            while len(self._seen) > self._max_entries:
+                self._seen.popitem(last=False)
+
+    def size(self) -> int:
+        with self._mutex:
+            return len(self._seen)
 
 
-def _has_seen(context_id: str) -> bool:
-    with _seen_mutex:
-        return context_id in _seen_contexts
+# The runner contract is ``(cmd, cwd, timeout) -> (stdout, rc, stderr)``.
+# (stderr is appended in v0.3 so the poll loop can surface a snippet on failure;
+#  legacy 2-tuple runners are still accepted for backward compatibility.)
 
 
-def _mark_seen(context_id: str) -> None:
-    with _seen_mutex:
-        _seen_contexts.add(context_id)
+class ClaudeCLINotFound(Exception):
+    """Raised by the runner when the ``claude`` binary is not on PATH."""
 
 
 def run_claude_turn(
@@ -332,25 +420,31 @@ def run_claude_turn(
     cfg: Dict[str, Any],
     *,
     runner: Any = None,
+    seen: Optional["SeenContexts"] = None,
 ) -> Optional[str]:
-    """Run one claude turn for ``context_id`` with self-correcting session mode.
+    """Run one claude turn for ``context_id`` with narrowed session retry.
 
     ``runner`` is an injectable callable ``(cmd, cwd, timeout) -> (stdout, rc)``
-    used by tests to stub the subprocess. Defaults to the real subprocess call.
+    or ``(stdout, rc, stderr)`` used by tests to stub the subprocess. Defaults to
+    the real subprocess call.
 
-    Session strategy: try resume-vs-first based on whether we've seen this
-    context; on a session error, retry the other mode once (self-correcting —
-    handles stale state / restarts where ``_seen_contexts`` was reset).
+    Session strategy: pick resume-vs-first from ``seen``. We retry the OTHER mode
+    once ONLY on a genuine session-not-found signal (result frame / stderr match
+    against ``SESSION_NOT_FOUND_SIGNALS``). A bare ``rc != 0`` does NOT trigger a
+    retry: this receiver runs ``--permission-mode bypassPermissions`` and a
+    spurious second turn could double-execute a side-effecting action.
     """
     if runner is None:
         runner = _subprocess_runner
+    if seen is None:
+        seen = SeenContexts()
 
     repo_path = Path(cfg["repo_path"])
     session_uuid = session_id_for_context(context_id)
     mcp_config = resolve_mcp_config(repo_path)
     timeout = float(cfg.get("claude_timeout_s") or DEFAULTS["claude_timeout_s"])
 
-    first_resume = _has_seen(context_id)
+    first_resume = seen.has(context_id)
     attempts = [first_resume, not first_resume]
     last_reply: Optional[str] = None
 
@@ -359,49 +453,137 @@ def run_claude_turn(
             prompt, session_uuid, cfg, resume=resume, mcp_config_path=mcp_config
         )
         try:
-            stdout, rc = runner(cmd, str(repo_path), timeout)
+            stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
         except subprocess.TimeoutExpired:
             return f"[error] claude turn timed out after {timeout}s"
+        except (FileNotFoundError, ClaudeCLINotFound):
+            # Fatal + distinct: do NOT make this look transient/retryable.
+            return "[error] claude CLI not found on PATH"
         except Exception as exc:  # noqa: BLE001 - never crash the poll loop
             log.warning("claude invocation failed (%s)", exc)
             return f"[error] claude invocation failed: {exc}"
 
         reply = parse_claude_output(stdout)
-        last_reply = reply
-        if _is_session_error(reply, rc) and resume != attempts[-1]:
-            log.info("session mode %s failed for ctx=%s; retrying other mode",
+        # Only retry on a TRUE session-not-found signal, and only once.
+        if (
+            resume != attempts[-1]
+            and _is_session_not_found(reply, stderr)
+        ):
+            log.info("session mode %s reported not-found for ctx=%s; retrying other mode",
                      "resume" if resume else "first", context_id)
             continue
-        _mark_seen(context_id)
+
+        if reply is None and rc != 0:
+            # No parseable frames + non-zero rc: surface a stderr snippet so the
+            # failure is diagnosable rather than a generic "[no reply produced]".
+            snippet = (stderr or "").strip().replace("\n", " ")[:300]
+            reply = (
+                f"[error] claude exited rc={rc} with no parseable output"
+                + (f": {snippet}" if snippet else "")
+            )
+        last_reply = reply
+        seen.mark(context_id)
         return reply
 
-    _mark_seen(context_id)
+    seen.mark(context_id)
     return last_reply
 
 
-def _is_session_error(reply: Optional[str], rc: int) -> bool:
-    """Heuristic: did the turn fail in a way a session-mode flip might fix?"""
-    if rc == 0:
-        return False
-    if reply is None:
-        return True
-    low = reply.lower()
-    return "session" in low and ("not found" in low or "exist" in low or "resume" in low)
+def _call_runner(runner: Any, cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
+    """Invoke a runner that may return a 2-tuple (legacy) or 3-tuple (with stderr)."""
+    result = runner(cmd, cwd, timeout)
+    if isinstance(result, tuple) and len(result) == 3:
+        stdout, rc, stderr = result
+        return stdout, rc, (stderr or "")
+    stdout, rc = result  # type: ignore[misc]
+    return stdout, rc, ""
 
 
-def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int]:
-    """Real subprocess invocation of ``claude -p``. Returns (stdout, returncode)."""
-    proc = subprocess.run(
-        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
-    )
-    if proc.returncode != 0 and proc.stderr:
-        log.warning("claude stderr: %s", proc.stderr.strip()[:500])
-    return proc.stdout, proc.returncode
+def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
+    """True only on a genuine session-not-found signal (reply text or stderr).
+
+    Deliberately narrow: we do NOT treat a bare non-zero rc or a None reply as a
+    session error, because retrying the other mode would re-run the turn.
+    """
+    haystacks: List[str] = []
+    if reply:
+        haystacks.append(reply.lower())
+    if stderr:
+        haystacks.append(stderr.lower())
+    for hay in haystacks:
+        for sig in SESSION_NOT_FOUND_SIGNALS:
+            if sig in hay:
+                return True
+    return False
+
+
+def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
+    """Real subprocess invocation of ``claude -p``.
+
+    Uses ``Popen`` + ``start_new_session=True`` so the whole process tree (claude
+    plus any MCP servers / tool subprocesses) lands in its own process group; on
+    timeout we ``killpg`` the group to reap orphans. Returns (stdout, rc, stderr).
+    Buffers are capped (``MAX_STDOUT_BYTES``) defensively.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise ClaudeCLINotFound("claude") from None
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _killpg(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    rc = proc.returncode
+    if stdout and len(stdout) > MAX_STDOUT_BYTES:
+        stdout = stdout[:MAX_STDOUT_BYTES]
+    if rc != 0 and stderr:
+        log.warning("claude stderr: %s", stderr.strip()[:500])
+    return stdout or "", rc, stderr or ""
+
+
+def _killpg(proc: "subprocess.Popen[Any]") -> None:
+    """SIGKILL the whole process group of ``proc`` (best-effort)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        log.warning("killpg failed for pid=%s (%s); falling back to kill", proc.pid, exc)
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Transcript + reply
 # ---------------------------------------------------------------------------
+
+# One lock per append-only file. ThreadingHTTPServer + many turn threads append
+# concurrently; without serialization interleaved writes tear JSONL lines and a
+# [queued]-ACKed message can be silently lost. These guard the WHOLE append.
+_TRANSCRIPT_LOCK = threading.Lock()
+_INBOX_LOCK = threading.Lock()
+
+
+def _append_jsonl(path: Path, rec: Dict[str, Any], lock: threading.Lock) -> None:
+    """Append one JSON record + newline atomically wrt other threads on ``lock``."""
+    line = json.dumps(rec) + "\n"
+    with lock:
+        with path.open("a") as f:
+            f.write(line)
+            f.flush()
+
 
 def _transcript(direction: str, frm: str, to: str, context_id: str, text: str) -> None:
     rec = {
@@ -413,8 +595,7 @@ def _transcript(direction: str, frm: str, to: str, context_id: str, text: str) -
         "text": text,
     }
     try:
-        with TRANSCRIPT_PATH.open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+        _append_jsonl(TRANSCRIPT_PATH, rec, _TRANSCRIPT_LOCK)
     except OSError as exc:
         log.warning("transcript write failed (%s)", exc)
 
@@ -455,49 +636,127 @@ def post_reply(hermes_url: str, context_id: str, text: str) -> bool:
 # Inbox processing
 # ---------------------------------------------------------------------------
 
+def _read_offset(path: Path) -> int:
+    """Read a persisted processed-line offset. Missing/garbage -> 0."""
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return 0
+    try:
+        val = int(raw)
+    except ValueError:
+        return 0
+    return val if val >= 0 else 0
+
+
+def _write_offset(path: Path, offset: int) -> None:
+    """Persist the processed-line offset atomically (write tmp + os.replace)."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(str(offset))
+        os.replace(tmp, path)  # atomic on POSIX
+    except OSError as exc:
+        log.warning("offset persist failed (%s)", exc)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class Receiver:
     """Owns the inbox poll loop + per-context serialization + reply dispatch."""
 
-    def __init__(self, cfg: Dict[str, Any], runner: Any = None) -> None:
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        runner: Any = None,
+        *,
+        inbox_path: Path = INBOX_PATH,
+        offset_path: Path = INBOX_OFFSET_PATH,
+        on_idle_shutdown: Optional[Any] = None,
+    ) -> None:
         self.cfg = cfg
         self.runner = runner
-        self.locks = ContextLocks()
-        self._processed = 0  # number of inbox lines already consumed
+        max_ctx = int(cfg.get("max_tracked_contexts") or DEFAULTS["max_tracked_contexts"])
+        self.locks = ContextLocks(max_entries=max_ctx)
+        self.seen = SeenContexts(max_entries=max_ctx)
+        self.inbox_path = inbox_path
+        self.offset_path = offset_path
+        # Persisted offset => skip the historical backlog on restart (at-most-once).
+        self._processed = _read_offset(offset_path)
+        self._offset_lock = threading.Lock()
         self._stop = threading.Event()
+        # Global cap on concurrent claude subprocesses (per-context lock still
+        # serializes same-context turns; this bounds the cross-context fan-out).
+        max_turns = int(cfg.get("max_concurrent_turns") or DEFAULTS["max_concurrent_turns"])
+        self._turn_slots = threading.BoundedSemaphore(max(1, max_turns))
+        # Idle-timeout self-teardown bookkeeping.
+        self._last_msg_ts = time.monotonic()
+        self._on_idle_shutdown = on_idle_shutdown
+
+    # -- inbox offset -------------------------------------------------------
+
+    def _advance_offset(self, new_offset: int) -> None:
+        with self._offset_lock:
+            if new_offset <= self._processed:
+                return
+            self._processed = new_offset
+            _write_offset(self.offset_path, new_offset)
+
+    def note_inbound(self) -> None:
+        """Record that an inbound message arrived (resets the idle clock)."""
+        self._last_msg_ts = time.monotonic()
+
+    # -- turn processing ----------------------------------------------------
 
     def process_message(self, context_id: str, text: str) -> Optional[str]:
-        """Serialize per contextId, run the turn, POST the reply. Returns reply."""
-        lock = self.locks.get(context_id)
+        """Bounded-concurrency + per-context serialization, run turn, POST reply."""
+        # Global concurrency cap: bounded wait, then reply [busy] (never block
+        # the poll-spawned thread forever).
         wait = float(self.cfg.get("context_lock_wait_s") or DEFAULTS["context_lock_wait_s"])
-        acquired = lock.acquire(timeout=wait)
-        if not acquired:
-            busy = "[busy] this context is processing another turn; retry shortly"
-            log.warning("ctx=%s busy; lock wait %.0fs exceeded", context_id, wait)
+        if not self._turn_slots.acquire(timeout=wait):
+            busy = "[busy] max concurrent turns reached, retry"
+            log.warning("ctx=%s busy; concurrency cap reached", context_id)
             _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
             post_reply(self.cfg["hermes_url"], context_id, busy)
             return busy
         try:
-            reply = run_claude_turn(text, context_id, self.cfg, runner=self.runner)
-            out = reply if reply is not None else "[no reply produced by claude]"
-            _transcript("claude->hermes", "claude-code", "hermes", context_id, out)
-            post_reply(self.cfg["hermes_url"], context_id, out)
-            return reply
+            lock = self.locks.get(context_id)
+            acquired = lock.acquire(timeout=wait)
+            if not acquired:
+                busy = "[busy] this context is processing another turn; retry shortly"
+                log.warning("ctx=%s busy; lock wait %.0fs exceeded", context_id, wait)
+                _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
+                post_reply(self.cfg["hermes_url"], context_id, busy)
+                return busy
+            try:
+                reply = run_claude_turn(
+                    text, context_id, self.cfg, runner=self.runner, seen=self.seen
+                )
+                out = reply if reply is not None else "[no reply produced by claude]"
+                _transcript("claude->hermes", "claude-code", "hermes", context_id, out)
+                post_reply(self.cfg["hermes_url"], context_id, out)
+                return reply
+            finally:
+                lock.release()
         finally:
-            lock.release()
+            self._turn_slots.release()
 
     def poll_once(self) -> None:
         """Drain new inbox lines, dispatching each on its own thread (per-context
         locking inside ``process_message`` serializes same-context turns)."""
-        if not INBOX_PATH.exists():
+        if not self.inbox_path.exists():
             return
         try:
-            lines = INBOX_PATH.read_text().splitlines()
+            lines = self.inbox_path.read_text().splitlines()
         except OSError as exc:
             log.warning("inbox read failed (%s)", exc)
             return
         for idx in range(self._processed, len(lines)):
             line = lines[idx].strip()
-            self._processed = idx + 1
+            # Persist the offset for EVERY consumed line (blank/malformed too) so
+            # a restart never reprocesses it (at-most-once).
+            self._advance_offset(idx + 1)
             if not line:
                 continue
             try:
@@ -506,8 +765,11 @@ class Receiver:
                 continue
             if entry.get("from") != "hermes":
                 continue
-            context_id = entry.get("contextId") or "ctx-anon"
+            # Missing contextId -> mint a fresh uuid4 (no shared anon sentinel,
+            # so unrelated anonymous tasks don't cross-talk on one session/lock).
+            context_id = entry.get("contextId") or f"anon-{uuid.uuid4()}"
             text = entry.get("text", "")
+            self.note_inbound()
             threading.Thread(
                 target=self.process_message,
                 args=(context_id, text),
@@ -521,6 +783,40 @@ class Receiver:
         while not self._stop.is_set():
             self.poll_once()
             self._stop.wait(interval)
+
+    # -- idle-timeout self-teardown ----------------------------------------
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self._last_msg_ts
+
+    def idle_monitor_once(self) -> bool:
+        """Return True (and trigger teardown) if idle past the configured limit."""
+        idle_to = float(self.cfg.get("idle_timeout_s") or 0)
+        if idle_to <= 0:
+            return False
+        if self.idle_seconds() >= idle_to:
+            log.info("idle for %.0fs (>= idle_timeout_s=%.0f); self-teardown",
+                     self.idle_seconds(), idle_to)
+            self.stop()
+            if self._on_idle_shutdown is not None:
+                try:
+                    self._on_idle_shutdown()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("idle shutdown hook failed (%s)", exc)
+            return True
+        return False
+
+    def idle_monitor_loop(self) -> None:
+        idle_to = float(self.cfg.get("idle_timeout_s") or 0)
+        if idle_to <= 0:
+            return
+        # Check on a fraction of the timeout so teardown is reasonably prompt.
+        tick = max(1.0, min(idle_to / 4.0, 60.0))
+        log.info("idle monitor started (idle_timeout_s=%.0f, tick=%.0fs)", idle_to, tick)
+        while not self._stop.is_set():
+            if self.idle_monitor_once():
+                return
+            self._stop.wait(tick)
 
     def stop(self) -> None:
         self._stop.set()
@@ -560,8 +856,16 @@ def _agent_card(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def make_handler(cfg: Dict[str, Any], expected_token: Optional[str]) -> type:
-    """Build a BaseHTTPRequestHandler subclass closed over config + token."""
+def make_handler(
+    cfg: Dict[str, Any],
+    expected_token: Optional[str],
+    receiver: Optional["Receiver"] = None,
+) -> type:
+    """Build a BaseHTTPRequestHandler subclass closed over config + token.
+
+    ``receiver`` (when supplied) is notified of inbound messages so the idle
+    monitor's clock resets on real traffic.
+    """
 
     def extract_text(params: Dict[str, Any]) -> str:
         message = params.get("message") or {}
@@ -592,7 +896,13 @@ def make_handler(cfg: Dict[str, Any], expected_token: Optional[str]) -> type:
             if not header.lower().startswith("bearer "):
                 self._json(401, {"error": "missing bearer token"})
                 return False
-            presented = header.split(None, 1)[1].strip()
+            # "bearer " prefix matched, but the token may be missing/whitespace:
+            # split can yield a single element -> guard against IndexError (500).
+            parts = header.split(None, 1)
+            if len(parts) < 2 or not parts[1].strip():
+                self._json(401, {"error": "missing bearer token"})
+                return False
+            presented = parts[1].strip()
             if not hmac.compare_digest(presented.encode(), expected_token.encode()):
                 self._json(401, {"error": "invalid bearer token"})
                 return False
@@ -616,7 +926,26 @@ def make_handler(cfg: Dict[str, Any], expected_token: Optional[str]) -> type:
                 return
             if not self._check_auth():
                 return
-            length = int(self.headers.get("Content-Length", 0) or 0)
+            # Parse Content-Length defensively: malformed -> -32600, oversized ->
+            # HTTP 413 BEFORE allocating the read buffer (DoS guard).
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except (TypeError, ValueError):
+                self._json(200, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32600, "message": "invalid Content-Length"}})
+                return
+            if length < 0:
+                self._json(200, {"jsonrpc": "2.0", "id": None,
+                                 "error": {"code": -32600, "message": "invalid Content-Length"}})
+                return
+            if length > MAX_BODY_BYTES:
+                body = json.dumps({"error": "request entity too large"}).encode()
+                self.send_response(413)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             try:
                 body = json.loads(self.rfile.read(length).decode())
             except (json.JSONDecodeError, ValueError):
@@ -635,21 +964,27 @@ def make_handler(cfg: Dict[str, Any], expected_token: Optional[str]) -> type:
                                  "error": {"code": -32601, "message": f"method not found: {method!r}"}})
                 return
             text = extract_text(params)
+            # Clamp prompt size before it can reach claude.
+            if len(text) > MAX_PROMPT_CHARS:
+                text = text[:MAX_PROMPT_CHARS]
             message = params.get("message") or {}
-            context_id = message.get("contextId") or "ctx-anon"
-            # Queue to inbox; the poll loop processes asynchronously.
+            # Missing contextId -> fresh uuid4 (no shared anon sentinel).
+            context_id = message.get("contextId") or f"anon-{uuid.uuid4()}"
+            # Queue to inbox; the poll loop processes asynchronously. The append
+            # is serialized via _INBOX_LOCK so concurrent POSTs can't tear lines.
             try:
-                with INBOX_PATH.open("a") as f:
-                    f.write(json.dumps({
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "from": "hermes",
-                        "contextId": context_id,
-                        "text": text,
-                    }) + "\n")
+                _append_jsonl(INBOX_PATH, {
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "from": "hermes",
+                    "contextId": context_id,
+                    "text": text,
+                }, _INBOX_LOCK)
             except OSError as exc:
                 self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
                                  "error": {"code": -32000, "message": f"inbox write failed: {exc}"}})
                 return
+            if receiver is not None:
+                receiver.note_inbound()
             _transcript("hermes->claude", "hermes", "claude-code", context_id, text)
             ack = "Message received; executing in repo via Claude Code. Reply will follow. [queued]"
             _transcript("claude->hermes (ack)", "claude-code", "hermes", context_id, ack)
@@ -687,6 +1022,33 @@ def log_harness_inventory(repo_path: Path) -> Dict[str, bool]:
 # PID file
 # ---------------------------------------------------------------------------
 
+def is_loopback_bind(host: str) -> bool:
+    """True if ``host`` is a loopback address (auth may be optional there)."""
+    return str(host).strip().lower() in {"127.0.0.1", "::1", "localhost", ""}
+
+
+def probe_claude_cli() -> bool:
+    """Best-effort ``claude --version`` probe; loud warning if missing. Non-fatal."""
+    try:
+        proc = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            log.info("claude CLI present: %s", (proc.stdout or "").strip()[:120])
+            return True
+        log.warning("claude --version exited rc=%s: %s", proc.returncode,
+                    (proc.stderr or "").strip()[:200])
+        return False
+    except FileNotFoundError:
+        log.warning("claude CLI NOT FOUND on PATH — turns will fail fatally "
+                    "with '[error] claude CLI not found on PATH'")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        log.warning("claude --version probe failed (%s)", exc)
+        return False
+
+
 def write_pid_file(path: Path = PID_PATH) -> None:
     try:
         path.write_text(str(os.getpid()))
@@ -713,11 +1075,23 @@ def main() -> int:
     cfg = load_config()
     repo_path = Path(cfg["repo_path"])
 
+    expected_token = resolve_auth_token(cfg)
+    bind_host = cfg.get("bind_host", "")
+
+    # Fail-closed: a non-loopback bind with no auth token is an open RCE surface
+    # (bypassPermissions). Refuse to start rather than merely warn.
+    if not expected_token and not is_loopback_bind(bind_host):
+        log.error(
+            "refusing to start: bind_host=%r is not loopback and no auth token is "
+            "configured (auth_token_env=%r). Set an auth token or bind to loopback.",
+            bind_host, cfg.get("auth_token_env"),
+        )
+        return 2
+
     INBOX_PATH.touch(exist_ok=True)
     TRANSCRIPT_PATH.touch(exist_ok=True)
     write_pid_file()
 
-    expected_token = resolve_auth_token(cfg)
     if not expected_token:
         log.warning(
             "no bearer token configured (auth_token_env=%r) — POST /jsonrpc is OPEN. "
@@ -725,15 +1099,32 @@ def main() -> int:
             cfg.get("auth_token_env"),
         )
 
+    probe_claude_cli()
     log_harness_inventory(repo_path)
     log.info("repo_path (cwd for claude) pinned to %s", repo_path)
 
-    receiver = Receiver(cfg)
+    httpd_box: Dict[str, Any] = {}
+
+    def _idle_teardown() -> None:
+        log.info("idle-timeout teardown: removing PID file and stopping server")
+        remove_pid_file()
+        httpd = httpd_box.get("httpd")
+        if httpd is not None:
+            threading.Thread(target=httpd.shutdown, name="idle-shutdown", daemon=True).start()
+
+    receiver = Receiver(cfg, on_idle_shutdown=_idle_teardown)
     poll_thread = threading.Thread(target=receiver.poll_loop, name="inbox-poll", daemon=True)
     poll_thread.start()
 
-    handler = make_handler(cfg, expected_token)
+    if float(cfg.get("idle_timeout_s") or 0) > 0:
+        idle_thread = threading.Thread(
+            target=receiver.idle_monitor_loop, name="idle-monitor", daemon=True
+        )
+        idle_thread.start()
+
+    handler = make_handler(cfg, expected_token, receiver)
     httpd = ThreadingHTTPServer((cfg["bind_host"], int(cfg["bind_port"])), handler)
+    httpd_box["httpd"] = httpd
 
     def _shutdown(signum: int, _frame: Any) -> None:
         log.info("signal %s received; shutting down", signum)

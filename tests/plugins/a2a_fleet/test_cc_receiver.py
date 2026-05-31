@@ -292,3 +292,384 @@ def test_resolve_auth_token(ccr, monkeypatch):
     assert ccr.resolve_auth_token({"auth_token_env": "CC_TEST_TOKEN"}) is None
     monkeypatch.setenv("CC_TEST_TOKEN", "s3cr3t")
     assert ccr.resolve_auth_token({"auth_token_env": "CC_TEST_TOKEN"}) == "s3cr3t"
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 — inbox offset persistence (no reprocess after restart)
+# ---------------------------------------------------------------------------
+
+def _ok_runner(*_a, **_k):
+    return (json.dumps({"type": "result", "subtype": "success", "result": "ok"}), 0)
+
+
+def test_offset_persists_and_skips_backlog_after_restart(ccr, tmp_path, monkeypatch):
+    monkeypatch.setattr(ccr, "post_reply", lambda *a, **k: True)
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    offset = tmp_path / "a2a-inbox.offset"
+    inbox.write_text("\n".join([
+        json.dumps({"from": "hermes", "contextId": "c1", "text": "one"}),
+        json.dumps({"from": "hermes", "contextId": "c2", "text": "two"}),
+    ]) + "\n")
+
+    calls = []
+
+    def runner(cmd, cwd, timeout):
+        return _ok_runner()
+
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["hermes_url"] = "http://127.0.0.1:1/jsonrpc"
+    recv = ccr.Receiver(cfg, runner=runner, inbox_path=inbox, offset_path=offset)
+    # Spy on dispatch so we can count without spawning real work.
+    monkeypatch.setattr(recv, "process_message",
+                        lambda cid, text: calls.append((cid, text)))
+    recv.poll_once()
+    time.sleep(0.05)
+    assert len(calls) == 2
+    assert offset.read_text().strip() == "2"
+
+    # Simulate restart: brand-new Receiver reads the persisted offset.
+    calls2 = []
+    recv2 = ccr.Receiver(cfg, runner=runner, inbox_path=inbox, offset_path=offset)
+    monkeypatch.setattr(recv2, "process_message",
+                        lambda cid, text: calls2.append((cid, text)))
+    recv2.poll_once()
+    time.sleep(0.05)
+    assert calls2 == [], "restart must NOT reprocess historical backlog"
+
+    # A NEW inbound line is picked up and the offset advances.
+    with inbox.open("a") as f:
+        f.write(json.dumps({"from": "hermes", "contextId": "c3", "text": "three"}) + "\n")
+    recv2.poll_once()
+    time.sleep(0.05)
+    assert len(calls2) == 1 and calls2[0][0] == "c3"
+    assert offset.read_text().strip() == "3"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 — bounded concurrency semaphore
+# ---------------------------------------------------------------------------
+
+def test_bounded_concurrency_caps_simultaneous_turns(ccr, tmp_path, monkeypatch):
+    monkeypatch.setattr(ccr, "post_reply", lambda *a, **k: True)
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["hermes_url"] = "http://127.0.0.1:1/jsonrpc"
+    cfg["max_concurrent_turns"] = 2
+
+    overlap = {"max": 0, "active": 0}
+    olock = threading.Lock()
+
+    def fake_runner(cmd, cwd, timeout):
+        with olock:
+            overlap["active"] += 1
+            overlap["max"] = max(overlap["max"], overlap["active"])
+        time.sleep(0.15)
+        with olock:
+            overlap["active"] -= 1
+        return _ok_runner()
+
+    recv = ccr.Receiver(cfg, runner=fake_runner)
+    # Distinct contexts -> would be unbounded without the semaphore.
+    threads = [threading.Thread(target=recv.process_message, args=(f"ctx-{i}", "m"))
+               for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert overlap["max"] <= 2, "concurrency must be capped at max_concurrent_turns"
+
+
+def test_concurrency_cap_replies_busy_when_full(ccr, tmp_path, monkeypatch):
+    posted = []
+    monkeypatch.setattr(ccr, "post_reply", lambda url, cid, text: posted.append(text) or True)
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["hermes_url"] = "http://127.0.0.1:1/jsonrpc"
+    cfg["max_concurrent_turns"] = 1
+    cfg["context_lock_wait_s"] = 0.05  # short bounded wait -> busy
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_runner(cmd, cwd, timeout):
+        started.set()
+        release.wait(2.0)
+        return _ok_runner()
+
+    recv = ccr.Receiver(cfg, runner=blocking_runner)
+    t1 = threading.Thread(target=recv.process_message, args=("ctx-a", "m"))
+    t1.start()
+    assert started.wait(2.0)
+    # Second distinct context can't get a slot -> [busy] reply.
+    reply = recv.process_message("ctx-b", "m")
+    assert reply == "[busy] max concurrent turns reached, retry"
+    release.set()
+    t1.join()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3 — registry eviction never evicts a held lock
+# ---------------------------------------------------------------------------
+
+def test_context_locks_eviction_bounds_registry(ccr):
+    locks = ccr.ContextLocks(max_entries=3)
+    for i in range(10):
+        locks.get(f"ctx-{i}")
+    assert locks.size() <= 3
+
+
+def test_context_locks_never_evicts_held_lock(ccr):
+    locks = ccr.ContextLocks(max_entries=2)
+    held = locks.get("held")
+    assert held.acquire(blocking=False)
+    try:
+        # Add many more contexts; the held lock must survive eviction.
+        for i in range(20):
+            locks.get(f"other-{i}")
+        # Re-requesting "held" must return the SAME lock object (not evicted).
+        assert locks.get("held") is held
+        assert held.locked()
+    finally:
+        held.release()
+
+
+def test_seen_contexts_bounded(ccr):
+    seen = ccr.SeenContexts(max_entries=3)
+    for i in range(10):
+        seen.mark(f"c{i}")
+    assert seen.size() <= 3
+    # Most recent retained.
+    assert seen.has("c9")
+
+
+# ---------------------------------------------------------------------------
+# Fix 5 — narrowed session-retry trigger
+# ---------------------------------------------------------------------------
+
+def test_no_retry_on_generic_nonzero_rc(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    seen = ccr.SeenContexts()
+    calls = []
+
+    def runner(cmd, cwd, timeout):
+        calls.append(cmd)
+        # Generic failure: rc!=0, no parseable frames, no session signal.
+        return ("not json garbage", 1, "boom: something broke")
+
+    reply = ccr.run_claude_turn("hi", "ctx-x", cfg, runner=runner, seen=seen)
+    assert len(calls) == 1, "generic rc!=0 must NOT trigger a session-mode retry"
+    assert reply is not None and reply.startswith("[error]")
+    assert "boom" in reply  # stderr snippet surfaced
+
+
+def test_retry_only_on_true_session_not_found(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    seen = ccr.SeenContexts()
+    seen.mark("ctx-x")  # so first attempt is resume
+    calls = []
+
+    def runner(cmd, cwd, timeout):
+        calls.append(list(cmd))
+        if "--resume" in cmd:
+            return ("", 1, "Error: No conversation found with session id abc")
+        return (json.dumps({"type": "result", "subtype": "success", "result": "RECOVERED"}), 0, "")
+
+    reply = ccr.run_claude_turn("hi", "ctx-x", cfg, runner=runner, seen=seen)
+    assert len(calls) == 2, "true session-not-found must retry the other mode once"
+    assert reply == "RECOVERED"
+
+
+def test_claude_not_found_is_distinct_fatal(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    seen = ccr.SeenContexts()
+
+    def runner(cmd, cwd, timeout):
+        raise FileNotFoundError("claude")
+
+    reply = ccr.run_claude_turn("hi", "ctx-x", cfg, runner=runner, seen=seen)
+    assert reply == "[error] claude CLI not found on PATH"
+
+
+# ---------------------------------------------------------------------------
+# Fix 6 — fail-closed bind (non-loopback + no token)
+# ---------------------------------------------------------------------------
+
+def test_is_loopback_bind(ccr):
+    assert ccr.is_loopback_bind("127.0.0.1")
+    assert ccr.is_loopback_bind("::1")
+    assert ccr.is_loopback_bind("localhost")
+    assert not ccr.is_loopback_bind("0.0.0.0")
+    assert not ccr.is_loopback_bind("10.0.0.5")
+
+
+def test_main_refuses_nonloopback_without_token(ccr, tmp_path, monkeypatch):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["bind_host"] = "0.0.0.0"
+    cfg["auth_token_env"] = None
+    monkeypatch.setattr(ccr, "load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr(ccr, "resolve_auth_token", lambda *a, **k: None)
+    # If it (wrongly) proceeds, these would be touched; ensure they aren't needed.
+    rc = ccr.main()
+    assert rc == 2, "must refuse to start (non-zero) on non-loopback bind w/o token"
+
+
+# ---------------------------------------------------------------------------
+# Fixes 7 & 9 — HTTP handler: malformed bearer 401, Content-Length cap
+# ---------------------------------------------------------------------------
+
+class _FakeRfile:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self, n):
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+class _FakeWfile:
+    def __init__(self):
+        self.buf = b""
+
+    def write(self, b):
+        self.buf += b
+
+
+def _make_request(ccr, cfg, token, *, headers, body=b"", path="/jsonrpc", method="POST"):
+    """Drive a Handler instance without a real socket."""
+    HandlerCls = ccr.make_handler(cfg, token, None)
+
+    class H(HandlerCls):
+        def __init__(self):  # bypass BaseHTTPRequestHandler.__init__ (no socket)
+            self.headers = headers
+            self.path = path
+            self.command = method
+            self.rfile = _FakeRfile(body)
+            self.wfile = _FakeWfile()
+            self.requestline = ""
+            self.client_address = ("127.0.0.1", 0)
+            self._status = None
+
+        def send_response(self, code, message=None):
+            self._status = code
+
+        def send_header(self, *a, **k):
+            pass
+
+        def end_headers(self):
+            pass
+
+    h = H()
+    return h
+
+
+def test_malformed_bearer_header_returns_401(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    # "bearer" prefix matched but no token after it -> must be 401, not 500.
+    h = _make_request(ccr, cfg, "expected-token",
+                      headers={"Authorization": "bearer "}, body=b"{}")
+    h.do_POST()
+    assert h._status == 401
+    # Empty-token variant ("bearer    ").
+    h2 = _make_request(ccr, cfg, "expected-token",
+                       headers={"Authorization": "bearer    "}, body=b"{}")
+    h2.do_POST()
+    assert h2._status == 401
+
+
+def test_content_length_too_large_returns_413(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    big = str(ccr.MAX_BODY_BYTES + 1)
+    h = _make_request(ccr, cfg, None,
+                      headers={"Content-Length": big}, body=b"{}")
+    h.do_POST()
+    assert h._status == 413
+
+
+def test_content_length_malformed_returns_error(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    h = _make_request(ccr, cfg, None,
+                      headers={"Content-Length": "notanint"}, body=b"{}")
+    h.do_POST()
+    # JSON-RPC error envelope is sent at HTTP 200 with code -32600.
+    payload = json.loads(h.wfile.buf.decode())
+    assert payload["error"]["code"] == -32600
+
+
+# ---------------------------------------------------------------------------
+# Fix 11 — idle-timeout self-teardown
+# ---------------------------------------------------------------------------
+
+def test_idle_monitor_triggers_teardown(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["idle_timeout_s"] = 0.1
+    fired = {"n": 0}
+    recv = ccr.Receiver(cfg, on_idle_shutdown=lambda: fired.__setitem__("n", fired["n"] + 1))
+    # Not idle yet.
+    assert recv.idle_monitor_once() is False
+    time.sleep(0.15)
+    assert recv.idle_monitor_once() is True
+    assert fired["n"] == 1
+    assert recv._stop.is_set()
+
+
+def test_idle_monitor_disabled_when_zero(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["idle_timeout_s"] = 0
+    recv = ccr.Receiver(cfg)
+    time.sleep(0.05)
+    assert recv.idle_monitor_once() is False
+
+
+def test_note_inbound_resets_idle_clock(ccr, tmp_path):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["idle_timeout_s"] = 0.2
+    recv = ccr.Receiver(cfg)
+    time.sleep(0.15)
+    recv.note_inbound()  # reset
+    assert recv.idle_monitor_once() is False
+
+
+# ---------------------------------------------------------------------------
+# Fix 12 — anonymous contextId mints a fresh uuid4 (no shared sentinel)
+# ---------------------------------------------------------------------------
+
+def test_anon_context_mints_unique_uuid(ccr, tmp_path, monkeypatch):
+    monkeypatch.setattr(ccr, "post_reply", lambda *a, **k: True)
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    offset = tmp_path / "a2a-inbox.offset"
+    inbox.write_text("\n".join([
+        json.dumps({"from": "hermes", "text": "a"}),   # no contextId
+        json.dumps({"from": "hermes", "text": "b"}),   # no contextId
+    ]) + "\n")
+    seen_ctx = []
+    cfg = _base_cfg(ccr, tmp_path)
+    recv = ccr.Receiver(cfg, runner=_ok_runner, inbox_path=inbox, offset_path=offset)
+    monkeypatch.setattr(recv, "process_message",
+                        lambda cid, text: seen_ctx.append(cid))
+    recv.poll_once()
+    time.sleep(0.05)
+    assert len(seen_ctx) == 2
+    assert seen_ctx[0] != seen_ctx[1], "anon contexts must not share a sentinel"
+    assert all(c.startswith("anon-") for c in seen_ctx)
+
+
+# ---------------------------------------------------------------------------
+# Fix 8 — concurrent inbox appends do not tear lines
+# ---------------------------------------------------------------------------
+
+def test_concurrent_inbox_appends_no_torn_lines(ccr, tmp_path, monkeypatch):
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    inbox.touch()
+    monkeypatch.setattr(ccr, "INBOX_PATH", inbox)
+
+    def writer(i):
+        ccr._append_jsonl(inbox, {"from": "hermes", "contextId": f"c{i}",
+                                  "text": "x" * 500}, ccr._INBOX_LOCK)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    lines = [l for l in inbox.read_text().splitlines() if l.strip()]
+    assert len(lines) == 40
+    for l in lines:
+        json.loads(l)  # every line must be valid JSON (not torn)
