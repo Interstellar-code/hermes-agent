@@ -26,7 +26,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +44,9 @@ del _sys, _Path
 
 # Cap a single transcript read so a runaway log can't balloon a response.
 _MAX_MESSAGES_PER_CONTEXT = 2000
+# Above this size, read only the TAIL (bounds memory/latency before the per-context
+# cap kicks in — the cap alone fires after the whole file is already in memory).
+_MAX_TRANSCRIPT_BYTES = 5_000_000  # ~5 MB
 TRANSCRIPT_RELPATH = (".hermes", "a2a-transcript.jsonl")
 
 router = APIRouter()
@@ -85,7 +88,14 @@ def _read_transcript(repo_path: str) -> List[Dict[str, Any]]:
     path = _transcript_path(repo_path)
     msgs: List[Dict[str, Any]] = []
     try:
-        raw = path.read_text(encoding="utf-8")
+        size = path.stat().st_size
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            if size > _MAX_TRANSCRIPT_BYTES:
+                # Seek to the tail and drop the first (likely partial) line so a
+                # huge transcript can't balloon memory before the per-context cap.
+                fh.seek(size - _MAX_TRANSCRIPT_BYTES)
+                fh.readline()
+            raw = fh.read()
     except OSError:
         return msgs
     for line in raw.splitlines():
@@ -109,33 +119,41 @@ def _read_transcript(repo_path: str) -> List[Dict[str, Any]]:
     return msgs
 
 
-def _collect() -> Dict[str, Dict[str, Any]]:
-    """Build {contextId: {peer, repo_path, messages: [...]}} across all managed peers."""
-    convos: Dict[str, Dict[str, Any]] = {}
+def _collect() -> List[Dict[str, Any]]:
+    """Build a list of conversation buckets across all managed peers.
+
+    Keyed by ``(repo_path, contextId)`` — NOT contextId alone: two different repos
+    can legitimately reuse the same contextId (e.g. ``handshake:<profile>``), and
+    merging them would misattribute one repo's transcript text to another. Each
+    bucket is therefore scoped to a single repo. Insertion order is preserved.
+    """
+    buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    order: List[Tuple[str, str]] = []
     for peer_name, repo in _managed_repos():
         for msg in _read_transcript(repo):
             cid = msg.get("contextId") or "(no-context)"
-            bucket = convos.get(cid)
+            key = (repo, cid)
+            bucket = buckets.get(key)
             if bucket is None:
-                bucket = {"peer": peer_name, "repo_path": repo, "messages": []}
-                convos[cid] = bucket
+                bucket = {"contextId": cid, "peer": peer_name, "repo_path": repo, "messages": []}
+                buckets[key] = bucket
+                order.append(key)
             if len(bucket["messages"]) < _MAX_MESSAGES_PER_CONTEXT:
                 # Drop the now-redundant contextId from each message for payload size.
                 bucket["messages"].append({k: msg[k] for k in ("ts", "dir", "from", "to", "text")})
-    return convos
+    return [buckets[k] for k in order]
 
 
 @router.get("/conversations")
 async def list_conversations() -> Dict[str, Any]:
     """Summary of every A2A conversation, newest activity first."""
-    convos = _collect()
     out: List[Dict[str, Any]] = []
-    for cid, bucket in convos.items():
+    for bucket in _collect():
         msgs = bucket["messages"]
         last = msgs[-1] if msgs else {}
         text = last.get("text") or ""
         out.append({
-            "contextId": cid,
+            "contextId": bucket["contextId"],
             "peer": bucket["peer"],
             "repo_path": bucket["repo_path"],
             "message_count": len(msgs),
@@ -149,13 +167,36 @@ async def list_conversations() -> Dict[str, Any]:
 
 
 @router.get("/conversations/{context_id:path}")
-async def get_conversation(context_id: str) -> Dict[str, Any]:
-    """Full ordered message list for one conversation (by contextId)."""
-    bucket = _collect().get(context_id)
-    if bucket is None:
+async def get_conversation(
+    context_id: str,
+    peer: Optional[str] = None,
+    repo_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Full ordered message list for one conversation.
+
+    A contextId can be shared across repos, so the match may be ambiguous. Narrow
+    with ``?peer=`` / ``?repo_path=`` when it is; an ambiguous bare lookup returns
+    409 with the candidate peers/repos rather than silently merging them.
+    """
+    matches = [
+        b for b in _collect()
+        if b["contextId"] == context_id
+        and (peer is None or b["peer"] == peer)
+        and (repo_path is None or b["repo_path"] == repo_path)
+    ]
+    if not matches:
         raise HTTPException(status_code=404, detail=f"no A2A conversation for contextId {context_id!r}")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": f"contextId {context_id!r} matches multiple peers; narrow with ?peer= or ?repo_path=",
+                "candidates": [{"peer": b["peer"], "repo_path": b["repo_path"]} for b in matches],
+            },
+        )
+    bucket = matches[0]
     return {
-        "contextId": context_id,
+        "contextId": bucket["contextId"],
         "peer": bucket["peer"],
         "repo_path": bucket["repo_path"],
         "messages": bucket["messages"],

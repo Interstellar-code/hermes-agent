@@ -118,3 +118,47 @@ def test_no_managed_peers_degrades_to_empty(monkeypatch):
     monkeypatch.setattr(mod, "_managed_repos", lambda: [])
     res = _run(mod.list_conversations())
     assert res == {"conversations": [], "count": 0}
+
+
+@pytest.fixture
+def multirepo(monkeypatch, tmp_path):
+    """Two repos that reuse the SAME contextId — must NOT merge into one bucket."""
+    mod = _load_module()
+    repo_a = tmp_path / "repo-a"; repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"; repo_b.mkdir()
+    _write_transcript(repo_a, [
+        {"ts": "2026-05-31 10:00:00", "dir": "hermes->claude", "contextId": "handshake:sw", "text": "A-only"},
+    ])
+    _write_transcript(repo_b, [
+        {"ts": "2026-05-31 11:00:00", "dir": "hermes->claude", "contextId": "handshake:sw", "text": "B-only"},
+    ])
+    monkeypatch.setattr(mod, "_managed_repos", lambda: [
+        ("cc-a", str(repo_a)), ("cc-b", str(repo_b)),
+    ])
+    return mod, repo_a, repo_b
+
+
+def test_same_contextid_across_repos_does_not_merge(multirepo):
+    mod, _, _ = multirepo
+    res = _run(mod.list_conversations())
+    assert res["count"] == 2  # one bucket per (repo, contextId), not merged
+    texts = {(c["peer"], c["last_text"]) for c in res["conversations"]}
+    assert ("cc-a", "A-only") in texts
+    assert ("cc-b", "B-only") in texts
+
+
+def test_ambiguous_contextid_returns_409_with_candidates(multirepo):
+    mod, _, _ = multirepo
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as ei:
+        _run(mod.get_conversation("handshake:sw"))
+    assert ei.value.status_code == 409
+    cands = ei.value.detail["candidates"]
+    assert {c["peer"] for c in cands} == {"cc-a", "cc-b"}
+
+
+def test_disambiguate_by_peer(multirepo):
+    mod, _, _ = multirepo
+    res = _run(mod.get_conversation("handshake:sw", peer="cc-b"))
+    assert res["peer"] == "cc-b"
+    assert res["messages"][0]["text"] == "B-only"
