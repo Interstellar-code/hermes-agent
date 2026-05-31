@@ -25,15 +25,16 @@ def test_load_fleet_happy_path(fleet_home: Path) -> None:
 
 
 def test_response_handler_fail_fast(fleet_home: Path) -> None:
+    """Unsupported handlers still raise; 'llm' is now supported (v0.2)."""
     from a2a_fleet.fleet_config import FleetConfigError, load_fleet
 
     fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
     data = yaml.safe_load(fleet_yaml.read_text())
-    data["fleet"]["response_handler"] = "llm"
+    data["fleet"]["response_handler"] = "not-a-real-handler"
     fleet_yaml.write_text(yaml.safe_dump(data))
     with pytest.raises((FleetConfigError, ValueError)) as exc:
         load_fleet()
-    assert "llm" in str(exc.value)
+    assert "not-a-real-handler" in str(exc.value)
 
 
 def test_missing_bind_port_raises(fleet_home: Path) -> None:

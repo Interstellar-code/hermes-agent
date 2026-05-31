@@ -145,6 +145,14 @@ def register(ctx) -> None:
                     "type": "string",
                     "description": "Plain-text message to send to the peer agent.",
                 },
+                "context_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional conversation context id for multi-turn exchanges. "
+                        "When omitted the server generates one and returns it; "
+                        "pass the returned context_id on subsequent turns to continue the thread."
+                    ),
+                },
             },
             "required": ["agent", "message"],
         },

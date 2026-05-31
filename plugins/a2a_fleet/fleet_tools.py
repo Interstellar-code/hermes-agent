@@ -13,19 +13,29 @@ from .client import FleetClientError, send_message
 log = logging.getLogger("a2a_fleet.tools")
 
 
-async def fleet_send_handler(agent: str, message: str) -> Dict[str, Any]:
-    """Send ``message`` to the named fleet peer and return ``{reply}``.
+async def fleet_send_handler(
+    agent: str,
+    message: str,
+    context_id: str = "",
+) -> Dict[str, Any]:
+    """Send ``message`` to the named fleet peer and return ``{"reply": ..., "context_id": ...}``.
 
-    On any failure (network error, peer 401, peer JSON-RPC error, etc.) returns
-    ``{"error": "..."}`` rather than raising — the calling agent can surface the
-    string verbatim in chat without needing exception handling.
+    ``context_id`` is optional; when empty the server generates one and the
+    generated id is returned in the result so the caller can continue the thread.
+
+    On any failure returns ``{"error": "..."}`` rather than raising — the calling
+    agent can surface the string verbatim in chat without exception handling.
     """
     try:
-        reply = await send_message(agent, message)
+        result = await send_message(
+            agent,
+            message,
+            context_id=context_id if context_id else None,
+        )
     except FleetClientError as exc:
         log.warning("fleet_send: peer %r returned an error: %s", agent, exc)
         return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001 — tools must never crash the agent loop
         log.exception("fleet_send: unexpected error talking to %r", agent)
         return {"error": f"unexpected error: {exc}"}
-    return {"reply": reply}
+    return {"reply": result["reply"], "context_id": result["context_id"]}

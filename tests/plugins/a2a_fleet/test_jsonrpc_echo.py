@@ -66,6 +66,34 @@ def test_unknown_method_returns_method_not_found(fleet_home: Path) -> None:
     assert response.json()["error"]["code"] == -32601
 
 
+def test_message_send_alias_returns_same_envelope(fleet_home: Path) -> None:
+    from a2a_fleet.server import build_app
+
+    body = {
+        "jsonrpc": "2.0",
+        "id": "alias-1",
+        "method": "message/send",
+        "params": {"message": {"role": "user", "parts": [{"text": "ping"}]}},
+    }
+    with TestClient(build_app()) as client:
+        response = client.post("/jsonrpc", json=body)
+    assert response.status_code == 200
+    result = response.json()
+    assert result["jsonrpc"] == "2.0"
+    assert result["result"]["kind"] == "message"
+    assert result["result"]["message"]["parts"][0]["text"] == "pong"
+
+
+def test_message_stream_returns_not_implemented(fleet_home: Path) -> None:
+    from a2a_fleet.server import build_app
+
+    body = {"jsonrpc": "2.0", "id": "stream-1", "method": "message/stream", "params": {}}
+    with TestClient(build_app()) as client:
+        response = client.post("/jsonrpc", json=body)
+    assert response.status_code == 200
+    assert response.json()["error"]["code"] == -32601
+
+
 def test_bearer_enforced_when_auth_required(fleet_home: Path) -> None:
     fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
     data = yaml.safe_load(fleet_yaml.read_text())
