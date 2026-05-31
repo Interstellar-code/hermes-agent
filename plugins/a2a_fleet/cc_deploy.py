@@ -352,7 +352,11 @@ def _terminate_pid(pid: int) -> bool:
         if not _pid_alive(pid):
             return True
         time.sleep(STOP_POLL_INTERVAL_S)
-    # Still alive -> SIGKILL.
+    # Still alive -> SIGKILL. SIGKILL is uncatchable, so a successful delivery
+    # guarantees the process dies; it may briefly remain a zombie until reaped,
+    # which os.kill(pid, 0) still reports as "alive" — that is NOT "still
+    # running", so do not report a false negative. Give it a brief moment to be
+    # reaped, then report success.
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -360,7 +364,12 @@ def _terminate_pid(pid: int) -> bool:
     except OSError as exc:
         log.warning("SIGKILL pid=%s failed (%s)", pid, exc)
         return False
-    return not _pid_alive(pid)
+    reap_deadline = time.monotonic() + 1.0
+    while time.monotonic() < reap_deadline:
+        if not _pid_alive(pid):
+            break
+        time.sleep(STOP_POLL_INTERVAL_S)
+    return True
 
 
 def _kill_launched_child(pid: int) -> None:
