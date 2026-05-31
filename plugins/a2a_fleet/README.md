@@ -10,8 +10,8 @@ including straight into the real Hermes agent via a platform adapter.
 
 > **Authoritative source**: this README matches the shipped code
 > (`server.py` embedded-uvicorn architecture, `fleet_config.SUPPORTED_HANDLERS`,
-> `adapter.py` Route B bridge). `CHANGELOG.md` tracks notable changes. Sections
-> labelled **(v0.3 — planned)** describe the next milestone and are NOT shipped.
+> `adapter.py` Route B bridge). `CHANGELOG.md` tracks notable changes. The v0.3
+> Claude Code executor and v0.4 config bootstrap are shipped and live-verified.
 
 ---
 
@@ -271,9 +271,11 @@ The answering behavior depends on `response_handler` (echo / llm / agent above).
 
 ## v0.3 — Claude Code as a repo-scoped A2A executor (shipped)
 
-> **Status: planned.** The pieces below are the v0.3 direction, NOT shipped yet.
-> Treat this section as the roadmap the orchestrator should plan around, not as
-> a description of current behavior.
+> **Status: shipped.** The pieces below describe current behavior:
+> `deploy_cc_receiver` / `cc_receiver_status` / `cc_receiver_stop` are live tools,
+> the receiver template ships in `templates/cc_receiver.py`, and v0.4 adds config
+> bootstrap (auto-scaffold + auto-wired managed peer). Live-verified end-to-end:
+> Hermes → receiver → `claude -p` → reply POSTed back to `:9219` (HTTP 200).
 
 **Vision.** Hermes = **orchestrator**. Claude Code = **executor** running inside
 a specific repo with that repo's FULL harness — skills, MCP, plugins, `.claude/`
@@ -281,11 +283,10 @@ settings, `CLAUDE.md`, claude-mem. The point of routing through Claude Code (not
 a raw LLM) is to leverage that harness: exactly what the user would have manually,
 but now driven by Hermes over A2A.
 
-**Deploy flow (v0.3 — planned).**
+**Deploy flow.**
 1. User → Hermes: "work on repo X where Claude Code is set up."
 2. Hermes confirms the repo path back to the user.
-3. Hermes calls `deploy_cc_receiver(repo_path)` (a tool that ships in a later
-   v0.3 phase). It:
+3. Hermes calls `deploy_cc_receiver(repo_path)` (a live tool). It:
    - copies a standalone receiver into `<repo>/.hermes/cc_receiver.py`,
    - writes binding config `<repo>/.hermes/a2a_receiver.json` (cwd **pinned** to
      `repo_path` — never taken from an inbound message),
@@ -306,8 +307,8 @@ Each inbound task spawns `claude -p` with `cwd=<repo>`, a persistent session
 loaded (`--setting-sources user,project,local`, `--mcp-config`), so the executor
 answers with the repo's real skills/tools/MCP/CLAUDE.md.
 
-**fleet.yaml peer schema (v0.3 — planned).** A Claude Code peer gains repo
-binding:
+**fleet.yaml peer schema.** A managed Claude Code peer carries repo binding
+(written automatically by `deploy_cc_receiver` — see "Config bootstrap"):
 
 ```yaml
 agents:
@@ -318,10 +319,10 @@ agents:
     mode: claude_code                      # NEW — distinguishes from plain peers
 ```
 
-`load_fleet()` will surface `repo_path` / `managed` / `mode` so Hermes knows
-which repo a link drives and whether it owns the daemon (boot-reconcile).
+`load_fleet()` surfaces `repo_path` / `managed` / `mode` so Hermes knows which
+repo a link drives and whether it owns the daemon (boot-reconcile).
 
-**Guardrails (v0.3 — planned).** The receiver runs with `bypassPermissions` in a
+**Guardrails.** The receiver runs with `bypassPermissions` in a
 real repo, so: cwd is pinned at deploy time (never from a message), per-`context_id`
 serialization prevents two `claude -p --resume` overlapping the same session,
 bearer auth gates `:9300`, and autonomous operation is bounded (per-turn timeout,
@@ -379,6 +380,49 @@ the reply is POSTed back to Hermes `:9219` with the same `context_id`. Reusing a
 `context_id` continues that Claude session — context accumulates; a new one
 starts a fresh thread. Hermes does **not** auto-loop: it summarizes each reply to
 the user and awaits direction (anti-loop guardrail).
+
+### Reply delivery & the round-trip (orchestrator responsibility)
+
+The reply is **asynchronous**. The receiver answers the inbound `fleet_send`
+immediately with a `[queued]` ack, runs `claude -p` (seconds to minutes), then
+makes a **separate outbound** A2A `SendMessage` POST back to `hermes_url`
+(`:9219`) carrying the result on the **same `context_id`**. Proven end-to-end
+(receiver log: `posted reply to hermes ctx=handshake:... status=200`):
+
+```
+hermes → claude   task            (fleet_send, context_id=C)
+claude → hermes   "[queued]" ack  (immediate JSON-RPC response)
+… claude -p turn runs …
+claude → hermes   real reply      (separate POST to :9219, context_id=C, HTTP 200)
+```
+
+**The plugin's job ends at HTTP 200.** Transport, auth, and dispatch are the
+plugin's responsibility and are verified. **Surfacing that reply to the human is
+the orchestrator's job** — and it hinges on `context_id`:
+
+- The reply arrives on `:9219` as an inbound A2A message on `context_id=C`. The
+  `agent` handler ingests it into the Hermes agent **on context `C`**.
+- If `C` is **not mapped to a live user conversation**, the reply is received but
+  **never relayed to the user**. In particular, a reply on the reserved
+  **`handshake:<repo>`** context is intentionally *not* user-facing — it closes
+  the handshake, nothing more.
+
+**Rule for an orchestrator (Hermes) to make executor replies reach the user:**
+
+1. When dispatching real work, **`fleet_send` with a `context_id` you can map
+   back to the originating user conversation** (e.g. derive it from the chat/
+   thread id, or keep a `context_id → conversation` table). Do **not** use the
+   `handshake:*` context for work whose reply must surface.
+2. On inbound A2A delivery (the `agent` handler firing for a peer reply), **look
+   up that `context_id`** and **relay the reply text into the mapped
+   conversation** (Telegram/Discord/etc.), rather than treating it as a fresh
+   agent turn.
+3. Keep the anti-loop guardrail: relay-and-summarize; do not auto-reply back to
+   the executor without user direction.
+
+This mapping is **orchestrator logic, not plugin logic** — the plugin neither
+owns user conversations nor knows the chat platform. See the deploy skill
+(`skills/deploy-cc-receiver/SKILL.md`) for the orchestration procedure.
 
 ---
 
@@ -472,7 +516,7 @@ curl http://<bind_host>:<bind_port>/health
 | `agent_bridge.py` | Global bridge registry + `A2ABusyError` / `A2ABridgeNotReady` errors |
 | `context_store.py` | Per-`context_id` multi-turn history + locks (used by `llm`) |
 | `skills/deploy-fleet/SKILL.md` | Procedure: bring up a node, verify, ping/pong |
-| `skills/deploy-cc-receiver/SKILL.md` | (v0.3 — planned) Procedure: deploy a Claude Code executor receiver into a repo |
+| `skills/deploy-cc-receiver/SKILL.md` | Procedure: deploy a Claude Code executor receiver into a repo |
 | `plugin.yaml` | Hermes plugin manifest |
 | `references/` | A2A spec summary + Hermes plugin guide |
 
