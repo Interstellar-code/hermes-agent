@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.4.x` · v0.3 executor + v0.4 config bootstrap shipped
+Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -473,6 +473,37 @@ JSONL + its memory provider; Claude Code remembers via its own session files;
 
 ---
 
+## Dashboard API — A2A conversation feed (v0.5)
+
+A read-only HTTP surface for a front-end to render the Hermes ⇄ Claude Code
+executor conversations (e.g. a "A2A Fleet" tab). Lives in
+`dashboard/{manifest.json, plugin_api.py}`; `web_server._mount_plugin_api_routes`
+auto-mounts the FastAPI `router` under `/api/plugins/a2a_fleet/`, **behind the
+dashboard session auth** (same origin/auth a dashboard front-end already uses).
+Bundled-plugin backend imports are allowed; project plugins are not
+(GHSA-5qr3-c538-wm9j).
+
+**Source of truth:** each managed `claude_code` peer's per-repo transcript
+`<repo>/.hermes/a2a-transcript.jsonl` — both directions, including the `[queued]`
+ack and the executor reply. Peers come from `fleet.yaml`. Degrades to an empty
+list on missing/invalid config or absent transcripts (never 500). Per-context
+reads are capped at 2000 messages.
+
+| Method · path | Returns |
+|---|---|
+| `GET /api/plugins/a2a_fleet/conversations` | `{count, conversations: [{contextId, peer, repo_path, message_count, last_ts, last_dir, last_text}]}` — newest activity first |
+| `GET /api/plugins/a2a_fleet/conversations/{contextId}` | `{contextId, peer, repo_path, messages: [{ts, dir, from, to, text}]}` — chronological. `contextId` contains a colon (`handshake:hermes-switch`) → URL-encode it |
+| `GET /api/plugins/a2a_fleet/peers` | `{count, peers: [{name, repo_path, transcript_exists, message_count}]}` |
+
+`dir` values drive rendering: `hermes->claude` (orchestrator→executor),
+`claude->hermes (ack)` (the `[queued]` ack), `claude->hermes` (the real reply).
+`text` is markdown. Poll `/conversations` (and the open thread) every ~2s for a
+live feel. The route appears only after the gateway is (re)started with the
+plugin present — discovery + mount happen at `web_server` startup; a 404 means a
+restart is needed.
+
+---
+
 ## Install / enable
 
 ```bash
@@ -517,6 +548,10 @@ curl http://<bind_host>:<bind_port>/health
 | `context_store.py` | Per-`context_id` multi-turn history + locks (used by `llm`) |
 | `skills/deploy-fleet/SKILL.md` | Procedure: bring up a node, verify, ping/pong |
 | `skills/deploy-cc-receiver/SKILL.md` | Procedure: deploy a Claude Code executor receiver into a repo |
+| `fleet_yaml_io.py` | First-enable `fleet.yaml` scaffold + comment-preserving managed-peer upsert (`deploy_cc_receiver` auto-wiring) |
+| `dashboard/manifest.json` · `dashboard/plugin_api.py` | Read-only dashboard API (`/api/plugins/a2a_fleet/conversations` · `/peers`) feeding a front-end A2A conversation tab |
+| `templates/cc_receiver.py` | Standalone receiver dropped into `<repo>/.hermes/` by `deploy_cc_receiver` |
+| `cc_deploy.py` | `deploy_cc_receiver` / `cc_receiver_status` / `cc_receiver_stop` handlers, token provisioning, boot-reconcile |
 | `plugin.yaml` | Hermes plugin manifest |
 | `references/` | A2A spec summary + Hermes plugin guide |
 

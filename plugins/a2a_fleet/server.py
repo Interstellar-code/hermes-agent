@@ -338,12 +338,14 @@ async def start_server(timeout: float = 5.0) -> Dict[str, Any]:
 
     task = asyncio.create_task(_serve(), name="a2a_fleet.server")
     _server_task = task
+    inst = _server_instance  # local handle — see note below
 
     # Poll for either the bind to succeed (started=True) or the task to die
     # with an exception (typical case: port already in use). Poll the LOCAL
-    # ``task`` handle, not the module global: a concurrent start/stop (seen in
-    # the test suite spinning servers up/down) can null ``_server_task`` mid-loop,
-    # and ``None.done()`` would crash this startup path.
+    # ``task`` / ``inst`` handles, not the module globals: a concurrent start/stop
+    # (seen in the test suite spinning servers up/down) can null ``_server_task`` /
+    # ``_server_instance`` mid-loop, and ``None.done()`` / ``None.started`` would
+    # crash this startup path.
     deadline_iters = max(1, int(timeout / 0.02))
     for _ in range(deadline_iters):
         if task.done():
@@ -354,13 +356,13 @@ async def start_server(timeout: float = 5.0) -> Dict[str, Any]:
             raise A2AServerStartError(
                 f"uvicorn task exited during startup on {host}:{port}: {exc!r}"
             ) from exc
-        if _server_instance.started:
+        if inst.started:
             break
         await asyncio.sleep(0.02)
     else:
         # Loop completed without break — startup timed out without the task
         # dying. Force the task to exit and surface the timeout.
-        _server_instance.should_exit = True
+        inst.should_exit = True
         task.cancel()
         _server_instance = None
         _server_task = None
