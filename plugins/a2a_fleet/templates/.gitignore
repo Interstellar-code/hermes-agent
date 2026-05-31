@@ -1,0 +1,11 @@
+# cc_receiver.py is the only source file here. Everything below is RUNTIME state
+# the receiver writes next to itself when deployed — it must never be committed,
+# and tests must never leak it into the source tree (see the autouse
+# _isolate_receiver_runtime_paths fixture in tests/plugins/a2a_fleet/test_cc_receiver.py).
+a2a-transcript.jsonl
+a2a-inbox.jsonl
+a2a-inbox.offset
+a2a_receiver.json
+cc_receiver.pid
+cc_receiver.log
+.token
