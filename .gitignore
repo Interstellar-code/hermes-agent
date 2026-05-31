@@ -92,3 +92,15 @@ docs/superpowers/*
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.
 .hermes/
+
+# Agent / orchestration runtime state created in-repo — never codebase artifacts.
+.omc/
+*.log
+# Local agent instructions for this checkout (imports the gitignored .hermes/);
+# AGENTS.md is the tracked, committed instructions file.
+CLAUDE.md
+# Local Hindsight compat shim for this environment (maps `hindsight` ->
+# hindsight_embed/hindsight_client); not part of the codebase.
+hindsight.py
+# Claude Code per-checkout runtime: agent worktrees (large), scheduler lock, etc.
+.claude/
