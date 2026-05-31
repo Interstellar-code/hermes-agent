@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped (0.5.1: multi-repo conversation keys)
+Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped (0.5.1 multi-repo keys; 0.5.2 profile-agnostic discovery)
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -485,9 +485,17 @@ Bundled-plugin backend imports are allowed; project plugins are not
 
 **Source of truth:** each managed `claude_code` peer's per-repo transcript
 `<repo>/.hermes/a2a-transcript.jsonl` — both directions, including the `[queued]`
-ack and the executor reply. Peers come from `fleet.yaml`. Degrades to an empty
-list on missing/invalid config or absent transcripts (never 500). Per-context
-reads are capped at 2000 messages.
+ack and the executor reply. Degrades to an empty list on missing/invalid config or
+absent transcripts (never 500). Per-context reads are capped at 2000 messages.
+
+**Profile-agnostic peer discovery (v0.5.2):** the dashboard is a global control
+plane — it usually runs under the default Hermes home (`~/.hermes`) while the
+managed receivers live in a specific profile (`~/.hermes/profiles/<name>/fleet.yaml`).
+So peers are read from **every** profile: the home's own `fleet.yaml` *and* each
+`profiles/*/fleet.yaml` beneath it, deduped by `repo_path`. Parsing is lenient (raw
+YAML, no schema/`token_env` validation — that is the live server's job), so one bad
+file never blanks the feed. This is why the feed populates even though the
+dashboard's own profile has no `fleet.yaml`.
 
 | Method · path | Returns |
 |---|---|
