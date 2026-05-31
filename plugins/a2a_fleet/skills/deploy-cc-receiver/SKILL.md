@@ -46,7 +46,11 @@ Hermes agent ──────────────────────�
   accumulates across turns. Different `context_id` = different session.
 - The receiver loads the repo harness via `--setting-sources user,project,local`
   + `--mcp-config <repo>/.mcp.json` and **no `--bare`** (so `CLAUDE.md` + hooks
-  load). The managed `CLAUDE.md` block is the source of truth for the role.
+  load). The role is written to `<repo>/.hermes/A2A.md` and pulled in via a single
+  `@import .hermes/A2A.md` line appended to `<repo>/CLAUDE.md` — keeps the role
+  text out of the tracked `CLAUDE.md` (no git pollution) while still auto-loading.
+- The receiver self-terminates after an idle timeout (no messages for N min);
+  Hermes redeploys on the next request.
 - Replies are POSTed back to Hermes on `:9219` with the same `context_id`.
 
 ## fleet.yaml peer schema (repo-aware — v0.3)
@@ -82,9 +86,11 @@ fleet:
    - copies the receiver into `<repo>/.hermes/cc_receiver.py`,
    - writes binding config `<repo>/.hermes/a2a_receiver.json` (cwd pinned,
      atomic temp-file + rename),
-   - writes/refreshes the idempotent managed A2A-role block in
-     `<repo>/CLAUDE.md` (between `<!-- a2a-fleet:start -->` / `:end -->`;
-     creates the file if absent, never clobbers existing content),
+   - writes the A2A-role text to `<repo>/.hermes/A2A.md` and appends a single
+     idempotent `@import .hermes/A2A.md` line to `<repo>/CLAUDE.md` (between
+     `<!-- a2a-fleet:start -->` / `:end -->`; creates `CLAUDE.md` if absent,
+     never clobbers existing content) — role text stays out of tracked files,
+   - stops any existing receiver for this repo before launching a fresh one,
    - launches the receiver **detached** (survives gateway restart) on `:9300`,
      records `<repo>/.hermes/cc_receiver.pid`, health-checks `:9300/health`.
 

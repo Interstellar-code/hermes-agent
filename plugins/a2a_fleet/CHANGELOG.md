@@ -8,10 +8,11 @@
 
 ### Planned
 - `deploy_cc_receiver(repo_path)` tool — deploys a standalone Claude Code
-  executor receiver into a target repo's `.hermes/`, writes an idempotent
-  managed A2A-role block into `<repo>/CLAUDE.md` (between
-  `<!-- a2a-fleet:start -->` / `:end -->` markers), and launches a detached,
-  Hermes-managed daemon on `:9300`. Each inbound task spawns `claude -p` with
+  executor receiver into a target repo's `.hermes/`, writes the A2A-role text to
+  `<repo>/.hermes/A2A.md` and appends a single idempotent `@import .hermes/A2A.md`
+  line to `<repo>/CLAUDE.md` (between `<!-- a2a-fleet:start -->` / `:end -->`
+  markers — keeps role text out of tracked files, no git pollution), and launches
+  a detached, Hermes-managed daemon on `:9300` (with idle-timeout self-teardown). Each inbound task spawns `claude -p` with
   `cwd=<repo>` and the repo's full harness loaded
   (`--setting-sources user,project,local`, `--mcp-config`, no `--bare`), keyed
   to a persistent session per `context_id` (`--session-id` / `--resume`).
