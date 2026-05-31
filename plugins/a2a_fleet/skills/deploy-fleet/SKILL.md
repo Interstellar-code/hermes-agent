@@ -20,8 +20,13 @@ config layout, startup, discovery verification, and the ping/pong smoke test.
   `FleetConfigError` if missing.
 - `auth_required` **defaults to `true`** — inbound `/jsonrpc` requires a bearer
   token. Newly-created configs are protected by default.
-- Only `response_handler: echo` is supported in v0.1. `ping` → `pong`, anything
-  else echoes verbatim. `llm` raises `FleetConfigError`.
+- `response_handler` selects how inbound is answered:
+  `SUPPORTED_HANDLERS = {echo, llm, agent}` — anything else raises
+  `FleetConfigError` at load. `echo` (`ping`→`pong`, else verbatim) is the
+  transport smoke test below. `llm` is a stateless model call (Route A — bypasses
+  the agent). `agent` dispatches inbound into the REAL Hermes agent (Route B, via
+  the platform adapter — requires `platforms.a2a_fleet.enabled=true`). See the
+  README for the three modes.
 - Tokens are never in the YAML — `token_env` names an environment variable.
   Convention: `<PEER>_A2A_TOKEN`.
 - Agent Card is served PUBLIC (no auth) at `/.well-known/agent-card.json`.
@@ -105,3 +110,11 @@ fleet:
 - **Cross-machine bearer over plain HTTP** → tokens travel in cleartext;
   terminate TLS in front when binding to a non-loopback address.
 - **No CORS** → expected; A2A is server-to-server, browsers are not clients.
+
+## Related
+
+- To make this node answer with real reasoning/tools, set `response_handler: llm`
+  (Route A — stateless model call) or `agent` (Route B — real Hermes agent). See
+  the README "Inbound response handlers" section.
+- To orchestrate **Claude Code** as a repo-scoped executor peer, see
+  `deploy-cc-receiver` **(v0.3 — planned)**.

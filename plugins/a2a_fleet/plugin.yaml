@@ -1,6 +1,6 @@
 name: a2a_fleet
-version: "0.1.0"
-description: "A2A fleet plugin — agent-to-agent communication over JSON-RPC. v0.1 echo handler."
+version: "0.2.0"
+description: "A2A fleet membership over JSON-RPC: embedded A2A server + fleet_send outbound tool, with echo/llm/agent inbound handlers (agent = real Hermes agent via platform adapter) + (v0.3 planned) Claude Code executor deployment."
 author: Interstellar-code
 kind: standalone
 
