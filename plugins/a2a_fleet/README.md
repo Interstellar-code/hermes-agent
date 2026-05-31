@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped
+Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped (0.5.1: multi-repo conversation keys)
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -492,7 +492,7 @@ reads are capped at 2000 messages.
 | Method · path | Returns |
 |---|---|
 | `GET /api/plugins/a2a_fleet/conversations` | `{count, conversations: [{contextId, peer, repo_path, message_count, last_ts, last_dir, last_text}]}` — newest activity first |
-| `GET /api/plugins/a2a_fleet/conversations/{contextId}` | `{contextId, peer, repo_path, messages: [{ts, dir, from, to, text}]}` — chronological. `contextId` contains a colon (`handshake:hermes-switch`) → URL-encode it |
+| `GET /api/plugins/a2a_fleet/conversations/{contextId}` | `{contextId, peer, repo_path, messages: [{ts, dir, from, to, text}]}` — chronological. `contextId` contains a colon (`handshake:hermes-switch`) → URL-encode it. A contextId can be shared across repos → narrow with `?peer=` / `?repo_path=`; an ambiguous bare lookup returns **409** with the candidate peers |
 | `GET /api/plugins/a2a_fleet/peers` | `{count, peers: [{name, repo_path, transcript_exists, message_count}]}` |
 
 `dir` values drive rendering: `hermes->claude` (orchestrator→executor),
