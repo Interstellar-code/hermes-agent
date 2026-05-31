@@ -1046,3 +1046,11 @@ def test_json_tool_result_stringifies_dict_returns():
     assert isinstance(out_dict, str)
     assert _json.loads(out_dict) == {"running": True, "pid": 123, "port": 9311}
     assert out_str == "plain"  # already-string returns pass through unchanged
+
+
+def test_canonicalize_unwraps_nested_repo_path_dict(tmp_path):
+    # Weaker models nest the arg as {"repo_path": "..."} — must be unwrapped.
+    repo = _make_repo(tmp_path)
+    p, err = cc_deploy.canonicalize_repo_path({"repo_path": str(repo)})
+    assert err is None
+    assert p == Path(os.path.realpath(str(repo)))
