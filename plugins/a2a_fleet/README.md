@@ -1,39 +1,69 @@
 # a2a_fleet
 
-Version: `0.1.0`
+Version: `0.2.x` · v0.3 in progress
 
-Agent-to-Agent (A2A) communication for Hermes Agent. Lets one Hermes profile send plain-text messages to peer agents over JSON-RPC 2.0 and exposes this profile as a discoverable A2A fleet member.
+Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
+profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
+the profile as a discoverable A2A peer, registers the outbound `fleet_send` tool,
+and (for inbound) dispatches messages through one of three response handlers —
+including straight into the real Hermes agent via a platform adapter.
 
-v0.1 ships an **echo handler** (ping → pong) — the wiring is complete end-to-end; the response logic is deliberately trivial. TaskManager, streaming (SSE), and an LLM-backed handler are deferred to v0.2+.
+> **Authoritative source**: this README matches the shipped code
+> (`server.py` embedded-uvicorn architecture, `fleet_config.SUPPORTED_HANDLERS`,
+> `adapter.py` Route B bridge). `CHANGELOG.md` tracks notable changes. Sections
+> labelled **(v0.3 — planned)** describe the next milestone and are NOT shipped.
 
-> **Authoritative source**: this README matches the shipped code (`server.py` embedded-uvicorn architecture). `PROGRESS.md` is the as-built ralph-loop record; `CHANGELOG.md` tracks notable changes.
+---
+
+## What this plugin gives a profile
+
+1. **An embedded A2A server** (`server.py`) on a dedicated port — Agent Card
+   discovery, `/health`, and a JSON-RPC `SendMessage` endpoint.
+2. **The outbound `fleet_send` tool** — the agent calls a named peer and gets
+   the reply back, with optional multi-turn `context_id` threading.
+3. **A platform adapter** (`adapter.py`) — when `response_handler: agent`,
+   inbound A2A messages are dispatched into the real Hermes agent (its
+   conversation loop, SOUL, tools, memory) and the agent's reply is returned
+   synchronously to the peer.
 
 ---
 
 ## Architecture
 
-The plugin runs its **own** FastAPI/uvicorn server on a dedicated port — it does **not** mount routes on the Hermes dashboard gateway. This isolation sidesteps the gateway's session-token middleware, localhost-only CORS, and Host-header validation, all of which would block cross-machine peer access.
+The plugin runs its **own** FastAPI/uvicorn server on a dedicated port — it does
+**not** mount routes on the Hermes dashboard gateway. This isolation sidesteps
+the gateway's session-token middleware, localhost-only CORS, and Host-header
+validation, all of which would block cross-machine peer access.
 
 ```
-┌────────────────────────────────────────────┐
-│           Hermes Agent Process              │
-│                                             │
-│  ┌────────────────────┐                     │
-│  │  Dashboard Gateway  │  localhost:8642     │
-│  └────────────────────┘                     │
-│                                             │
-│  ┌────────────────────────────────────┐     │
-│  │  a2a_fleet server (server.py)       │     │
-│  │  uvicorn on its own event loop,     │     │
-│  │  running on a daemon thread,        │     │
-│  │  bound to fleet.yaml bind_host:port │     │
-│  └────────────────────────────────────┘     │
-└────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                  Hermes Agent Process                     │
+│                                                           │
+│  ┌────────────────────┐                                   │
+│  │  Dashboard Gateway  │  localhost:8642                  │
+│  │  (agent loop, SOUL, │                                  │
+│  │   tools, memory)    │◀───┐                             │
+│  └────────────────────┘     │ run_coroutine_threadsafe    │
+│                             │ (adapter.bridge_sync,        │
+│  ┌──────────────────────────┴──────────────┐  Route B)    │
+│  │  a2a_fleet server (server.py)            │              │
+│  │  uvicorn on its own event loop / daemon  │              │
+│  │  thread, bound to fleet.yaml host:port   │              │
+│  │  inbound → echo | llm | agent handler    │              │
+│  └──────────────────────────────────────────┘              │
+└──────────────────────────────────────────────────────────┘
 ```
 
-- `register(ctx)` registers the `fleet_send` tool and spawns the server on a **named daemon thread** with its own `asyncio` event loop (`_start_server_in_thread`). This works whether `register()` is called from a synchronous context or inside a running loop — the daemon-thread design fixes the "server never starts in sync context" bug.
-- An `atexit` handler (`_atexit_stop`) signals uvicorn to exit on process shutdown. There is **no** `disable()` hook in v0.1; the daemon thread is reaped by the OS on exit.
-- Config (`fleet.yaml`) is re-read on **every request**, so handler/peer edits take effect without a server restart.
+- `register(ctx)` registers the `fleet_send` tool, registers the `a2a_fleet`
+  platform adapter (via `ctx.register_platform`, when available), registers the
+  `deploy-fleet` skill, and spawns the server on a **named daemon thread** with
+  its own `asyncio` event loop (`_start_server_in_thread`). The daemon-thread
+  design works whether `register()` is called from a synchronous context or
+  inside a running loop.
+- An `atexit` handler (`_atexit_stop`) signals uvicorn to exit on process
+  shutdown; the daemon thread is reaped by the OS on exit.
+- Config (`fleet.yaml`) is re-read on **every request**, so handler/peer edits
+  take effect without a server restart.
 
 ### Routes
 
@@ -42,23 +72,75 @@ The server (bound to `fleet.server.bind_host:bind_port`) serves:
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/.well-known/agent-card.json` | **public** | A2A capability discovery (RFC 8615). Always anonymous. |
-| `GET` | `/health` | public | `{"ok": true, "version": "0.1.0", "peer_count": N}` |
-| `POST` | `/jsonrpc` | bearer (if `auth_required`) | A2A JSON-RPC 2.0 `SendMessage` endpoint |
+| `GET` | `/health` | public | `{"ok": true, "version": ..., "peer_count": N}` |
+| `POST` | `/jsonrpc` | bearer (if `auth_required`) | A2A JSON-RPC 2.0 `SendMessage` / `message/send` endpoint |
 
-Interactive docs (`/docs`, `/redoc`, `/openapi.json`) are disabled — this is a peer-facing surface.
+Interactive docs (`/docs`, `/redoc`, `/openapi.json`) are disabled — this is a
+peer-facing surface. **No CORS middleware**: A2A is server-to-server; browsers
+are not A2A clients.
 
-**No CORS middleware.** A2A is server-to-server; browsers are not A2A clients. Wildcard CORS would be misleading, so it is intentionally omitted.
+---
+
+## Inbound response handlers (the three modes)
+
+`fleet.response_handler` selects how an inbound `SendMessage` is answered.
+`fleet_config.SUPPORTED_HANDLERS = {"echo", "llm", "agent"}` — any other value
+raises `FleetConfigError` at load time.
+
+### `echo` — ping/pong diagnostic
+`ping` → `pong`; anything else echoes the input verbatim. No model, no agent.
+Use it to smoke-test transport, auth, and discovery end-to-end.
+
+### `llm` — stateless model call (Route A)
+Calls the **active profile's configured provider** directly
+(`resolve_provider_client("auto")`) with a small per-context history kept in
+`context_store`. It delivers real conversational back-and-forth (reasoning, Q&A,
+persona replies) with multi-turn context on the same `context_id`.
+
+> **This BYPASSES the Hermes agent.** It has NO access to the profile's live
+> tools, memory, MCP, or SOUL — it is a raw model call. Treat `llm` as a
+> fallback for plain chat; for tool-grounded or memory-aware answers use `agent`.
+
+System prompt resolves as: `llm.system_prompt` string > `llm.system_prompt_file`
+> built-in default. `llm.max_tokens` (default 2048) and `llm.temperature`
+(default 0.7) are honored.
+
+### `agent` — dispatch into the real Hermes agent (Route B)
+The inbound message is routed into the **real Hermes agent** through the
+`a2a_fleet` platform adapter (`adapter.py`). The flow:
+
+1. The uvicorn handler (on the server's daemon-thread loop) calls
+   `bridge.bridge_sync(text, context_id, peer_id, timeout)` in a worker thread.
+2. `bridge_sync` submits the message to the gateway's event loop via
+   `asyncio.run_coroutine_threadsafe(self._message_handler(event), gateway_loop)`
+   and blocks for the reply.
+3. The gateway runs a **real agent turn** — SOUL, tools, memory — and returns
+   the answer; the adapter strips a leading `💭 Reasoning:` preamble (when
+   `show_reasoning` is on) and returns the final answer over the wire.
+
+Concurrency: per-`context_id` threading locks serialize same-context turns; a
+second overlapping turn on the same context gets an `A2ABusyError` (JSON-RPC
+"peer busy on this context, retry") rather than racing the first. `agent.timeout_s`
+(default 120) bounds the wait. The A2A `contextId` maps to the Hermes session
+`chat_id`, so the same `context_id` continues the same agent session.
+
+Route B requires the gateway to have the adapter connected — i.e.
+`platforms.a2a_fleet.enabled=true` in the active profile config so the gateway
+calls `adapter.connect()` and registers the bridge. If the bridge is not ready,
+`/jsonrpc` returns a JSON-RPC error telling you to enable it.
 
 ---
 
 ## Configuration
 
-Config lives in a standalone `fleet.yaml` under the active Hermes home (`$HERMES_HOME/fleet.yaml`). For early-checkout compatibility, the loader falls back to `$HERMES_HOME/profiles/<name>/fleet.yaml` if the primary file is absent.
+Config lives in a standalone `fleet.yaml` under the active Hermes home
+(`$HERMES_HOME/fleet.yaml`). For early-checkout compatibility the loader falls
+back to `$HERMES_HOME/profiles/<name>/fleet.yaml` if the primary is absent.
 
 ```yaml
 fleet:
   enabled: true                   # set false to keep the plugin idle for this profile
-  response_handler: echo          # only "echo" is supported in v0.1 (anything else → FleetConfigError)
+  response_handler: agent         # echo | llm | agent  (anything else → FleetConfigError)
 
   server:
     bind_host: 0.0.0.0            # default 127.0.0.1
@@ -68,6 +150,16 @@ fleet:
 
   self:
     name: switch                 # name advertised in the Agent Card
+
+  # Optional — only read when response_handler: llm
+  llm:
+    system_prompt: "You are ..."   # or system_prompt_file: /path/to/prompt.txt
+    max_tokens: 2048
+    temperature: 0.7
+
+  # Optional — only read when response_handler: agent (Route B)
+  agent:
+    timeout_s: 120               # max seconds to wait for the agent reply
 
   agents:                        # peers this node can call via fleet_send
     construct:
@@ -80,23 +172,29 @@ fleet:
 ### Key config facts
 
 - **`bind_port` is required** — `FleetConfigError` if missing. No default.
-- **`auth_required` defaults to `true`.** Newly-created profiles opt into bearer protection automatically. If you copy an example with no `auth_required` line, the server enforces bearer tokens.
-- **`response_handler` must be `echo`** in v0.1. `llm` or any other value raises `FleetConfigError` at load time.
+- **`auth_required` defaults to `true`.** Newly-created profiles opt into bearer
+  protection automatically.
+- **`response_handler` must be `echo`, `llm`, or `agent`.** Any other value
+  raises `FleetConfigError` at load time.
 - Peer `url` must be `http`/`https` with a real host or load fails.
-- Tokens are never stored in `fleet.yaml`. Each `token_env` names an environment variable holding the actual pre-shared bearer token. Convention: `<PEER>_A2A_TOKEN`.
+- Tokens are never stored in `fleet.yaml`. Each `token_env` names an environment
+  variable holding the actual pre-shared bearer token. Convention:
+  `<PEER>_A2A_TOKEN`.
 
 ### Auth behavior
 
-- `auth_required: true` + no resolved token → server returns **HTTP 503** (misconfig; does not leak the `token_env` name).
+- `auth_required: true` + no resolved token → server returns **HTTP 503**
+  (misconfig; does not leak the `token_env` name).
 - Missing/malformed `Authorization: Bearer ...` → **HTTP 401**.
-- Bearer comparison uses `hmac.compare_digest` (constant-time, resists timing attacks).
-- Sending plaintext bearer tokens over non-loopback HTTP is inadvisable — terminate TLS in front of the server when binding to a public address.
+- Bearer comparison uses `hmac.compare_digest` (constant-time).
+- Sending plaintext bearer tokens over non-loopback HTTP is inadvisable —
+  terminate TLS in front of the server when binding to a public address.
 
 ---
 
 ## The `fleet_send` tool (agent-facing)
 
-The plugin registers exactly **one** agent tool in v0.1:
+The plugin registers the `fleet_send` outbound tool:
 
 ```json
 {
@@ -104,17 +202,19 @@ The plugin registers exactly **one** agent tool in v0.1:
   "parameters": {
     "type": "object",
     "properties": {
-      "agent":   {"type": "string", "description": "Name of the fleet peer (matches fleet.yaml)."},
-      "message": {"type": "string", "description": "Plain-text message to send to the peer agent."}
+      "agent":      {"type": "string", "description": "Name of the fleet peer (matches fleet.yaml)."},
+      "message":    {"type": "string", "description": "Plain-text message to send to the peer agent."},
+      "context_id": {"type": "string", "description": "Optional conversation context id for multi-turn exchanges. When omitted the server generates one and returns it; pass it back on later turns to continue the thread."}
     },
     "required": ["agent", "message"]
   }
 }
 ```
 
-Returns `{"reply": "..."}` on success or `{"error": "..."}` on any failure (network error, peer 401, JSON-RPC error). It never raises — the calling agent can surface the string verbatim.
-
-> `fleet_status`, `fleet_discover`, and `fleet_get_agent_card` do **not** exist in v0.1.
+Returns `{"reply": "...", ...}` on success or `{"error": "..."}` on any failure
+(network error, peer 401, JSON-RPC error). It never raises — the calling agent
+can surface the string verbatim. Pass the returned `context_id` on subsequent
+turns to continue a multi-turn thread with the peer.
 
 ---
 
@@ -134,15 +234,80 @@ HERMES_HOME=~/.hermes python -m a2a_fleet.client construct ping
 
 ## JSON-RPC contract
 
-`POST /jsonrpc` accepts raw JSON (no Pydantic in route signatures):
+`POST /jsonrpc` accepts raw JSON:
 
-- `SendMessage` → returns `{result: {kind: "message", message: {role: "agent", parts: [{text}], contextId}}}`.
+- `SendMessage` / `message/send` → returns
+  `{result: {kind, message: {role: "agent", parts: [{text}], contextId}}}`.
 - Malformed JSON → HTTP 200 with JSON-RPC error `-32700`.
 - Non-object body → `-32600`; non-object `params` → `-32602`.
-- `SendStreamingMessage`, `tasks.get`, `tasks.list`, `tasks.cancel` → `-32601` ("deferred to v0.2+").
+- `SendStreamingMessage`, `message/stream`, `tasks.get`, `tasks.list`,
+  `tasks.cancel` → `-32601` (not implemented).
 - Any other method → `-32601` ("Method not found").
 
-The echo handler: `ping` → `pong`; anything else echoes the input verbatim.
+The answering behavior depends on `response_handler` (echo / llm / agent above).
+
+---
+
+## v0.3 — Claude Code as a repo-scoped A2A executor (planned / in progress)
+
+> **Status: planned.** The pieces below are the v0.3 direction, NOT shipped yet.
+> Treat this section as the roadmap the orchestrator should plan around, not as
+> a description of current behavior.
+
+**Vision.** Hermes = **orchestrator**. Claude Code = **executor** running inside
+a specific repo with that repo's FULL harness — skills, MCP, plugins, `.claude/`
+settings, `CLAUDE.md`, claude-mem. The point of routing through Claude Code (not
+a raw LLM) is to leverage that harness: exactly what the user would have manually,
+but now driven by Hermes over A2A.
+
+**Deploy flow (v0.3 — planned).**
+1. User → Hermes: "work on repo X where Claude Code is set up."
+2. Hermes confirms the repo path back to the user.
+3. Hermes calls `deploy_cc_receiver(repo_path)` (a tool that ships in a later
+   v0.3 phase). It:
+   - copies a standalone receiver into `<repo>/.hermes/cc_receiver.py`,
+   - writes binding config `<repo>/.hermes/a2a_receiver.json` (cwd **pinned** to
+     `repo_path` — never taken from an inbound message),
+   - writes/refreshes an idempotent **managed A2A-role block** into
+     `<repo>/CLAUDE.md` (between `<!-- a2a-fleet:start -->` / `:end -->`
+     markers),
+   - launches the receiver as a **detached, Hermes-managed daemon** on `:9300`,
+     records a PID file, health-checks it.
+4. **Handshake**: Hermes and Claude Code exchange roles (orchestrator /
+   executor), the bound repo, the comm contract (same `context_id` = same
+   persistent session; replies POSTed to `:9219`), and purpose.
+5. Ongoing: Hermes relays tasks via
+   `fleet_send(agent="claude-code", message, context_id)`, monitors, and awaits
+   the reply on `:9219`, liaising with the user.
+
+Each inbound task spawns `claude -p` with `cwd=<repo>`, a persistent session
+(`--session-id` / `--resume` keyed off the `context_id`), and the repo's harness
+loaded (`--setting-sources user,project,local`, `--mcp-config`), so the executor
+answers with the repo's real skills/tools/MCP/CLAUDE.md.
+
+**fleet.yaml peer schema (v0.3 — planned).** A Claude Code peer gains repo
+binding:
+
+```yaml
+agents:
+  claude-code:
+    url: http://127.0.0.1:9300
+    repo_path: /Users/you/dev/some-repo   # NEW — the bound repo (cwd of claude -p)
+    managed: true                          # NEW — Hermes owns/launches the daemon
+    mode: claude_code                      # NEW — distinguishes from plain peers
+```
+
+`load_fleet()` will surface `repo_path` / `managed` / `mode` so Hermes knows
+which repo a link drives and whether it owns the daemon (boot-reconcile).
+
+**Guardrails (v0.3 — planned).** The receiver runs with `bypassPermissions` in a
+real repo, so: cwd is pinned at deploy time (never from a message), per-`context_id`
+serialization prevents two `claude -p --resume` overlapping the same session,
+bearer auth gates `:9300`, and autonomous operation is bounded (per-turn timeout,
+restart backoff, idle cap). Deploy only to repos the user has authorized.
+
+See `skills/deploy-cc-receiver/SKILL.md` for the orchestration procedure and
+`.omc/plans/a2a-fleet-v0.3-plan.md` for the full design.
 
 ---
 
@@ -153,12 +318,17 @@ hermes plugins enable a2a_fleet
 hermes gateway restart
 ```
 
-The inbound server requires `fastapi` + `uvicorn` (install `hermes-agent[web]`). If those are missing, the plugin loads but the server stays idle and logs a warning — `fleet_send` (outbound) still works.
+The inbound server requires `fastapi` + `uvicorn` (install `hermes-agent[web]`).
+If those are missing, the plugin loads but the server stays idle and logs a
+warning — `fleet_send` (outbound) still works. For Route B (`agent`), also set
+`platforms.a2a_fleet.enabled=true` in the active profile config.
 
 Look for in the agent log:
 ```
 a2a_fleet: registered fleet_send tool + spawned A2A server thread
 a2a_fleet: server started on 0.0.0.0:9219
+a2a_fleet: registered platform adapter with gateway     # when register_platform available
+a2a_fleet: adapter connected; bridge ready               # Route B, once the gateway connects it
 ```
 
 Verify discovery:
@@ -173,16 +343,20 @@ curl http://<bind_host>:<bind_port>/health
 
 | Path | Purpose |
 |------|---------|
-| `__init__.py` | `register(ctx)` — registers `fleet_send`, spawns server daemon thread, registers `atexit` stop |
-| `server.py` | FastAPI app factory (`build_app`), Agent Card builder, JSON-RPC handler, uvicorn lifecycle (`start_server`/`stop_server`/`stop_server_sync`) |
-| `fleet_config.py` | `fleet.yaml` loader, env-var token resolution, fail-fast validation, `SUPPORTED_HANDLERS = {"echo"}` |
-| `fleet_tools.py` | `fleet_send_handler` — wraps the client in a `{reply}`/`{error}` dict |
+| `__init__.py` | `register(ctx)` — registers `fleet_send`, the `deploy-fleet` skill, the `a2a_fleet` platform adapter, spawns the server daemon thread, registers `atexit` stop |
+| `server.py` | FastAPI app factory (`build_app`), Agent Card builder, JSON-RPC handler (echo/llm/agent dispatch), uvicorn lifecycle |
+| `fleet_config.py` | `fleet.yaml` loader, env-var token resolution, validation, `SUPPORTED_HANDLERS = {"echo", "llm", "agent"}`, `llm`/`agent` blocks |
+| `fleet_tools.py` | `fleet_send_handler` — wraps the client in a `{reply}`/`{error}` dict, threads `context_id` |
 | `client.py` | Async A2A client (`send_message`) over httpx + `__main__` CLI |
-| `response_handler.py` | `echo_handler(text, context_id)` |
+| `response_handler.py` | `HandlerResult` dataclass + `echo_handler` |
+| `llm_handler.py` | `llm_handler` (Route A) — stateless call to the active profile's provider |
+| `adapter.py` | `A2AFleetAdapter` (Route B) — bridges inbound A2A into the real Hermes agent via the gateway loop |
+| `agent_bridge.py` | Global bridge registry + `A2ABusyError` / `A2ABridgeNotReady` errors |
+| `context_store.py` | Per-`context_id` multi-turn history + locks (used by `llm`) |
+| `skills/deploy-fleet/SKILL.md` | Procedure: bring up a node, verify, ping/pong |
+| `skills/deploy-cc-receiver/SKILL.md` | (v0.3 — planned) Procedure: deploy a Claude Code executor receiver into a repo |
 | `plugin.yaml` | Hermes plugin manifest |
 | `references/` | A2A spec summary + Hermes plugin guide |
-
-Tests live in the repo `tests/` tree at `tests/plugins/a2a_fleet/` (9 modules): agent card, client, config, JSON-RPC echo, server lifecycle, concurrent/sync register, blocker fixes, hardening.
 
 ```bash
 cd ~/.hermes/hermes-agent
@@ -196,4 +370,6 @@ venv/bin/python -m pytest tests/plugins/a2a_fleet/ -q
 | Phase | Status | Description |
 |-------|--------|-------------|
 | v0.1 | ✅ shipped | Embedded uvicorn server, Agent Card discovery, JSON-RPC `SendMessage`, bearer auth, echo handler, `fleet_send` tool, async client |
-| v0.2 | planned | LLM-backed response handler, TaskManager (`tasks.*`), streaming (`SendStreamingMessage` / SSE) |
+| v0.2 | ✅ shipped | `llm` response handler (Route A — stateless model call + multi-turn `context_store`), `message/send` alias, `HandlerResult`, outbound `context_id` threading |
+| Route B | ✅ shipped | `agent` response handler — inbound dispatched into the real Hermes agent via the `a2a_fleet` platform adapter + `run_coroutine_threadsafe` bridge to the gateway loop |
+| v0.3 | 🚧 in progress / planned | `deploy_cc_receiver` — Claude Code executor receiver deployed into a target repo's `.hermes/`, repo-aware `fleet.yaml` (`repo_path`/`managed`/`mode`), handshake, managed daemon lifecycle |
