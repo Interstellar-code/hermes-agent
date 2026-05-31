@@ -30,6 +30,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
+from .agent_bridge import A2ABridgeNotReady, A2ABusyError, get_agent_bridge
 from .context_store import generate_context_id
 from .fleet_config import load_fleet
 from .llm_handler import A2AHandlerError, llm_handler
@@ -201,11 +202,49 @@ def build_app() -> FastAPI:
         if method in {"SendMessage", "message/send"}:
             text = _extract_text(params)
             context_id = _context_id(params)
-            handler = HANDLERS.get(cfg["response_handler"], echo_handler)
-            try:
-                result: HandlerResult = await handler(text, context_id, cfg)
-            except (A2AHandlerError, Exception) as exc:
-                return _rpc_error(rpc_id, -32000, f"Server error: {exc}")
+
+            if cfg["response_handler"] == "agent":
+                # Route B: dispatch into the real Hermes agent via the adapter bridge.
+                bridge = get_agent_bridge()
+                if bridge is None:
+                    return _rpc_error(
+                        rpc_id,
+                        -32000,
+                        "agent bridge not ready (is platforms.a2a_fleet.enabled set + gateway running?)",
+                    )
+                # Extract peer identity from A2A message metadata / user field.
+                msg_block = params.get("message") or {}
+                peer_id = (
+                    msg_block.get("user")
+                    or (msg_block.get("metadata") or {}).get("peer_id")
+                    or "a2a-peer"
+                )
+                timeout = float(cfg.get("agent", {}).get("timeout_s", 120))
+                try:
+                    reply = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        bridge.bridge_sync,
+                        text,
+                        context_id,
+                        peer_id,
+                        timeout,
+                    )
+                except A2ABusyError as exc:
+                    return _rpc_error(rpc_id, -32000, f"peer busy on this context, retry: {exc}")
+                except A2ABridgeNotReady as exc:
+                    return _rpc_error(rpc_id, -32000, f"agent bridge not ready: {exc}")
+                except TimeoutError as exc:
+                    return _rpc_error(rpc_id, -32000, f"agent reply timed out after {timeout}s: {exc}")
+                except Exception as exc:
+                    return _rpc_error(rpc_id, -32000, f"Server error: {exc}")
+                result = HandlerResult(text=reply, context_id=context_id)
+            else:
+                handler = HANDLERS.get(cfg["response_handler"], echo_handler)
+                try:
+                    result = await handler(text, context_id, cfg)
+                except (A2AHandlerError, Exception) as exc:
+                    return _rpc_error(rpc_id, -32000, f"Server error: {exc}")
+
             return JSONResponse({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
