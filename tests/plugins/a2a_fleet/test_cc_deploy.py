@@ -742,7 +742,7 @@ def test_reconcile_redeploys_when_down(tmp_path: Path, monkeypatch: pytest.Monke
     canonical = Path(os.path.realpath(str(repo)))
     _stub_fleet(monkeypatch, {
         "claude-code": {
-            "url": "http://127.0.0.1:9300", "managed": True,
+            "url": "http://127.0.0.1:9301", "managed": True,
             "mode": "claude_code", "repo_path": str(canonical),
         },
     })
@@ -759,21 +759,29 @@ def test_reconcile_redeploys_when_down(tmp_path: Path, monkeypatch: pytest.Monke
 
     monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
     rows = cc_deploy.reconcile_managed_receivers()
-    assert rows[0]["action"] == "reconciled"
+    assert rows[0]["action"] == "redeployed"
     assert rows[0]["pid"] == 7777
     assert called["repo_path"] == str(canonical)
+    # Port for the redeploy comes from the fleet.yaml peer url, not on-disk json.
+    assert called["bind_port"] == 9301
 
 
-def test_reconcile_redeploys_when_alive_but_token_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Alive + healthy receiver but this gateway lost the token (restart) -> redeploy."""
+def test_reconcile_leaves_healthy_and_republishes_persisted_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """H1: a HEALTHY receiver is LEFT running even if this gateway lost the token
+    in os.environ after a restart — the persisted .token is re-published instead of
+    killing the (possibly mid-task) executor."""
     repo = _make_repo(tmp_path)
     canonical = Path(os.path.realpath(str(repo)))
     token_env = cc_deploy.stable_token_env_name(canonical)
-    monkeypatch.delenv(token_env, raising=False)
+    monkeypatch.delenv(token_env, raising=False)  # gateway lost the token on restart
     hermes_dir = repo / ".hermes"
     hermes_dir.mkdir()
     (hermes_dir / "cc_receiver.pid").write_text("4242")
     (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
+    # The token persisted by the prior successful deploy.
+    (hermes_dir / cc_deploy.TOKEN_FILENAME).write_text("persisted-token")
     _stub_fleet(monkeypatch, {
         "claude-code": {
             "url": "http://127.0.0.1:9300", "managed": True,
@@ -783,16 +791,15 @@ def test_reconcile_redeploys_when_alive_but_token_lost(tmp_path: Path, monkeypat
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(cc_deploy, "_check_health_once",
                         lambda port, expected_repo_path=None: True)
-    called = {"n": 0}
-
-    async def fake_deploy(repo_path, bind_port=cc_deploy.DEFAULT_BIND_PORT, **k):
-        called["n"] += 1
-        return {"deployed": True, "pid": 8888}
-
-    monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
+    # Healthy -> must NOT redeploy (would kill the in-flight executor).
+    monkeypatch.setattr(
+        cc_deploy, "deploy_cc_receiver_handler",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not deploy a healthy receiver")),
+    )
     rows = cc_deploy.reconcile_managed_receivers()
-    assert called["n"] == 1
-    assert rows[0]["action"] == "reconciled"
+    assert rows[0]["action"] == "healthy"
+    # The persisted token was re-published so in-session fleet_send keeps working.
+    assert os.environ[token_env] == "persisted-token"
 
 
 def test_reconcile_failed_deploy_surfaces_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -826,3 +833,147 @@ def test_reconcile_never_raises_on_bad_fleet(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(fleet_config, "load_fleet", boom)
     # Must swallow the error and return an empty summary, not raise.
     assert cc_deploy.reconcile_managed_receivers() == []
+
+
+def test_reconcile_redeploy_port_from_url_over_on_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """When the on-disk a2a_receiver.json port drifts from fleet.yaml, the redeploy
+    uses the fleet.yaml (desired-state) port."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    hermes_dir = repo / ".hermes"
+    hermes_dir.mkdir()
+    # On-disk says 9300; fleet.yaml url says 9305 -> prefer fleet.yaml.
+    (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
+    _stub_fleet(monkeypatch, {
+        "claude-code": {
+            "url": "http://127.0.0.1:9305", "managed": True,
+            "mode": "claude_code", "repo_path": str(canonical),
+        },
+    })
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
+    called = {}
+
+    async def fake_deploy(repo_path, bind_port=cc_deploy.DEFAULT_BIND_PORT, **k):
+        called["bind_port"] = bind_port
+        return {"deployed": True, "pid": 6060}
+
+    monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert rows[0]["action"] == "redeployed"
+    assert called["bind_port"] == 9305
+
+
+# ---------------------------------------------------------------------------
+# Token persistence (.token 0600) + .gitignore (hardening)
+# ---------------------------------------------------------------------------
+
+def test_deploy_persists_token_file_0600(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """A successful deploy writes <repo>/.hermes/.token (mode 0600) with the token."""
+    import stat
+
+    repo = _make_repo(tmp_path)
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda r, rp, lp, env=None: 1357)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert res["deployed"] is True
+    token_path = repo / ".hermes" / cc_deploy.TOKEN_FILENAME
+    assert token_path.exists()
+    assert token_path.read_text() == res["receiver_token"]
+    mode = stat.S_IMODE(token_path.stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+def test_deploy_writes_gitignore_with_runtime_entries(tmp_path: Path, stub_template, stub_runtime):
+    repo = _make_repo(tmp_path)
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert res["deployed"] is True
+    gitignore = repo / ".hermes" / cc_deploy.GITIGNORE_FILENAME
+    assert gitignore.exists()
+    body = gitignore.read_text()
+    for entry in (".token", "*.pid", "*.log", "a2a-inbox*", "a2a-transcript*", "a2a-inbox.offset"):
+        assert entry in body, f"{entry} missing from .hermes/.gitignore"
+
+
+def test_gitignore_idempotent_and_preserves_user_lines(tmp_path: Path):
+    hermes_dir = tmp_path / ".hermes"
+    hermes_dir.mkdir()
+    gi = hermes_dir / cc_deploy.GITIGNORE_FILENAME
+    gi.write_text("# user content\nmy-secret-dir/\n")
+    cc_deploy.upsert_hermes_gitignore(gi)
+    cc_deploy.upsert_hermes_gitignore(gi)  # second call must not duplicate
+    body = gi.read_text()
+    assert "# user content" in body
+    assert "my-secret-dir/" in body
+    assert body.count(".token") == 1
+    assert body.count("a2a-inbox.offset") == 1
+
+
+def test_deploy_no_token_leak_on_health_fail(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """Health-fail path: os.environ is NOT mutated and no .token is written."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    token_env = cc_deploy.stable_token_env_name(canonical)
+    monkeypatch.delenv(token_env, raising=False)
+
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda r, rp, lp, env=None: 2468)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: False)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+    monkeypatch.setattr(cc_deploy, "_kill_launched_child", lambda pid: None)
+
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert "error" in res
+    assert "never became healthy" in res["error"]
+    # No env leak: the token was never published to the parent process.
+    assert token_env not in os.environ
+    # No persisted secret.
+    assert not (repo / ".hermes" / cc_deploy.TOKEN_FILENAME).exists()
+
+
+def test_stable_token_env_name_suffix_is_12_hex(tmp_path: Path):
+    """The SHA-256 suffix is 12 hex chars (widened from 8 for entropy)."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    name = cc_deploy.stable_token_env_name(canonical)
+    # Trailing component after the final underscore is the hash suffix.
+    suffix = name.rsplit("_", 1)[-1]
+    assert len(suffix) == 12
+    assert all(c in "0123456789ABCDEF" for c in suffix)
+
+
+# ---------------------------------------------------------------------------
+# Reconcile singleton guard (#6) — repeated starts don't double-spawn.
+# ---------------------------------------------------------------------------
+
+def test_reconcile_in_thread_singleton(monkeypatch: pytest.MonkeyPatch):
+    """Calling the in_thread starter twice while a reconcile thread is alive must
+    NOT spawn a second thread."""
+    import threading
+
+    # Reset module state for isolation.
+    monkeypatch.setattr(cc_deploy, "_reconcile_thread", None)
+
+    spawned = {"n": 0}
+    release = threading.Event()
+
+    def slow_reconcile():
+        spawned["n"] += 1
+        release.wait(timeout=2.0)
+        return []
+
+    monkeypatch.setattr(cc_deploy, "reconcile_managed_receivers", slow_reconcile)
+    cc_deploy.reconcile_managed_receivers_in_thread()
+    # Second call while the first worker is still running -> no-op.
+    cc_deploy.reconcile_managed_receivers_in_thread()
+    release.set()
+    t = cc_deploy._reconcile_thread
+    if t is not None:
+        t.join(timeout=2.0)
+    assert spawned["n"] == 1

@@ -1,6 +1,6 @@
 name: a2a_fleet
-version: "0.2.0"
-description: "A2A fleet membership over JSON-RPC: embedded A2A server + fleet_send outbound tool, with echo/llm/agent inbound handlers (agent = real Hermes agent via platform adapter) + (v0.3 planned) Claude Code executor deployment."
+version: "0.3.0"
+description: "A2A fleet membership over JSON-RPC: embedded A2A server + fleet_send outbound tool, with echo/llm/agent inbound handlers (agent = real Hermes agent via platform adapter) + Claude Code executor deployment (deploy_cc_receiver: repo-pinned managed receiver, persisted token, boot-reconcile leaves healthy receivers running). Anti-loop is enforced orchestrator-side (Hermes); the receiver enforces per-context serialization, concurrency, and idle-timeout."
 author: Interstellar-code
 kind: standalone
 

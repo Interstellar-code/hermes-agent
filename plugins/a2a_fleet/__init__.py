@@ -177,7 +177,9 @@ def register(ctx) -> None:
                     "type": "string",
                     "description": (
                         "Absolute path to the target repo Claude Code is set up + "
-                        "authorized in. Canonicalized; symlink-escapes are rejected."
+                        "authorized in. Symlinked inputs are RESOLVED to their real "
+                        "on-disk target and the receiver cwd is pinned there "
+                        "(security preserved)."
                     ),
                 },
                 "bind_port": {

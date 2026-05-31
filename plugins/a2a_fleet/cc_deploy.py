@@ -51,6 +51,13 @@ CLAUDE_MD_IMPORT_LINE = "@.hermes/A2A.md"
 # It teaches a FRESH ``claude -p`` (no prior turn context) three things: its role,
 # how to answer the one-shot handshake Hermes sends before any real task, and the
 # session/reply guardrails so Hermes can liaise safely (no autonomous ping-pong).
+#
+# Anti-loop is enforced ORCHESTRATOR-side: Hermes decides not to ping-pong
+# (summarize each reply to the user, await direction, one fleet_send per
+# instruction). The receiver side does NOT run a handshake state machine; it
+# enforces only its own bounds — per-context serialization (one in-flight turn
+# per contextId), max_concurrent_turns, and the idle timeout. Those receiver
+# bounds already live in the cc_receiver template and are sufficient (Phase 4).
 A2A_ROLE_TEXT = (
     "# A2A Executor Role (managed by Hermes a2a_fleet)\n"
     "\n"
@@ -91,6 +98,19 @@ RECEIVER_FILENAME = "cc_receiver.py"
 CONFIG_FILENAME = "a2a_receiver.json"
 ROLE_FILENAME = "A2A.md"
 LOG_FILENAME = "cc_receiver.log"
+TOKEN_FILENAME = ".token"
+GITIGNORE_FILENAME = ".gitignore"
+
+# Runtime/secret files under <repo>/.hermes/ that must NEVER be committed. The
+# CLAUDE.md @import (.hermes/A2A.md) is fine to track; secrets/runtime are not.
+HERMES_GITIGNORE_ENTRIES = (
+    ".token",
+    "*.pid",
+    "*.log",
+    "a2a-inbox*",
+    "a2a-transcript*",
+    "a2a-inbox.offset",
+)
 
 # Health-check poll budget (~8s) and per-attempt request timeout.
 HEALTH_POLL_BUDGET_S = 8.0
@@ -148,6 +168,52 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
     os.replace(tmp, path)  # atomic on POSIX
+
+
+def _write_token_file(token_path: Path, token: str) -> None:
+    """Persist the receiver token to ``token_path`` with mode 0600 (owner-only).
+
+    Uses ``os.open`` with ``O_CREAT|O_WRONLY|O_TRUNC`` and mode ``0o600`` so the
+    secret is never world/group-readable even for an instant; ``os.chmod`` after
+    the fact additionally repairs the mode if the file pre-existed with looser
+    perms (umask can otherwise relax the create mode).
+    """
+    fd = os.open(token_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, token.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(token_path, 0o600)
+    except OSError:
+        pass
+
+
+def upsert_hermes_gitignore(gitignore_path: Path) -> None:
+    """Ensure ``<repo>/.hermes/.gitignore`` ignores runtime/secret files.
+
+    Idempotent: creates the file with all entries when absent, else appends only
+    the entries not already present (one per line), preserving any user content.
+    The tracked ``A2A.md`` / receiver template are deliberately NOT ignored.
+    """
+    existing_lines: List[str] = []
+    if gitignore_path.exists():
+        try:
+            existing_lines = gitignore_path.read_text().splitlines()
+        except OSError:
+            existing_lines = []
+    present = {ln.strip() for ln in existing_lines}
+    missing = [e for e in HERMES_GITIGNORE_ENTRIES if e not in present]
+    if not missing:
+        return
+    if existing_lines:
+        body = "\n".join(existing_lines)
+        if not body.endswith("\n"):
+            body += "\n"
+        body += "\n".join(missing) + "\n"
+    else:
+        body = "\n".join(HERMES_GITIGNORE_ENTRIES) + "\n"
+    _atomic_write_text(gitignore_path, body)
 
 
 # ---------------------------------------------------------------------------
@@ -463,14 +529,15 @@ def stable_token_env_name(repo: Path) -> str:
     every deploy and can't be wired ahead of time. The token VALUE stays a fresh
     ``secrets.token_urlsafe`` per deploy; only the NAME is stable.
 
-    Scheme: ``A2A_CC_TOKEN_<SLUG>_<HASH8>`` where SLUG is the uppercased final
+    Scheme: ``A2A_CC_TOKEN_<SLUG>_<HASH12>`` where SLUG is the uppercased final
     path component with non-alphanumerics collapsed to ``_`` (env-var-safe), and
-    HASH8 is the first 8 hex chars of the SHA-256 of the canonical path (so two
-    repos with the same basename get distinct, stable names).
+    HASH12 is the first 12 hex chars of the SHA-256 of the canonical path (so two
+    repos with the same basename get distinct, stable names with low collision
+    probability).
     """
     canonical = str(repo)
     slug = re.sub(r"[^A-Za-z0-9]+", "_", repo.name).strip("_").upper() or "REPO"
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8].upper()
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12].upper()
     return f"{RECEIVER_TOKEN_ENV_PREFIX}{slug}_{digest}"
 
 
@@ -583,13 +650,13 @@ async def deploy_cc_receiver_handler(
     if stopped is not None:
         warnings.append(f"stopped previous receiver pid={stopped}")
 
-    # 9. Launch detached, injecting the inbound token into the child's env. Also
-    # publish it into THIS process's os.environ under the stable name so an
-    # in-process fleet_send (which resolves token_env via os.environ) can present
-    # it this session — the token is intentionally NOT persisted to disk.
+    # 9. Launch detached, injecting the inbound token into the child's env ONLY.
+    # The parent's os.environ and the on-disk .token are NOT mutated yet: if the
+    # launch fails or the child never becomes healthy, we must leave no token
+    # leak behind (#7). The doomed child still got the token at launch, but it is
+    # torn down below, so that copy is harmless.
     child_env: Optional[Dict[str, str]] = None
     if receiver_token is not None:
-        os.environ[receiver_token_env] = receiver_token
         child_env = dict(os.environ)
         child_env[receiver_token_env] = receiver_token
     try:
@@ -603,6 +670,7 @@ async def deploy_cc_receiver_handler(
     if not healthy:
         # Fail-closed: a launched-but-unhealthy child must not be reported as a
         # success. Tear it down (killpg/SIGTERM), drop any pidfile it wrote, error.
+        # os.environ / .token were NOT touched on this path -> no token leak (#7).
         _kill_launched_child(pid)
         try:
             pid_path.unlink(missing_ok=True)
@@ -614,6 +682,23 @@ async def deploy_cc_receiver_handler(
                 f"(port in use? startup crash? see {log_path})"
             )
         }
+
+    # 11. Health passed -> commit the token to BOTH the parent environment (so an
+    # in-process fleet_send resolves token_env via os.environ this session) and
+    # the persisted <repo>/.hermes/.token (chmod 0600) so a gateway RESTART can
+    # re-publish the SAME token the surviving receiver was launched with — this is
+    # what lets boot-reconcile leave a healthy receiver alone (#1). Also ensure the
+    # runtime/secret .gitignore so the token + pid/log never get committed.
+    if receiver_token is not None:
+        os.environ[receiver_token_env] = receiver_token
+        try:
+            _write_token_file(hermes_dir / TOKEN_FILENAME, receiver_token)
+        except OSError as exc:
+            warnings.append(f"could not persist receiver token to .token: {exc}")
+    try:
+        upsert_hermes_gitignore(hermes_dir / GITIGNORE_FILENAME)
+    except OSError as exc:
+        warnings.append(f"could not write .hermes/.gitignore: {exc}")
 
     result: Dict[str, Any] = {
         "deployed": True,
@@ -736,19 +821,50 @@ def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:
     return int(default)
 
 
-def reconcile_managed_receivers() -> List[Dict[str, Any]]:
-    """On gateway start, (re)provision any down/orphaned managed CC receivers.
+def _port_from_peer_url(url: Optional[str]) -> Optional[int]:
+    """Parse the bind port from a peer ``url`` (e.g. http://127.0.0.1:9301 -> 9301).
 
-    For each managed claude_code peer with a repo_path:
-      * If its receiver is alive AND healthy (PID + /health, identity-matched)
-        AND this gateway already holds its inbound token in ``os.environ`` ->
-        LEAVE it (the live session + token are intact).
-      * Otherwise (down, OR alive-but-this-gateway-lost-the-token after a
-        restart) -> call ``deploy_cc_receiver_handler(repo_path)`` to re-provision:
-        it stops any old receiver fail-closed, relaunches with a fresh token, and
-        republishes the token into ``os.environ``. The token is deliberately not
-        persisted to disk; receiver conversation context survives via the claude
-        ``--resume`` session files, so a receiver restart is safe.
+    Returns ``None`` when the url is absent or carries no explicit port.
+    """
+    if not url:
+        return None
+    try:
+        from urllib.parse import urlparse  # noqa: PLC0415,WPS433
+
+        port = urlparse(str(url)).port
+    except (ValueError, TypeError):
+        return None
+    return int(port) if port is not None else None
+
+
+def _read_token_file(repo: Path) -> Optional[str]:
+    """Read the persisted receiver token from <repo>/.hermes/.token (None if absent)."""
+    try:
+        raw = (repo / ".hermes" / TOKEN_FILENAME).read_text().strip()
+    except OSError:
+        return None
+    return raw or None
+
+
+def reconcile_managed_receivers() -> List[Dict[str, Any]]:
+    """On gateway start, leave healthy managed CC receivers alone; redeploy down ones.
+
+    fleet.yaml is the DESIRED state. For each managed claude_code peer with a
+    repo_path:
+      1. Read the persisted ``<repo>/.hermes/.token`` (if any) and re-publish it
+         to ``os.environ[token_env]`` so an in-session ``fleet_send`` presents the
+         SAME token the surviving receiver was launched with (H1).
+      2. Determine the desired bind port from the peer ``url`` in fleet.yaml; if
+         the on-disk ``a2a_receiver.json`` records a different port, prefer
+         fleet.yaml and log the drift.
+      3. Check health (PID alive + /health + repo_path identity) on that port.
+      4. If HEALTHY -> LEAVE IT (action="healthy"). Do NOT redeploy — the running
+         executor (possibly mid-task) is preserved and its token is now
+         re-published. This fixes restart-kills-in-flight-work (H1).
+      5. Only if DOWN/unhealthy -> redeploy (fresh token, rewrites .token,
+         relaunches, re-publishes) via ``deploy_cc_receiver_handler``
+         (action="redeployed"). Receiver conversation context survives via the
+         claude ``--resume`` session files, so a redeploy is safe.
 
     Never raises: each peer's failure is captured into its summary row. Returns a
     list of ``{agent, repo_path, action, ...}`` rows (one per managed peer).
@@ -779,19 +895,42 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
             continue
 
         token_env = entry.get("token_env") or stable_token_env_name(repo)
-        port = _receiver_port(repo)
+
+        # (1) Re-publish the persisted token so in-session fleet_send matches the
+        # surviving receiver. Only set when present and not already in os.environ
+        # with the same value (avoid clobbering a fresher in-process value).
+        persisted = _read_token_file(repo)
+        if persisted and os.environ.get(token_env) != persisted:
+            os.environ[token_env] = persisted
+
+        # (2) Desired port from fleet.yaml url; warn on drift vs on-disk config.
+        desired_port = _port_from_peer_url(entry.get("url"))
+        on_disk_port = _receiver_port(repo)
+        if desired_port is None:
+            port = on_disk_port
+        else:
+            port = desired_port
+            if desired_port != on_disk_port:
+                log.warning(
+                    "a2a_fleet: boot-reconcile %s port drift — fleet.yaml says :%s but "
+                    "a2a_receiver.json says :%s; using fleet.yaml",
+                    name, desired_port, on_disk_port,
+                )
+
+        # (3) Health on the desired port.
         pid = _read_pid(repo / ".hermes" / PID_FILENAME)
         alive = pid is not None and _pid_alive(pid)
         healthy = bool(alive and _check_health_once(port, expected_repo_path=str(repo)))
-        have_token = bool(os.environ.get(token_env))
 
-        if healthy and have_token:
+        # (4) Healthy -> leave it (token already re-published above).
+        if healthy:
             row["action"] = "healthy"
-            log.info("a2a_fleet: boot-reconcile %s -> healthy (pid=%s :%s)", name, pid, port)
+            log.info("a2a_fleet: boot-reconcile %s -> healthy (pid=%s :%s); left running",
+                     name, pid, port)
             results.append(row)
             continue
 
-        # Down, or alive-but-this-gateway-lost-the-token -> (re)provision.
+        # (5) Down/unhealthy -> redeploy on the desired port.
         try:
             res = asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
         except Exception as exc:  # noqa: BLE001
@@ -806,12 +945,19 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
             row["error"] = res["error"]
             log.warning("a2a_fleet: boot-reconcile %s -> failed (%s)", name, res["error"])
         else:
-            row["action"] = "reconciled"
+            row["action"] = "redeployed"
             row["pid"] = res.get("pid") if isinstance(res, dict) else None
-            log.info("a2a_fleet: boot-reconcile %s -> reconciled (pid=%s)", name, row.get("pid"))
+            log.info("a2a_fleet: boot-reconcile %s -> redeployed (pid=%s)", name, row.get("pid"))
         results.append(row)
 
     return results
+
+
+# Singleton guard for the boot-reconcile thread. Mirrors __init__'s
+# _server_thread / _server_thread_lock pattern so repeated register() calls
+# (double plugin load) never spawn racing reconcile threads (#6).
+_reconcile_thread: Optional[threading.Thread] = None
+_reconcile_lock = threading.Lock()
 
 
 def reconcile_managed_receivers_in_thread() -> None:
@@ -819,15 +965,24 @@ def reconcile_managed_receivers_in_thread() -> None:
 
     Mirrors ``__init__._start_server_in_thread``: the work happens off the plugin
     load path and any failure is swallowed so register() is never disrupted.
+    Idempotent — a second call while a reconcile thread is alive is a no-op so
+    repeated register() calls don't double-spawn (#6).
     """
+    global _reconcile_thread
+
     def _worker() -> None:
         try:
             reconcile_managed_receivers()
         except Exception:  # noqa: BLE001 — defensive; reconcile already guards.
             log.debug("a2a_fleet: boot-reconcile thread failed", exc_info=True)
 
-    threading.Thread(
-        target=_worker,
-        name="a2a_fleet.boot_reconcile",
-        daemon=True,
-    ).start()
+    with _reconcile_lock:
+        if _reconcile_thread is not None and _reconcile_thread.is_alive():
+            log.debug("a2a_fleet: boot-reconcile thread already running, skipping spawn")
+            return
+        _reconcile_thread = threading.Thread(
+            target=_worker,
+            name="a2a_fleet.boot_reconcile",
+            daemon=True,
+        )
+        _reconcile_thread.start()

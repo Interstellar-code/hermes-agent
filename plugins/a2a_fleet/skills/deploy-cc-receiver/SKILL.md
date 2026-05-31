@@ -1,6 +1,6 @@
 ---
 name: deploy-cc-receiver
-description: (v0.3 — planned) End-to-end procedure for deploying a Claude Code executor receiver into a target repo so Hermes can orchestrate Claude Code over A2A — confirm the repo path, call deploy_cc_receiver, run the roles/repo/comm/purpose handshake, then relay tasks via fleet_send and monitor replies. Use when asked to deploy Claude Code as an executor, set up a repo-scoped A2A executor, or have Hermes drive Claude Code in a specific repo.
+description: End-to-end procedure for deploying a Claude Code executor receiver into a target repo so Hermes can orchestrate Claude Code over A2A — confirm the repo path, call deploy_cc_receiver, run the roles/repo/comm/purpose handshake, then relay tasks via fleet_send and monitor replies. Use when asked to deploy Claude Code as an executor, set up a repo-scoped A2A executor, or have Hermes drive Claude Code in a specific repo.
 metadata:
   hermes:
     tags: [a2a_fleet, a2a, agent-to-agent, claude-code, executor, orchestrator]
@@ -8,10 +8,9 @@ metadata:
 
 # a2a_fleet: deploy-cc-receiver
 
-> **Status: v0.3 — planned / in progress.** The `deploy_cc_receiver` tool and the
-> standalone receiver ship in a later v0.3 phase. This skill is the orchestration
-> procedure Hermes follows once the tool is available; the steps and contracts
-> below are the target design (see `.omc/plans/a2a-fleet-v0.3-plan.md`).
+> **Status: v0.3.** The `deploy_cc_receiver` tool and the standalone receiver
+> ship in v0.3. This skill is the orchestration procedure Hermes follows to bring
+> up and drive the receiver.
 
 How to make **Claude Code** a repo-scoped executor in the fleet. Hermes is the
 **orchestrator**; Claude Code is the **executor** running inside one specific
@@ -76,9 +75,14 @@ boot-reconcile manages it. The deploy result returns the exact values to wire:
 
 - `repo_path` — the canonical repo path (echoed in the result),
 - `receiver_token_env` — the **stable** inbound-token env var NAME (e.g.
-  `A2A_CC_TOKEN_<SLUG>_<HASH8>`); the same name every redeploy, so it can be
+  `A2A_CC_TOKEN_<SLUG>_<HASH12>`); the same name every redeploy, so it can be
   referenced persistently. The token VALUE is fresh per deploy and is published
-  into the gateway's environment + the child's env — never written to disk.
+  into the gateway's environment + the child's env AND persisted (on a successful
+  deploy) to `<repo>/.hermes/.token` (chmod 0600) so a gateway restart can
+  re-publish the same token and leave a healthy receiver running. The deploy also
+  writes `<repo>/.hermes/.gitignore` so `.token` / `*.pid` / `*.log` / inbox +
+  transcript runtime files are never committed (the tracked `A2A.md` @import is
+  fine to commit).
 
 Add (or confirm) this block, using the `receiver_token_env` deploy returned:
 
@@ -95,9 +99,17 @@ fleet:
 
 With `token_env` set, `fleet_send(agent="claude-code", ...)` resolves the bearer
 from the gateway environment and presents it on `POST :9300/jsonrpc`. With
-`managed: true` + `mode: claude_code` + `repo_path`, boot-reconcile re-provisions
-this receiver on the next gateway start if it is down (the token is re-minted —
-receiver conversation context survives via the claude `--resume` session files).
+`managed: true` + `mode: claude_code` + `repo_path`, boot-reconcile on the next
+gateway start **leaves a healthy receiver running** (it re-publishes the persisted
+`.token` so in-session `fleet_send` keeps working — it does NOT kill an executor
+that may be mid-task) and only redeploys when the receiver is down (then the token
+is re-minted and `.token` rewritten — receiver conversation context survives via
+the claude `--resume` session files). The desired bind port comes from this peer's
+`url`, not from on-disk state.
+
+`token_env` for a managed `claude_code` peer **must** equal the `receiver_token_env`
+the deploy returned (the stable per-repo name); `load_fleet` rejects a mismatch so
+the gateway and receiver never resolve different vars.
 
 ## Procedure
 
@@ -118,7 +130,9 @@ the user + await direction.**
    deploy_cc_receiver(repo_path="/Users/you/dev/some-repo")
    ```
    It (deterministic, side-effecting):
-   - canonicalizes `repo_path` (rejects symlink escapes / non-canonical paths),
+   - canonicalizes `repo_path` (RESOLVES symlinks / `..` to the real on-disk
+     target and pins the cwd there — symlinked inputs are accepted, not rejected;
+     security is preserved because the receiver only ever runs in the real dir),
    - copies the receiver into `<repo>/.hermes/cc_receiver.py`,
    - writes binding config `<repo>/.hermes/a2a_receiver.json` (cwd pinned,
      atomic temp-file + rename),
@@ -128,17 +142,25 @@ the user + await direction.**
      never clobbers existing content) — role text stays out of tracked files,
    - stops any existing receiver for this repo before launching a fresh one,
    - launches the receiver **detached** (survives gateway restart) on `:9300`,
-     records `<repo>/.hermes/cc_receiver.pid`, health-checks `:9300/health`.
+     records `<repo>/.hermes/cc_receiver.pid`, health-checks `:9300/health`,
+   - on a SUCCESSFUL deploy (after health passes) persists the provisioned token
+     to `<repo>/.hermes/.token` (chmod 0600) and writes/updates
+     `<repo>/.hermes/.gitignore` (`.token`, `*.pid`, `*.log`, `a2a-inbox*`,
+     `a2a-transcript*`, `a2a-inbox.offset`). On a failed/unhealthy deploy NO token
+     is published to the gateway env and NO `.token` is written (no secret leak).
 
-   Returns `{deployed, pid, port, repo_path, status}`. If `status` is not
-   healthy, surface the error to the user — do not start relaying tasks.
+   Returns `{deployed, pid, port, repo_path, status, receiver_token_env}`. If
+   `status` is not healthy, surface the error to the user — do not start relaying
+   tasks.
 
 3. **Ensure the `fleet.yaml` peer entry** (see schema above). Confirm the
    `claude-code` peer block exists with the `token_env` the deploy returned, and
    set a generous turn timeout — **`agent.timeout_s` must be 300+** (a `claude -p`
    turn that uses tools runs 30s–5min; a short timeout will look like a failure
-   when the executor is simply still working). A no-reply-yet is NOT an error: the
-   async reply POSTs back to `:9219` minutes later.
+   when the executor is simply still working). `load_fleet` logs a warning (not an
+   error) when a managed `claude_code` peer is configured with `agent.timeout_s`
+   below 300. A no-reply-yet is NOT an error: the async reply POSTs back to `:9219`
+   minutes later.
 
 4. **Handshake** — one-shot, before any real task. Send the executor a structured
    first message on a reserved `context_id` (e.g. `handshake:<repo-slug>`) and read
@@ -210,11 +232,13 @@ the user + await direction.**
 - **One in-flight turn per `context_id`.** Two overlapping `--resume <same>` turns
   corrupt the session; the receiver serializes per `context_id` and returns
   "busy, retry" for a second concurrent turn. Respect it — don't retry-storm.
-- **Receiver-side bounds.** The receiver caps concurrency (`max_concurrent_turns`)
-  and tears itself down after an idle timeout (no messages for N min). So: a
-  "busy" response means wait, not retry; and if the receiver has idled out, the
-  next request needs a fresh deploy (or boot-reconcile relaunch) — don't hammer a
-  torn-down port.
+- **Receiver-side bounds.** Anti-loop is enforced ORCHESTRATOR-side (here): the
+  receiver runs NO handshake state machine. It enforces only its own bounds —
+  per-`context_id` serialization (one in-flight turn per context), concurrency cap
+  (`max_concurrent_turns`), and an idle timeout (tears itself down after no
+  messages for N min). So: a "busy" response means wait, not retry; and if the
+  receiver has idled out, the next request needs a fresh deploy (or boot-reconcile
+  relaunch) — don't hammer a torn-down port.
 - **Error handling — surface, don't silently retry.** If Claude's reply is an
   `[error] ...` (e.g. `claude` not found, permission error, broken session) or the
   receiver is unreachable, **surface it to the user clearly** and stop. Do not loop
@@ -241,8 +265,10 @@ the user + await direction.**
   inventory means the repo settings didn't load.
 - **"busy, retry" on `:9300`** → a turn for that `context_id` is still running;
   wait for it, don't fire a second concurrent turn on the same context.
-- **Receiver down after gateway restart** → boot-reconcile relaunches `managed`
-  peers; if it's still down, re-run `deploy_cc_receiver` (or
+- **Gateway restart** → boot-reconcile re-publishes each managed peer's persisted
+  `.token` and **leaves a healthy receiver running** (it never kills an executor
+  that may be mid-task); it relaunches ONLY a `managed` peer that is down. If a
+  peer is still down after that, re-run `deploy_cc_receiver` (or
   `cc_receiver_status` / `cc_receiver_stop`).
 - **Deploying to an unauthorized repo** → never. cwd is pinned and runs with
   `bypassPermissions`; confirm the path with the user first (Step 1).
