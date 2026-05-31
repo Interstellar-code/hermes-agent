@@ -9,11 +9,33 @@ See ``README.md`` for the full architecture and roadmap.
 from __future__ import annotations
 
 import atexit
+import functools
 import importlib.util
+import json
 import logging
 import threading
 
 logger = logging.getLogger("a2a_fleet.plugin")
+
+
+def _json_tool_result(fn):
+    """Wrap an async tool handler so a dict/list return is JSON-stringified.
+
+    Tool handlers in this plugin build structured dicts, but the gateway puts a
+    handler's return value DIRECTLY into the tool-result message ``content``
+    (see agent/tool_dispatch_helpers.make_tool_result_message). OpenAI-compatible
+    upstreams require ``content`` to be a string — a raw dict serializes to an
+    object and is rejected with ``invalid message content type:
+    map[string]interface{}`` (HTTP 400). Stringify non-str returns here so the
+    handlers can keep their dict API while the tool wire format stays valid.
+    """
+    @functools.wraps(fn)
+    async def _wrapper(*args, **kwargs):
+        result = await fn(*args, **kwargs)
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
+    return _wrapper
 
 # Daemon thread that owns the server event loop — kept as a module-level
 # reference so that _start_server_in_thread() is idempotent.
@@ -156,7 +178,7 @@ def register(ctx) -> None:
             },
             "required": ["agent", "message"],
         },
-        handler=fleet_tools.fleet_send_handler,
+        handler=_json_tool_result(fleet_tools.fleet_send_handler),
         check_fn=None,
         is_async=True,
         description="Send a message to a fleet peer agent via A2A and return the reply.",
@@ -193,7 +215,7 @@ def register(ctx) -> None:
             },
             "required": ["repo_path"],
         },
-        handler=cc_deploy.deploy_cc_receiver_handler,
+        handler=_json_tool_result(cc_deploy.deploy_cc_receiver_handler),
         check_fn=None,
         is_async=True,
         description="Deploy + launch a Claude Code A2A executor receiver in a target repo.",
@@ -212,7 +234,7 @@ def register(ctx) -> None:
             },
             "required": ["repo_path"],
         },
-        handler=cc_deploy.cc_receiver_status_handler,
+        handler=_json_tool_result(cc_deploy.cc_receiver_status_handler),
         check_fn=None,
         is_async=True,
         description="Report whether the repo's Claude Code receiver is running (PID alive AND /health).",
@@ -231,7 +253,7 @@ def register(ctx) -> None:
             },
             "required": ["repo_path"],
         },
-        handler=cc_deploy.cc_receiver_stop_handler,
+        handler=_json_tool_result(cc_deploy.cc_receiver_stop_handler),
         check_fn=None,
         is_async=True,
         description="Stop the repo's Claude Code receiver via its PID file and remove the pidfile.",

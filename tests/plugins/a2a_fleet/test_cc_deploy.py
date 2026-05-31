@@ -1021,3 +1021,28 @@ def test_terminate_pid_true_when_process_already_gone(monkeypatch):
         raise ProcessLookupError
     monkeypatch.setattr(cc_deploy.os, "kill", fake_kill)
     assert cc_deploy._terminate_pid(4242) is True
+
+
+# ---------------------------------------------------------------------------
+# Tool handler return value MUST reach the wire as a string, not a dict
+# (openai-compatible upstreams reject object content → 400 fallback_exhausted)
+# ---------------------------------------------------------------------------
+
+def test_json_tool_result_stringifies_dict_returns():
+    import asyncio
+    import json as _json
+    import a2a_fleet as _pkg
+
+    async def returns_dict(**kwargs):
+        return {"running": True, "pid": 123, "port": 9311}
+
+    async def returns_str(**kwargs):
+        return "plain"
+
+    wrapped_dict = _pkg._json_tool_result(returns_dict)
+    wrapped_str = _pkg._json_tool_result(returns_str)
+    out_dict = asyncio.run(wrapped_dict(task_id="t"))
+    out_str = asyncio.run(wrapped_str())
+    assert isinstance(out_dict, str)
+    assert _json.loads(out_dict) == {"running": True, "pid": 123, "port": 9311}
+    assert out_str == "plain"  # already-string returns pass through unchanged
