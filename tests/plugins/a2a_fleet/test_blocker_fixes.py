@@ -82,7 +82,10 @@ def test_register_logs_when_start_server_fails(
         register(ctx)
         import time; time.sleep(0.2)  # let the daemon thread log
 
-    assert len(ctx.calls) == 1, "tool should still register even when the server thread fails"
+    # fleet_send + the three v0.3 cc_receiver tools (deploy/status/stop) register
+    # before the server thread is spawned, so a server-start failure must not
+    # prevent any of them from being registered.
+    assert len(ctx.calls) == 4, "tools should still register even when the server thread fails"
     assert any(
         "server failed to start" in rec.message
         for rec in caplog.records
