@@ -101,6 +101,10 @@ receiver conversation context survives via the claude `--resume` session files).
 
 ## Procedure
 
+End-to-end: **confirm repo → `deploy_cc_receiver` → ensure `fleet.yaml` peer entry
+(with `token_env`) → handshake → (per task) `fleet_send` + monitor + summarize to
+the user + await direction.**
+
 1. **Ask the user for the target repo path, then CONFIRM it back before acting.**
    Do not proceed on an assumed path. Example:
    > "I'll deploy a Claude Code executor into `/Users/you/dev/some-repo` — Claude
@@ -129,44 +133,95 @@ receiver conversation context survives via the claude `--resume` session files).
    Returns `{deployed, pid, port, repo_path, status}`. If `status` is not
    healthy, surface the error to the user — do not start relaying tasks.
 
-3. **Handshake** — send the executor a structured first message on a reserved
-   `context_id` (e.g. `handshake:<repo-hash>`) and read the confirmation:
-   - **Hermes declares:** role=orchestrator; bound repo=`<repo_path>`; comm
-     contract (same `context_id` = same persistent session; replies POSTed to
-     `:9219`); purpose/scope.
-   - **Claude confirms:** role=executor; the repo it's operating in (echo its
-     `cwd`); harness loaded (skills / MCP inventory, optional); ready.
+3. **Ensure the `fleet.yaml` peer entry** (see schema above). Confirm the
+   `claude-code` peer block exists with the `token_env` the deploy returned, and
+   set a generous turn timeout — **`agent.timeout_s` must be 300+** (a `claude -p`
+   turn that uses tools runs 30s–5min; a short timeout will look like a failure
+   when the executor is simply still working). A no-reply-yet is NOT an error: the
+   async reply POSTs back to `:9219` minutes later.
+
+4. **Handshake** — one-shot, before any real task. Send the executor a structured
+   first message on a reserved `context_id` (e.g. `handshake:<repo-slug>`) and read
+   the confirmation. The deployed role text (`<repo>/.hermes/A2A.md`) already tells
+   a fresh `claude -p` to recognize a handshake and answer with the confirmation
+   below.
+
+   **Hermes → Claude** (copy-usable; fill the `<...>` fields):
+   ```
+   fleet_send(
+     agent="claude-code",
+     context_id="handshake:<repo-slug>",
+     message="""[A2A HANDSHAKE]
+   Hermes role: orchestrator (node http://127.0.0.1:9219).
+   Bound repo: <repo_path>  (your cwd is pinned here).
+   Comm contract: same context_id = the same persistent Claude session (context
+     accumulates); your replies POST back to Hermes on :9219.
+   Purpose/scope: you are the executor for THIS repo; I relay user tasks, you plan
+     and execute them here using your full harness, and reply concisely with
+     status/results. I summarize each reply to the user and await direction before
+     the next instruction — no autonomous loop.
+   Please confirm: (1) role = executor, (2) the repo/cwd you are operating in,
+   (3) a brief harness inventory (skills / MCP / CLAUDE.md active), (4) ready or
+   not-ready.""",
+   )
+   ```
+
+   **Claude → Hermes** (the receiver's `claude -p` reply): role=executor; the repo
+   it's operating in (echoed `cwd`); harness loaded (skills / MCP / CLAUDE.md
+   inventory); ready / not-ready.
+
    Report roles + readiness + the harness inventory back to the user. If the
    harness did not load (e.g. `.mcp.json` absent/malformed), say so — the feature
    runs with a reduced harness, never silently.
 
-4. **Relay tasks** — for each user task, call:
+5. **Relay tasks** — for each user task, call:
    ```
    fleet_send(agent="claude-code", message="<task>", context_id="<thread-id>")
    ```
    Reuse the SAME `context_id` for a continuing conversation/thread (persistent
-   Claude session); use a fresh one to start an independent thread.
+   Claude session); use a fresh one to start an independent thread. Frame the task
+   so it stays within the bound repo (the executor's cwd is pinned there).
 
-5. **Monitor + liaise** — await Claude's reply (it arrives back on `:9219` as a
-   real Hermes-agent turn). Relay status/results to the user, ask follow-ups,
-   and feed the next instruction back via `fleet_send` with the same
-   `context_id`. You are the liaison between the user and the executor.
+6. **Monitor → summarize → await direction (anti-loop — critical).** Claude's
+   reply arrives back on `:9219` as a real Hermes-agent turn, possibly minutes
+   later. When it arrives:
+   - **SUMMARIZE it to the user** (status, what changed, what's blocked), then
+     **WAIT for the user's direction** before the next `fleet_send`. Do NOT
+     auto-reply to every inbound turn — no autonomous ping-pong between Hermes and
+     the executor. One `fleet_send` per user instruction.
+   - **A no-reply-yet is not a failure.** The turn may still be running (tool use
+     can take minutes). Do not retry or re-send while a turn is in flight; just
+     keep waiting, or tell the user it's still working.
+   You are the liaison between the user and the executor — feed the next
+   instruction back via `fleet_send` with the same `context_id` only after the
+   user directs it.
 
 ## Autonomous-operation guardrails
 
 `bypassPermissions` + "plan and execute autonomously" is powerful — bound it:
 
-- **Per-turn timeout.** Each turn spawns a fresh `claude -p` (seconds of
-  cold-start even with `--resume`). Honor the configured per-turn timeout; do not
-  block indefinitely.
-- **Do NOT loop.** One `fleet_send` per task instruction. Do not auto-resend or
-  spin awaiting a reply — relay, await once, then bring the result to the user.
-- **One in-flight turn per `context_id`.** Two overlapping `--resume <same>`
-  turns corrupt the session; the receiver serializes per `context_id` and
-  returns "busy, retry" for a second concurrent turn. Respect it — don't retry-
-  storm.
-- **Authorized repo only.** cwd is pinned at deploy; never pass a repo/cwd from a
-  message. Deploy only where the user authorized.
+- **Anti-loop (critical).** Hermes does NOT auto-reply to every inbound A2A turn.
+  When Claude's reply lands on `:9219`, summarize it to the user and **wait for the
+  user's direction** before the next `fleet_send`. No autonomous ping-pong; one
+  `fleet_send` per user instruction.
+- **Timeout / async replies.** Set `fleet.yaml agent.timeout_s` to **300+**
+  (tool-using turns run 30s–5min). A no-reply-yet is **not** a failure — the async
+  reply can arrive minutes later. Don't re-send or retry while a turn is in flight.
+- **One in-flight turn per `context_id`.** Two overlapping `--resume <same>` turns
+  corrupt the session; the receiver serializes per `context_id` and returns
+  "busy, retry" for a second concurrent turn. Respect it — don't retry-storm.
+- **Receiver-side bounds.** The receiver caps concurrency (`max_concurrent_turns`)
+  and tears itself down after an idle timeout (no messages for N min). So: a
+  "busy" response means wait, not retry; and if the receiver has idled out, the
+  next request needs a fresh deploy (or boot-reconcile relaunch) — don't hammer a
+  torn-down port.
+- **Error handling — surface, don't silently retry.** If Claude's reply is an
+  `[error] ...` (e.g. `claude` not found, permission error, broken session) or the
+  receiver is unreachable, **surface it to the user clearly** and stop. Do not loop
+  re-sending. Re-deploy / `cc_receiver_status` to diagnose if needed.
+- **Authorized repo only / scope discipline.** cwd is pinned at deploy; never pass
+  a repo/cwd from a message. Claude operates ONLY in the bound repo — frame tasks
+  accordingly. Deploy only where the user authorized.
 
 ## Success criteria
 

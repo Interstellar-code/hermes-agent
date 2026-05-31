@@ -120,6 +120,35 @@ def test_a2a_md_written_with_role_text(tmp_path: Path, stub_template, stub_runti
     assert "contextId" in text
 
 
+def test_role_text_includes_handshake_protocol():
+    """The role text must teach a fresh ``claude -p`` how to answer a handshake.
+
+    A handshake message (reserved contextId ``handshake:<repo-slug>``) must elicit
+    a structured confirmation: role=executor, the repo cwd it is operating in, a
+    brief harness inventory (skills / MCP / CLAUDE.md), and ready/not-ready.
+    """
+    text = cc_deploy.A2A_ROLE_TEXT
+    low = text.lower()
+    assert "handshake" in low
+    # Must instruct the confirmation contents.
+    assert "executor" in low
+    assert "cwd" in low or "working directory" in low
+    assert "harness" in low or "skills" in low
+    assert "ready" in low
+
+
+def test_role_text_includes_session_and_guardrail_instructions():
+    """Role text must convey same-contextId continuity + concise-reply guardrails."""
+    text = cc_deploy.A2A_ROLE_TEXT
+    low = text.lower()
+    assert "contextid" in low
+    # Same context_id = continuing session.
+    assert "same" in low and "session" in low
+    # Concise replies with results/status (so Hermes can summarize to the user).
+    assert "concise" in low
+    assert "status" in low
+
+
 # ---------------------------------------------------------------------------
 # CLAUDE.md @import managed block
 # ---------------------------------------------------------------------------
