@@ -311,6 +311,53 @@ See `skills/deploy-cc-receiver/SKILL.md` for the orchestration procedure and
 
 ---
 
+## Context & memory model
+
+This plugin stores **no conversation context of its own** — no SQLite DB, no
+JSON history file it maintains. Conversation memory is delegated to whichever
+agent actually runs the turn. `contextId` is the join key across all paths.
+
+| Path | Where the conversation lives | Durable? |
+|------|------------------------------|----------|
+| **v0.3 `claude_code` executor** | Claude Code's **native session store** (`~/.claude/` session files), keyed by `--session-id <uuid5(contextId)>` / `--resume` | ✅ Claude Code owns it (incl. its own compaction) |
+| **`agent` (Route B)** | The **Hermes agent session** keyed `agent:main:a2a_fleet:dm:{contextId}` (see below) | ✅ Hermes owns it |
+| **`llm` (Route A, fallback)** | `context_store.py` — an **in-memory** LRU dict (max ~20 turns / 500 contexts) | ❌ ephemeral, lost on restart |
+| **`echo`** | none (stateless ping/pong) | — |
+
+For the v0.3 executor, the receiver only maps `contextId → session-id` and lets
+Claude Code remember. Same `contextId` → same Claude session → context
+accumulates across turns. The `<repo>/.hermes/*.jsonl` files (`a2a-inbox`,
+`a2a-transcript`, `a2a-inbox.offset`) are **operational logs/queues — not
+conversation context.**
+
+**Boundary (by design):**
+- *Durability = the running agent's retention, not this plugin's.* If Claude
+  Code (or Hermes) prunes very old sessions, a long-dormant `contextId` can lose
+  its history. Fine for active work; relevant only for resuming weeks-old threads.
+- *Session files are host-local* — they live where the agent runs (the repo's
+  machine/user home for `claude -p`; the profile dir for Hermes). A `contextId`
+  is therefore bound to that host. This matches the single-host repo model; it is
+  not portable across machines (which this design does not need).
+
+### How the Hermes agent itself remembers (for reference)
+The peer on the Hermes side has two independent layers, separate from this plugin:
+- **Session (short-term):** the gateway `SessionStore` writes a per-session
+  transcript `<profile>/sessions/{session_id}.jsonl` plus a `sessions.json`
+  index. This is the active conversation history (Hermes applies its own
+  compaction as it grows).
+- **Long-term (cross-session):** a pluggable **memory provider** via
+  `agent/memory_manager.py` — e.g. **Hindsight** (local-embedded, SQLite +
+  vector index, daemon on `:9177`). It runs RAG-style: *recall* relevant
+  memories before a turn (injected into the system prompt) and *store*
+  observations after (`prefetch_all` / `sync_all`). The built-in `memory` tool
+  (`MEMORY.md` / `USER.md` hot-cache) is the simplest such provider.
+
+So: **two agents, two independent memories.** Hermes remembers via its session
+JSONL + its memory provider; Claude Code remembers via its own session files;
+`a2a_fleet` just threads `contextId` between them and persists none of it.
+
+---
+
 ## Install / enable
 
 ```bash
