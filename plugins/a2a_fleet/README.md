@@ -502,6 +502,39 @@ live feel. The route appears only after the gateway is (re)started with the
 plugin present — discovery + mount happen at `web_server` startup; a 404 means a
 restart is needed.
 
+### Which server hosts this, and how to reach it
+
+This endpoint lives on **exactly one** of the several Hermes ports — getting this
+wrong is the #1 source of confusion. It is mounted on the **Hermes Dashboard web
+server** (`hermes dashboard`, default **`:9119`**), the same app that serves the
+SPA. It is **NOT** on any of these:
+
+| Port | Server | Auth | Hosts `/api/plugins/a2a_fleet/*`? |
+|------|--------|------|----------------------------------|
+| **`:9119`** | **Dashboard web server** (`hermes dashboard`) | **browser session cookie** (dashboard login / OAuth gate) | ✅ **yes** |
+| `:8642` | Gateway **API server** (`API_SERVER_PORT`) | `API_SERVER_KEY` **bearer** | ❌ no |
+| `:9219` | a2a_fleet **peer server** (`server.py`) | A2A bearer (`fleet.server.token_env`) | ❌ no |
+| `:9300+` | deployed **CC receiver** | A2A bearer | ❌ no |
+
+**Auth:** the Dashboard gates `/api/*` with a **browser session cookie**, not the
+`API_SERVER_KEY` bearer (that key is for the `:8642` API server and does nothing
+here). So a plain `curl` from a terminal gets a 401 / login redirect **by design**
+— this is the gate working, not a misconfiguration. A browser front-end on the
+dashboard origin already carries the cookie, so it reaches the endpoint with no
+extra auth.
+
+**Verifying without a browser (terminal / an agent):** do **not** curl `:9119`
+(no session cookie). Read the **source of truth directly** instead — the same
+JSONL the endpoint serves:
+
+```bash
+cat <repo>/.hermes/a2a-transcript.jsonl      # both directions, one JSON line per message
+```
+
+Confirm the route is *mounted* (not auth) by listing discovered dashboard plugins
+in-process, e.g. via `web_server._get_dashboard_plugins()`, or just check the
+`web_server` startup log for `Mounted plugin API routes: /api/plugins/a2a_fleet/`.
+
 ---
 
 ## Install / enable
