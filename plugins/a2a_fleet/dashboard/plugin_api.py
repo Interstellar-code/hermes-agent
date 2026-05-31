@@ -52,30 +52,65 @@ TRANSCRIPT_RELPATH = (".hermes", "a2a-transcript.jsonl")
 router = APIRouter()
 
 
-def _managed_repos() -> List[Tuple[str, str]]:
-    """Return [(peer_name, repo_path)] for managed claude_code peers in fleet.yaml.
+def _fleet_yaml_candidates() -> List[Path]:
+    """Every fleet.yaml the dashboard should consider, across ALL profiles.
 
-    Never raises: a missing/invalid fleet.yaml yields an empty list (the tab just
-    shows no conversations rather than 500-ing).
+    The dashboard is a global control plane — it typically runs under the default
+    Hermes home (``~/.hermes``) while the managed receivers live in a specific
+    profile (e.g. ``~/.hermes/profiles/hermes-switch/fleet.yaml``). Binding this
+    endpoint to the dashboard's own profile would make it perpetually empty. So we
+    scan the home's own ``fleet.yaml`` AND every ``profiles/*/fleet.yaml`` beneath
+    it — surfacing A2A conversations regardless of which profile owns the receiver.
     """
     try:
-        from a2a_fleet import fleet_config  # noqa: PLC0415
-        cfg = fleet_config.load_fleet()
-    except Exception as exc:  # noqa: BLE001 — read-only surface; degrade to empty.
-        log.debug("a2a_fleet conversations: load_fleet failed: %s", exc)
+        from hermes_constants import get_hermes_home  # noqa: PLC0415
+        home = get_hermes_home()
+    except Exception:  # noqa: BLE001
         return []
+    candidates: List[Path] = [home / "fleet.yaml"]
+    profiles_dir = home / "profiles"
+    try:
+        if profiles_dir.is_dir():
+            for child in sorted(profiles_dir.iterdir()):
+                if child.is_dir():
+                    candidates.append(child / "fleet.yaml")
+    except OSError:
+        pass
+    return [c for c in candidates if c.is_file()]
+
+
+def _managed_repos() -> List[Tuple[str, str]]:
+    """Return ``[(peer_name, repo_path)]`` for managed claude_code peers across all
+    profiles' fleet.yaml — deduped by repo_path.
+
+    Profile-agnostic (see :func:`_fleet_yaml_candidates`) so a global dashboard
+    surfaces every profile's receivers. Parses raw YAML leniently — no token_env /
+    schema validation (that is ``load_fleet``'s job for the live server, and a
+    validation error must not blank the read-only feed). Never raises: any
+    unreadable/invalid file is skipped and yields no peers.
+    """
+    import yaml  # noqa: PLC0415
 
     out: List[Tuple[str, str]] = []
     seen: set = set()
-    for name, entry in (cfg.get("agents") or {}).items():
-        if not isinstance(entry, dict):
+    for path in _fleet_yaml_candidates():
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            agents = ((raw.get("fleet") or {}).get("agents")) or {}
+        except Exception as exc:  # noqa: BLE001 — read-only surface; skip bad files.
+            log.debug("a2a_fleet conversations: skipping %s: %s", path, exc)
             continue
-        repo = entry.get("repo_path")
-        if entry.get("managed") and entry.get("mode") == "claude_code" and repo:
-            key = str(repo)
-            if key not in seen:
-                seen.add(key)
-                out.append((str(name), key))
+        if not isinstance(agents, dict):
+            continue
+        for name, entry in agents.items():
+            if not isinstance(entry, dict):
+                continue
+            repo = entry.get("repo_path")
+            if entry.get("managed") is True and entry.get("mode") == "claude_code" and repo:
+                key = str(repo)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((str(name), key))
     return out
 
 
