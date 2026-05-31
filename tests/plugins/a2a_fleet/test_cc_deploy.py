@@ -498,6 +498,57 @@ def test_deploy_provisions_inbound_token(tmp_path: Path, stub_template, monkeypa
     assert captured["env"][token_env] == token
 
 
+def test_stable_token_env_name_is_deterministic(tmp_path: Path):
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    name1 = cc_deploy.stable_token_env_name(canonical)
+    name2 = cc_deploy.stable_token_env_name(canonical)
+    # Stable across calls for the same repo.
+    assert name1 == name2
+    assert name1.startswith(cc_deploy.RECEIVER_TOKEN_ENV_PREFIX)
+    # Env-var-safe: only uppercase / digits / underscore.
+    assert all(c.isupper() or c.isdigit() or c == "_" for c in name1)
+
+
+def test_stable_token_env_name_differs_per_repo(tmp_path: Path):
+    a = tmp_path / "repo_a"
+    a.mkdir()
+    b = tmp_path / "repo_b"
+    b.mkdir()
+    na = cc_deploy.stable_token_env_name(Path(os.path.realpath(str(a))))
+    nb = cc_deploy.stable_token_env_name(Path(os.path.realpath(str(b))))
+    assert na != nb
+
+
+def test_deploy_uses_stable_token_name_and_publishes_to_environ(
+    tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch
+):
+    """The inbound token env var NAME is the stable per-repo name, and the VALUE
+    is published into the gateway's os.environ this session (for in-process
+    fleet_send) while the NAME stays constant across redeploys."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    expected_name = cc_deploy.stable_token_env_name(canonical)
+    monkeypatch.delenv(expected_name, raising=False)
+
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda r, rp, lp, env=None: 2121)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+
+    res1 = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert res1["receiver_token_env"] == expected_name
+    # Published into the current process environment under the stable name.
+    assert os.environ[expected_name] == res1["receiver_token"]
+
+    res2 = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    # NAME stable across redeploys; VALUE fresh.
+    assert res2["receiver_token_env"] == expected_name
+    assert res2["receiver_token"] != res1["receiver_token"]
+    assert os.environ[expected_name] == res2["receiver_token"]
+
+
 def test_deploy_no_auth_opt_out(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
     """no_auth=True skips token provisioning (open loopback dev)."""
     repo = _make_repo(tmp_path)
@@ -589,3 +640,157 @@ def test_deploy_aborts_when_old_receiver_wont_die(tmp_path: Path, stub_template,
     assert "could not stop existing receiver" in res["error"]
     assert "deployed" not in res
     assert launched["n"] == 0, "must NOT launch a second receiver after stop-old failure"
+
+
+# ---------------------------------------------------------------------------
+# Boot-reconcile (Phase 3) — selects managed claude_code peers, decides
+# reconcile-vs-leave, never spawns real processes / hits the network in tests.
+# ---------------------------------------------------------------------------
+
+def _stub_fleet(monkeypatch: pytest.MonkeyPatch, agents: dict):
+    from a2a_fleet import fleet_config
+    monkeypatch.setattr(fleet_config, "load_fleet", lambda profile=None: {"agents": agents})
+
+
+def test_managed_cc_peers_selection():
+    agents = {
+        "plain": {"url": "http://x", "managed": False, "mode": None, "repo_path": None},
+        "route-b": {"url": "http://y", "managed": True, "mode": None, "repo_path": "/r"},
+        "wrong-mode": {"url": "http://z", "managed": True, "mode": "llm", "repo_path": "/r"},
+        "no-repo": {"url": "http://w", "managed": True, "mode": "claude_code", "repo_path": None},
+        "good": {"url": "http://c", "managed": True, "mode": "claude_code", "repo_path": "/r"},
+    }
+    selected = cc_deploy._managed_cc_peers({"agents": agents})
+    names = [n for n, _ in selected]
+    assert names == ["good"]
+
+
+def test_reconcile_noop_when_no_managed_peers(monkeypatch: pytest.MonkeyPatch):
+    _stub_fleet(monkeypatch, {
+        "construct": {"url": "http://x", "managed": False, "mode": None, "repo_path": None},
+    })
+    # Deploy must never be called when there is nothing managed to reconcile.
+    monkeypatch.setattr(
+        cc_deploy, "deploy_cc_receiver_handler",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not deploy")),
+    )
+    assert cc_deploy.reconcile_managed_receivers() == []
+
+
+def test_reconcile_leaves_healthy_peer_with_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    token_env = cc_deploy.stable_token_env_name(canonical)
+    hermes_dir = repo / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "cc_receiver.pid").write_text("4242")
+    (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
+    monkeypatch.setenv(token_env, "live-token")
+    _stub_fleet(monkeypatch, {
+        "claude-code": {
+            "url": "http://127.0.0.1:9300", "managed": True,
+            "mode": "claude_code", "repo_path": str(canonical), "token_env": token_env,
+        },
+    })
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: True)
+    # Healthy + token present -> must NOT redeploy.
+    monkeypatch.setattr(
+        cc_deploy, "deploy_cc_receiver_handler",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not deploy")),
+    )
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert len(rows) == 1
+    assert rows[0]["action"] == "healthy"
+
+
+def test_reconcile_redeploys_when_down(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    _stub_fleet(monkeypatch, {
+        "claude-code": {
+            "url": "http://127.0.0.1:9300", "managed": True,
+            "mode": "claude_code", "repo_path": str(canonical),
+        },
+    })
+    # No pidfile / not healthy -> down.
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
+    called = {}
+
+    async def fake_deploy(repo_path, bind_port=cc_deploy.DEFAULT_BIND_PORT, **k):
+        called["repo_path"] = repo_path
+        called["bind_port"] = bind_port
+        return {"deployed": True, "pid": 7777}
+
+    monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert rows[0]["action"] == "reconciled"
+    assert rows[0]["pid"] == 7777
+    assert called["repo_path"] == str(canonical)
+
+
+def test_reconcile_redeploys_when_alive_but_token_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Alive + healthy receiver but this gateway lost the token (restart) -> redeploy."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    token_env = cc_deploy.stable_token_env_name(canonical)
+    monkeypatch.delenv(token_env, raising=False)
+    hermes_dir = repo / ".hermes"
+    hermes_dir.mkdir()
+    (hermes_dir / "cc_receiver.pid").write_text("4242")
+    (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
+    _stub_fleet(monkeypatch, {
+        "claude-code": {
+            "url": "http://127.0.0.1:9300", "managed": True,
+            "mode": "claude_code", "repo_path": str(canonical), "token_env": token_env,
+        },
+    })
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: True)
+    called = {"n": 0}
+
+    async def fake_deploy(repo_path, bind_port=cc_deploy.DEFAULT_BIND_PORT, **k):
+        called["n"] += 1
+        return {"deployed": True, "pid": 8888}
+
+    monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert called["n"] == 1
+    assert rows[0]["action"] == "reconciled"
+
+
+def test_reconcile_failed_deploy_surfaces_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    _stub_fleet(monkeypatch, {
+        "claude-code": {
+            "url": "http://127.0.0.1:9300", "managed": True,
+            "mode": "claude_code", "repo_path": str(canonical),
+        },
+    })
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
+
+    async def fake_deploy(repo_path, bind_port=cc_deploy.DEFAULT_BIND_PORT, **k):
+        return {"error": "port in use"}
+
+    monkeypatch.setattr(cc_deploy, "deploy_cc_receiver_handler", fake_deploy)
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert rows[0]["action"] == "failed"
+    assert "port in use" in rows[0]["error"]
+
+
+def test_reconcile_never_raises_on_bad_fleet(monkeypatch: pytest.MonkeyPatch):
+    from a2a_fleet import fleet_config
+
+    def boom(profile=None):
+        raise fleet_config.FleetConfigError("no fleet.yaml")
+
+    monkeypatch.setattr(fleet_config, "load_fleet", boom)
+    # Must swallow the error and return an empty summary, not raise.
+    assert cc_deploy.reconcile_managed_receivers() == []

@@ -263,6 +263,17 @@ def register(ctx) -> None:
         except Exception:
             logger.debug("a2a_fleet: register_platform failed (non-gateway context)", exc_info=True)
 
+    # v0.3 boot-reconcile: re-provision any managed Claude Code receivers that are
+    # down (or whose inbound token this gateway lost on restart). Runs on its own
+    # daemon thread so it never blocks plugin load; a clean no-op when there are no
+    # managed peers (the common case / fresh installs). Guarded so a failure here
+    # never disrupts the server thread / tools / skill / platform above.
+    try:
+        if hasattr(cc_deploy, "reconcile_managed_receivers_in_thread"):
+            cc_deploy.reconcile_managed_receivers_in_thread()
+    except Exception:  # noqa: BLE001 — additive, must never break register().
+        logger.debug("a2a_fleet: boot-reconcile spawn failed", exc_info=True)
+
     _start_server_in_thread()
     atexit.register(_atexit_stop)
     logger.info("a2a_fleet: registered fleet_send tool + spawned A2A server thread")

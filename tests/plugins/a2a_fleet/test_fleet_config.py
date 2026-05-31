@@ -64,6 +64,47 @@ def test_get_agent_unknown_raises(fleet_home: Path) -> None:
         get_agent("nonexistent")
 
 
+def test_plain_peer_gets_repo_aware_defaults(fleet_home: Path) -> None:
+    """Existing url/token peers (no v0.3 fields) parse with inert defaults."""
+    from a2a_fleet.fleet_config import load_fleet
+
+    cfg = load_fleet()
+    construct = cfg["agents"]["construct"]
+    # Pre-existing behaviour unchanged.
+    assert construct["url"] == "http://127.0.0.1:9320"
+    assert construct["token"] == "tok-construct"
+    # New repo-aware fields default to the inert (non-managed) values.
+    assert construct["repo_path"] is None
+    assert construct["managed"] is False
+    assert construct["mode"] is None
+
+
+def test_repo_aware_peer_fields_parsed(fleet_home: Path) -> None:
+    """A managed claude_code peer surfaces repo_path / managed / mode."""
+    from a2a_fleet.fleet_config import load_fleet
+
+    fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
+    data = yaml.safe_load(fleet_yaml.read_text())
+    data["fleet"]["agents"]["claude-code"] = {
+        "url": "http://127.0.0.1:9300",
+        "repo_path": "/Users/you/dev/some-repo",
+        "managed": True,
+        "mode": "claude_code",
+        "token_env": "A2A_CC_TOKEN_SOME_REPO_1A2B3C4D",
+    }
+    fleet_yaml.write_text(yaml.safe_dump(data))
+
+    cfg = load_fleet()
+    cc = cfg["agents"]["claude-code"]
+    assert cc["url"] == "http://127.0.0.1:9300"
+    assert cc["repo_path"] == "/Users/you/dev/some-repo"
+    assert cc["managed"] is True
+    assert cc["mode"] == "claude_code"
+    assert cc["token_env"] == "A2A_CC_TOKEN_SOME_REPO_1A2B3C4D"
+    # Adding a repo-aware peer never disturbs an existing plain peer.
+    assert cfg["agents"]["construct"]["managed"] is False
+
+
 def test_profile_home_reads_fleet_yaml_without_nested_profiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Profile-mode HERMES_HOME already points at the active profile directory."""
     from a2a_fleet.fleet_config import load_fleet

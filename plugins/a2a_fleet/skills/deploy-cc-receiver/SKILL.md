@@ -67,6 +67,38 @@ fleet:
       mode: claude_code                      # distinguishes from plain url/token peers
 ```
 
+### fleet.yaml peer entry (after deploy)
+
+`deploy_cc_receiver` does **NOT** auto-edit `fleet.yaml` — it preserves your
+comments and hand-maintained structure. After a successful deploy, ensure the
+`claude-code` peer exists in `fleet.yaml` so `fleet_send` authenticates and
+boot-reconcile manages it. The deploy result returns the exact values to wire:
+
+- `repo_path` — the canonical repo path (echoed in the result),
+- `receiver_token_env` — the **stable** inbound-token env var NAME (e.g.
+  `A2A_CC_TOKEN_<SLUG>_<HASH8>`); the same name every redeploy, so it can be
+  referenced persistently. The token VALUE is fresh per deploy and is published
+  into the gateway's environment + the child's env — never written to disk.
+
+Add (or confirm) this block, using the `receiver_token_env` deploy returned:
+
+```yaml
+fleet:
+  agents:
+    claude-code:
+      url: http://127.0.0.1:9300
+      repo_path: /Users/you/dev/some-repo
+      managed: true
+      mode: claude_code
+      token_env: A2A_CC_TOKEN_SOME_REPO_1A2B3C4D   # <- receiver_token_env from deploy
+```
+
+With `token_env` set, `fleet_send(agent="claude-code", ...)` resolves the bearer
+from the gateway environment and presents it on `POST :9300/jsonrpc`. With
+`managed: true` + `mode: claude_code` + `repo_path`, boot-reconcile re-provisions
+this receiver on the next gateway start if it is down (the token is re-minted —
+receiver conversation context survives via the claude `--resume` session files).
+
 ## Procedure
 
 1. **Ask the user for the target repo path, then CONFIRM it back before acting.**

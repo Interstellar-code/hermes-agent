@@ -163,12 +163,21 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         _validate_peer_url(peer_url, "url", name, path)
         if peer_card_url:
             _validate_peer_url(peer_card_url, "agent_card_url", name, path)
+        # v0.3 repo-aware peer fields (additive, all OPTIONAL). A plain url/token
+        # peer (Route B / v0.2) omits these and gets the inert defaults below, so
+        # existing fleets are unaffected. ``managed`` + ``mode == "claude_code"``
+        # + ``repo_path`` together mark a Hermes-managed Claude Code receiver that
+        # boot-reconcile owns.
+        repo_path = entry.get("repo_path")
         agents_out[name] = {
             "url": peer_url,
             "agent_card_url": peer_card_url,
             "token": _resolve_token(entry.get("token_env")),
             "token_env": entry.get("token_env"),
             "description": entry.get("description", ""),
+            "repo_path": str(repo_path) if repo_path else None,
+            "managed": bool(entry.get("managed", False)),
+            "mode": entry.get("mode"),
         }
 
     # Optional llm block — system_prompt / system_prompt_file, max_tokens, temperature.

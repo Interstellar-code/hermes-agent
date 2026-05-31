@@ -23,14 +23,17 @@ Design constraints (deliberate):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -427,7 +430,26 @@ def _launch_receiver(
 # Handlers
 # ---------------------------------------------------------------------------
 
-RECEIVER_TOKEN_ENV_PREFIX = "A2A_CC_RECEIVER_TOKEN_"
+RECEIVER_TOKEN_ENV_PREFIX = "A2A_CC_TOKEN_"
+
+
+def stable_token_env_name(repo: Path) -> str:
+    """Deterministic inbound-token env var NAME for a canonical repo path.
+
+    The NAME is stable per repo so it can be referenced persistently from
+    fleet.yaml (``token_env: <name>``) — unlike a random-hex name, which changes
+    every deploy and can't be wired ahead of time. The token VALUE stays a fresh
+    ``secrets.token_urlsafe`` per deploy; only the NAME is stable.
+
+    Scheme: ``A2A_CC_TOKEN_<SLUG>_<HASH8>`` where SLUG is the uppercased final
+    path component with non-alphanumerics collapsed to ``_`` (env-var-safe), and
+    HASH8 is the first 8 hex chars of the SHA-256 of the canonical path (so two
+    repos with the same basename get distinct, stable names).
+    """
+    canonical = str(repo)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", repo.name).strip("_").upper() or "REPO"
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:8].upper()
+    return f"{RECEIVER_TOKEN_ENV_PREFIX}{slug}_{digest}"
 
 
 async def deploy_cc_receiver_handler(
@@ -507,8 +529,9 @@ async def deploy_cc_receiver_handler(
     receiver_token_env: str = ""
     if not no_auth:
         receiver_token = secrets.token_urlsafe(32)
-        short = secrets.token_hex(4)
-        receiver_token_env = f"{RECEIVER_TOKEN_ENV_PREFIX}{short}"
+        # STABLE name (derived from the canonical repo path) so fleet.yaml can
+        # reference it persistently; the VALUE is fresh each deploy.
+        receiver_token_env = stable_token_env_name(repo)
     else:
         warnings.append(
             "no_auth=True: receiver started WITHOUT an inbound token — POST /jsonrpc "
@@ -538,9 +561,13 @@ async def deploy_cc_receiver_handler(
     if stopped is not None:
         warnings.append(f"stopped previous receiver pid={stopped}")
 
-    # 9. Launch detached, injecting the inbound token into the child's env.
+    # 9. Launch detached, injecting the inbound token into the child's env. Also
+    # publish it into THIS process's os.environ under the stable name so an
+    # in-process fleet_send (which resolves token_env via os.environ) can present
+    # it this session — the token is intentionally NOT persisted to disk.
     child_env: Optional[Dict[str, str]] = None
     if receiver_token is not None:
+        os.environ[receiver_token_env] = receiver_token
         child_env = dict(os.environ)
         child_env[receiver_token_env] = receiver_token
     try:
@@ -646,3 +673,139 @@ async def cc_receiver_stop_handler(repo_path: str) -> Dict[str, Any]:
     except OSError:
         pass
     return {"stopped": bool(killed), "pid": pid}
+
+
+# ---------------------------------------------------------------------------
+# Boot-reconcile (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _managed_cc_peers(fleet_cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    """Select fleet peers Hermes owns as Claude Code receivers.
+
+    A peer qualifies iff ``managed is True`` AND ``mode == "claude_code"`` AND it
+    names a ``repo_path``. Anything else (plain url/token peers, Route B, peers
+    missing the v0.3 fields) is ignored, so a fresh install with no managed peers
+    yields an empty list -> reconcile is a clean no-op.
+    """
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    agents = fleet_cfg.get("agents") or {}
+    if not isinstance(agents, dict):
+        return out
+    for name, entry in agents.items():
+        if not isinstance(entry, dict):
+            continue
+        if (
+            entry.get("managed") is True
+            and entry.get("mode") == "claude_code"
+            and entry.get("repo_path")
+        ):
+            out.append((name, entry))
+    return out
+
+
+def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:
+    """Read the receiver's bound port from <repo>/.hermes/a2a_receiver.json."""
+    try:
+        cfg = json.loads((repo / ".hermes" / CONFIG_FILENAME).read_text())
+        if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
+            return int(cfg["bind_port"])
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return int(default)
+
+
+def reconcile_managed_receivers() -> List[Dict[str, Any]]:
+    """On gateway start, (re)provision any down/orphaned managed CC receivers.
+
+    For each managed claude_code peer with a repo_path:
+      * If its receiver is alive AND healthy (PID + /health, identity-matched)
+        AND this gateway already holds its inbound token in ``os.environ`` ->
+        LEAVE it (the live session + token are intact).
+      * Otherwise (down, OR alive-but-this-gateway-lost-the-token after a
+        restart) -> call ``deploy_cc_receiver_handler(repo_path)`` to re-provision:
+        it stops any old receiver fail-closed, relaunches with a fresh token, and
+        republishes the token into ``os.environ``. The token is deliberately not
+        persisted to disk; receiver conversation context survives via the claude
+        ``--resume`` session files, so a receiver restart is safe.
+
+    Never raises: each peer's failure is captured into its summary row. Returns a
+    list of ``{agent, repo_path, action, ...}`` rows (one per managed peer).
+    """
+    import asyncio
+
+    from . import fleet_config  # noqa: WPS433 — lazy import is the contract.
+
+    results: List[Dict[str, Any]] = []
+    try:
+        cfg = fleet_config.load_fleet()
+    except Exception as exc:  # noqa: BLE001 — never raise out of reconcile.
+        log.warning("a2a_fleet: boot-reconcile skipped; fleet.yaml not usable (%s)", exc)
+        return results
+
+    peers = _managed_cc_peers(cfg)
+    if not peers:
+        return results  # common case / fresh installs: nothing to do.
+
+    for name, entry in peers:
+        row: Dict[str, Any] = {"agent": name, "repo_path": entry.get("repo_path")}
+        repo, err = canonicalize_repo_path(str(entry.get("repo_path")))
+        if err is not None or repo is None:
+            row["action"] = "failed"
+            row["error"] = err or "invalid repo_path"
+            log.warning("a2a_fleet: boot-reconcile %s -> failed (%s)", name, row["error"])
+            results.append(row)
+            continue
+
+        token_env = entry.get("token_env") or stable_token_env_name(repo)
+        port = _receiver_port(repo)
+        pid = _read_pid(repo / ".hermes" / PID_FILENAME)
+        alive = pid is not None and _pid_alive(pid)
+        healthy = bool(alive and _check_health_once(port, expected_repo_path=str(repo)))
+        have_token = bool(os.environ.get(token_env))
+
+        if healthy and have_token:
+            row["action"] = "healthy"
+            log.info("a2a_fleet: boot-reconcile %s -> healthy (pid=%s :%s)", name, pid, port)
+            results.append(row)
+            continue
+
+        # Down, or alive-but-this-gateway-lost-the-token -> (re)provision.
+        try:
+            res = asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
+        except Exception as exc:  # noqa: BLE001
+            row["action"] = "failed"
+            row["error"] = f"deploy raised: {exc}"
+            log.warning("a2a_fleet: boot-reconcile %s -> failed (%s)", name, exc)
+            results.append(row)
+            continue
+
+        if isinstance(res, dict) and res.get("error"):
+            row["action"] = "failed"
+            row["error"] = res["error"]
+            log.warning("a2a_fleet: boot-reconcile %s -> failed (%s)", name, res["error"])
+        else:
+            row["action"] = "reconciled"
+            row["pid"] = res.get("pid") if isinstance(res, dict) else None
+            log.info("a2a_fleet: boot-reconcile %s -> reconciled (pid=%s)", name, row.get("pid"))
+        results.append(row)
+
+    return results
+
+
+def reconcile_managed_receivers_in_thread() -> None:
+    """Run ``reconcile_managed_receivers`` on a daemon thread (never blocks load).
+
+    Mirrors ``__init__._start_server_in_thread``: the work happens off the plugin
+    load path and any failure is swallowed so register() is never disrupted.
+    """
+    def _worker() -> None:
+        try:
+            reconcile_managed_receivers()
+        except Exception:  # noqa: BLE001 — defensive; reconcile already guards.
+            log.debug("a2a_fleet: boot-reconcile thread failed", exc_info=True)
+
+    threading.Thread(
+        target=_worker,
+        name="a2a_fleet.boot_reconcile",
+        daemon=True,
+    ).start()
