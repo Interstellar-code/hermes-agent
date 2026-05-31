@@ -99,7 +99,8 @@ DEFAULTS: Dict[str, Any] = {
     "role_file": None,            # if set, read role prompt from this path (overrides role_prompt)
     "claude_model": "sonnet",
     "claude_extra_flags": [],     # list[str] appended verbatim to the command
-    "auth_token_env": None,       # env var name holding the bearer token
+    "auth_token_env": None,       # env var name holding the INBOUND bearer token (POST /jsonrpc)
+    "hermes_auth_token_env": None,  # env var name holding the bearer token for OUTBOUND replies to Hermes
     "poll_interval_s": 2.0,
     "claude_timeout_s": 300,
     "context_lock_wait_s": 600.0,  # how long a queued same-context turn waits for the lock
@@ -152,8 +153,21 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
 
 
 def resolve_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
-    """Return the bearer token from ``auth_token_env`` env var, or None."""
+    """Return the INBOUND bearer token from ``auth_token_env`` env var, or None."""
     env_name = cfg.get("auth_token_env")
+    if not env_name:
+        return None
+    token = os.environ.get(env_name)
+    return token or None
+
+
+def resolve_hermes_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
+    """Return the OUTBOUND bearer token (for replies to Hermes) or None.
+
+    Read from the env var named in ``hermes_auth_token_env``. Unset name or
+    unset/empty value -> None (no Authorization header sent; current behavior).
+    """
+    env_name = cfg.get("hermes_auth_token_env")
     if not env_name:
         return None
     token = os.environ.get(env_name)
@@ -600,10 +614,26 @@ def _transcript(direction: str, frm: str, to: str, context_id: str, text: str) -
         log.warning("transcript write failed (%s)", exc)
 
 
-def post_reply(hermes_url: str, context_id: str, text: str) -> bool:
+POST_REPLY_MAX_ATTEMPTS = 3
+POST_REPLY_BACKOFF_S = 0.5
+
+
+def post_reply(
+    hermes_url: str,
+    context_id: str,
+    text: str,
+    auth_token: Optional[str] = None,
+) -> bool:
     """POST the reply back to Hermes as JSON-RPC SendMessage. Returns success.
 
-    Failure is logged and swallowed (never crashes the poll loop).
+    When ``auth_token`` is supplied, an ``Authorization: Bearer <token>`` header
+    is sent (an auth-enabled Hermes node would 401 otherwise). When None, no
+    Authorization header is sent (open loopback dev node — current behavior).
+
+    A transient Hermes outage would drop a completed result, so we retry up to
+    ``POST_REPLY_MAX_ATTEMPTS`` with short backoff before giving up (in-process
+    only — NOT a durable queue). Final failure is logged loudly and swallowed
+    (never crashes the poll loop).
     """
     payload = {
         "jsonrpc": "2.0",
@@ -617,19 +647,33 @@ def post_reply(hermes_url: str, context_id: str, text: str) -> bool:
             }
         },
     }
-    try:
-        req = urllib.request.Request(
-            hermes_url,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            log.info("posted reply to hermes ctx=%s status=%s", context_id, resp.status)
-        return True
-    except Exception as exc:  # noqa: BLE001
-        log.warning("failed to POST reply to hermes (%s)", exc)
-        return False
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    data = json.dumps(payload).encode()
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, POST_REPLY_MAX_ATTEMPTS + 1):
+        try:
+            req = urllib.request.Request(
+                hermes_url, data=data, headers=headers, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                log.info("posted reply to hermes ctx=%s status=%s", context_id, resp.status)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            log.warning(
+                "failed to POST reply to hermes ctx=%s (attempt %d/%d): %s",
+                context_id, attempt, POST_REPLY_MAX_ATTEMPTS, exc,
+            )
+            if attempt < POST_REPLY_MAX_ATTEMPTS:
+                time.sleep(POST_REPLY_BACKOFF_S * attempt)
+    log.error(
+        "GIVING UP on reply to hermes ctx=%s after %d attempts (last error: %s); "
+        "result is LOST", context_id, POST_REPLY_MAX_ATTEMPTS, last_exc,
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +721,8 @@ class Receiver:
     ) -> None:
         self.cfg = cfg
         self.runner = runner
+        # Resolve the outbound (reply-to-Hermes) bearer once at construction.
+        self._hermes_auth_token = resolve_hermes_auth_token(cfg)
         max_ctx = int(cfg.get("max_tracked_contexts") or DEFAULTS["max_tracked_contexts"])
         self.locks = ContextLocks(max_entries=max_ctx)
         self.seen = SeenContexts(max_entries=max_ctx)
@@ -718,7 +764,7 @@ class Receiver:
             busy = "[busy] max concurrent turns reached, retry"
             log.warning("ctx=%s busy; concurrency cap reached", context_id)
             _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
-            post_reply(self.cfg["hermes_url"], context_id, busy)
+            post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
             return busy
         try:
             lock = self.locks.get(context_id)
@@ -727,7 +773,7 @@ class Receiver:
                 busy = "[busy] this context is processing another turn; retry shortly"
                 log.warning("ctx=%s busy; lock wait %.0fs exceeded", context_id, wait)
                 _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
-                post_reply(self.cfg["hermes_url"], context_id, busy)
+                post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
                 return busy
             try:
                 reply = run_claude_turn(
@@ -735,7 +781,7 @@ class Receiver:
                 )
                 out = reply if reply is not None else "[no reply produced by claude]"
                 _transcript("claude->hermes", "claude-code", "hermes", context_id, out)
-                post_reply(self.cfg["hermes_url"], context_id, out)
+                post_reply(self.cfg["hermes_url"], context_id, out, self._hermes_auth_token)
                 return reply
             finally:
                 lock.release()
@@ -747,6 +793,11 @@ class Receiver:
         locking inside ``process_message`` serializes same-context turns)."""
         if not self.inbox_path.exists():
             return
+        # TODO(perf, a2a_fleet v0.4): this rereads the ENTIRE inbox every poll and
+        # re-splits O(history) lines just to skip already-processed ones. For a
+        # long-lived receiver this is O(n) per poll. Switch to seeking a persisted
+        # BYTE offset (read from there to EOF) and/or periodic inbox compaction.
+        # Left as a clear TODO deliberately — not half-built here.
         try:
             lines = self.inbox_path.read_text().splitlines()
         except OSError as exc:
@@ -754,28 +805,43 @@ class Receiver:
             return
         for idx in range(self._processed, len(lines)):
             line = lines[idx].strip()
-            # Persist the offset for EVERY consumed line (blank/malformed too) so
-            # a restart never reprocesses it (at-most-once).
-            self._advance_offset(idx + 1)
+            # Blank/malformed/non-hermes lines are consumed with no handoff, so
+            # persist their offset immediately (at-most-once; nothing to lose).
             if not line:
+                self._advance_offset(idx + 1)
                 continue
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
+                self._advance_offset(idx + 1)
                 continue
             if entry.get("from") != "hermes":
+                self._advance_offset(idx + 1)
                 continue
             # Missing contextId -> mint a fresh uuid4 (no shared anon sentinel,
             # so unrelated anonymous tasks don't cross-talk on one session/lock).
             context_id = entry.get("contextId") or f"anon-{uuid.uuid4()}"
             text = entry.get("text", "")
             self.note_inbound()
-            threading.Thread(
+            thread = threading.Thread(
                 target=self.process_message,
                 args=(context_id, text),
                 name=f"turn-{context_id[:12]}",
                 daemon=True,
-            ).start()
+            )
+            try:
+                thread.start()
+            except RuntimeError as exc:
+                # Thread creation failed (e.g. resource exhaustion): do NOT advance
+                # the offset, so the next poll retries this message rather than
+                # losing an already-ACKed task. Stop draining this pass.
+                log.warning("failed to start turn thread for ctx=%s (%s); "
+                            "leaving message unconsumed for retry", context_id, exc)
+                return
+            # At-most-once: advance ONLY after a successful handoff. A crash in the
+            # window between .start() and here is near-zero; we accept it rather
+            # than risk at-least-once re-execution under bypassPermissions.
+            self._advance_offset(idx + 1)
 
     def poll_loop(self) -> None:
         interval = float(self.cfg.get("poll_interval_s") or DEFAULTS["poll_interval_s"])
@@ -1049,14 +1115,20 @@ def probe_claude_cli() -> bool:
         return False
 
 
-def write_pid_file(path: Path = PID_PATH) -> None:
+def write_pid_file(path: Optional[Path] = None) -> None:
+    # Resolve PID_PATH at CALL time (not as a default-arg binding) so the
+    # module-level constant is authoritative — and so tests can monkeypatch it.
+    if path is None:
+        path = PID_PATH
     try:
         path.write_text(str(os.getpid()))
     except OSError as exc:
         log.warning("could not write PID file %s (%s)", path, exc)
 
 
-def remove_pid_file(path: Path = PID_PATH) -> None:
+def remove_pid_file(path: Optional[Path] = None) -> None:
+    if path is None:
+        path = PID_PATH
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
@@ -1090,7 +1162,6 @@ def main() -> int:
 
     INBOX_PATH.touch(exist_ok=True)
     TRANSCRIPT_PATH.touch(exist_ok=True)
-    write_pid_file()
 
     if not expected_token:
         log.warning(
@@ -1113,6 +1184,21 @@ def main() -> int:
             threading.Thread(target=httpd.shutdown, name="idle-shutdown", daemon=True).start()
 
     receiver = Receiver(cfg, on_idle_shutdown=_idle_teardown)
+
+    # Bind the server FIRST. A failed bind (port in use) must NOT leave a stale
+    # PID file behind to poison status/stop — so the pidfile is written only
+    # AFTER a successful bind, and removed if bind raises.
+    handler = make_handler(cfg, expected_token, receiver)
+    try:
+        httpd = ThreadingHTTPServer((cfg["bind_host"], int(cfg["bind_port"])), handler)
+    except OSError as exc:
+        log.error("failed to bind %s:%s (%s); not writing PID file",
+                  cfg["bind_host"], cfg["bind_port"], exc)
+        remove_pid_file()  # defensive: ensure no stale pidfile survives a bind failure
+        return 2
+    httpd_box["httpd"] = httpd
+    write_pid_file()
+
     poll_thread = threading.Thread(target=receiver.poll_loop, name="inbox-poll", daemon=True)
     poll_thread.start()
 
@@ -1121,10 +1207,6 @@ def main() -> int:
             target=receiver.idle_monitor_loop, name="idle-monitor", daemon=True
         )
         idle_thread.start()
-
-    handler = make_handler(cfg, expected_token, receiver)
-    httpd = ThreadingHTTPServer((cfg["bind_host"], int(cfg["bind_port"])), handler)
-    httpd_box["httpd"] = httpd
 
     def _shutdown(signum: int, _frame: Any) -> None:
         log.info("signal %s received; shutting down", signum)

@@ -380,7 +380,10 @@ def test_bounded_concurrency_caps_simultaneous_turns(ccr, tmp_path, monkeypatch)
 
 def test_concurrency_cap_replies_busy_when_full(ccr, tmp_path, monkeypatch):
     posted = []
-    monkeypatch.setattr(ccr, "post_reply", lambda url, cid, text: posted.append(text) or True)
+    monkeypatch.setattr(
+        ccr, "post_reply",
+        lambda url, cid, text, token=None: posted.append(text) or True,
+    )
     cfg = _base_cfg(ccr, tmp_path)
     cfg["hermes_url"] = "http://127.0.0.1:1/jsonrpc"
     cfg["max_concurrent_turns"] = 1
@@ -673,3 +676,209 @@ def test_concurrent_inbox_appends_no_torn_lines(ccr, tmp_path, monkeypatch):
     assert len(lines) == 40
     for l in lines:
         json.loads(l)  # every line must be valid JSON (not torn)
+
+
+# ---------------------------------------------------------------------------
+# Outbound auth — replies to an auth-enabled Hermes carry a bearer
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _capture_post_request(ccr, monkeypatch):
+    """Patch urlopen; return a dict that captures the Request object on POST."""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["req"] = req
+        return _FakeResp()
+
+    monkeypatch.setattr(ccr.urllib.request, "urlopen", fake_urlopen)
+    return captured
+
+
+def test_resolve_hermes_auth_token(ccr, monkeypatch):
+    assert ccr.resolve_hermes_auth_token({}) is None
+    assert ccr.resolve_hermes_auth_token({"hermes_auth_token_env": None}) is None
+    monkeypatch.delenv("HERMES_CB", raising=False)
+    assert ccr.resolve_hermes_auth_token({"hermes_auth_token_env": "HERMES_CB"}) is None
+    monkeypatch.setenv("HERMES_CB", "cbtoken")
+    assert ccr.resolve_hermes_auth_token({"hermes_auth_token_env": "HERMES_CB"}) == "cbtoken"
+
+
+def test_post_reply_sends_bearer_when_token_set(ccr, monkeypatch):
+    captured = _capture_post_request(ccr, monkeypatch)
+    ok = ccr.post_reply("http://127.0.0.1:9219/jsonrpc", "ctx-1", "hi", auth_token="abc123")
+    assert ok is True
+    auth = captured["req"].headers.get("Authorization")
+    assert auth == "Bearer abc123"
+
+
+def test_post_reply_no_auth_header_when_token_unset(ccr, monkeypatch):
+    captured = _capture_post_request(ccr, monkeypatch)
+    ok = ccr.post_reply("http://127.0.0.1:9219/jsonrpc", "ctx-1", "hi")
+    assert ok is True
+    # urllib normalizes header keys to capitalized; no Authorization present.
+    assert captured["req"].headers.get("Authorization") is None
+
+
+def test_post_reply_retries_then_gives_up(ccr, monkeypatch):
+    attempts = {"n": 0}
+
+    def always_fail(req, timeout=None):
+        attempts["n"] += 1
+        raise OSError("hermes down")
+
+    monkeypatch.setattr(ccr.urllib.request, "urlopen", always_fail)
+    monkeypatch.setattr(ccr.time, "sleep", lambda *_a: None)  # no real backoff
+    ok = ccr.post_reply("http://127.0.0.1:9219/jsonrpc", "ctx-1", "hi")
+    assert ok is False
+    assert attempts["n"] == ccr.POST_REPLY_MAX_ATTEMPTS
+
+
+def test_post_reply_succeeds_after_transient_failure(ccr, monkeypatch):
+    attempts = {"n": 0}
+
+    def flaky(req, timeout=None):
+        attempts["n"] += 1
+        if attempts["n"] < 2:
+            raise OSError("transient")
+        return _FakeResp()
+
+    monkeypatch.setattr(ccr.urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(ccr.time, "sleep", lambda *_a: None)
+    ok = ccr.post_reply("http://127.0.0.1:9219/jsonrpc", "ctx-1", "hi")
+    assert ok is True
+    assert attempts["n"] == 2
+
+
+def test_receiver_uses_hermes_token_on_reply(ccr, tmp_path, monkeypatch):
+    """A Receiver resolves hermes_auth_token_env and threads it into post_reply."""
+    monkeypatch.setenv("HERMES_CB2", "recv-token")
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["hermes_url"] = "http://127.0.0.1:9219/jsonrpc"
+    cfg["hermes_auth_token_env"] = "HERMES_CB2"
+    seen_tokens = []
+    monkeypatch.setattr(ccr, "post_reply",
+                        lambda url, cid, text, token=None: seen_tokens.append(token) or True)
+    recv = ccr.Receiver(cfg, runner=_ok_runner)
+    recv.process_message("ctx-x", "do it")
+    assert seen_tokens and seen_tokens[-1] == "recv-token"
+
+
+# ---------------------------------------------------------------------------
+# Offset advanced AFTER thread handoff (not before)
+# ---------------------------------------------------------------------------
+
+def test_offset_not_advanced_when_thread_start_fails(ccr, tmp_path, monkeypatch):
+    """If Thread.start() raises, the message stays unconsumed (offset not advanced)."""
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    offset = tmp_path / "a2a-inbox.offset"
+    inbox.write_text(json.dumps({"from": "hermes", "contextId": "c1", "text": "one"}) + "\n")
+    cfg = _base_cfg(ccr, tmp_path)
+    recv = ccr.Receiver(cfg, runner=_ok_runner, inbox_path=inbox, offset_path=offset)
+
+    real_thread = threading.Thread
+
+    class BoomThread(real_thread):
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(ccr.threading, "Thread", BoomThread)
+    recv.poll_once()
+    # Offset must NOT have advanced past the un-dispatched message.
+    assert recv._processed == 0
+    assert not offset.exists() or offset.read_text().strip() in ("", "0")
+
+
+def test_offset_advances_after_successful_thread_start(ccr, tmp_path, monkeypatch):
+    """Happy path: offset advances once the turn thread is handed off."""
+    monkeypatch.setattr(ccr, "post_reply", lambda *a, **k: True)
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    offset = tmp_path / "a2a-inbox.offset"
+    inbox.write_text(json.dumps({"from": "hermes", "contextId": "c1", "text": "one"}) + "\n")
+    cfg = _base_cfg(ccr, tmp_path)
+    recv = ccr.Receiver(cfg, runner=_ok_runner, inbox_path=inbox, offset_path=offset)
+    dispatched = []
+    monkeypatch.setattr(recv, "process_message",
+                        lambda cid, text: dispatched.append((cid, text)))
+    recv.poll_once()
+    time.sleep(0.05)
+    assert dispatched == [("c1", "one")]
+    assert recv._processed == 1
+    assert offset.read_text().strip() == "1"
+
+
+# ---------------------------------------------------------------------------
+# PID file written AFTER bind (bind failure leaves no stale pidfile)
+# ---------------------------------------------------------------------------
+
+def test_main_no_pidfile_when_bind_fails(ccr, tmp_path, monkeypatch):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["bind_host"] = "127.0.0.1"
+    cfg["idle_timeout_s"] = 0
+    pid_path = tmp_path / "cc_receiver.pid"
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    transcript = tmp_path / "a2a-transcript.jsonl"
+    monkeypatch.setattr(ccr, "PID_PATH", pid_path)
+    monkeypatch.setattr(ccr, "INBOX_PATH", inbox)
+    monkeypatch.setattr(ccr, "TRANSCRIPT_PATH", transcript)
+    monkeypatch.setattr(ccr, "load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr(ccr, "resolve_auth_token", lambda *a, **k: "tok")  # auth ok
+    monkeypatch.setattr(ccr, "probe_claude_cli", lambda: True)
+
+    def boom(*a, **k):
+        raise OSError("address already in use")
+
+    monkeypatch.setattr(ccr, "ThreadingHTTPServer", boom)
+    rc = ccr.main()
+    assert rc == 2
+    assert not pid_path.exists(), "bind failure must NOT leave a stale pidfile"
+
+
+def test_main_writes_pidfile_after_successful_bind(ccr, tmp_path, monkeypatch):
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["bind_host"] = "127.0.0.1"
+    cfg["idle_timeout_s"] = 0
+    pid_path = tmp_path / "cc_receiver.pid"
+    inbox = tmp_path / "a2a-inbox.jsonl"
+    transcript = tmp_path / "a2a-transcript.jsonl"
+    monkeypatch.setattr(ccr, "PID_PATH", pid_path)
+    monkeypatch.setattr(ccr, "INBOX_PATH", inbox)
+    monkeypatch.setattr(ccr, "TRANSCRIPT_PATH", transcript)
+    monkeypatch.setattr(ccr, "load_config", lambda *a, **k: cfg)
+    monkeypatch.setattr(ccr, "resolve_auth_token", lambda *a, **k: "tok")
+    monkeypatch.setattr(ccr, "probe_claude_cli", lambda: True)
+
+    pid_at_bind = {}
+
+    class FakeHTTPD:
+        def __init__(self, addr, handler):
+            self.addr = addr
+            # At construction (bind) time, the pidfile must NOT yet exist.
+            pid_at_bind["existed_before_bind"] = pid_path.exists()
+
+        def serve_forever(self):
+            # By now the pidfile must be written.
+            pid_at_bind["existed_during_serve"] = pid_path.exists()
+            raise KeyboardInterrupt  # break out of serve_forever cleanly
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(ccr, "ThreadingHTTPServer", FakeHTTPD)
+    # serve_forever raises KeyboardInterrupt -> main's finally removes the pidfile;
+    # we only assert ordering captured during the run.
+    try:
+        ccr.main()
+    except KeyboardInterrupt:
+        pass
+    assert pid_at_bind["existed_before_bind"] is False
+    assert pid_at_bind["existed_during_serve"] is True

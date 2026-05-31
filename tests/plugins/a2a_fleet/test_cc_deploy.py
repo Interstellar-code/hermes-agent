@@ -54,10 +54,13 @@ def stub_runtime(monkeypatch: pytest.MonkeyPatch):
         launched["log"] = log_path
         return 4242
 
-    monkeypatch.setattr(cc_deploy, "_launch_receiver", fake_launch)
-    monkeypatch.setattr(cc_deploy, "_poll_health", lambda port, budget_s=8.0: True)
+    monkeypatch.setattr(cc_deploy, "_launch_receiver",
+                        lambda repo, receiver_path, log_path, env=None: fake_launch(
+                            repo, receiver_path, log_path))
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
     monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
-    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: None)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
     return launched
 
 
@@ -251,8 +254,9 @@ def test_stop_old_receiver_stops_live_pid(tmp_path: Path, monkeypatch: pytest.Mo
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
     terminated = {}
     monkeypatch.setattr(cc_deploy, "_terminate_pid", lambda pid: terminated.setdefault("pid", pid) or True)
-    stopped = cc_deploy._stop_old_receiver(pid_path)
+    stopped, err = cc_deploy._stop_old_receiver(pid_path)
     assert stopped == 1234
+    assert err is None
     assert terminated["pid"] == 1234
     assert not pid_path.exists()
 
@@ -261,7 +265,20 @@ def test_stop_old_receiver_none_when_dead(tmp_path: Path, monkeypatch: pytest.Mo
     pid_path = tmp_path / "cc_receiver.pid"
     pid_path.write_text("1234")
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: False)
-    assert cc_deploy._stop_old_receiver(pid_path) is None
+    assert cc_deploy._stop_old_receiver(pid_path) == (None, None)
+
+
+def test_stop_old_receiver_aborts_when_terminate_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Fail-closed: if the old receiver won't die, return an error AND keep the pidfile."""
+    pid_path = tmp_path / "cc_receiver.pid"
+    pid_path.write_text("4321")
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cc_deploy, "_terminate_pid", lambda pid: False)  # survives
+    stopped, err = cc_deploy._stop_old_receiver(pid_path)
+    assert stopped == 4321
+    assert err is not None and "could not stop existing receiver" in err
+    # Pidfile preserved (we did NOT confirm the process dead).
+    assert pid_path.exists()
 
 
 def test_deploy_stops_old_before_relaunch(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
@@ -273,8 +290,9 @@ def test_deploy_stops_old_before_relaunch(tmp_path: Path, stub_template, monkeyp
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
     killed = {}
     monkeypatch.setattr(cc_deploy, "_terminate_pid", lambda pid: killed.setdefault("pid", pid) or True)
-    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp: 5555)
-    monkeypatch.setattr(cc_deploy, "_poll_health", lambda port, budget_s=8.0: True)
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp, env=None: 5555)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
     monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
     assert killed["pid"] == 999
@@ -293,7 +311,8 @@ def test_status_running_requires_pid_and_health(tmp_path: Path, monkeypatch: pyt
     (hermes_dir / "cc_receiver.pid").write_text("321")
     (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
-    monkeypatch.setattr(cc_deploy, "_check_health_once", lambda port: True)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: True)
     res = _run(cc_deploy.cc_receiver_status_handler(str(repo)))
     assert res["running"] is True
     assert res["pid"] == 321
@@ -308,7 +327,8 @@ def test_status_not_running_when_pid_alive_but_unhealthy(tmp_path: Path, monkeyp
     (hermes_dir / "cc_receiver.pid").write_text("321")
     (hermes_dir / "a2a_receiver.json").write_text(json.dumps({"bind_port": 9300}))
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)
-    monkeypatch.setattr(cc_deploy, "_check_health_once", lambda port: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
     res = _run(cc_deploy.cc_receiver_status_handler(str(repo)))
     assert res["running"] is False
     assert res["healthy"] is False
@@ -317,7 +337,8 @@ def test_status_not_running_when_pid_alive_but_unhealthy(tmp_path: Path, monkeyp
 def test_status_no_pidfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo = _make_repo(tmp_path)
     (repo / ".hermes").mkdir()
-    monkeypatch.setattr(cc_deploy, "_check_health_once", lambda port: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
     res = _run(cc_deploy.cc_receiver_status_handler(str(repo)))
     assert res["running"] is False
     assert res["pid"] is None
@@ -383,27 +404,34 @@ def test_deploy_error_on_missing_template(tmp_path: Path, monkeypatch: pytest.Mo
 def test_deploy_error_on_launch_failure(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
     repo = _make_repo(tmp_path)
 
-    def boom(repo, rp, lp):
+    def boom(repo, rp, lp, env=None):
         raise OSError("address already in use")
 
     monkeypatch.setattr(cc_deploy, "_launch_receiver", boom)
     monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
-    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: None)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
     assert "error" in res
     assert "launch" in res["error"]
 
 
-def test_deploy_unhealthy_status_when_health_fails(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+def test_deploy_errors_and_kills_child_when_health_fails(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """Health never coming up must NOT report success: error + child torn down."""
     repo = _make_repo(tmp_path)
-    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp: 1010)
-    monkeypatch.setattr(cc_deploy, "_poll_health", lambda port, budget_s=8.0: False)
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp, env=None: 1010)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: False)
     monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
-    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: None)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+    killed = {}
+    monkeypatch.setattr(cc_deploy, "_kill_launched_child",
+                        lambda pid: killed.setdefault("pid", pid))
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
-    assert res["deployed"] is True
-    assert res["status"] == "unhealthy"
-    assert any("health-check failed" in w for w in res["warnings"])
+    assert "error" in res
+    assert "never became healthy" in res["error"]
+    assert "deployed" not in res
+    # The just-launched child was torn down.
+    assert killed["pid"] == 1010
 
 
 def test_deploy_warns_on_non_git_repo(tmp_path: Path, stub_template, stub_runtime):
@@ -415,10 +443,11 @@ def test_deploy_warns_on_non_git_repo(tmp_path: Path, stub_template, stub_runtim
 
 def test_deploy_warns_when_claude_missing(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
     repo = _make_repo(tmp_path)
-    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp: 1212)
-    monkeypatch.setattr(cc_deploy, "_poll_health", lambda port, budget_s=8.0: True)
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", lambda repo, rp, lp, env=None: 1212)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
     monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: False)
-    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: None)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
     assert any("claude CLI not found" in w for w in res["warnings"])
 
@@ -431,3 +460,132 @@ def test_status_error_on_bad_repo(tmp_path: Path):
 def test_stop_error_on_bad_repo(tmp_path: Path):
     res = _run(cc_deploy.cc_receiver_stop_handler(str(tmp_path / "nope")))
     assert "error" in res
+
+
+# ---------------------------------------------------------------------------
+# Inbound auth provisioning (security)
+# ---------------------------------------------------------------------------
+
+def test_deploy_provisions_inbound_token(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """A random inbound token is generated, written to config as auth_token_env,
+    injected into the child env, and surfaced in the result."""
+    repo = _make_repo(tmp_path)
+    captured = {}
+
+    def fake_launch(repo_, rp, lp, env=None):
+        captured["env"] = env
+        return 2020
+
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", fake_launch)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert res["deployed"] is True
+    # Returned to Hermes for fleet_send wiring.
+    token = res["receiver_token"]
+    token_env = res["receiver_token_env"]
+    assert token and isinstance(token, str)
+    assert token_env.startswith(cc_deploy.RECEIVER_TOKEN_ENV_PREFIX)
+    # Config records the env var NAME (never the literal token).
+    cfg = json.loads((repo / ".hermes" / "a2a_receiver.json").read_text())
+    assert cfg["auth_token_env"] == token_env
+    assert token not in json.dumps(cfg)
+    # Child env carries the actual token under that name.
+    assert captured["env"] is not None
+    assert captured["env"][token_env] == token
+
+
+def test_deploy_no_auth_opt_out(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """no_auth=True skips token provisioning (open loopback dev)."""
+    repo = _make_repo(tmp_path)
+    captured = {}
+
+    def fake_launch(repo_, rp, lp, env=None):
+        captured["env"] = env
+        return 3030
+
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", fake_launch)
+    monkeypatch.setattr(cc_deploy, "_poll_health",
+                        lambda port, budget_s=8.0, expected_repo_path=None: True)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(cc_deploy, "_stop_old_receiver", lambda pid_path: (None, None))
+
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo), no_auth=True))
+    assert res["deployed"] is True
+    assert "receiver_token" not in res
+    cfg = json.loads((repo / ".hermes" / "a2a_receiver.json").read_text())
+    assert "auth_token_env" not in cfg
+    # No injected env override (full os.environ not copied).
+    assert captured["env"] is None
+    assert any("no_auth" in w for w in res["warnings"])
+
+
+def test_deploy_passes_hermes_auth_token_env_to_config(tmp_path: Path):
+    """hermes_auth_token_env flows through build_receiver_config into the config."""
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    cfg = cc_deploy.build_receiver_config(
+        canonical, 9300, "sonnet", hermes_auth_token_env="HERMES_CB_TOKEN"
+    )
+    assert cfg["hermes_auth_token_env"] == "HERMES_CB_TOKEN"
+    # Omitted when empty.
+    cfg2 = cc_deploy.build_receiver_config(canonical, 9300, "sonnet")
+    assert "hermes_auth_token_env" not in cfg2
+
+
+# ---------------------------------------------------------------------------
+# Health-check identity (repo_path echoed by /health must match the target)
+# ---------------------------------------------------------------------------
+
+def test_check_health_identity_match(monkeypatch: pytest.MonkeyPatch):
+    class _Resp:
+        status = 200
+
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        return _Resp(json.dumps({"ok": True, "repo_path": "/canon/repo"}).encode())
+
+    monkeypatch.setattr(cc_deploy.urllib.request, "urlopen", fake_urlopen)
+    # Matching repo_path -> healthy.
+    assert cc_deploy._check_health_once(9300, expected_repo_path="/canon/repo") is True
+    # Mismatched repo_path (stale/unrelated process on the port) -> unhealthy.
+    assert cc_deploy._check_health_once(9300, expected_repo_path="/other/repo") is False
+    # No expectation -> ok flag alone suffices (back-compat).
+    assert cc_deploy._check_health_once(9300) is True
+
+
+def test_deploy_aborts_when_old_receiver_wont_die(tmp_path: Path, stub_template, monkeypatch: pytest.MonkeyPatch):
+    """Fail-closed at the handler level: stop-old failure aborts the deploy and the
+    new receiver is never launched."""
+    repo = _make_repo(tmp_path)
+    launched = {"n": 0}
+
+    def fake_launch(repo_, rp, lp, env=None):
+        launched["n"] += 1
+        return 4040
+
+    monkeypatch.setattr(cc_deploy, "_launch_receiver", fake_launch)
+    monkeypatch.setattr(cc_deploy, "_probe_claude_cli", lambda: True)
+    monkeypatch.setattr(
+        cc_deploy, "_stop_old_receiver",
+        lambda pid_path: (999, "could not stop existing receiver (pid 999); aborting redeploy"),
+    )
+    res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
+    assert "error" in res
+    assert "could not stop existing receiver" in res["error"]
+    assert "deployed" not in res
+    assert launched["n"] == 0, "must NOT launch a second receiver after stop-old failure"

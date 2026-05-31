@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -183,6 +184,8 @@ def build_receiver_config(
     repo_path: Path,
     bind_port: int,
     model: Optional[str],
+    auth_token_env: str = "",
+    hermes_auth_token_env: str = "",
 ) -> Dict[str, Any]:
     """Build the ``a2a_receiver.json`` payload matching cc_receiver's load_config.
 
@@ -190,6 +193,11 @@ def build_receiver_config(
     directly. ``role_file`` is a repo-relative path to ``.hermes/A2A.md``; cwd is
     pinned to the canonical ``repo_path``. ``claude_model`` is omitted when no
     model is supplied so the template's own default applies.
+
+    ``auth_token_env`` names the env var holding the INBOUND bearer the receiver
+    requires on POST /jsonrpc; ``hermes_auth_token_env`` names the env var holding
+    the OUTBOUND bearer for replies to an auth-enabled Hermes node. Both are
+    written only when non-empty (keys the template's DEFAULTS recognize).
     """
     cfg: Dict[str, Any] = {
         "repo_path": str(repo_path),  # canonical, pinned cwd for claude
@@ -202,6 +210,10 @@ def build_receiver_config(
     }
     if model:
         cfg["claude_model"] = str(model)
+    if auth_token_env:
+        cfg["auth_token_env"] = str(auth_token_env)
+    if hermes_auth_token_env:
+        cfg["hermes_auth_token_env"] = str(hermes_auth_token_env)
     return cfg
 
 
@@ -260,18 +272,55 @@ def _terminate_pid(pid: int) -> bool:
     return not _pid_alive(pid)
 
 
-def _stop_old_receiver(pid_path: Path) -> Optional[int]:
-    """If a live receiver PID is recorded, stop it. Returns the stopped PID or None."""
+def _kill_launched_child(pid: int) -> None:
+    """Best-effort teardown of a just-launched receiver child + its process group.
+
+    The child is started with ``start_new_session=True``, so it is the leader of
+    its own group; ``killpg`` reaps any orphaned subprocesses too. Falls back to a
+    plain SIGTERM/SIGKILL on the pid if the group signal fails.
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        log.warning("killpg SIGTERM pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
+        _terminate_pid(pid)
+        return
+    deadline = time.monotonic() + STOP_TERM_WAIT_S
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(STOP_POLL_INTERVAL_S)
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        log.warning("killpg SIGKILL pid=%s failed (%s)", pid, exc)
+        _terminate_pid(pid)
+
+
+def _stop_old_receiver(pid_path: Path) -> Tuple[Optional[int], Optional[str]]:
+    """If a live receiver PID is recorded, stop it (fail-closed).
+
+    Returns ``(stopped_pid, None)`` when an old receiver was confirmed dead (or
+    there was nothing live to stop -> ``(None, None)``).
+
+    If termination FAILS (process still alive after SIGTERM+SIGKILL+wait), returns
+    ``(pid, error_message)`` and DOES NOT remove the pidfile — the caller must
+    ABORT the redeploy rather than launch a second receiver that double-binds the
+    port / runs two bypassPermissions executors against the same repo.
+    """
     pid = _read_pid(pid_path)
     if pid is None or not _pid_alive(pid):
-        return None
+        return None, None
     log.info("stopping existing receiver pid=%s before redeploy", pid)
-    _terminate_pid(pid)
+    if not _terminate_pid(pid):
+        return pid, (
+            f"could not stop existing receiver (pid {pid}); aborting redeploy"
+        )
     try:
         pid_path.unlink(missing_ok=True)
     except OSError:
         pass
-    return pid
+    return pid, None
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +352,13 @@ def _health_url(bind_port: int) -> str:
     return f"http://127.0.0.1:{int(bind_port)}/health"
 
 
-def _check_health_once(bind_port: int) -> bool:
-    """Single GET /health probe; True iff HTTP 200 with JSON ``{"ok": true}``."""
+def _check_health_once(bind_port: int, expected_repo_path: Optional[str] = None) -> bool:
+    """Single GET /health probe; True iff HTTP 200 with JSON ``{"ok": true}``.
+
+    When ``expected_repo_path`` is given, the response's ``repo_path`` MUST equal
+    it — otherwise an UNRELATED process or a stale receiver bound to the same port
+    (e.g. a different repo on :9300) would satisfy the check. Mismatch -> False.
+    """
     try:
         req = urllib.request.Request(_health_url(bind_port), method="GET")
         with urllib.request.urlopen(req, timeout=HEALTH_REQUEST_TIMEOUT_S) as resp:
@@ -313,14 +367,22 @@ def _check_health_once(bind_port: int) -> bool:
             body = json.loads(resp.read().decode())
     except Exception:  # noqa: BLE001 — any failure means not-yet-healthy
         return False
-    return isinstance(body, dict) and bool(body.get("ok"))
+    if not (isinstance(body, dict) and bool(body.get("ok"))):
+        return False
+    if expected_repo_path is not None and body.get("repo_path") != expected_repo_path:
+        return False
+    return True
 
 
-def _poll_health(bind_port: int, budget_s: float = HEALTH_POLL_BUDGET_S) -> bool:
-    """Poll GET /health until healthy or the budget elapses."""
+def _poll_health(
+    bind_port: int,
+    budget_s: float = HEALTH_POLL_BUDGET_S,
+    expected_repo_path: Optional[str] = None,
+) -> bool:
+    """Poll GET /health until healthy (and identity-matched) or the budget elapses."""
     deadline = time.monotonic() + budget_s
     while time.monotonic() < deadline:
-        if _check_health_once(bind_port):
+        if _check_health_once(bind_port, expected_repo_path):
             return True
         time.sleep(HEALTH_POLL_INTERVAL_S)
     return False
@@ -330,12 +392,21 @@ def _poll_health(bind_port: int, budget_s: float = HEALTH_POLL_BUDGET_S) -> bool
 # Detached launch
 # ---------------------------------------------------------------------------
 
-def _launch_receiver(repo: Path, receiver_path: Path, log_path: Path) -> int:
+def _launch_receiver(
+    repo: Path,
+    receiver_path: Path,
+    log_path: Path,
+    env: Optional[Dict[str, str]] = None,
+) -> int:
     """Launch the receiver detached; return the child PID.
 
     Uses ``start_new_session=True`` so the receiver outlives the gateway and
     lands in its own session/process group (no reliance on a ``setsid`` binary).
     stdout/stderr are redirected to ``<repo>/.hermes/cc_receiver.log``.
+
+    ``env`` (when supplied) is the FULL environment for the child — used to inject
+    the provisioned inbound bearer token (its env var name is recorded in the
+    config's ``auth_token_env``) so the receiver starts requiring auth.
     """
     logf = open(log_path, "ab")  # noqa: SIM115 — fd handed to the child; closed below
     try:
@@ -345,6 +416,7 @@ def _launch_receiver(repo: Path, receiver_path: Path, log_path: Path) -> int:
             stdout=logf,
             stderr=logf,
             start_new_session=True,
+            env=env,
         )
     finally:
         logf.close()
@@ -355,15 +427,31 @@ def _launch_receiver(repo: Path, receiver_path: Path, log_path: Path) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
+RECEIVER_TOKEN_ENV_PREFIX = "A2A_CC_RECEIVER_TOKEN_"
+
+
 async def deploy_cc_receiver_handler(
     repo_path: str,
     bind_port: int = DEFAULT_BIND_PORT,
     model: Optional[str] = None,
+    no_auth: bool = False,
+    hermes_auth_token_env: str = "",
 ) -> Dict[str, Any]:
     """Deploy + launch a Claude Code A2A receiver in ``repo_path``.
 
     Never raises: returns ``{"error": "..."}`` on any failure, else a result dict
     with ``deployed``/``status``/``pid``/``warnings``.
+
+    Auth provisioning (security): unless ``no_auth=True`` (loopback dev opt-out),
+    a random inbound bearer token is generated and injected into the launched
+    child's environment under a unique env var name; the receiver config records
+    that var name in ``auth_token_env`` so the receiver REQUIRES the bearer on
+    POST /jsonrpc. The token value + env var name are surfaced in the result
+    (``receiver_token`` / ``receiver_token_env``) so Hermes can wire fleet_send to
+    present it (full fleet.yaml wiring is Phase 3).
+
+    ``hermes_auth_token_env`` (optional) is written into the config so the receiver
+    sends ``Authorization: Bearer <token>`` on replies to an auth-enabled Hermes.
     """
     warnings: List[str] = []
 
@@ -412,9 +500,28 @@ async def deploy_cc_receiver_handler(
     except OSError as exc:
         return {"error": f"cannot update {claude_md_path}: {exc}"}
 
-    # 6. Write the binding config (cwd pinned to canonical repo).
+    # 6. Provision an inbound bearer token (unless explicitly opted out). The
+    # token reaches the child via its env; only the env var NAME goes in the
+    # config so the receiver requires the bearer on POST /jsonrpc.
+    receiver_token: Optional[str] = None
+    receiver_token_env: str = ""
+    if not no_auth:
+        receiver_token = secrets.token_urlsafe(32)
+        short = secrets.token_hex(4)
+        receiver_token_env = f"{RECEIVER_TOKEN_ENV_PREFIX}{short}"
+    else:
+        warnings.append(
+            "no_auth=True: receiver started WITHOUT an inbound token — POST /jsonrpc "
+            "is OPEN (acceptable only on a trusted loopback dev bind)"
+        )
+
+    # 7. Write the binding config (cwd pinned to canonical repo).
     try:
-        cfg = build_receiver_config(repo, bind_port, model)
+        cfg = build_receiver_config(
+            repo, bind_port, model,
+            auth_token_env=receiver_token_env,
+            hermes_auth_token_env=hermes_auth_token_env,
+        )
         _atomic_write_text(config_dest, json.dumps(cfg, indent=2) + "\n")
     except OSError as exc:
         return {"error": f"cannot write {config_dest}: {exc}"}
@@ -423,34 +530,57 @@ async def deploy_cc_receiver_handler(
     if not _probe_claude_cli():
         warnings.append("claude CLI not found on PATH (claude --version failed); turns will fail")
 
-    # 7. Stop any old receiver before relaunch (avoid double-bind on the port).
-    stopped = _stop_old_receiver(pid_path)
+    # 8. Stop any old receiver before relaunch (fail-closed: abort if it survives,
+    # else a live old receiver double-binds the port / runs a second executor).
+    stopped, stop_err = _stop_old_receiver(pid_path)
+    if stop_err is not None:
+        return {"error": stop_err}
     if stopped is not None:
         warnings.append(f"stopped previous receiver pid={stopped}")
 
-    # 8. Launch detached.
+    # 9. Launch detached, injecting the inbound token into the child's env.
+    child_env: Optional[Dict[str, str]] = None
+    if receiver_token is not None:
+        child_env = dict(os.environ)
+        child_env[receiver_token_env] = receiver_token
     try:
-        pid = _launch_receiver(repo, receiver_dest, log_path)
+        pid = _launch_receiver(repo, receiver_dest, log_path, env=child_env)
     except OSError as exc:
         return {"error": f"failed to launch receiver (port {bind_port} in use?): {exc}"}
 
-    # 9. Health-check.
-    healthy = _poll_health(int(bind_port))
+    # 10. Health-check WITH identity validation (the receiver's /health echoes its
+    # pinned repo_path; an unrelated/stale process on the port must not pass).
+    healthy = _poll_health(int(bind_port), expected_repo_path=str(repo))
     if not healthy:
-        warnings.append(
-            f"health-check failed: GET {_health_url(bind_port)} did not return ok within "
-            f"{HEALTH_POLL_BUDGET_S:.0f}s (see {log_path})"
-        )
+        # Fail-closed: a launched-but-unhealthy child must not be reported as a
+        # success. Tear it down (killpg/SIGTERM), drop any pidfile it wrote, error.
+        _kill_launched_child(pid)
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return {
+            "error": (
+                f"receiver launched but never became healthy on :{int(bind_port)} "
+                f"(port in use? startup crash? see {log_path})"
+            )
+        }
 
-    return {
+    result: Dict[str, Any] = {
         "deployed": True,
         "repo_path": str(repo),
         "port": int(bind_port),
         "pid": pid,
-        "status": "healthy" if healthy else "unhealthy",
+        "status": "healthy",
         "claude_md": claude_md_status,
         "warnings": warnings,
     }
+    # Surface the provisioned inbound token so Hermes can wire fleet_send to send
+    # it (Phase 3). Present only when auth was provisioned.
+    if receiver_token is not None:
+        result["receiver_token"] = receiver_token
+        result["receiver_token_env"] = receiver_token_env
+    return result
 
 
 async def cc_receiver_status_handler(repo_path: str) -> Dict[str, Any]:
@@ -477,7 +607,7 @@ async def cc_receiver_status_handler(repo_path: str) -> Dict[str, Any]:
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         port = None
 
-    healthy = bool(port is not None and _check_health_once(port))
+    healthy = bool(port is not None and _check_health_once(port, expected_repo_path=str(repo)))
     running = bool(alive and healthy)
 
     return {
