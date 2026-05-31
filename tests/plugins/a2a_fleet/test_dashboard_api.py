@@ -162,3 +162,58 @@ def test_disambiguate_by_peer(multirepo):
     res = _run(mod.get_conversation("handshake:sw", peer="cc-b"))
     assert res["peer"] == "cc-b"
     assert res["messages"][0]["text"] == "B-only"
+
+
+# ---------------------------------------------------------------------------
+# Profile-agnostic discovery: a global dashboard (default HERMES_HOME) must find
+# managed peers in OTHER profiles' fleet.yaml, not just its own.
+# ---------------------------------------------------------------------------
+
+def _write_managed_fleet(path: Path, peer_name: str, repo: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "fleet:\n"
+        "  agents:\n"
+        f"    {peer_name}:\n"
+        f"      url: http://127.0.0.1:9300\n"
+        f"      managed: true\n"
+        f"      mode: claude_code\n"
+        f"      repo_path: {repo}\n",
+        encoding="utf-8",
+    )
+
+
+def test_managed_repos_scans_all_profiles(monkeypatch, tmp_path):
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    # home's own fleet.yaml + two profile fleet.yamls, each with a managed peer
+    _write_managed_fleet(tmp_path / "fleet.yaml", "cc-home", "/repos/home")
+    _write_managed_fleet(tmp_path / "profiles" / "switch" / "fleet.yaml", "claude-code", "/repos/switch")
+    _write_managed_fleet(tmp_path / "profiles" / "other" / "fleet.yaml", "claude-code", "/repos/other")
+
+    repos = {repo: name for name, repo in mod._managed_repos()}
+    assert set(repos) == {"/repos/home", "/repos/switch", "/repos/other"}
+
+
+def test_managed_repos_dedupes_same_repo_across_profiles(monkeypatch, tmp_path):
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_managed_fleet(tmp_path / "profiles" / "p1" / "fleet.yaml", "claude-code", "/repos/shared")
+    _write_managed_fleet(tmp_path / "profiles" / "p2" / "fleet.yaml", "claude-code", "/repos/shared")
+    assert mod._managed_repos() == [("claude-code", "/repos/shared")]
+
+
+def test_managed_repos_skips_non_managed_and_bad_files(monkeypatch, tmp_path):
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # non-managed peer (managed absent) — must be skipped
+    (tmp_path / "fleet.yaml").write_text(
+        "fleet:\n  agents:\n    plain:\n      url: http://x\n      repo_path: /repos/plain\n",
+        encoding="utf-8",
+    )
+    # corrupt profile fleet.yaml — must be skipped, not raise
+    bad = tmp_path / "profiles" / "broken" / "fleet.yaml"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("}{ not yaml", encoding="utf-8")
+    assert mod._managed_repos() == []
