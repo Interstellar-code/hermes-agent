@@ -31,6 +31,30 @@ def ccr():
     return module
 
 
+@pytest.fixture(autouse=True)
+def _isolate_receiver_runtime_paths(ccr, tmp_path, monkeypatch):
+    """Redirect the receiver's ``__file__``-derived runtime paths to a tmp dir.
+
+    The template defines CONFIG/INBOX/OFFSET/TRANSCRIPT/PID paths relative to its
+    own location — correct in production (it is deployed into ``<repo>/.hermes/``),
+    but loaded from ``plugins/a2a_fleet/templates/`` under test. Without this, any
+    test that reaches ``_transcript()`` (e.g. the concurrency tests) writes a stray
+    ``a2a-transcript.jsonl`` into the source tree. Default every runtime path under
+    tmp; tests that need a specific path still override these with their own
+    ``monkeypatch.setattr`` (which wins, running after this autouse fixture).
+    """
+    runtime = tmp_path / "receiver-runtime"
+    runtime.mkdir()
+    for attr, name in (
+        ("CONFIG_PATH", "a2a_receiver.json"),
+        ("INBOX_PATH", "a2a-inbox.jsonl"),
+        ("INBOX_OFFSET_PATH", "a2a-inbox.offset"),
+        ("TRANSCRIPT_PATH", "a2a-transcript.jsonl"),
+        ("PID_PATH", "cc_receiver.pid"),
+    ):
+        monkeypatch.setattr(ccr, attr, runtime / name, raising=False)
+
+
 # ---------------------------------------------------------------------------
 # Session-id determinism
 # ---------------------------------------------------------------------------
