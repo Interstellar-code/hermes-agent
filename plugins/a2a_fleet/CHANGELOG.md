@@ -1,5 +1,45 @@
 # a2a_fleet — Changelog
 
+## v0.6.1 — shipped
+
+### Bug fixes
+
+- **H2 (dispatch)**: `deploy_oc_receiver_handler`, `deploy_cc_receiver_handler` now
+  unwrap ALL recognised params (`bind_port`, `model`, `no_auth`,
+  `hermes_auth_token_env`) when the registry passes the whole args dict as the
+  first positional argument. Previously only `repo_path` was extracted (via
+  `canonicalize_repo_path`), so `bind_port` and `model` silently defaulted
+  regardless of what the caller sent.
+
+- **H1 (remint)**: `_is_session_not_found` in `oc_receiver.py` now accepts
+  `(reply, stderr)` and checks both, mirroring `cc_receiver`'s implementation.
+  The dead `session_missing` third return value from `parse_opencode_output` has
+  been removed. Previously the dead-session remint guard only inspected stderr, so
+  a session-not-found signal that appeared only in the parsed reply text was
+  silently ignored and the stale session was re-used.
+
+### Cleanup
+
+- **H3**: Removed dead `_managed_cc_peers()` from `cc_deploy.py` (superseded by
+  `managed_peers.iter_supported_managed_peers`). Its unit test is retargeted to
+  `iter_supported_managed_peers` and now covers both `claude_code` and `opencode`
+  managed modes.
+
+### Tests added
+
+- `test_deploy_handler_dict_dispatch_extracts_all_params` (oc) and
+  `test_deploy_cc_handler_dict_dispatch_extracts_all_params` (cc): confirm
+  registry-style dict dispatch uses the caller-supplied `bind_port`, not the
+  default.
+- `test_run_opencode_turn_remints_when_dead_session_in_reply`: confirms remint
+  fires when the dead-session signal is in parsed reply text (not stderr).
+- `test_reconcile_down_opencode_peer_triggers_oc_redeploy`: boot-reconcile routes
+  a down `mode: opencode` peer through `oc_deploy`.
+- `test_reconcile_legacy_no_mode_peer_is_ignored`: legacy no-`mode` peer is
+  ignored gracefully.
+- `test_oc_receiver_bearer_auth_*`: per-request bearer auth on the OC receiver
+  HTTP layer — wrong/missing token → 401, correct token → accepted.
+
 ## v0.6.0 — shipped
 
 - Added OpenCode as a second managed repo-scoped executor peer alongside Claude

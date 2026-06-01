@@ -607,6 +607,16 @@ async def deploy_cc_receiver_handler(
     ``hermes_auth_token_env`` (optional) is written into the config so the receiver
     sends ``Authorization: Bearer <token>`` on replies to an auth-enabled Hermes.
     """
+    # Dispatch shape: registry.dispatch() calls handler(args, **kwargs) — the
+    # WHOLE args dict lands in the first positional (repo_path). Unwrap it so
+    # all params are extracted, while still tolerating direct kwarg-style calls.
+    if isinstance(repo_path, dict):
+        _p = repo_path
+        repo_path = _p.get("repo_path") or _p.get("path") or ""
+        bind_port = int(_p.get("bind_port") or bind_port)
+        model = _p.get("model") or model
+        no_auth = bool(_p.get("no_auth", no_auth))
+        hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
     warnings: List[str] = []
 
     # 1. Validate + canonicalize.
@@ -851,28 +861,6 @@ async def cc_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str
 # Boot-reconcile (Phase 3)
 # ---------------------------------------------------------------------------
 
-def _managed_cc_peers(fleet_cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    """Select fleet peers Hermes owns as Claude Code receivers.
-
-    A peer qualifies iff ``managed is True`` AND ``mode == "claude_code"`` AND it
-    names a ``repo_path``. Anything else (plain url/token peers, Route B, peers
-    missing the v0.3 fields) is ignored, so a fresh install with no managed peers
-    yields an empty list -> reconcile is a clean no-op.
-    """
-    out: List[Tuple[str, Dict[str, Any]]] = []
-    agents = fleet_cfg.get("agents") or {}
-    if not isinstance(agents, dict):
-        return out
-    for name, entry in agents.items():
-        if not isinstance(entry, dict):
-            continue
-        if (
-            entry.get("managed") is True
-            and entry.get("mode") == "claude_code"
-            and entry.get("repo_path")
-        ):
-            out.append((name, entry))
-    return out
 
 
 def _managed_receiver_module(mode: str):
