@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
-SUPPORTED_MANAGED_MODES = frozenset({"claude_code", "opencode"})
+SUPPORTED_MANAGED_MODES = frozenset({"claude_code", "opencode", "codex"})
 
 _MODE_SPECS: Dict[str, Dict[str, str]] = {
     "claude_code": {
@@ -27,6 +27,12 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "description": "OpenCode executor receiver",
         "token_prefix": "A2A_OC_TOKEN_",
         "deploy_module": "oc_deploy",
+    },
+    "codex": {
+        "default_name": "codex",
+        "description": "Codex CLI executor receiver",
+        "token_prefix": "A2A_CODEX_TOKEN_",
+        "deploy_module": "codex_deploy",
     },
 }
 

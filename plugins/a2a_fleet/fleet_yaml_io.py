@@ -311,3 +311,24 @@ def upsert_oc_peer(
         description=description,
         profile=profile,
     )
+
+
+def upsert_codex_peer(
+    *,
+    repo_path: str,
+    url: str,
+    token_env: str = "",
+    name: str = "codex",
+    description: str = "",
+    profile: str | None = None,
+) -> Dict[str, Any]:
+    """Codex CLI wrapper around ``upsert_managed_peer()``."""
+    return upsert_managed_peer(
+        repo_path=repo_path,
+        url=url,
+        token_env=token_env,
+        name=name or managed_peer_default_name("codex"),
+        mode="codex",
+        description=description,
+        profile=profile,
+    )
