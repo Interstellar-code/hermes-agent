@@ -432,6 +432,92 @@ def test_codex_receiver_bearer_auth_correct_token_is_accepted(cxr, tmp_path) -> 
     assert h._status != 401, "Correct token was rejected with 401"
 
 
+# ---------------------------------------------------------------------------
+# Fix 1: remint clears stale thread_id even when fresh retry yields no thread.started
+# ---------------------------------------------------------------------------
+
+def test_remint_clears_stale_thread_id_when_fresh_retry_yields_no_new_id(cxr, tmp_path) -> None:
+    """Remint path removes the dead thread_id from the session map BEFORE retrying.
+
+    If the fresh retry also emits no thread.started, the map must have NO entry
+    for that contextId — the bad id must NOT be re-persisted.
+
+    This test FAILS before Fix 1 (stale id stays on disk) and PASSES after.
+    """
+    cfg = _base_cfg(cxr, tmp_path)
+    session_map_path = cxr.SESSION_MAP_PATH
+
+    # Seed a dead thread_id into the on-disk session map.
+    cxr.store_thread_id_for_context("ctx-stale", "tid-dead", session_map_path)
+    assert cxr.get_thread_id_for_context("ctx-stale", session_map_path) == "tid-dead"
+
+    def fake_runner(cmd, cwd, timeout):
+        if "resume" in cmd:
+            # Resume attempt → session-not-found signal
+            return ("", 1, "error: no rollout found for thread id tid-dead")
+        # Fresh first-turn attempt → succeeds but emits NO thread.started
+        # (simulates a remint retry that completes without a thread.started frame)
+        return (
+            "\n".join([
+                json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "partial"}}),
+            ]),
+            0,
+            "",
+        )
+
+    reply = cxr.run_codex_turn("redo", "ctx-stale", cfg, runner=fake_runner)
+
+    # The stale id must be gone — not re-persisted after the failed remint.
+    stored = cxr.get_thread_id_for_context("ctx-stale", session_map_path)
+    assert stored is None, (
+        f"Expected no thread_id after failed remint, but found {stored!r} — "
+        "Fix 1: clear_thread_id_for_context must be called before the retry"
+    )
+    # The reply should still be returned (partial output from the retry).
+    assert reply == "partial"
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: forbidden flags in codex_extra_flags are sanitized on resume and first turn
+# ---------------------------------------------------------------------------
+
+def test_forbidden_extra_flags_stripped_on_resume_and_ephemeral_on_first_turn(cxr, tmp_path) -> None:
+    """codex_extra_flags with forbidden flags are stripped before appending to the command.
+
+    Resume command: --color/value, -s/value, --ephemeral must be removed; --foo bar must survive.
+    First-turn command: --ephemeral must be removed; --color and -s are allowed.
+
+    This test verifies Fix 2.
+    """
+    cfg = _base_cfg(cxr, tmp_path)
+    cfg["codex_extra_flags"] = ["--color", "never", "-s", "danger-full-access", "--ephemeral", "--foo", "bar"]
+
+    # --- RESUME command ---
+    resume_cmd = cxr.build_codex_command("do work", cfg, thread_id="tid-xyz")
+
+    # Forbidden tokens must not appear anywhere in the resume command.
+    assert "--color" not in resume_cmd, "--color must be stripped from resume command"
+    assert "never" not in resume_cmd, "value 'never' of --color must be stripped from resume command"
+    assert "-s" not in resume_cmd, "-s must be stripped from resume command"
+    assert "danger-full-access" not in resume_cmd, "value of -s must be stripped from resume command"
+    assert "--ephemeral" not in resume_cmd, "--ephemeral must be stripped from resume command"
+
+    # Allowed extra flags must survive.
+    assert "--foo" in resume_cmd, "--foo must be retained in resume command"
+    assert "bar" in resume_cmd, "value 'bar' of --foo must be retained in resume command"
+
+    # --- FIRST-TURN command ---
+    first_cmd = cxr.build_codex_command("do work", cfg, thread_id=None)
+
+    # --ephemeral must be stripped from first-turn too (breaks resume model).
+    assert "--ephemeral" not in first_cmd, "--ephemeral must be stripped from first-turn command"
+
+    # --color and -s are allowed on first turn — they should survive.
+    assert "--color" in first_cmd, "--color should be retained on first-turn command"
+    assert "--foo" in first_cmd, "--foo must be retained in first-turn command"
+    assert "bar" in first_cmd, "value 'bar' of --foo must be retained in first-turn command"
+
+
 def test_main_fails_closed_for_non_loopback_without_auth(cxr, monkeypatch, tmp_path) -> None:
     cfg = _base_cfg(cxr, tmp_path)
     cfg["bind_host"] = "0.0.0.0"

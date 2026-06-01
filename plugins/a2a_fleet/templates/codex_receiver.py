@@ -253,6 +253,32 @@ def store_thread_id_for_context(context_id: str, thread_id: str, path: Path = SE
                 pass
 
 
+def clear_thread_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> None:
+    """Remove a stale/dead thread_id entry for ``context_id`` from the session map.
+
+    Atomic tmp+os.replace write, same as ``store_thread_id_for_context``.
+    Called under the per-contextId lock before a remint retry so that a failed
+    remint leaves the map clean (no stale id re-persisted on the next turn).
+    Must be called while already holding _SESSION_MAP_LOCK or before acquiring it
+    — this function acquires the lock itself.
+    """
+    with _SESSION_MAP_LOCK:
+        data = load_session_map(path)
+        if context_id not in data:
+            return
+        del data[context_id]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.warning("session map clear failed for ctx=%s (%s)", context_id, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # Command builder
 # ---------------------------------------------------------------------------
@@ -300,8 +326,59 @@ def build_codex_command(
         cmd += ["-m", str(model)]
     extra = cfg.get("codex_extra_flags") or []
     if isinstance(extra, list):
-        cmd += [str(x) for x in extra]
+        cmd += _sanitize_extra_flags(extra, is_resume=bool(thread_id))
     return cmd
+
+
+# Flags that are ALWAYS forbidden (they break the resume model wholesale).
+_FORBIDDEN_ANY: frozenset[str] = frozenset({"--ephemeral"})
+# Flags that are forbidden only on resume (rejected by codex exec resume).
+_FORBIDDEN_RESUME: frozenset[str] = frozenset({"--color", "-s", "--sandbox"})
+
+
+def _sanitize_extra_flags(extra: List[str], *, is_resume: bool) -> List[str]:
+    """Return a copy of ``extra`` with forbidden flags (and their values) removed.
+
+    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one token).
+    Forbidden on ANY command: ``--ephemeral``.
+    Forbidden on RESUME only: ``--color``, ``-s``/``--sandbox``.
+    Logs a warning for each dropped flag so operators notice stale configs.
+    """
+    forbidden = set(_FORBIDDEN_ANY)
+    if is_resume:
+        forbidden |= _FORBIDDEN_RESUME
+
+    result: List[str] = []
+    tokens = [str(x) for x in extra]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # --flag=value form: extract the flag portion before '='
+        base = tok.split("=", 1)[0] if "=" in tok else tok
+
+        if base in forbidden:
+            log.warning(
+                "dropping forbidden codex_extra_flags token %r%s",
+                tok,
+                " (resume command)" if is_resume else "",
+            )
+            i += 1
+            # --flag value form (no '='): also consume the following value token
+            # if it does not look like a flag itself.
+            if "=" not in tok and i < len(tokens) and not tokens[i].startswith("-"):
+                log.warning(
+                    "dropping forbidden codex_extra_flags value token %r%s",
+                    tokens[i],
+                    " (resume command)" if is_resume else "",
+                )
+                i += 1
+            continue
+
+        result.append(tok)
+        i += 1
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -432,16 +509,20 @@ def run_codex_turn(
     if runner is None:
         runner = _subprocess_runner
 
+    # Look up SESSION_MAP_PATH dynamically (module-level variable may be
+    # monkeypatched in tests; default-argument form captures the original value).
+    session_map_path: Path = SESSION_MAP_PATH
+
     repo_path = Path(cfg["repo_path"])
     timeout = float(cfg.get("codex_timeout_s") or DEFAULTS["codex_timeout_s"])
-    stored_thread_id = get_thread_id_for_context(context_id)
+    stored_thread_id = get_thread_id_for_context(context_id, session_map_path)
 
     def _invoke(thread_id: Optional[str]) -> Tuple[Optional[str], Optional[str], int, str]:
         cmd = build_codex_command(prompt, cfg, thread_id=thread_id)
         stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
         parsed_thread_id, reply = parse_codex_output(stdout)
         if parsed_thread_id:
-            store_thread_id_for_context(context_id, parsed_thread_id)
+            store_thread_id_for_context(context_id, parsed_thread_id, session_map_path)
         return parsed_thread_id, reply, rc, stderr
 
     try:
@@ -457,6 +538,10 @@ def run_codex_turn(
     # Remint: only on genuine session-not-found signal in BOTH reply and stderr
     if stored_thread_id and _is_session_not_found(reply, stderr):
         log.info("stored thread %s missing for ctx=%s; reminting new Codex thread", stored_thread_id, context_id)
+        # Clear the stale thread_id BEFORE the retry so that if the retry also
+        # fails (emits no thread.started), the bad id is not left on disk and
+        # the next turn does not blindly attempt resume <dead-id> again.
+        clear_thread_id_for_context(context_id, session_map_path)
         try:
             parsed_thread_id, reply, rc, stderr = _invoke(None)
         except subprocess.TimeoutExpired:

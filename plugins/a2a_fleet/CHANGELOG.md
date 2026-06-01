@@ -1,5 +1,36 @@
 # a2a_fleet — Changelog
 
+## v0.7.0 — in progress (PR #79)
+
+- Added OpenAI Codex CLI as a third managed repo-scoped executor peer
+  (`mode: codex`, default port 9311):
+  - new standalone template `templates/codex_receiver.py` (STDLIB-only, no
+    a2a_fleet import dependency)
+  - new deploy/manage module `codex_deploy.py` with
+    `deploy_codex_receiver_handler`, `codex_receiver_status_handler`,
+    `codex_receiver_stop_handler`; full dict-unwrap for all params
+  - `codex exec` / `codex exec resume` command builder; JSONL parser for
+    `thread.started` → `thread_id` and last `item.completed agent_message`
+    → reply text
+  - `_is_session_not_found` checks both reply text and stderr for
+    `"no rollout found for thread id"`
+
+### Bug fixes
+
+- **remint clears stale thread_id**: when a stored `thread_id` is dead and
+  the remint retry emits no `thread.started`, the stale id is now deleted
+  from `a2a-codex-sessions.json` before the fresh `_invoke(None)` call.
+  Previously the bad id stayed on disk and every subsequent turn attempted
+  `codex exec resume <dead-id>` first.
+
+- **codex_extra_flags sanitized on resume**: forbidden flags (`--color`,
+  `-s`/`--sandbox`, `--ephemeral`) are now stripped from `codex_extra_flags`
+  before appending to the command. `--ephemeral` is stripped on any command
+  (breaks resume); `--color`/`-s`/`--sandbox` are stripped on resume only
+  (rejected by `codex exec resume` in codex-cli 0.135.0). Both
+  `--flag value` and `--flag=value` forms are handled; a warning is logged
+  for each dropped token.
+
 ## v0.6.1 — shipped
 
 ### Bug fixes
