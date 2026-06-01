@@ -200,6 +200,7 @@ def register(ctx) -> None:
     # target repo. Lazy-import keeps the import cost off the hot path / avoids
     # cycles. Additive — never touches the fleet_send registration above.
     from . import cc_deploy  # noqa: WPS433 — lazy import is the contract.
+    from . import codex_deploy  # noqa: WPS433 — lazy import is the contract.
     from . import oc_deploy  # noqa: WPS433 — lazy import is the contract.
 
     ctx.register_tool(
@@ -340,6 +341,87 @@ def register(ctx) -> None:
         check_fn=None,
         is_async=True,
         description="Stop the repo's OpenCode receiver via its PID file and remove the pidfile.",
+        emoji="🛑",
+    )
+    ctx.register_tool(
+        name="deploy_codex_receiver",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to the target repo Codex CLI is set up + "
+                        "authorized in. Symlinked inputs are RESOLVED to their real "
+                        "on-disk target and the receiver cwd is pinned there "
+                        "(security preserved)."
+                    ),
+                },
+                "bind_port": {
+                    "type": "integer",
+                    "description": "Port the receiver binds on (default 9311).",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional Codex model to pin (e.g. 'o4-mini', 'o3').",
+                },
+                "sandbox": {
+                    "type": "string",
+                    "description": (
+                        "Codex sandbox level: read-only | workspace-write | danger-full-access "
+                        "(default workspace-write). Only applies on first turn; resume inherits."
+                    ),
+                },
+                "hermes_auth_token_env": {
+                    "type": "string",
+                    "description": "Env var name holding the outbound bearer token for replies to Hermes.",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(codex_deploy.deploy_codex_receiver_handler),
+        check_fn=None,
+        is_async=True,
+        description="Deploy + launch a Codex CLI A2A executor receiver in a target repo.",
+        emoji="🚀",
+    )
+    ctx.register_tool(
+        name="codex_receiver_status",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose Codex receiver to check (PID + /health).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(codex_deploy.codex_receiver_status_handler),
+        check_fn=None,
+        is_async=True,
+        description="Report whether the repo's Codex receiver is running (PID alive AND /health).",
+        emoji="🩺",
+    )
+    ctx.register_tool(
+        name="codex_receiver_stop",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose Codex receiver to stop (SIGTERM via PID file).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(codex_deploy.codex_receiver_stop_handler),
+        check_fn=None,
+        is_async=True,
+        description="Stop the repo's Codex receiver via its PID file and remove the pidfile.",
         emoji="🛑",
     )
 
