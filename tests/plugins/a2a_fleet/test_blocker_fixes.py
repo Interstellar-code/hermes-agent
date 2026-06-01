@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import socket
 from pathlib import Path
@@ -60,6 +61,22 @@ class _StubCtx:
         self.calls.append(kwargs)
 
 
+def _expected_registered_tool_names() -> set[str]:
+    names = {
+        "fleet_send",
+        "deploy_cc_receiver",
+        "cc_receiver_status",
+        "cc_receiver_stop",
+    }
+    if importlib.util.find_spec("a2a_fleet.oc_deploy") is not None:
+        names.update({
+            "deploy_oc_receiver",
+            "oc_receiver_status",
+            "oc_receiver_stop",
+        })
+    return names
+
+
 def test_register_logs_when_start_server_fails(
     fleet_home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -82,10 +99,12 @@ def test_register_logs_when_start_server_fails(
         register(ctx)
         import time; time.sleep(0.2)  # let the daemon thread log
 
-    # fleet_send + the three v0.3 cc_receiver tools (deploy/status/stop) register
-    # before the server thread is spawned, so a server-start failure must not
-    # prevent any of them from being registered.
-    assert len(ctx.calls) == 4, "tools should still register even when the server thread fails"
+    # fleet_send + the mode-specific deploy/status/stop tools register before the
+    # server thread is spawned, so a server-start failure must not prevent any of
+    # them from being registered.
+    expected = _expected_registered_tool_names()
+    actual = {call["name"] for call in ctx.calls}
+    assert actual == expected, "tool registration should keep fleet/deploy parity even when the server thread fails"
     assert any(
         "server failed to start" in rec.message
         for rec in caplog.records

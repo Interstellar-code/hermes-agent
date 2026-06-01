@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
-"""Standalone A2A receiver — Claude Code as a repo-scoped executor peer.
+"""Standalone A2A receiver — OpenCode as a repo-scoped executor peer.
 
-This file is a TEMPLATE. Hermes' ``deploy_cc_receiver`` tool copies it verbatim
-into a target repo's ``<repo>/.hermes/cc_receiver.py`` and writes a sibling
-``a2a_receiver.json`` config. The receiver then runs as a detached daemon that:
+This file is a TEMPLATE. Hermes' ``deploy_oc_receiver`` tool copies it verbatim
+into a target repo's ``<repo>/.hermes/oc_receiver.py`` and writes a sibling
+``oc_receiver.json`` config. The receiver then runs as a detached daemon that:
 
   1. Serves an A2A surface on ``bind_host:bind_port``
      (GET /health, GET /.well-known/agent-card.json, POST /jsonrpc).
   2. Queues inbound messages to an inbox JSONL and ACKs immediately.
-  3. A background poll loop drains the inbox, spawning ``claude -p`` with the
-     FULL repo harness (CLAUDE.md, .mcp.json, .claude settings, skills, plugins)
-     inherited via ``cwd=repo_path`` + ``--setting-sources user,project,local``.
-  4. Maintains a persistent claude session per A2A ``contextId`` via
-     ``--session-id`` (first turn) / ``--resume`` (subsequent turns).
+  3. A background poll loop drains the inbox, spawning ``opencode run`` with the
+     FULL repo harness inherited via ``cwd=repo_path`` and the receiver role prompt.
+  4. Maintains a persistent OpenCode session per A2A ``contextId`` via
+     a durable ``a2a-oc-sessions.json`` map + ``--session <sessionID>``.
   5. POSTs the result back to ``hermes_url`` as a JSON-RPC SendMessage.
 
 Design constraints (deliberate):
-  * STDLIB ONLY (+ the ``claude`` CLI). No import of the a2a_fleet package, no
+  * STDLIB ONLY (+ the ``opencode`` CLI). No import of the a2a_fleet package, no
     Hermes gateway dependency — it must run on its own inside any repo.
-  * ``cwd`` for claude is ALWAYS ``repo_path`` from config, NEVER taken from an
+  * ``cwd`` for opencode is ALWAYS ``repo_path`` from config, NEVER taken from an
     inbound message (a remote peer must not be able to redirect execution).
   * Per-contextId serialization: two concurrent turns on the same contextId must
-    NOT both spawn ``claude -p --resume <same>`` (that races/corrupts the
-    session). A per-contextId lock serializes same-context turns;
+    NOT both mint / reuse the same OpenCode session concurrently. A per-contextId
+    lock serializes same-context turns;
     different contextIds run concurrently.
 
 Reply contract (receiver -> Hermes), POSTed to ``hermes_url``::
 
-    {"jsonrpc": "2.0", "id": "cc-<ts>", "method": "SendMessage",
+    {"jsonrpc": "2.0", "id": "oc-<ts>", "method": "SendMessage",
      "params": {"message": {"role": "agent",
                             "parts": [{"text": "<result>"}],
                             "contextId": "<same contextId>"}}}
@@ -55,61 +54,57 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "a2a_receiver.json"
-INBOX_PATH = SCRIPT_DIR / "a2a-inbox.jsonl"
-INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-inbox.offset"
-TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-transcript.jsonl"
-PID_PATH = SCRIPT_DIR / "cc_receiver.pid"
+CONFIG_PATH = SCRIPT_DIR / "oc_receiver.json"
+INBOX_PATH = SCRIPT_DIR / "a2a-oc-inbox.jsonl"
+INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-oc-inbox.offset"
+TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-oc-transcript.jsonl"
+PID_PATH = SCRIPT_DIR / "oc_receiver.pid"
 
 # Cap on a single inbound JSON-RPC body (DoS guard) and the prompt we hand to
-# claude. 1 MiB body is generous for text tasks; oversized bodies are rejected
+# opencode. 1 MiB body is generous for text tasks; oversized bodies are rejected
 # with HTTP 413 before allocation.
 MAX_BODY_BYTES = 1 * 1024 * 1024
 MAX_PROMPT_CHARS = 256 * 1024
-# Cap claude stdout we buffer in memory (defensive — runaway tool output).
+# Cap opencode stdout we buffer in memory (defensive — runaway tool output).
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
+TOKEN_PATH = SCRIPT_DIR / ".oc-token"
+SESSION_MAP_PATH = SCRIPT_DIR / "a2a-oc-sessions.json"
 
 # A signal in a result frame / stderr that a session genuinely does not exist
 # (the ONLY condition under which we retry the other session mode — see
-# ``run_claude_turn``). Kept narrow on purpose: this receiver runs autonomously
+# ``run_opencode_turn``). Kept narrow on purpose: this receiver runs autonomously
 # with ``--permission-mode bypassPermissions``, so a spurious retry can
 # double-execute a side-effecting turn.
 SESSION_NOT_FOUND_SIGNALS = (
-    "no conversation found",
-    "session not found",
-    "no session found",
-    "could not find session",
-    "no such session",
+    "error: session not found",
 )
 
-# uuid5 namespace for deterministic session ids derived from contextId.
-SESSION_NAMESPACE = uuid.NAMESPACE_URL
 
 DEFAULTS: Dict[str, Any] = {
     "repo_path": str(SCRIPT_DIR.parent),  # .hermes/ is inside the repo
     "bind_host": "127.0.0.1",
-    "bind_port": 9300,
+    "bind_port": 9310,
     "hermes_url": "http://127.0.0.1:9219/jsonrpc",
     "role_prompt": (
-        "You are a Claude Code executor peer in an A2A fleet. The orchestrator "
+        "You are an OpenCode executor peer in an A2A fleet. The orchestrator "
         "is Hermes. You receive tasks over A2A and execute them in THIS repo "
         "using your full tools/skills/MCP. Reply concisely with results/status. "
         "Same contextId = same ongoing session/thread."
     ),
     "role_file": None,            # if set, read role prompt from this path (overrides role_prompt)
-    "claude_model": "sonnet",
-    "claude_extra_flags": [],     # list[str] appended verbatim to the command
+    "opencode_model": None,
+    "opencode_extra_flags": [],     # list[str] appended verbatim to the command
     "auth_token_env": None,       # env var name holding the INBOUND bearer token (POST /jsonrpc)
     "hermes_auth_token_env": None,  # env var name holding the bearer token for OUTBOUND replies to Hermes
     "poll_interval_s": 2.0,
-    "claude_timeout_s": 300,
+    "opencode_timeout_s": 300,
     "context_lock_wait_s": 600.0,  # how long a queued same-context turn waits for the lock
-    "max_concurrent_turns": 3,     # global cap on simultaneous claude subprocesses
-    "max_tracked_contexts": 1024,  # bound on the per-context lock + seen registries
+    "max_concurrent_turns": 3,     # global cap on simultaneous OpenCode subprocesses
+    "max_tracked_contexts": 1024,  # bound on the per-context lock registry
     "idle_timeout_s": 1800,        # self-teardown after this many idle seconds (0 = disabled)
 }
 
-log = logging.getLogger("cc_receiver")
+log = logging.getLogger("oc_receiver")
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +112,13 @@ log = logging.getLogger("cc_receiver")
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
-    """Read ``a2a_receiver.json`` (sibling of this script), merge over DEFAULTS.
+    """Read ``oc_receiver.json`` (sibling of this script), merge over DEFAULTS.
 
     Missing / malformed config is non-fatal: defaults are used and a warning is
     logged. ``role_file`` (if set + readable) supplies the role prompt.
     """
     cfg = dict(DEFAULTS)
-    cfg["claude_extra_flags"] = list(DEFAULTS["claude_extra_flags"])
+    cfg["opencode_extra_flags"] = list(DEFAULTS["opencode_extra_flags"])
     try:
         raw = json.loads(config_path.read_text())
         if isinstance(raw, dict):
@@ -145,9 +140,9 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
         except OSError as exc:
             log.warning("role_file %s unreadable (%s); using role_prompt", role_file, exc)
 
-    if not isinstance(cfg.get("claude_extra_flags"), list):
-        log.warning("claude_extra_flags is not a list; ignoring")
-        cfg["claude_extra_flags"] = []
+    if not isinstance(cfg.get("opencode_extra_flags"), list):
+        log.warning("opencode_extra_flags is not a list; ignoring")
+        cfg["opencode_extra_flags"] = []
 
     return cfg
 
@@ -175,104 +170,117 @@ def resolve_hermes_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Session id (deterministic per contextId)
+# Durable OpenCode session map
 # ---------------------------------------------------------------------------
 
-def session_id_for_context(context_id: str) -> str:
-    """Deterministic uuid5 session id for a given A2A contextId.
+_SESSION_MAP_LOCK = threading.Lock()
 
-    Same contextId -> same uuid (stable across turns / restarts).
-    Distinct contexts -> distinct uuids.
-    """
-    return str(uuid.uuid5(SESSION_NAMESPACE, "a2a:" + context_id))
+
+def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]:
+    """Load the durable OpenCode session map. Malformed content -> empty map."""
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("session map %s unreadable (%s); treating as empty", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        log.warning("session map %s is not a JSON object; treating as empty", path)
+        return {}
+    clean: Dict[str, Dict[str, Any]] = {}
+    for context_id, entry in raw.items():
+        if not isinstance(context_id, str) or not isinstance(entry, dict):
+            continue
+        session_id = entry.get("session_id")
+        updated_at = entry.get("updated_at")
+        if isinstance(session_id, str) and session_id.strip():
+            clean[context_id] = {
+                "session_id": session_id.strip(),
+                "updated_at": int(updated_at) if isinstance(updated_at, (int, float)) else int(time.time()),
+            }
+    return clean
+
+
+def get_session_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> Optional[str]:
+    entry = load_session_map(path).get(context_id) or {}
+    session_id = entry.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
+def store_session_id_for_context(context_id: str, session_id: str, path: Path = SESSION_MAP_PATH) -> None:
+    if not session_id.strip():
+        return
+    with _SESSION_MAP_LOCK:
+        data = load_session_map(path)
+        data[context_id] = {
+            "session_id": session_id.strip(),
+            "updated_at": int(time.time()),
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.warning("session map persist failed (%s)", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Command builder
 # ---------------------------------------------------------------------------
 
-def build_claude_command(
+
+def _prompt_with_role(prompt: str, cfg: Dict[str, Any]) -> str:
+    role = str(cfg.get("role_prompt") or DEFAULTS["role_prompt"]).strip()
+    prompt = prompt.strip()
+    if not role:
+        return prompt
+    if not prompt:
+        return role
+    return role + "\n\n" + prompt
+
+
+def build_opencode_command(
     prompt: str,
-    session_uuid: str,
     cfg: Dict[str, Any],
     *,
-    resume: bool,
-    mcp_config_path: Optional[Path] = None,
+    session_id: Optional[str] = None,
 ) -> List[str]:
-    """Build the ``claude -p`` argv for one turn.
-
-    * ``resume=False`` -> ``--session-id <uuid>`` (first turn for this context).
-    * ``resume=True``  -> ``--resume <uuid>`` (subsequent turns).
-    * ``--mcp-config`` is appended ONLY when ``mcp_config_path`` is provided
-      (the caller decides presence by probing ``<repo>/.mcp.json``).
-    * NO ``--bare`` (would disable CLAUDE.md + hooks — the opposite of the goal).
-    """
-    cmd: List[str] = [
-        "claude",
-        "-p",
-        prompt,
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--permission-mode",
-        "bypassPermissions",
-        "--setting-sources",
-        "user,project,local",
-        "--model",
-        str(cfg.get("claude_model") or DEFAULTS["claude_model"]),
-        "--append-system-prompt",
-        str(cfg.get("role_prompt") or DEFAULTS["role_prompt"]),
+    """Build the ``opencode run`` argv for one turn."""
+    cmd: List[str] = ["opencode", "run"]
+    if session_id:
+        cmd += ["--session", session_id]
+    cmd += [
+        _prompt_with_role(prompt, cfg),
+        "--format",
+        "json",
+        "--dangerously-skip-permissions",
     ]
-    if mcp_config_path is not None:
-        cmd += ["--mcp-config", str(mcp_config_path)]
-    if resume:
-        cmd += ["--resume", session_uuid]
-    else:
-        cmd += ["--session-id", session_uuid]
-
-    extra = cfg.get("claude_extra_flags") or []
+    model = cfg.get("opencode_model")
+    if model:
+        cmd += ["--model", str(model)]
+    extra = cfg.get("opencode_extra_flags") or []
     if isinstance(extra, list):
         cmd += [str(x) for x in extra]
     return cmd
-
-
-def resolve_mcp_config(repo_path: Path) -> Optional[Path]:
-    """Return ``<repo>/.mcp.json`` if it exists and is readable JSON, else None.
-
-    Degradation (Codex hardening): absent -> skip flag (log debug). Present but
-    malformed/unreadable -> log warning + skip the flag (continue without it).
-    Never crash the turn over MCP config.
-    """
-    mcp_path = repo_path / ".mcp.json"
-    if not mcp_path.exists():
-        log.debug("no .mcp.json in %s; running without --mcp-config", repo_path)
-        return None
-    try:
-        json.loads(mcp_path.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        log.warning(".mcp.json present but unusable (%s); skipping --mcp-config", exc)
-        return None
-    return mcp_path
 
 
 # ---------------------------------------------------------------------------
 # Deterministic result parsing
 # ---------------------------------------------------------------------------
 
-def parse_claude_output(stdout: str) -> Optional[str]:
-    """Deterministically extract the reply text from ``stream-json --verbose``.
 
-    Selection order:
-      1. The FINAL ``{"type":"result"}`` frame. If that frame signals an error
-         (``is_error`` truthy, or ``subtype`` other than ``"success"``), return
-         an ``"[error] ..."`` string rather than its (possibly empty) result.
-      2. Fallback: the last ``assistant`` message's concatenated text blocks.
-      3. None if nothing usable was found.
-
-    Never grabs the last raw line.
-    """
-    final_result: Optional[Dict[str, Any]] = None
-    last_assistant_text: Optional[str] = None
+def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str], bool]:
+    """Parse OpenCode NDJSON stdout into session id, reply text, and retry signal."""
+    session_id: Optional[str] = None
+    parts: List[str] = []
+    session_missing = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -284,47 +292,37 @@ def parse_claude_output(stdout: str) -> Optional[str]:
             continue
         if not isinstance(obj, dict):
             continue
-        frame_type = obj.get("type")
-        if frame_type == "result":
-            final_result = obj  # keep overwriting -> ends on the last result frame
-        elif frame_type == "assistant":
-            text = _assistant_text(obj)
-            if text:
-                last_assistant_text = text
-
-    if final_result is not None:
-        is_error = bool(final_result.get("is_error"))
-        subtype = final_result.get("subtype")
-        if is_error or (subtype is not None and subtype != "success"):
-            detail = final_result.get("result") or subtype or "unknown error"
-            return f"[error] claude turn failed: {detail}"
-        result_text = final_result.get("result")
-        if isinstance(result_text, str) and result_text.strip():
-            return result_text.strip()
-        # result frame had no usable text — fall through to assistant fallback.
-
-    if last_assistant_text:
-        return last_assistant_text.strip()
-    return None
+        if session_id is None:
+            top = obj.get("sessionID")
+            if isinstance(top, str) and top.strip():
+                session_id = top.strip()
+            else:
+                part = obj.get("part")
+                if isinstance(part, dict):
+                    nested = part.get("sessionID")
+                    if isinstance(nested, str) and nested.strip():
+                        session_id = nested.strip()
+        text_part = _text_from_frame(obj)
+        if text_part:
+            parts.append(text_part)
+    reply_text = "".join(parts).strip() or None
+    return session_id, reply_text, session_missing
 
 
-def _assistant_text(frame: Dict[str, Any]) -> str:
-    """Concatenate text blocks from an ``assistant`` stream-json frame."""
-    message = frame.get("message")
-    if not isinstance(message, dict):
+def _text_from_frame(obj: Dict[str, Any]) -> str:
+    if obj.get("type") != "text":
         return ""
-    parts: List[str] = []
-    for block in message.get("content") or []:
-        if isinstance(block, dict) and block.get("type") == "text":
-            txt = block.get("text")
-            if isinstance(txt, str):
-                parts.append(txt)
-    return "".join(parts).strip()
+    part = obj.get("part")
+    if not isinstance(part, dict):
+        return ""
+    text = part.get("text")
+    return text if isinstance(text, str) else ""
 
 
 # ---------------------------------------------------------------------------
 # Per-contextId serialization
 # ---------------------------------------------------------------------------
+
 
 class ContextLocks:
     """Hand out one ``threading.Lock`` per contextId, with bounded eviction.
@@ -334,10 +332,9 @@ class ContextLocks:
     creation / eviction only; it is NEVER held while a turn runs.
 
     The registry is bounded to ``max_entries`` via LRU eviction. A lock is only
-    evicted if it is NOT currently held (``lock.locked()`` is False) — evicting a
-    held lock would let a concurrent same-context turn create a fresh lock and
-    race ``--resume`` on the same session. If every candidate is held we exceed
-    the bound temporarily rather than corrupt serialization.
+    evicted if it is NOT currently held (``lock.locked()`` is False). Held locks
+    are never evicted, so the registry may temporarily exceed the bound rather
+    than corrupt same-context serialization.
     """
 
     def __init__(self, max_entries: int = 1024) -> None:
@@ -351,22 +348,15 @@ class ContextLocks:
             if lock is None:
                 lock = threading.Lock()
                 self._registry[context_id] = lock
-            self._registry.move_to_end(context_id)  # mark most-recently-used
+            self._registry.move_to_end(context_id)
             self._evict_locked()
             return lock
 
     def _evict_locked(self) -> None:
-        """Evict least-recently-used UNHELD locks until within the bound.
-
-        Caller must hold ``self._mutex``. Held locks are skipped (never evicted),
-        so the registry may briefly exceed ``max_entries`` if all overflow
-        candidates are actively running.
-        """
         if len(self._registry) <= self._max_entries:
             return
         overflow = len(self._registry) - self._max_entries
         evicted = 0
-        # Iterate oldest-first; skip held locks.
         for cid in list(self._registry.keys()):
             if evicted >= overflow:
                 break
@@ -385,122 +375,69 @@ class ContextLocks:
 # Turn execution
 # ---------------------------------------------------------------------------
 
-class SeenContexts:
-    """Bounded set of contextIds that already started a claude session.
-
-    Used to pick ``--resume`` vs ``--session-id`` (first turn). Bounded via LRU
-    so it cannot grow without limit on a long-lived receiver. Eviction here is
-    safe regardless of held state: a wrongly-evicted context simply gets treated
-    as a first turn, which the narrowed session-retry (see ``run_claude_turn``)
-    corrects on a genuine not-found signal.
-    """
-
-    def __init__(self, max_entries: int = 1024) -> None:
-        self._seen: "OrderedDict[str, None]" = OrderedDict()
-        self._mutex = threading.Lock()
-        self._max_entries = max(1, int(max_entries))
-
-    def has(self, context_id: str) -> bool:
-        with self._mutex:
-            if context_id in self._seen:
-                self._seen.move_to_end(context_id)
-                return True
-            return False
-
-    def mark(self, context_id: str) -> None:
-        with self._mutex:
-            self._seen[context_id] = None
-            self._seen.move_to_end(context_id)
-            while len(self._seen) > self._max_entries:
-                self._seen.popitem(last=False)
-
-    def size(self) -> int:
-        with self._mutex:
-            return len(self._seen)
-
-
 # The runner contract is ``(cmd, cwd, timeout) -> (stdout, rc, stderr)``.
 # (stderr is appended in v0.3 so the poll loop can surface a snippet on failure;
-#  legacy 2-tuple runners are still accepted for backward compatibility.)
+# legacy 2-tuple runners are still accepted for backward compatibility.)
 
 
-class ClaudeCLINotFound(Exception):
-    """Raised by the runner when the ``claude`` binary is not on PATH."""
+class OpenCodeCLINotFound(Exception):
+    """Raised by the runner when the ``opencode`` binary is not on PATH."""
 
 
-def run_claude_turn(
+def run_opencode_turn(
     prompt: str,
     context_id: str,
     cfg: Dict[str, Any],
     *,
     runner: Any = None,
-    seen: Optional["SeenContexts"] = None,
 ) -> Optional[str]:
-    """Run one claude turn for ``context_id`` with narrowed session retry.
-
-    ``runner`` is an injectable callable ``(cmd, cwd, timeout) -> (stdout, rc)``
-    or ``(stdout, rc, stderr)`` used by tests to stub the subprocess. Defaults to
-    the real subprocess call.
-
-    Session strategy: pick resume-vs-first from ``seen``. We retry the OTHER mode
-    once ONLY on a genuine session-not-found signal (result frame / stderr match
-    against ``SESSION_NOT_FOUND_SIGNALS``). A bare ``rc != 0`` does NOT trigger a
-    retry: this receiver runs ``--permission-mode bypassPermissions`` and a
-    spurious second turn could double-execute a side-effecting action.
-    """
+    """Run one OpenCode turn for ``context_id`` with narrow session remint."""
     if runner is None:
         runner = _subprocess_runner
-    if seen is None:
-        seen = SeenContexts()
 
     repo_path = Path(cfg["repo_path"])
-    session_uuid = session_id_for_context(context_id)
-    mcp_config = resolve_mcp_config(repo_path)
-    timeout = float(cfg.get("claude_timeout_s") or DEFAULTS["claude_timeout_s"])
+    timeout = float(cfg.get("opencode_timeout_s") or DEFAULTS["opencode_timeout_s"])
+    stored_session_id = get_session_id_for_context(context_id)
 
-    first_resume = seen.has(context_id)
-    attempts = [first_resume, not first_resume]
-    last_reply: Optional[str] = None
+    def _invoke(session_id: Optional[str]) -> Tuple[Optional[str], Optional[str], bool, int, str]:
+        cmd = build_opencode_command(prompt, cfg, session_id=session_id)
+        stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
+        parsed_session_id, reply, session_missing = parse_opencode_output(stdout)
+        if parsed_session_id:
+            store_session_id_for_context(context_id, parsed_session_id)
+        return parsed_session_id, reply, session_missing, rc, stderr
 
-    for resume in attempts:
-        cmd = build_claude_command(
-            prompt, session_uuid, cfg, resume=resume, mcp_config_path=mcp_config
-        )
+    try:
+        parsed_session_id, reply, session_missing, rc, stderr = _invoke(stored_session_id)
+    except subprocess.TimeoutExpired:
+        return f"[error] opencode turn timed out after {timeout}s"
+    except (FileNotFoundError, OpenCodeCLINotFound):
+        return "[error] opencode CLI not found on PATH"
+    except Exception as exc:  # noqa: BLE001
+        log.warning("opencode invocation failed (%s)", exc)
+        return f"[error] opencode invocation failed: {exc}"
+
+    if stored_session_id and (session_missing or _is_session_not_found(stderr)):
+        log.info("stored session %s missing for ctx=%s; reminting new OpenCode session", stored_session_id, context_id)
         try:
-            stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
+            parsed_session_id, reply, _session_missing, rc, stderr = _invoke(None)
         except subprocess.TimeoutExpired:
-            return f"[error] claude turn timed out after {timeout}s"
-        except (FileNotFoundError, ClaudeCLINotFound):
-            # Fatal + distinct: do NOT make this look transient/retryable.
-            return "[error] claude CLI not found on PATH"
-        except Exception as exc:  # noqa: BLE001 - never crash the poll loop
-            log.warning("claude invocation failed (%s)", exc)
-            return f"[error] claude invocation failed: {exc}"
+            return f"[error] opencode turn timed out after {timeout}s"
+        except (FileNotFoundError, OpenCodeCLINotFound):
+            return "[error] opencode CLI not found on PATH"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("opencode remint failed (%s)", exc)
+            return f"[error] opencode invocation failed: {exc}"
+        if parsed_session_id:
+            log.info("stored reminted OpenCode session %s for ctx=%s", parsed_session_id, context_id)
 
-        reply = parse_claude_output(stdout)
-        # Only retry on a TRUE session-not-found signal, and only once.
-        if (
-            resume != attempts[-1]
-            and _is_session_not_found(reply, stderr)
-        ):
-            log.info("session mode %s reported not-found for ctx=%s; retrying other mode",
-                     "resume" if resume else "first", context_id)
-            continue
-
-        if reply is None and rc != 0:
-            # No parseable frames + non-zero rc: surface a stderr snippet so the
-            # failure is diagnosable rather than a generic "[no reply produced]".
-            snippet = (stderr or "").strip().replace("\n", " ")[:300]
-            reply = (
-                f"[error] claude exited rc={rc} with no parseable output"
-                + (f": {snippet}" if snippet else "")
-            )
-        last_reply = reply
-        seen.mark(context_id)
-        return reply
-
-    seen.mark(context_id)
-    return last_reply
+    if reply is None and rc != 0:
+        snippet = (stderr or "").strip().replace("\n", " ")[:300]
+        reply = (
+            f"[error] opencode exited rc={rc} with no parseable output"
+            + (f": {snippet}" if snippet else "")
+        )
+    return reply
 
 
 def _call_runner(runner: Any, cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
@@ -513,31 +450,20 @@ def _call_runner(runner: Any, cmd: List[str], cwd: str, timeout: float) -> Tuple
     return stdout, rc, ""
 
 
-def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
-    """True only on a genuine session-not-found signal (reply text or stderr).
-
-    Deliberately narrow: we do NOT treat a bare non-zero rc or a None reply as a
-    session error, because retrying the other mode would re-run the turn.
-    """
-    haystacks: List[str] = []
-    if reply:
-        haystacks.append(reply.lower())
-    if stderr:
-        haystacks.append(stderr.lower())
-    for hay in haystacks:
-        for sig in SESSION_NOT_FOUND_SIGNALS:
-            if sig in hay:
-                return True
-    return False
+def _is_session_not_found(stderr: str) -> bool:
+    """True only on a genuine OpenCode session-not-found stderr signal."""
+    hay = (stderr or "").strip().lower()
+    if not hay:
+        return False
+    return any(sig in hay for sig in SESSION_NOT_FOUND_SIGNALS)
 
 
 def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
-    """Real subprocess invocation of ``claude -p``.
+    """Real subprocess invocation of ``opencode run``.
 
-    Uses ``Popen`` + ``start_new_session=True`` so the whole process tree (claude
-    plus any MCP servers / tool subprocesses) lands in its own process group; on
-    timeout we ``killpg`` the group to reap orphans. Returns (stdout, rc, stderr).
-    Buffers are capped (``MAX_STDOUT_BYTES``) defensively.
+    Uses ``Popen`` + ``start_new_session=True`` so the whole process tree lands in
+    its own process group; on timeout we ``killpg`` the group to reap orphans.
+    Returns (stdout, rc, stderr). Buffers are capped defensively.
     """
     try:
         proc = subprocess.Popen(
@@ -549,7 +475,7 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
             start_new_session=True,
         )
     except FileNotFoundError:
-        raise ClaudeCLINotFound("claude") from None
+        raise OpenCodeCLINotFound("opencode") from None
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -563,7 +489,7 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
     if stdout and len(stdout) > MAX_STDOUT_BYTES:
         stdout = stdout[:MAX_STDOUT_BYTES]
     if rc != 0 and stderr:
-        log.warning("claude stderr: %s", stderr.strip()[:500])
+        log.warning("opencode stderr: %s", stderr.strip()[:500])
     return stdout or "", rc, stderr or ""
 
 
@@ -645,7 +571,7 @@ def post_reply(
     """
     payload = {
         "jsonrpc": "2.0",
-        "id": f"cc-{int(time.time() * 1000)}",
+        "id": f"oc-{int(time.time() * 1000)}",
         "method": "SendMessage",
         "params": {
             "message": {
@@ -733,14 +659,13 @@ class Receiver:
         self._hermes_auth_token = resolve_hermes_auth_token(cfg)
         max_ctx = int(cfg.get("max_tracked_contexts") or DEFAULTS["max_tracked_contexts"])
         self.locks = ContextLocks(max_entries=max_ctx)
-        self.seen = SeenContexts(max_entries=max_ctx)
         self.inbox_path = inbox_path
         self.offset_path = offset_path
         # Persisted offset => skip the historical backlog on restart (at-most-once).
         self._processed = _read_offset(offset_path)
         self._offset_lock = threading.Lock()
         self._stop = threading.Event()
-        # Global cap on concurrent claude subprocesses (per-context lock still
+        # Global cap on concurrent OpenCode subprocesses (per-context lock still
         # serializes same-context turns; this bounds the cross-context fan-out).
         max_turns = int(cfg.get("max_concurrent_turns") or DEFAULTS["max_concurrent_turns"])
         self._turn_slots = threading.BoundedSemaphore(max(1, max_turns))
@@ -771,7 +696,7 @@ class Receiver:
         if not self._turn_slots.acquire(timeout=wait):
             busy = "[busy] max concurrent turns reached, retry"
             log.warning("ctx=%s busy; concurrency cap reached", context_id)
-            _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
+            _transcript("opencode->hermes (busy)", "opencode", "hermes", context_id, busy)
             post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
             return busy
         try:
@@ -780,15 +705,15 @@ class Receiver:
             if not acquired:
                 busy = "[busy] this context is processing another turn; retry shortly"
                 log.warning("ctx=%s busy; lock wait %.0fs exceeded", context_id, wait)
-                _transcript("claude->hermes (busy)", "claude-code", "hermes", context_id, busy)
+                _transcript("opencode->hermes (busy)", "opencode", "hermes", context_id, busy)
                 post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
                 return busy
             try:
-                reply = run_claude_turn(
-                    text, context_id, self.cfg, runner=self.runner, seen=self.seen
+                reply = run_opencode_turn(
+                    text, context_id, self.cfg, runner=self.runner
                 )
-                out = reply if reply is not None else "[no reply produced by claude]"
-                _transcript("claude->hermes", "claude-code", "hermes", context_id, out)
+                out = reply if reply is not None else "[no reply produced by opencode]"
+                _transcript("opencode->hermes", "opencode", "hermes", context_id, out)
                 post_reply(self.cfg["hermes_url"], context_id, out, self._hermes_auth_token)
                 return reply
             finally:
@@ -903,8 +828,8 @@ class Receiver:
 def _agent_card(cfg: Dict[str, Any]) -> Dict[str, Any]:
     base = f"http://{cfg['bind_host']}:{cfg['bind_port']}"
     return {
-        "name": "claude-code",
-        "description": "Claude Code repo-scoped A2A executor peer (cc_receiver).",
+        "name": "opencode",
+        "description": "OpenCode repo-scoped A2A executor peer (oc_receiver).",
         "url": f"{base}/jsonrpc",
         "version": "0.3.0",
         "protocolVersion": "1.0",
@@ -923,8 +848,8 @@ def _agent_card(cfg: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "id": "execute",
                 "name": "Repo executor",
-                "description": "Executes A2A tasks in the bound repo via claude -p with full harness.",
-                "tags": ["v0.3", "claude_code", "executor"],
+                "description": "Executes A2A tasks in the bound repo via opencode run with full harness.",
+                "tags": ["v0.3", "opencode", "executor"],
             }
         ],
     }
@@ -986,7 +911,7 @@ def make_handler(
             if self.path == "/health":
                 self._json(200, {
                     "ok": True,
-                    "name": "claude-code",
+                    "name": "opencode",
                     "repo_path": cfg["repo_path"],
                 })
             elif self.path.startswith("/.well-known/agent-card.json"):
@@ -1038,7 +963,7 @@ def make_handler(
                                  "error": {"code": -32601, "message": f"method not found: {method!r}"}})
                 return
             text = extract_text(params)
-            # Clamp prompt size before it can reach claude.
+            # Clamp prompt size before it can reach OpenCode.
             if len(text) > MAX_PROMPT_CHARS:
                 text = text[:MAX_PROMPT_CHARS]
             message = params.get("message") or {}
@@ -1059,9 +984,9 @@ def make_handler(
                 return
             if receiver is not None:
                 receiver.note_inbound()
-            _transcript("hermes->claude", "hermes", "claude-code", context_id, text)
-            ack = "Message received; executing in repo via Claude Code. Reply will follow. [queued]"
-            _transcript("claude->hermes (ack)", "claude-code", "hermes", context_id, ack)
+            _transcript("hermes->opencode", "hermes", "opencode", context_id, text)
+            ack = "Message received; executing in repo via OpenCode. Reply will follow. [queued]"
+            _transcript("opencode->hermes (ack)", "opencode", "hermes", context_id, ack)
             self._json(200, {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -1081,13 +1006,13 @@ def make_handler(
 def log_harness_inventory(repo_path: Path) -> Dict[str, bool]:
     """Log + return which harness assets exist in the repo (visibility)."""
     inventory = {
-        "CLAUDE.md": (repo_path / "CLAUDE.md").exists(),
+        "AGENTS.md": (repo_path / "AGENTS.md").exists(),
         ".mcp.json": (repo_path / ".mcp.json").exists(),
-        ".claude": (repo_path / ".claude").exists(),
+        ".opencode": (repo_path / ".opencode").exists(),
     }
     log.info(
-        "harness inventory for %s: CLAUDE.md=%s .mcp.json=%s .claude=%s",
-        repo_path, inventory["CLAUDE.md"], inventory[".mcp.json"], inventory[".claude"],
+        "harness inventory for %s: AGENTS.md=%s .mcp.json=%s .opencode=%s",
+        repo_path, inventory["AGENTS.md"], inventory[".mcp.json"], inventory[".opencode"],
     )
     return inventory
 
@@ -1101,25 +1026,25 @@ def is_loopback_bind(host: str) -> bool:
     return str(host).strip().lower() in {"127.0.0.1", "::1", "localhost", ""}
 
 
-def probe_claude_cli() -> bool:
-    """Best-effort ``claude --version`` probe; loud warning if missing. Non-fatal."""
+def probe_opencode_cli() -> bool:
+    """Best-effort ``opencode --version`` probe; loud warning if missing. Non-fatal."""
     try:
         proc = subprocess.run(
-            ["claude", "--version"],
+            ["opencode", "--version"],
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode == 0:
-            log.info("claude CLI present: %s", (proc.stdout or "").strip()[:120])
+            log.info("opencode CLI present: %s", (proc.stdout or "").strip()[:120])
             return True
-        log.warning("claude --version exited rc=%s: %s", proc.returncode,
+        log.warning("opencode --version exited rc=%s: %s", proc.returncode,
                     (proc.stderr or "").strip()[:200])
         return False
     except FileNotFoundError:
-        log.warning("claude CLI NOT FOUND on PATH — turns will fail fatally "
-                    "with '[error] claude CLI not found on PATH'")
+        log.warning("opencode CLI NOT FOUND on PATH — turns will fail fatally "
+                    "with '[error] opencode CLI not found on PATH'")
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("claude --version probe failed (%s)", exc)
+        log.warning("opencode --version probe failed (%s)", exc)
         return False
 
 
@@ -1150,7 +1075,7 @@ def remove_pid_file(path: Optional[Path] = None) -> None:
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [cc_receiver] %(levelname)s %(message)s",
+        format="%(asctime)s [oc_receiver] %(levelname)s %(message)s",
     )
     cfg = load_config()
     repo_path = Path(cfg["repo_path"])
@@ -1178,9 +1103,9 @@ def main() -> int:
             cfg.get("auth_token_env"),
         )
 
-    probe_claude_cli()
+    probe_opencode_cli()
     log_harness_inventory(repo_path)
-    log.info("repo_path (cwd for claude) pinned to %s", repo_path)
+    log.info("repo_path (cwd for opencode) pinned to %s", repo_path)
 
     httpd_box: Dict[str, Any] = {}
 
@@ -1224,13 +1149,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log.info("cc_receiver listening on http://%s:%s", cfg["bind_host"], cfg["bind_port"])
+    log.info("oc_receiver listening on http://%s:%s", cfg["bind_host"], cfg["bind_port"])
     try:
         httpd.serve_forever()
     finally:
         receiver.stop()
         remove_pid_file()
-        log.info("cc_receiver stopped")
+        log.info("oc_receiver stopped")
     return 0
 
 

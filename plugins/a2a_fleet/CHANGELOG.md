@@ -1,5 +1,24 @@
 # a2a_fleet — Changelog
 
+## v0.6.0 — shipped
+
+- Added OpenCode as a second managed repo-scoped executor peer alongside Claude
+  Code:
+  - new tools `deploy_oc_receiver`, `oc_receiver_status`, `oc_receiver_stop`
+  - new standalone template `templates/oc_receiver.py`
+  - new deploy/manage module `oc_deploy.py`
+- Managed-peer plumbing is now mode-aware for both `claude_code` and
+  `opencode`:
+  - `fleet_yaml_io.upsert_managed_peer(...)` + `upsert_oc_peer(...)`
+  - `fleet_config.load_fleet()` validates and surfaces managed OpenCode peers
+  - boot-reconcile now scans and redeploys both managed modes
+- OpenCode receiver runtime is isolated from Claude receiver runtime:
+  separate config, inbox, offset, transcript, pid, token, and session-map files
+  so both peers can coexist in one repo.
+- OpenCode receiver persists a durable `contextId -> sessionID` map and reuses
+  it on later turns; `Session not found` remints exactly once under the existing
+  per-context lock.
+
 ## v0.3.0 — planned / in progress
 
 > **Status: planned.** Direction only — NOT shipped. Tracks the v0.3 milestone:

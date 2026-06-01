@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.5.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API shipped (0.5.1 multi-repo keys; 0.5.2 profile-agnostic discovery)
+Version: `0.6.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 dual managed executors (Claude Code + OpenCode)
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -11,7 +11,8 @@ including straight into the real Hermes agent via a platform adapter.
 > **Authoritative source**: this README matches the shipped code
 > (`server.py` embedded-uvicorn architecture, `fleet_config.SUPPORTED_HANDLERS`,
 > `adapter.py` Route B bridge). `CHANGELOG.md` tracks notable changes. The v0.3
-> Claude Code executor and v0.4 config bootstrap are shipped and live-verified.
+> Claude Code executor, v0.4 config bootstrap, and v0.6 OpenCode executor are
+> shipped.
 
 ---
 
@@ -191,16 +192,17 @@ deployed receiver's peer entry:
   `response_handler: agent`, a `server` block, and an empty `agents: {}`) to
   `$HERMES_HOME/fleet.yaml`. The node comes up immediately instead of going
   silently idle. The write is idempotent and never clobbers an existing file.
-- **Auto-wired peer.** `deploy_cc_receiver` upserts the receiver's peer into
-  `fleet.yaml` **surgically** (ruamel round-trip — your comments and formatting are
-  preserved). With auth it writes a **managed `claude_code`** peer
-  (`url` + `token_env` + `managed: true` + `mode: claude_code` + `repo_path`), so
-  `fleet_send` resolves the bearer automatically (no more 401) and boot-reconcile
-  re-provisions the same token across a gateway restart. A `no_auth` deploy gets a
-  plain `url` peer. A second repo reusing the default `claude-code` name gets a
-  distinct `claude-code-<repo>` peer name. The upsert result is returned under
-  `fleet_peer`; a config-write hiccup is a non-fatal warning (the receiver is
-  already healthy).
+- **Auto-wired peer.** `deploy_cc_receiver` and `deploy_oc_receiver` upsert their
+  receiver peers into `fleet.yaml` **surgically** (ruamel round-trip — your
+  comments and formatting are preserved). With auth they write managed peers
+  (`url` + `token_env` + `managed: true` + `mode` + `repo_path`), so
+  `fleet_send` resolves the bearer automatically (no more 401) and
+  boot-reconcile re-provisions the same token across a gateway restart. A
+  `no_auth` deploy gets a plain `url` peer. Default peer names are
+  `claude-code` and `opencode`; a second repo reusing the same default name gets
+  a distinct `-<repo>` suffix. The upsert result is returned under `fleet_peer`;
+  a config-write hiccup is a non-fatal warning (the receiver is already
+  healthy).
 
 ### Auth behavior
 
@@ -331,6 +333,23 @@ restart backoff, idle cap). Deploy only to repos the user has authorized.
 See `skills/deploy-cc-receiver/SKILL.md` for the orchestration procedure and
 `.omc/plans/a2a-fleet-v0.3-plan.md` for the full design.
 
+## v0.6 — OpenCode as a second repo-scoped A2A executor (shipped)
+
+- Tools: `deploy_oc_receiver`, `oc_receiver_status`, `oc_receiver_stop`
+- Template: `templates/oc_receiver.py`
+- Deploy module: `oc_deploy.py`
+- Default peer name / mode / port: `opencode` / `opencode` / `9310`
+
+OpenCode mirrors the Claude receiver's security model (loopback-by-default,
+bearer auth, cwd pinned to the configured repo, bounded concurrency, idle
+teardown, reply retry parity), but its session model differs: the first turn
+must mint an OpenCode-generated `sessionID` from the NDJSON event stream and
+persist a durable `contextId -> sessionID` map in
+`<repo>/.hermes/a2a-oc-sessions.json`; later turns continue with
+`opencode run --session <stored_id> ...`. If OpenCode returns
+`Error: Session not found`, the receiver remints once under the same
+per-context lock and updates the map.
+
 ### How it works (end-to-end flow)
 
 Hermes is the **orchestrator** (its own LLM); Claude Code is the **executor**
@@ -340,8 +359,8 @@ Hermes is the **orchestrator** (its own LLM); Claude Code is the **executor**
 ┌──────────────┐   chat    ┌─────────────────────────────────────────────┐
 │   USER        │◄─────────►│        HERMES AGENT  (orchestrator)         │
 │ (Telegram/…)  │           │  its own LLM · inbound A2A node :9219       │
-└──────────────┘           │  tools: deploy_cc_receiver · fleet_send ·   │
-                           │         cc_receiver_status / _stop          │
+└──────────────┘           │  tools: deploy_cc_receiver · deploy_oc_receiver · fleet_send │
+                           │         cc_receiver_status/_stop · oc_receiver_status/_stop  │
                            └──────┬───────────────────────────▲──────────┘
                        deploy +   │ fleet_send(msg, context_id) │ reply POST
                        fleet_send │ + Bearer token              │ (same context_id)
@@ -589,10 +608,12 @@ curl http://<bind_host>:<bind_port>/health
 | `context_store.py` | Per-`context_id` multi-turn history + locks (used by `llm`) |
 | `skills/deploy-fleet/SKILL.md` | Procedure: bring up a node, verify, ping/pong |
 | `skills/deploy-cc-receiver/SKILL.md` | Procedure: deploy a Claude Code executor receiver into a repo |
-| `fleet_yaml_io.py` | First-enable `fleet.yaml` scaffold + comment-preserving managed-peer upsert (`deploy_cc_receiver` auto-wiring) |
+| `fleet_yaml_io.py` | First-enable `fleet.yaml` scaffold + comment-preserving managed-peer upsert (`deploy_cc_receiver` / `deploy_oc_receiver` auto-wiring) |
 | `dashboard/manifest.json` · `dashboard/plugin_api.py` | Read-only dashboard API (`/api/plugins/a2a_fleet/conversations` · `/peers`) feeding a front-end A2A conversation tab |
 | `templates/cc_receiver.py` | Standalone receiver dropped into `<repo>/.hermes/` by `deploy_cc_receiver` |
-| `cc_deploy.py` | `deploy_cc_receiver` / `cc_receiver_status` / `cc_receiver_stop` handlers, token provisioning, boot-reconcile |
+| `templates/oc_receiver.py` | Standalone receiver dropped into `<repo>/.hermes/` by `deploy_oc_receiver` |
+| `cc_deploy.py` | `deploy_cc_receiver` / `cc_receiver_status` / `cc_receiver_stop` handlers, token provisioning, boot-reconcile for both managed modes |
+| `oc_deploy.py` | `deploy_oc_receiver` / `oc_receiver_status` / `oc_receiver_stop` handlers, token provisioning |
 | `plugin.yaml` | Hermes plugin manifest |
 | `references/` | A2A spec summary + Hermes plugin guide |
 
@@ -610,4 +631,5 @@ venv/bin/python -m pytest tests/plugins/a2a_fleet/ -q
 | v0.1 | ✅ shipped | Embedded uvicorn server, Agent Card discovery, JSON-RPC `SendMessage`, bearer auth, echo handler, `fleet_send` tool, async client |
 | v0.2 | ✅ shipped | `llm` response handler (Route A — stateless model call + multi-turn `context_store`), `message/send` alias, `HandlerResult`, outbound `context_id` threading |
 | Route B | ✅ shipped | `agent` response handler — inbound dispatched into the real Hermes agent via the `a2a_fleet` platform adapter + `run_coroutine_threadsafe` bridge to the gateway loop |
-| v0.3 | 🚧 in progress / planned | `deploy_cc_receiver` — Claude Code executor receiver deployed into a target repo's `.hermes/`, repo-aware `fleet.yaml` (`repo_path`/`managed`/`mode`), handshake, managed daemon lifecycle |
+| v0.3 | ✅ shipped | `deploy_cc_receiver` — Claude Code executor receiver deployed into a target repo's `.hermes/`, repo-aware `fleet.yaml` (`repo_path`/`managed`/`mode`), handshake, managed daemon lifecycle |
+| v0.6 | ✅ shipped | `deploy_oc_receiver` — OpenCode executor receiver deployed into a target repo's `.hermes/`, durable OpenCode session map, mode-aware peer upsert/load/reconcile, coexistence with Claude receiver in one repo |

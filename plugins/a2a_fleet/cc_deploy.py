@@ -39,6 +39,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
+
 log = logging.getLogger("a2a_fleet.cc_deploy")
 
 # Managed-block markers injected into <repo>/CLAUDE.md. The block is rewritten
@@ -331,25 +333,24 @@ def _read_pid(pid_path: Path) -> Optional[int]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists (signal 0 probe)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-    return True
+    """True if a process with ``pid`` exists."""
+    return bool(psutil.pid_exists(pid))
 
 
 def _terminate_pid(pid: int) -> bool:
     """SIGTERM ``pid``, wait briefly, SIGKILL if still alive. Returns True if killed/gone."""
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
         return True
-    except OSError as exc:
+    except (psutil.Error, OSError) as exc:
+        log.warning("SIGTERM pid=%s failed (%s)", pid, exc)
+        return False
+    try:
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError) as exc:
         log.warning("SIGTERM pid=%s failed (%s)", pid, exc)
         return False
     deadline = time.monotonic() + STOP_TERM_WAIT_S
@@ -363,10 +364,10 @@ def _terminate_pid(pid: int) -> bool:
     # running", so do not report a false negative. Give it a brief moment to be
     # reaped, then report success.
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+        proc.kill()
+    except (psutil.NoSuchProcess, ProcessLookupError):
         return True
-    except OSError as exc:
+    except (psutil.Error, OSError) as exc:
         log.warning("SIGKILL pid=%s failed (%s)", pid, exc)
         return False
     reap_deadline = time.monotonic() + 1.0
@@ -385,9 +386,27 @@ def _kill_launched_child(pid: int) -> None:
     plain SIGTERM/SIGKILL on the pid if the group signal fails.
     """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError) as exc:
-        log.warning("killpg SIGTERM pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("process lookup pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
+        _terminate_pid(pid)
+        return
+    children = proc.children(recursive=True)
+    for child in children:
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as exc:
+            log.warning("child SIGTERM pid=%s failed (%s)", child.pid, exc)
+    try:
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("SIGTERM pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
         _terminate_pid(pid)
         return
     deadline = time.monotonic() + STOP_TERM_WAIT_S
@@ -396,9 +415,18 @@ def _kill_launched_child(pid: int) -> None:
             return
         time.sleep(STOP_POLL_INTERVAL_S)
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError) as exc:
-        log.warning("killpg SIGKILL pid=%s failed (%s)", pid, exc)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error as exc:
+                log.warning("child SIGKILL pid=%s failed (%s)", child.pid, exc)
+        proc.kill()
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("SIGKILL pid=%s failed (%s)", pid, exc)
         _terminate_pid(pid)
 
 
@@ -847,6 +875,57 @@ def _managed_cc_peers(fleet_cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, An
     return out
 
 
+def _managed_receiver_module(mode: str):
+    if mode == "claude_code":
+        return sys.modules[__name__]
+    if mode == "opencode":
+        from . import oc_deploy  # noqa: PLC0415,WPS433
+
+        return oc_deploy
+    raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+
+
+def _managed_receiver_port(repo: Path, mode: str) -> int:
+    module = _managed_receiver_module(mode)
+    default = int(getattr(module, "DEFAULT_BIND_PORT"))
+    config_filename = str(getattr(module, "CONFIG_FILENAME"))
+    try:
+        cfg = json.loads((repo / ".hermes" / config_filename).read_text())
+        if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
+            return int(cfg["bind_port"])
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return default
+
+
+def _read_managed_token_file(repo: Path, mode: str) -> Optional[str]:
+    module = _managed_receiver_module(mode)
+    token_filename = str(getattr(module, "TOKEN_FILENAME"))
+    try:
+        raw = (repo / ".hermes" / token_filename).read_text().strip()
+    except OSError:
+        return None
+    return raw or None
+
+
+def _read_managed_pid(repo: Path, mode: str) -> Optional[int]:
+    module = _managed_receiver_module(mode)
+    pid_filename = str(getattr(module, "PID_FILENAME"))
+    return _read_pid(repo / ".hermes" / pid_filename)
+
+
+def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]:
+    import asyncio
+
+    if mode == "claude_code":
+        return asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
+    if mode == "opencode":
+        from . import oc_deploy  # noqa: PLC0415,WPS433
+
+        return asyncio.run(oc_deploy.deploy_oc_receiver_handler(str(repo), bind_port=port))
+    raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+
+
 def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:
     """Read the receiver's bound port from <repo>/.hermes/a2a_receiver.json."""
     try:
@@ -884,31 +963,31 @@ def _read_token_file(repo: Path) -> Optional[str]:
 
 
 def reconcile_managed_receivers() -> List[Dict[str, Any]]:
-    """On gateway start, leave healthy managed CC receivers alone; redeploy down ones.
+    """On gateway start, leave healthy managed receivers alone; redeploy down ones.
 
-    fleet.yaml is the DESIRED state. For each managed claude_code peer with a
+    fleet.yaml is the DESIRED state. For each managed ``claude_code`` or
+    ``opencode`` peer with a
     repo_path:
       1. Read the persisted ``<repo>/.hermes/.token`` (if any) and re-publish it
          to ``os.environ[token_env]`` so an in-session ``fleet_send`` presents the
          SAME token the surviving receiver was launched with (H1).
       2. Determine the desired bind port from the peer ``url`` in fleet.yaml; if
-         the on-disk ``a2a_receiver.json`` records a different port, prefer
+         the on-disk receiver config records a different port, prefer
          fleet.yaml and log the drift.
       3. Check health (PID alive + /health + repo_path identity) on that port.
       4. If HEALTHY -> LEAVE IT (action="healthy"). Do NOT redeploy — the running
          executor (possibly mid-task) is preserved and its token is now
          re-published. This fixes restart-kills-in-flight-work (H1).
       5. Only if DOWN/unhealthy -> redeploy (fresh token, rewrites .token,
-         relaunches, re-publishes) via ``deploy_cc_receiver_handler``
+         relaunches, re-publishes) via the mode-specific deploy handler
          (action="redeployed"). Receiver conversation context survives via the
-         claude ``--resume`` session files, so a redeploy is safe.
+         mode-specific persistent session state, so a redeploy is safe.
 
     Never raises: each peer's failure is captured into its summary row. Returns a
     list of ``{agent, repo_path, action, ...}`` rows (one per managed peer).
     """
-    import asyncio
-
     from . import fleet_config  # noqa: WPS433 — lazy import is the contract.
+    from .managed_peers import iter_supported_managed_peers  # noqa: PLC0415,WPS433
 
     results: List[Dict[str, Any]] = []
     try:
@@ -917,12 +996,13 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
         log.warning("a2a_fleet: boot-reconcile skipped; fleet.yaml not usable (%s)", exc)
         return results
 
-    peers = _managed_cc_peers(cfg)
+    peers = list(iter_supported_managed_peers(cfg.get("agents") or {}))
     if not peers:
         return results  # common case / fresh installs: nothing to do.
 
     for name, entry in peers:
-        row: Dict[str, Any] = {"agent": name, "repo_path": entry.get("repo_path")}
+        mode = str(entry.get("mode") or "")
+        row: Dict[str, Any] = {"agent": name, "repo_path": entry.get("repo_path"), "mode": mode}
         repo, err = canonicalize_repo_path(str(entry.get("repo_path")))
         if err is not None or repo is None:
             row["action"] = "failed"
@@ -931,31 +1011,36 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
             results.append(row)
             continue
 
-        token_env = entry.get("token_env") or stable_token_env_name(repo)
+        token_env = entry.get("token_env")
+        if not token_env:
+            try:
+                token_env = _managed_receiver_module(mode).stable_token_env_name(repo)
+            except Exception:  # noqa: BLE001
+                token_env = stable_token_env_name(repo)
 
         # (1) Re-publish the persisted token so in-session fleet_send matches the
         # surviving receiver. Only set when present and not already in os.environ
         # with the same value (avoid clobbering a fresher in-process value).
-        persisted = _read_token_file(repo)
+        persisted = _read_managed_token_file(repo, mode)
         if persisted and os.environ.get(token_env) != persisted:
             os.environ[token_env] = persisted
 
         # (2) Desired port from fleet.yaml url; warn on drift vs on-disk config.
         desired_port = _port_from_peer_url(entry.get("url"))
-        on_disk_port = _receiver_port(repo)
+        on_disk_port = _managed_receiver_port(repo, mode)
         if desired_port is None:
             port = on_disk_port
         else:
             port = desired_port
             if desired_port != on_disk_port:
                 log.warning(
-                    "a2a_fleet: boot-reconcile %s port drift — fleet.yaml says :%s but "
-                    "a2a_receiver.json says :%s; using fleet.yaml",
-                    name, desired_port, on_disk_port,
+                    "a2a_fleet: boot-reconcile %s (%s) port drift — fleet.yaml says :%s but "
+                    "on-disk config says :%s; using fleet.yaml",
+                    name, mode, desired_port, on_disk_port,
                 )
 
         # (3) Health on the desired port.
-        pid = _read_pid(repo / ".hermes" / PID_FILENAME)
+        pid = _read_managed_pid(repo, mode)
         alive = pid is not None and _pid_alive(pid)
         healthy = bool(alive and _check_health_once(port, expected_repo_path=str(repo)))
 
@@ -969,7 +1054,7 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
 
         # (5) Down/unhealthy -> redeploy on the desired port.
         try:
-            res = asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
+            res = _deploy_managed_receiver(mode, repo, port)
         except Exception as exc:  # noqa: BLE001
             row["action"] = "failed"
             row["error"] = f"deploy raised: {exc}"

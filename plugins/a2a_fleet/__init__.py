@@ -200,6 +200,7 @@ def register(ctx) -> None:
     # target repo. Lazy-import keeps the import cost off the hot path / avoids
     # cycles. Additive — never touches the fleet_send registration above.
     from . import cc_deploy  # noqa: WPS433 — lazy import is the contract.
+    from . import oc_deploy  # noqa: WPS433 — lazy import is the contract.
 
     ctx.register_tool(
         name="deploy_cc_receiver",
@@ -271,6 +272,76 @@ def register(ctx) -> None:
         description="Stop the repo's Claude Code receiver via its PID file and remove the pidfile.",
         emoji="🛑",
     )
+    ctx.register_tool(
+        name="deploy_oc_receiver",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to the target repo OpenCode is set up + "
+                        "authorized in. Symlinked inputs are RESOLVED to their real "
+                        "on-disk target and the receiver cwd is pinned there "
+                        "(security preserved)."
+                    ),
+                },
+                "bind_port": {
+                    "type": "integer",
+                    "description": "Port the receiver binds on (default 9310).",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional OpenCode model to pin.",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(oc_deploy.deploy_oc_receiver_handler),
+        check_fn=None,
+        is_async=True,
+        description="Deploy + launch an OpenCode A2A executor receiver in a target repo.",
+        emoji="🧩",
+    )
+    ctx.register_tool(
+        name="oc_receiver_status",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose OpenCode receiver to check (PID + /health).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(oc_deploy.oc_receiver_status_handler),
+        check_fn=None,
+        is_async=True,
+        description="Report whether the repo's OpenCode receiver is running (PID alive AND /health).",
+        emoji="🩺",
+    )
+    ctx.register_tool(
+        name="oc_receiver_stop",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose OpenCode receiver to stop (SIGTERM via PID file).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(oc_deploy.oc_receiver_stop_handler),
+        check_fn=None,
+        is_async=True,
+        description="Stop the repo's OpenCode receiver via its PID file and remove the pidfile.",
+        emoji="🛑",
+    )
 
     # Plugin-scoped skill: end-to-end fleet bring-up + ping/pong verification.
     # Resolvable as 'a2a_fleet:deploy-fleet' via explicit load only.
@@ -299,8 +370,9 @@ def register(ctx) -> None:
         except Exception:
             logger.debug("a2a_fleet: register_platform failed (non-gateway context)", exc_info=True)
 
-    # v0.3 boot-reconcile: re-provision any managed Claude Code receivers that are
-    # down (or whose inbound token this gateway lost on restart). Runs on its own
+    # v0.6 boot-reconcile: re-provision any managed Claude Code / OpenCode
+    # receivers that are down (or whose inbound token this gateway lost on
+    # restart). Runs on its own
     # daemon thread so it never blocks plugin load; a clean no-op when there are no
     # managed peers (the common case / fresh installs). Guarded so a failure here
     # never disrupts the server thread / tools / skill / platform above.
