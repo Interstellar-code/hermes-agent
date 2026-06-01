@@ -495,8 +495,16 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
 
 def _killpg(proc: "subprocess.Popen[Any]") -> None:
     """SIGKILL the whole process group of ``proc`` (best-effort)."""
+    killpg = getattr(os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    if killpg is None:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        killpg(os.getpgid(proc.pid), sigkill)
     except (ProcessLookupError, PermissionError, OSError) as exc:
         log.warning("killpg failed for pid=%s (%s); falling back to kill", proc.pid, exc)
         try:

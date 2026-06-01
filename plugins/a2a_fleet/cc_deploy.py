@@ -39,6 +39,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import psutil
+
 log = logging.getLogger("a2a_fleet.cc_deploy")
 
 # Managed-block markers injected into <repo>/CLAUDE.md. The block is rewritten
@@ -331,25 +333,24 @@ def _read_pid(pid_path: Path) -> Optional[int]:
 
 
 def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists (signal 0 probe)."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another user
-    except OSError:
-        return False
-    return True
+    """True if a process with ``pid`` exists."""
+    return bool(psutil.pid_exists(pid))
 
 
 def _terminate_pid(pid: int) -> bool:
     """SIGTERM ``pid``, wait briefly, SIGKILL if still alive. Returns True if killed/gone."""
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
         return True
-    except OSError as exc:
+    except (psutil.Error, OSError) as exc:
+        log.warning("SIGTERM pid=%s failed (%s)", pid, exc)
+        return False
+    try:
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError) as exc:
         log.warning("SIGTERM pid=%s failed (%s)", pid, exc)
         return False
     deadline = time.monotonic() + STOP_TERM_WAIT_S
@@ -363,10 +364,10 @@ def _terminate_pid(pid: int) -> bool:
     # running", so do not report a false negative. Give it a brief moment to be
     # reaped, then report success.
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+        proc.kill()
+    except (psutil.NoSuchProcess, ProcessLookupError):
         return True
-    except OSError as exc:
+    except (psutil.Error, OSError) as exc:
         log.warning("SIGKILL pid=%s failed (%s)", pid, exc)
         return False
     reap_deadline = time.monotonic() + 1.0
@@ -385,9 +386,27 @@ def _kill_launched_child(pid: int) -> None:
     plain SIGTERM/SIGKILL on the pid if the group signal fails.
     """
     try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError) as exc:
-        log.warning("killpg SIGTERM pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
+        proc = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("process lookup pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
+        _terminate_pid(pid)
+        return
+    children = proc.children(recursive=True)
+    for child in children:
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error as exc:
+            log.warning("child SIGTERM pid=%s failed (%s)", child.pid, exc)
+    try:
+        proc.terminate()
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("SIGTERM pid=%s failed (%s); falling back to _terminate_pid", pid, exc)
         _terminate_pid(pid)
         return
     deadline = time.monotonic() + STOP_TERM_WAIT_S
@@ -396,9 +415,18 @@ def _kill_launched_child(pid: int) -> None:
             return
         time.sleep(STOP_POLL_INTERVAL_S)
     try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError) as exc:
-        log.warning("killpg SIGKILL pid=%s failed (%s)", pid, exc)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error as exc:
+                log.warning("child SIGKILL pid=%s failed (%s)", child.pid, exc)
+        proc.kill()
+    except psutil.NoSuchProcess:
+        return
+    except psutil.Error as exc:
+        log.warning("SIGKILL pid=%s failed (%s)", pid, exc)
         _terminate_pid(pid)
 
 

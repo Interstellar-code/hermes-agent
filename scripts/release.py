@@ -70,6 +70,7 @@ AUTHOR_MAP = {
     "erhanyasarx@gmail.com": "erhnysr",
     "30366221+WorldWriter@users.noreply.github.com": "WorldWriter",
     "dafeng@DafengdeMacBook-Pro.local": "WorldWriter",
+    "interstellar.consulting@gmail.com": "Interstellar-code",
     "schepers.zander1@gmail.com": "Strontvod",
     "ed@bebop.crew": "someaka",
     "anadi.jaggia@gmail.com": "Jaggia",

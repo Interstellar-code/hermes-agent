@@ -1003,17 +1003,22 @@ def test_handlers_absorb_injected_task_id(tmp_path: Path):
 def test_terminate_pid_reports_success_after_sigkill_even_if_zombie(monkeypatch):
     """SIGKILL is uncatchable; a lingering zombie (os.kill(pid,0) still 'alive')
     must NOT make _terminate_pid return False (the smoke-test false-negative)."""
-    import signal as _sig
-    sent = []
+    events = []
     monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: True)  # always 'alive' (zombie)
     monkeypatch.setattr(cc_deploy, "STOP_TERM_WAIT_S", 0.05)
     monkeypatch.setattr(cc_deploy, "STOP_POLL_INTERVAL_S", 0.01)
-    def fake_kill(pid, sig):
-        sent.append(sig)
-    monkeypatch.setattr(cc_deploy.os, "kill", fake_kill)
+
+    class FakeProc:
+        def terminate(self):
+            events.append("terminate")
+
+        def kill(self):
+            events.append("kill")
+
+    monkeypatch.setattr(cc_deploy.psutil, "Process", lambda pid: FakeProc())
     out = cc_deploy._terminate_pid(4242)
     assert out is True
-    assert _sig.SIGTERM in sent and _sig.SIGKILL in sent  # escalated then reported success
+    assert events == ["terminate", "kill"]
 
 
 def test_terminate_pid_true_when_process_already_gone(monkeypatch):
