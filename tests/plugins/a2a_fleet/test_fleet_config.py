@@ -219,3 +219,49 @@ def test_profile_home_reads_fleet_yaml_without_nested_profiles(tmp_path: Path, m
 
     assert cfg["self"]["name"] == "switch"
     assert cfg["self"]["bind_port"] == 9319
+
+
+
+def test_managed_oc_peer_token_env_mismatch_raises(tmp_path: Path, fleet_home: Path) -> None:
+    from a2a_fleet.fleet_config import FleetConfigError, load_fleet
+
+    repo = tmp_path / "oc-repo"
+    repo.mkdir()
+    fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
+    data = yaml.safe_load(fleet_yaml.read_text())
+    data["fleet"]["agents"]["opencode"] = {
+        "url": "http://127.0.0.1:9310",
+        "repo_path": str(repo),
+        "managed": True,
+        "mode": "opencode",
+        "token_env": "A2A_OC_TOKEN_WRONG_NAME",
+    }
+    fleet_yaml.write_text(yaml.safe_dump(data))
+    with pytest.raises(FleetConfigError) as exc:
+        load_fleet()
+    assert "token_env must be" in str(exc.value)
+
+
+
+def test_managed_oc_peer_token_env_matching_ok(tmp_path: Path, fleet_home: Path) -> None:
+    from a2a_fleet.oc_deploy import stable_token_env_name
+    from a2a_fleet.fleet_config import load_fleet
+
+    repo = tmp_path / "oc-repo"
+    repo.mkdir()
+    stable = stable_token_env_name(repo.resolve())
+    fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
+    data = yaml.safe_load(fleet_yaml.read_text())
+    data["fleet"]["agents"]["opencode"] = {
+        "url": "http://127.0.0.1:9310",
+        "repo_path": str(repo),
+        "managed": True,
+        "mode": "opencode",
+        "token_env": stable,
+    }
+    fleet_yaml.write_text(yaml.safe_dump(data))
+    cfg = load_fleet()
+    peer = cfg["agents"]["opencode"]
+    assert peer["managed"] is True
+    assert peer["mode"] == "opencode"
+    assert peer["token_env"] == stable

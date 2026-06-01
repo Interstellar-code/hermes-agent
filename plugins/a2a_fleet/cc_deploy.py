@@ -847,6 +847,57 @@ def _managed_cc_peers(fleet_cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, An
     return out
 
 
+def _managed_receiver_module(mode: str):
+    if mode == "claude_code":
+        return sys.modules[__name__]
+    if mode == "opencode":
+        from . import oc_deploy  # noqa: PLC0415,WPS433
+
+        return oc_deploy
+    raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+
+
+def _managed_receiver_port(repo: Path, mode: str) -> int:
+    module = _managed_receiver_module(mode)
+    default = int(getattr(module, "DEFAULT_BIND_PORT"))
+    config_filename = str(getattr(module, "CONFIG_FILENAME"))
+    try:
+        cfg = json.loads((repo / ".hermes" / config_filename).read_text())
+        if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
+            return int(cfg["bind_port"])
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return default
+
+
+def _read_managed_token_file(repo: Path, mode: str) -> Optional[str]:
+    module = _managed_receiver_module(mode)
+    token_filename = str(getattr(module, "TOKEN_FILENAME"))
+    try:
+        raw = (repo / ".hermes" / token_filename).read_text().strip()
+    except OSError:
+        return None
+    return raw or None
+
+
+def _read_managed_pid(repo: Path, mode: str) -> Optional[int]:
+    module = _managed_receiver_module(mode)
+    pid_filename = str(getattr(module, "PID_FILENAME"))
+    return _read_pid(repo / ".hermes" / pid_filename)
+
+
+def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]:
+    import asyncio
+
+    if mode == "claude_code":
+        return asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
+    if mode == "opencode":
+        from . import oc_deploy  # noqa: PLC0415,WPS433
+
+        return asyncio.run(oc_deploy.deploy_oc_receiver_handler(str(repo), bind_port=port))
+    raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+
+
 def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:
     """Read the receiver's bound port from <repo>/.hermes/a2a_receiver.json."""
     try:
@@ -884,31 +935,31 @@ def _read_token_file(repo: Path) -> Optional[str]:
 
 
 def reconcile_managed_receivers() -> List[Dict[str, Any]]:
-    """On gateway start, leave healthy managed CC receivers alone; redeploy down ones.
+    """On gateway start, leave healthy managed receivers alone; redeploy down ones.
 
-    fleet.yaml is the DESIRED state. For each managed claude_code peer with a
+    fleet.yaml is the DESIRED state. For each managed ``claude_code`` or
+    ``opencode`` peer with a
     repo_path:
       1. Read the persisted ``<repo>/.hermes/.token`` (if any) and re-publish it
          to ``os.environ[token_env]`` so an in-session ``fleet_send`` presents the
          SAME token the surviving receiver was launched with (H1).
       2. Determine the desired bind port from the peer ``url`` in fleet.yaml; if
-         the on-disk ``a2a_receiver.json`` records a different port, prefer
+         the on-disk receiver config records a different port, prefer
          fleet.yaml and log the drift.
       3. Check health (PID alive + /health + repo_path identity) on that port.
       4. If HEALTHY -> LEAVE IT (action="healthy"). Do NOT redeploy — the running
          executor (possibly mid-task) is preserved and its token is now
          re-published. This fixes restart-kills-in-flight-work (H1).
       5. Only if DOWN/unhealthy -> redeploy (fresh token, rewrites .token,
-         relaunches, re-publishes) via ``deploy_cc_receiver_handler``
+         relaunches, re-publishes) via the mode-specific deploy handler
          (action="redeployed"). Receiver conversation context survives via the
-         claude ``--resume`` session files, so a redeploy is safe.
+         mode-specific persistent session state, so a redeploy is safe.
 
     Never raises: each peer's failure is captured into its summary row. Returns a
     list of ``{agent, repo_path, action, ...}`` rows (one per managed peer).
     """
-    import asyncio
-
     from . import fleet_config  # noqa: WPS433 — lazy import is the contract.
+    from .managed_peers import iter_supported_managed_peers  # noqa: PLC0415,WPS433
 
     results: List[Dict[str, Any]] = []
     try:
@@ -917,12 +968,13 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
         log.warning("a2a_fleet: boot-reconcile skipped; fleet.yaml not usable (%s)", exc)
         return results
 
-    peers = _managed_cc_peers(cfg)
+    peers = list(iter_supported_managed_peers(cfg.get("agents") or {}))
     if not peers:
         return results  # common case / fresh installs: nothing to do.
 
     for name, entry in peers:
-        row: Dict[str, Any] = {"agent": name, "repo_path": entry.get("repo_path")}
+        mode = str(entry.get("mode") or "")
+        row: Dict[str, Any] = {"agent": name, "repo_path": entry.get("repo_path"), "mode": mode}
         repo, err = canonicalize_repo_path(str(entry.get("repo_path")))
         if err is not None or repo is None:
             row["action"] = "failed"
@@ -931,31 +983,36 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
             results.append(row)
             continue
 
-        token_env = entry.get("token_env") or stable_token_env_name(repo)
+        token_env = entry.get("token_env")
+        if not token_env:
+            try:
+                token_env = _managed_receiver_module(mode).stable_token_env_name(repo)
+            except Exception:  # noqa: BLE001
+                token_env = stable_token_env_name(repo)
 
         # (1) Re-publish the persisted token so in-session fleet_send matches the
         # surviving receiver. Only set when present and not already in os.environ
         # with the same value (avoid clobbering a fresher in-process value).
-        persisted = _read_token_file(repo)
+        persisted = _read_managed_token_file(repo, mode)
         if persisted and os.environ.get(token_env) != persisted:
             os.environ[token_env] = persisted
 
         # (2) Desired port from fleet.yaml url; warn on drift vs on-disk config.
         desired_port = _port_from_peer_url(entry.get("url"))
-        on_disk_port = _receiver_port(repo)
+        on_disk_port = _managed_receiver_port(repo, mode)
         if desired_port is None:
             port = on_disk_port
         else:
             port = desired_port
             if desired_port != on_disk_port:
                 log.warning(
-                    "a2a_fleet: boot-reconcile %s port drift — fleet.yaml says :%s but "
-                    "a2a_receiver.json says :%s; using fleet.yaml",
-                    name, desired_port, on_disk_port,
+                    "a2a_fleet: boot-reconcile %s (%s) port drift — fleet.yaml says :%s but "
+                    "on-disk config says :%s; using fleet.yaml",
+                    name, mode, desired_port, on_disk_port,
                 )
 
         # (3) Health on the desired port.
-        pid = _read_pid(repo / ".hermes" / PID_FILENAME)
+        pid = _read_managed_pid(repo, mode)
         alive = pid is not None and _pid_alive(pid)
         healthy = bool(alive and _check_health_once(port, expected_repo_path=str(repo)))
 
@@ -969,7 +1026,7 @@ def reconcile_managed_receivers() -> List[Dict[str, Any]]:
 
         # (5) Down/unhealthy -> redeploy on the desired port.
         try:
-            res = asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
+            res = _deploy_managed_receiver(mode, repo, port)
         except Exception as exc:  # noqa: BLE001
             row["action"] = "failed"
             row["error"] = f"deploy raised: {exc}"

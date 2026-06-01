@@ -175,3 +175,53 @@ def test_upsert_creates_file_when_absent(home: Path, tmp_path: Path):
     )
     assert res["action"] == "created"
     assert (home / "fleet.yaml").is_file()
+
+
+
+def test_upsert_oc_peer_writes_managed_opencode_peer(home: Path, tmp_path: Path):
+    repo = tmp_path / "oc-repo"
+    repo.mkdir()
+
+    from a2a_fleet.oc_deploy import stable_token_env_name
+
+    token_env = stable_token_env_name(repo.resolve())
+    res = fyio.upsert_oc_peer(
+        repo_path=str(repo),
+        url="http://127.0.0.1:9310",
+        token_env=token_env,
+    )
+    assert res["action"] == "created"
+    assert res["name"] == "opencode"
+
+    cfg = fleet_config.load_fleet()
+    peer = cfg["agents"]["opencode"]
+    assert peer["url"] == "http://127.0.0.1:9310"
+    assert peer["managed"] is True
+    assert peer["mode"] == "opencode"
+    assert peer["token_env"] == token_env
+    canon, _ = cc_deploy.canonicalize_repo_path(str(repo))
+    assert peer["repo_path"] == str(canon)
+
+
+
+def test_upsert_managed_peer_generic_honors_requested_mode(home: Path, tmp_path: Path):
+    repo = tmp_path / "generic-oc-repo"
+    repo.mkdir()
+
+    from a2a_fleet.oc_deploy import stable_token_env_name
+
+    token_env = stable_token_env_name(repo.resolve())
+    res = fyio.upsert_managed_peer(
+        repo_path=str(repo),
+        url="http://127.0.0.1:9310",
+        token_env=token_env,
+        name="opencode",
+        mode="opencode",
+    )
+    assert res["action"] == "created"
+
+    cfg = fleet_config.load_fleet()
+    peer = cfg["agents"]["opencode"]
+    assert peer["managed"] is True
+    assert peer["mode"] == "opencode"
+    assert peer["token_env"] == token_env

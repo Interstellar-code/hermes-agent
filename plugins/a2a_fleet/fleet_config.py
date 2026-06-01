@@ -27,6 +27,8 @@ from urllib.parse import urlparse
 
 import yaml
 
+from .managed_peers import stable_token_env_name, supports_managed_mode
+
 
 log = logging.getLogger("a2a_fleet.fleet_config")
 
@@ -34,10 +36,10 @@ SUPPORTED_HANDLERS = {"echo", "llm", "agent"}
 
 _ALLOWED_SCHEMES = {"http", "https"}
 
-# Managed claude_code peers need a generous turn timeout (a tool-using
-# ``claude -p`` turn runs 30s–5min). Below this we warn (not error) so a short
-# global Route B default doesn't silently look like a failure for these peers.
-_MANAGED_CC_MIN_TIMEOUT_S = 300
+# Managed receiver peers need a generous turn timeout. Below this we warn
+# (not error) so a short global Route B default doesn't silently look like a
+# failure for these peers.
+_MANAGED_PEER_MIN_TIMEOUT_S = 300
 
 
 def _validate_peer_url(url: str | None, field: str, peer_name: str, path: Path) -> None:
@@ -161,7 +163,7 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         )
 
     agents_out: Dict[str, Dict[str, Any]] = {}
-    has_managed_cc_peer = False
+    has_managed_receiver_peer = False
     for name, entry in agents_in.items():
         if not isinstance(entry, dict):
             raise FleetConfigError(
@@ -172,11 +174,10 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         _validate_peer_url(peer_url, "url", name, path)
         if peer_card_url:
             _validate_peer_url(peer_card_url, "agent_card_url", name, path)
-        # v0.3 repo-aware peer fields (additive, all OPTIONAL). A plain url/token
-        # peer (Route B / v0.2) omits these and gets the inert defaults below, so
-        # existing fleets are unaffected. ``managed`` + ``mode == "claude_code"``
-        # + ``repo_path`` together mark a Hermes-managed Claude Code receiver that
-        # boot-reconcile owns.
+        # v0.3+ repo-aware peer fields (additive, all OPTIONAL). A plain url/token
+        # peer omits these and gets inert defaults below, so existing fleets are
+        # unaffected. ``managed`` + supported ``mode`` + ``repo_path`` together
+        # mark a Hermes-managed receiver that boot-reconcile owns.
         repo_path = entry.get("repo_path")
         # ``managed`` must be a real Python bool. A truthy string such as the YAML
         # value "false" would otherwise bool()-coerce to True and silently flip a
@@ -191,20 +192,14 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         mode = entry.get("mode")
 
         # Single source of truth for the token env-var NAME of a managed
-        # claude_code receiver: it MUST equal stable_token_env_name(repo_path) so
-        # boot-reconcile and fleet_send resolve the same var (#3 / H3). Lazy import
-        # of cc_deploy avoids the fleet_config<->cc_deploy module-top import cycle.
-        if managed_raw and mode == "claude_code" and repo_path:
-            has_managed_cc_peer = True
-            from .cc_deploy import stable_token_env_name  # noqa: PLC0415,WPS433
-            from .cc_deploy import canonicalize_repo_path  # noqa: PLC0415,WPS433
-
-            canon, _ = canonicalize_repo_path(str(repo_path))
-            stable = stable_token_env_name(canon) if canon is not None \
-                else stable_token_env_name(Path(str(repo_path)))
+        # receiver: it MUST equal the mode-specific stable name so boot-reconcile
+        # and fleet_send resolve the same var.
+        if managed_raw and supports_managed_mode(mode) and repo_path:
+            has_managed_receiver_peer = True
+            stable = stable_token_env_name(str(mode), str(repo_path))
             if token_env != stable:
                 raise FleetConfigError(
-                    f"{path}: managed claude_code peer {name}: token_env must be "
+                    f"{path}: managed {mode} peer {name}: token_env must be "
                     f"{stable} for repo {repo_path} (got {token_env!r})"
                 )
 
@@ -236,15 +231,15 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         "timeout_s": int(agent_raw.get("timeout_s", 120)),
     }
 
-    # A managed claude_code peer needs a generous turn timeout. Do NOT change the
+    # Managed executor peers need a generous turn timeout. Do NOT change the
     # global Route B default (120); just WARN if it is under the recommended floor
-    # so these long tool-using turns aren't mistaken for failures (#8).
-    if has_managed_cc_peer and agent_block["timeout_s"] < _MANAGED_CC_MIN_TIMEOUT_S:
+    # so these longer turns are not mistaken for failures.
+    if has_managed_receiver_peer and agent_block["timeout_s"] < _MANAGED_PEER_MIN_TIMEOUT_S:
         log.warning(
             "a2a_fleet: fleet.agent.timeout_s=%s is below the recommended %s for "
-            "managed claude_code peers (tool-using claude -p turns run 30s-5min); a "
-            "short timeout will look like a failure while the executor is still working.",
-            agent_block["timeout_s"], _MANAGED_CC_MIN_TIMEOUT_S,
+            "managed claude_code/opencode peers; a short timeout will look like a "
+            "failure while the executor is still working.",
+            agent_block["timeout_s"], _MANAGED_PEER_MIN_TIMEOUT_S,
         )
 
     return {

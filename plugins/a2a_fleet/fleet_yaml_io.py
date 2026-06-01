@@ -8,12 +8,13 @@ Closes two onboarding gaps that made the plugin painful to bring up:
    ``FleetConfigError``, and ``register()`` went *silently idle* with only a log
    line. Now the node comes up with a documented, editable scaffold.
 
-2. ``upsert_cc_peer()`` — after ``deploy_cc_receiver`` stands up a receiver, write
-   (or refresh) its peer entry in fleet.yaml *surgically*, preserving the user's
-   comments and formatting via ruamel round-trip. Before this, the operator had to
-   hand-edit fleet.yaml to add ``url`` + ``token_env`` — the omission caused a 401
-   on ``fleet_send``. A managed claude_code peer also lets boot-reconcile
-   re-provision the inbound token across a gateway restart.
+2. ``upsert_managed_peer()`` + back-compat wrappers — after a managed receiver
+   deploy stands up, write (or refresh) its peer entry in fleet.yaml
+   *surgically*, preserving the user's comments and formatting via ruamel
+   round-trip. Before this, the operator had to hand-edit fleet.yaml to add
+   ``url`` + ``token_env`` — the omission caused a 401 on ``fleet_send``.
+   Managed Claude Code and OpenCode peers also let boot-reconcile re-provision
+   the inbound token across a gateway restart.
 
 ruamel.yaml (a declared dependency, see pyproject.toml) is used for the surgical
 upsert; the scaffold is a static commented string so its guidance reads cleanly.
@@ -32,6 +33,11 @@ from ruamel.yaml import YAML
 # Reuse the single source of truth for path resolution so scaffold + upsert + load
 # all agree on WHERE fleet.yaml lives for the active profile.
 from .fleet_config import _fleet_yaml_path, _legacy_profile_name
+from .managed_peers import (
+    canonicalize_managed_repo_path,
+    managed_peer_default_name,
+    managed_peer_description,
+)
 
 log = logging.getLogger("a2a_fleet.fleet_yaml_io")
 
@@ -163,29 +169,28 @@ def _repo_slug(repo_path: str) -> str:
     return slug or "repo"
 
 
-def upsert_cc_peer(
+def upsert_managed_peer(
     *,
     repo_path: str,
     url: str,
     token_env: str = "",
-    name: str = "claude-code",
+    name: str,
+    mode: str,
     description: str = "",
     profile: str | None = None,
 ) -> Dict[str, Any]:
-    """Insert or refresh a Claude Code executor peer in fleet.yaml, surgically.
+    """Insert or refresh a managed receiver peer in fleet.yaml, surgically.
 
     Comment- and format-preserving (ruamel round-trip). When ``token_env`` is set
-    the peer is written as a *managed claude_code* peer (``managed: true`` +
-    ``mode: claude_code`` + ``repo_path``) so:
-      * fleet_send resolves the bearer from ``os.environ[token_env]`` → no 401, and
-      * boot-reconcile re-provisions the token + receiver across a gateway restart.
-    A ``token_env``-less (``no_auth``) deploy gets a plain ``url`` peer (nothing to
-    re-provision). The managed token_env MUST equal stable_token_env_name(repo) —
-    the deploy passes exactly that, so load_fleet's managed-peer check stays happy.
+    the peer is written as a managed peer (``managed: true`` + ``mode`` +
+    canonical ``repo_path``) so:
+      * fleet_send resolves the bearer from ``os.environ[token_env]``, and
+      * boot-reconcile can re-provision the token + receiver across restart.
+    A ``token_env``-less (``no_auth``) deploy gets a plain ``url`` peer (nothing
+    to re-provision).
 
-    Peer keyed by ``name`` (default "claude-code"). If that name is already taken
-    by a DIFFERENT repo, a repo-suffixed name is used so distinct receivers don't
-    clobber each other.
+    Peer keyed by ``name``. If that name is already taken by a different repo, a
+    repo-suffixed name is used so distinct receivers do not clobber each other.
 
     Returns ``{"action": "created"|"updated"|"unchanged", "name": ..., "path": ...}``.
     Never raises: returns ``{"error": "..."}`` on any IO/parse failure so deploy
@@ -201,8 +206,6 @@ def upsert_cc_peer(
         else:
             data = None
         if data is None:
-            # No file (or empty/whitespace-only) — start from the scaffold so the
-            # node is fully formed, then upsert into it.
             ensure_example_fleet_yaml(profile)
             with path.open("r", encoding="utf-8") as fh:
                 data = yaml.load(fh)
@@ -215,14 +218,12 @@ def upsert_cc_peer(
 
     agents = fleet.get("agents")
     if not isinstance(agents, dict):
-        # Replace a null/flow placeholder (e.g. ``agents: {}``) with a fresh map.
         from ruamel.yaml.comments import CommentedMap  # noqa: PLC0415
         agents = CommentedMap()
         fleet["agents"] = agents
 
-    # Resolve a non-clobbering peer name: if the chosen name already exists for a
-    # different repo, suffix it with the repo slug.
-    canon = str(repo_path)
+    repo_canon_path, _ = canonicalize_managed_repo_path(repo_path)
+    canon = str(repo_canon_path or Path(str(repo_path)))
     chosen = name
     existing = agents.get(chosen)
     if isinstance(existing, dict):
@@ -243,16 +244,12 @@ def upsert_cc_peer(
     if token_env:
         peer["token_env"] = token_env
         peer["managed"] = True
-        peer["mode"] = "claude_code"
+        peer["mode"] = mode
         peer["repo_path"] = canon
     else:
-        # no_auth deploy: plain url peer; strip ALL managed markers including
-        # repo_path. load_fleet only reads repo_path for a managed claude_code peer
-        # (the token_env invariant + boot-reconcile); on a non-managed peer it is
-        # dead weight and would couple correctness to load_fleet's guard order.
         for k in ("token_env", "managed", "mode", "repo_path"):
             peer.pop(k, None)
-    peer["description"] = description or f"Claude Code executor receiver (repo: {canon})"
+    peer["description"] = description or managed_peer_description(mode, canon)
 
     agents[chosen] = peer
 
@@ -272,3 +269,45 @@ def upsert_cc_peer(
         "name": chosen,
         "path": str(path),
     }
+
+
+def upsert_cc_peer(
+    *,
+    repo_path: str,
+    url: str,
+    token_env: str = "",
+    name: str = "claude-code",
+    description: str = "",
+    profile: str | None = None,
+) -> Dict[str, Any]:
+    """Back-compat Claude Code wrapper around ``upsert_managed_peer()``."""
+    return upsert_managed_peer(
+        repo_path=repo_path,
+        url=url,
+        token_env=token_env,
+        name=name or managed_peer_default_name("claude_code"),
+        mode="claude_code",
+        description=description,
+        profile=profile,
+    )
+
+
+def upsert_oc_peer(
+    *,
+    repo_path: str,
+    url: str,
+    token_env: str = "",
+    name: str = "opencode",
+    description: str = "",
+    profile: str | None = None,
+) -> Dict[str, Any]:
+    """OpenCode wrapper around ``upsert_managed_peer()``."""
+    return upsert_managed_peer(
+        repo_path=repo_path,
+        url=url,
+        token_env=token_env,
+        name=name or managed_peer_default_name("opencode"),
+        mode="opencode",
+        description=description,
+        profile=profile,
+    )
