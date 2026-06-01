@@ -276,11 +276,10 @@ def build_opencode_command(
 # ---------------------------------------------------------------------------
 
 
-def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str], bool]:
-    """Parse OpenCode NDJSON stdout into session id, reply text, and retry signal."""
+def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse OpenCode NDJSON stdout into session id and reply text."""
     session_id: Optional[str] = None
     parts: List[str] = []
-    session_missing = False
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -306,7 +305,7 @@ def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str], bo
         if text_part:
             parts.append(text_part)
     reply_text = "".join(parts).strip() or None
-    return session_id, reply_text, session_missing
+    return session_id, reply_text
 
 
 def _text_from_frame(obj: Dict[str, Any]) -> str:
@@ -399,16 +398,16 @@ def run_opencode_turn(
     timeout = float(cfg.get("opencode_timeout_s") or DEFAULTS["opencode_timeout_s"])
     stored_session_id = get_session_id_for_context(context_id)
 
-    def _invoke(session_id: Optional[str]) -> Tuple[Optional[str], Optional[str], bool, int, str]:
+    def _invoke(session_id: Optional[str]) -> Tuple[Optional[str], Optional[str], int, str]:
         cmd = build_opencode_command(prompt, cfg, session_id=session_id)
         stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
-        parsed_session_id, reply, session_missing = parse_opencode_output(stdout)
+        parsed_session_id, reply = parse_opencode_output(stdout)
         if parsed_session_id:
             store_session_id_for_context(context_id, parsed_session_id)
-        return parsed_session_id, reply, session_missing, rc, stderr
+        return parsed_session_id, reply, rc, stderr
 
     try:
-        parsed_session_id, reply, session_missing, rc, stderr = _invoke(stored_session_id)
+        parsed_session_id, reply, rc, stderr = _invoke(stored_session_id)
     except subprocess.TimeoutExpired:
         return f"[error] opencode turn timed out after {timeout}s"
     except (FileNotFoundError, OpenCodeCLINotFound):
@@ -417,10 +416,10 @@ def run_opencode_turn(
         log.warning("opencode invocation failed (%s)", exc)
         return f"[error] opencode invocation failed: {exc}"
 
-    if stored_session_id and (session_missing or _is_session_not_found(stderr)):
+    if stored_session_id and _is_session_not_found(reply, stderr):
         log.info("stored session %s missing for ctx=%s; reminting new OpenCode session", stored_session_id, context_id)
         try:
-            parsed_session_id, reply, _session_missing, rc, stderr = _invoke(None)
+            parsed_session_id, reply, rc, stderr = _invoke(None)
         except subprocess.TimeoutExpired:
             return f"[error] opencode turn timed out after {timeout}s"
         except (FileNotFoundError, OpenCodeCLINotFound):
@@ -450,12 +449,22 @@ def _call_runner(runner: Any, cmd: List[str], cwd: str, timeout: float) -> Tuple
     return stdout, rc, ""
 
 
-def _is_session_not_found(stderr: str) -> bool:
-    """True only on a genuine OpenCode session-not-found stderr signal."""
-    hay = (stderr or "").strip().lower()
-    if not hay:
-        return False
-    return any(sig in hay for sig in SESSION_NOT_FOUND_SIGNALS)
+def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
+    """True only on a genuine OpenCode session-not-found signal (reply text or stderr).
+
+    Deliberately narrow: we do NOT treat a bare non-zero rc or a None reply as a
+    session error, because retrying would re-run the turn.
+    """
+    haystacks: List[str] = []
+    if reply:
+        haystacks.append(reply.lower())
+    if stderr:
+        haystacks.append(stderr.lower())
+    for hay in haystacks:
+        for sig in SESSION_NOT_FOUND_SIGNALS:
+            if sig in hay:
+                return True
+    return False
 
 
 def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:

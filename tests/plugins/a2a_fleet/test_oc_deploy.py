@@ -164,6 +164,30 @@ def test_stop_handler_reports_stopped_pid(tmp_path: Path, monkeypatch: pytest.Mo
     assert not (hermes_dir / oc_deploy.PID_FILENAME).exists()
 
 
+def test_deploy_handler_dict_dispatch_extracts_all_params(
+    tmp_path: Path, stub_template: Path, stub_runtime
+) -> None:
+    """Registry calls handler(args_dict, task_id=...) — all params must be unwrapped.
+
+    This test FAILS before the dict-unwrap fix (bind_port silently defaults to 9310)
+    and PASSES after (the config records 9311 as requested).
+    """
+    repo = _make_repo(tmp_path)
+    # Simulate registry dispatch: whole args dict as first positional, task_id injected
+    res = _run(oc_deploy.deploy_oc_receiver_handler(
+        {"repo_path": str(repo), "bind_port": 9311, "model": "gpt-oss"},
+        task_id="t-1",
+    ))
+    assert res.get("deployed") is True, f"deploy failed: {res}"
+    cfg_path = repo / ".hermes" / "oc_receiver.json"
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["bind_port"] == 9311, (
+        f"Expected bind_port=9311 (from dict args), got {cfg['bind_port']} — "
+        "dict-unwrap for non-repo_path params is missing"
+    )
+    assert cfg.get("opencode_model") == "gpt-oss"
+
+
 def test_oc_deploy_module_is_importable() -> None:
     spec = importlib.util.spec_from_file_location("oc_deploy_under_test", OC_DEPLOY_PATH)
     assert spec and spec.loader

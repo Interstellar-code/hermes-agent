@@ -445,6 +445,16 @@ async def deploy_oc_receiver_handler(
     hermes_auth_token_env: str = "",
     **_injected: Any,
 ) -> Dict[str, Any]:
+    # Dispatch shape: registry.dispatch() calls handler(args, **kwargs) — the
+    # WHOLE args dict lands in the first positional (repo_path). Unwrap it so
+    # all params are extracted, while still tolerating direct kwarg-style calls.
+    if isinstance(repo_path, dict):
+        _p = repo_path
+        repo_path = _p.get("repo_path") or _p.get("path") or ""
+        bind_port = int(_p.get("bind_port") or bind_port)
+        model = _p.get("model") or model
+        no_auth = bool(_p.get("no_auth", no_auth))
+        hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
     warnings: List[str] = []
     try:
         repo, err = canonicalize_repo_path(repo_path)

@@ -113,10 +113,9 @@ def test_parse_opencode_output_extracts_session_and_text(ocr) -> None:
             "part": {"type": "step-finish", "reason": "stop"},
         }),
     ])
-    session_id, reply, session_missing = ocr.parse_opencode_output(out)
+    session_id, reply = ocr.parse_opencode_output(out)
     assert session_id == "ses_live"
     assert reply == "hello world"
-    assert session_missing is False
 
 
 def test_run_opencode_turn_persists_then_reuses_session(ocr, tmp_path, monkeypatch) -> None:
@@ -190,6 +189,138 @@ def test_run_opencode_turn_remints_when_stored_session_missing(ocr, tmp_path, mo
     assert stored["ctx-1"] == "ses_new"
     assert "--session" in calls[0]
     assert "--session" not in calls[1]
+
+
+def test_run_opencode_turn_remints_when_dead_session_in_reply(ocr, tmp_path, monkeypatch) -> None:
+    """Remint fires when the session-not-found signal appears in parsed reply text, not stderr.
+
+    This test FAILS before the H1 fix (_is_session_not_found only checked stderr)
+    and PASSES after (it checks both reply and stderr).
+    """
+    cfg = _base_cfg(ocr, tmp_path)
+    calls = []
+    stored = {"ctx-2": "ses_dead"}
+
+    monkeypatch.setattr(ocr, "get_session_id_for_context", lambda context_id: stored.get(context_id))
+    monkeypatch.setattr(
+        ocr, "store_session_id_for_context",
+        lambda context_id, session_id: stored.__setitem__(context_id, session_id),
+    )
+
+    def fake_runner(cmd, cwd, timeout):
+        calls.append(cmd)
+        if "--session" in cmd:
+            # Dead-session signal in reply text (stdout), NOT stderr
+            return (
+                "\n".join([
+                    json.dumps({"type": "text", "part": {"type": "text", "text": "Error: session not found"}}),
+                ]),
+                0,
+                "",
+            )
+        return (
+            "\n".join([
+                json.dumps({"type": "step_start", "sessionID": "ses_fresh", "part": {"type": "step-start"}}),
+                json.dumps({"type": "text", "part": {"type": "text", "text": "reminted"}}),
+            ]),
+            0,
+            "",
+        )
+
+    reply = ocr.run_opencode_turn("test", "ctx-2", cfg, runner=fake_runner)
+    assert reply == "reminted", (
+        f"Expected reminted reply, got {reply!r} — "
+        "remint did not fire on reply-text session signal (H1 bug)"
+    )
+    assert stored["ctx-2"] == "ses_fresh"
+    assert len(calls) == 2
+    assert "--session" in calls[0]
+    assert "--session" not in calls[1]
+
+
+# ---------------------------------------------------------------------------
+# Bearer auth on the oc receiver HTTP layer
+# ---------------------------------------------------------------------------
+
+class _FakeRfile:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self, n):
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+class _FakeWfile:
+    def __init__(self):
+        self.buf = b""
+
+    def write(self, b):
+        self.buf += b
+
+
+def _make_oc_request(ocr, cfg, token, *, headers, body=b"", path="/jsonrpc", method="POST"):
+    """Drive a Handler instance without a real socket."""
+    HandlerCls = ocr.make_handler(cfg, token, None)
+
+    class H(HandlerCls):
+        def __init__(self):  # bypass BaseHTTPRequestHandler.__init__ (no socket)
+            self.headers = headers
+            self.path = path
+            self.command = method
+            self.rfile = _FakeRfile(body)
+            self.wfile = _FakeWfile()
+            self.requestline = ""
+            self.client_address = ("127.0.0.1", 0)
+            self._status = None
+
+        def send_response(self, code, message=None):
+            self._status = code
+
+        def send_header(self, *a, **k):
+            pass
+
+        def end_headers(self):
+            pass
+
+    h = H()
+    return h
+
+
+def test_oc_receiver_bearer_auth_wrong_token_returns_401(ocr, tmp_path) -> None:
+    """POST /jsonrpc with wrong token must return 401."""
+    cfg = _base_cfg(ocr, tmp_path)
+    h = _make_oc_request(ocr, cfg, "correct-token",
+                         headers={"Authorization": "Bearer wrong-token",
+                                  "Content-Length": "2"},
+                         body=b"{}")
+    h.do_POST()
+    assert h._status == 401
+
+
+def test_oc_receiver_bearer_auth_missing_token_returns_401(ocr, tmp_path) -> None:
+    """POST /jsonrpc with no Authorization header must return 401 when token is configured."""
+    cfg = _base_cfg(ocr, tmp_path)
+    h = _make_oc_request(ocr, cfg, "correct-token",
+                         headers={"Content-Length": "2"},
+                         body=b"{}")
+    h.do_POST()
+    assert h._status == 401
+
+
+def test_oc_receiver_bearer_auth_correct_token_is_accepted(ocr, tmp_path) -> None:
+    """POST /jsonrpc with the correct token must NOT return 401."""
+    cfg = _base_cfg(ocr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"message": {"contextId": "ctx-x", "parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_oc_request(ocr, cfg, "correct-token",
+                         headers={"Authorization": "Bearer correct-token",
+                                  "Content-Length": str(len(body))},
+                         body=body)
+    h.do_POST()
+    assert h._status != 401, f"Correct token was rejected with 401"
 
 
 def test_main_fails_closed_for_non_loopback_without_auth(ocr, monkeypatch, tmp_path) -> None:
