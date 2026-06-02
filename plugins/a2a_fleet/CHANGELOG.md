@@ -1,5 +1,19 @@
 # a2a_fleet — Changelog
 
+## v0.8.3 — security: system_prompt_file path-traversal guard + deploy schema regression guard (#84, #72)
+
+- **Security fix (#84)**: `load_fleet()` now validates `llm.system_prompt_file` against
+  `get_hermes_home()` before storing the path.  Relative paths are resolved relative to
+  the Hermes home; `~` is expanded; symlinks and `..` components are resolved via
+  `Path.resolve()`.  If the resolved path is not within `get_hermes_home().resolve()`,
+  `FleetConfigError` is raised at config-load time (fast-fail, before any file is read).
+  The validated, fully-resolved absolute path is stored back into the config dict so
+  `llm_handler` reads exactly the guarded value.
+- **Regression guard (#72)**: test asserts that `deploy_cc_receiver`, `deploy_oc_receiver`,
+  `deploy_codex_receiver`, and `deploy_agy_receiver` each have `repo_path` in both
+  `schema.properties` and `schema.required`.  The underlying bug (missing `repo_path` in
+  the old stub) was already fixed; this test prevents it from silently regressing.
+
 ## v0.8.1 — dashboard mode-aware (issue #80)
 
 - **Dashboard now covers all four managed executor modes** (claude_code, opencode,

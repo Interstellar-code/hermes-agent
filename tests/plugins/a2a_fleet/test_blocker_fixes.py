@@ -161,3 +161,46 @@ def test_auth_required_without_token_env_returns_jsonrpc_envelope(
     body = response.json()
     assert "error" in body
     assert "token_env" not in body["error"]
+
+
+# Issue #72 — deploy tool schemas must include repo_path in properties + required
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_receiver_tools_have_repo_path_in_schema(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each deploy_*_receiver tool must expose repo_path in its schema properties
+    AND in its required list.  Guards against #72 regression."""
+    import a2a_fleet
+    from a2a_fleet import register
+    from a2a_fleet import server as server_module
+
+    # We only need the captured register_tool calls — do NOT spawn the embedded
+    # A2A server thread (it would leak a running server and break
+    # test_server_lifecycle, which then sees a server already up).
+    monkeypatch.setattr(server_module, "start_server", lambda *a, **k: None)
+    monkeypatch.setattr(a2a_fleet, "_server_thread", None)
+
+    ctx = _StubCtx()
+    register(ctx)
+
+    deploy_tools = {
+        call["name"]: call
+        for call in ctx.calls
+        if call["name"].startswith("deploy_") and call["name"].endswith("_receiver")
+    }
+
+    # At minimum the cc receiver must always be present.
+    assert "deploy_cc_receiver" in deploy_tools, "deploy_cc_receiver must be registered"
+
+    for name, call in deploy_tools.items():
+        schema = call.get("schema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        assert "repo_path" in props, (
+            f"{name}: 'repo_path' missing from schema properties (issue #72 regression)"
+        )
+        assert "repo_path" in required, (
+            f"{name}: 'repo_path' missing from schema required list (issue #72 regression)"
+        )

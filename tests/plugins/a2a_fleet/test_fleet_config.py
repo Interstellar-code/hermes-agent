@@ -221,6 +221,88 @@ def test_profile_home_reads_fleet_yaml_without_nested_profiles(tmp_path: Path, m
     assert cfg["self"]["bind_port"] == 9319
 
 
+# ---------------------------------------------------------------------------
+# Issue #84 — system_prompt_file path-traversal guard
+# ---------------------------------------------------------------------------
+
+
+def _write_fleet_with_sp_file(fleet_yaml_path: Path, sp_file_value: str) -> None:
+    """Rewrite fleet.yaml to set llm.system_prompt_file."""
+    data = yaml.safe_load(fleet_yaml_path.read_text())
+    data["fleet"]["response_handler"] = "llm"
+    data["fleet"]["llm"] = {"system_prompt_file": sp_file_value}
+    fleet_yaml_path.write_text(yaml.safe_dump(data))
+
+
+def test_system_prompt_file_outside_hermes_home_raises(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """system_prompt_file pointing outside get_hermes_home() raises FleetConfigError (#84)."""
+    from a2a_fleet.fleet_config import FleetConfigError, load_fleet
+
+    fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
+    _write_fleet_with_sp_file(fleet_yaml, "/etc/passwd")
+    with pytest.raises(FleetConfigError, match="must be within"):
+        load_fleet()
+
+
+def test_system_prompt_file_dotdot_traversal_raises(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative path that escapes root via .. raises FleetConfigError (#84)."""
+    from a2a_fleet.fleet_config import FleetConfigError, load_fleet
+
+    # Create a file outside hermes_home to reference via traversal.
+    outside_file = tmp_path / "secret.txt"
+    outside_file.write_text("secret")
+
+    # HERMES_HOME is profile_dir inside tmp_path; build a relative escape.
+    # fleet_home fixture sets HERMES_HOME = profile_dir = tmp_path/profiles/switch.
+    # A relative path "../../secret.txt" from that root would resolve to tmp_path/secret.txt.
+    fleet_yaml = fleet_home / "profiles" / "switch" / "fleet.yaml"
+    _write_fleet_with_sp_file(fleet_yaml, "../../secret.txt")
+    with pytest.raises(FleetConfigError, match="must be within"):
+        load_fleet()
+
+
+def test_system_prompt_file_inside_hermes_home_loads_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """system_prompt_file inside get_hermes_home() loads without error, path resolved (#84)."""
+    from a2a_fleet.fleet_config import load_fleet
+
+    # Build a fresh hermes_home so we fully control its contents.
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    sp_file = hermes_home / "system_prompt.txt"
+    sp_file.write_text("You are a helpful assistant.")
+
+    fleet_yaml_data = {
+        "fleet": {
+            "enabled": True,
+            "self": {"name": "switch"},
+            "server": {"bind_host": "127.0.0.1", "bind_port": 9319},
+            "response_handler": "llm",
+            "agents": {},
+            "llm": {"system_prompt_file": str(sp_file)},
+        }
+    }
+    (hermes_home / "fleet.yaml").write_text(yaml.safe_dump(fleet_yaml_data))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    cfg = load_fleet()
+    # The stored path must be the resolved absolute path.
+    assert cfg["llm"]["system_prompt_file"] == str(sp_file.resolve())
+
+
+def test_system_prompt_file_absent_does_not_raise(fleet_home: Path) -> None:
+    """When system_prompt_file is not set, load_fleet() succeeds normally (#84)."""
+    from a2a_fleet.fleet_config import load_fleet
+
+    cfg = load_fleet()
+    assert cfg["llm"]["system_prompt_file"] is None
+
+
 
 def test_managed_oc_peer_token_env_mismatch_raises(tmp_path: Path, fleet_home: Path) -> None:
     from a2a_fleet.fleet_config import FleetConfigError, load_fleet

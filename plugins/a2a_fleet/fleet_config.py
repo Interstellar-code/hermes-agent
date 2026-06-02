@@ -218,9 +218,27 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
     # Provider/api_key are intentionally NOT read here; those come from the active
     # profile via resolve_provider_client("auto").
     llm_raw = fleet.get("llm") or {}
+
+    # Security: validate system_prompt_file is within get_hermes_home() to prevent
+    # path-traversal attacks (issue #84).
+    sp_file_raw = llm_raw.get("system_prompt_file")
+    validated_sp_file: str | None = None
+    if sp_file_raw is not None:
+        sp_file_str = os.path.expanduser(str(sp_file_raw))
+        sp_path = Path(sp_file_str)
+        if not sp_path.is_absolute():
+            sp_path = get_hermes_home() / sp_path
+        resolved = sp_path.resolve()
+        root = get_hermes_home().resolve()
+        if not resolved.is_relative_to(root):
+            raise FleetConfigError(
+                f"llm.system_prompt_file must be within {root}, got {resolved}"
+            )
+        validated_sp_file = str(resolved)
+
     llm_block: Dict[str, Any] = {
         "system_prompt": llm_raw.get("system_prompt"),
-        "system_prompt_file": llm_raw.get("system_prompt_file"),
+        "system_prompt_file": validated_sp_file,
         "max_tokens": int(llm_raw.get("max_tokens", 2048)),
         "temperature": float(llm_raw.get("temperature", 0.7)),
     }
