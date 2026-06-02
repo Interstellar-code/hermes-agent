@@ -167,10 +167,20 @@ def test_auth_required_without_token_env_returns_jsonrpc_envelope(
 # ---------------------------------------------------------------------------
 
 
-def test_deploy_receiver_tools_have_repo_path_in_schema(fleet_home: Path) -> None:
+def test_deploy_receiver_tools_have_repo_path_in_schema(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Each deploy_*_receiver tool must expose repo_path in its schema properties
     AND in its required list.  Guards against #72 regression."""
+    import a2a_fleet
     from a2a_fleet import register
+    from a2a_fleet import server as server_module
+
+    # We only need the captured register_tool calls — do NOT spawn the embedded
+    # A2A server thread (it would leak a running server and break
+    # test_server_lifecycle, which then sees a server already up).
+    monkeypatch.setattr(server_module, "start_server", lambda *a, **k: None)
+    monkeypatch.setattr(a2a_fleet, "_server_thread", None)
 
     ctx = _StubCtx()
     register(ctx)
