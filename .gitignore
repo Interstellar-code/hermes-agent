@@ -104,3 +104,9 @@ CLAUDE.md
 hindsight.py
 # Claude Code per-checkout runtime: agent worktrees (large), scheduler lock, etc.
 .claude/
+
+# Codegraph code-intelligence index — per-repo SQLite DB, regenerated via `codegraph index`.
+.codegraph/
+
+# Local tool/CLI runtime cache (regenerated; not source).
+cache/
