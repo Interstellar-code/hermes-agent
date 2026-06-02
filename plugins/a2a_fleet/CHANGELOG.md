@@ -1,5 +1,27 @@
 # a2a_fleet — Changelog
 
+## v0.8.1 — dashboard mode-aware (issue #80)
+
+- **Dashboard now covers all four managed executor modes** (claude_code, opencode,
+  codex, agy) — previously `_managed_repos()` filtered on `mode == "claude_code"`
+  only, so OpenCode, Codex, and agy peers were invisible in the conversations/peers
+  tab.
+- `managed_peers._MODE_SPECS` gains a `transcript_filename` field per mode
+  (e.g. `"a2a-codex-transcript.jsonl"`) so the dashboard reads the correct file
+  for each executor type.  New public accessor `transcript_filename_for(mode)`
+  with graceful fallback to the claude_code filename for unknown/legacy modes.
+- `dashboard/plugin_api.py`:
+  - `_managed_repos()` returns `(name, repo, mode)` 3-tuples; uses
+    `supports_managed_mode()` to accept every known mode.
+  - `_transcript_path(repo, mode)` and `_read_transcript(repo, mode)` are
+    now mode-aware; `TRANSCRIPT_RELPATH` kept as a back-compat constant.
+  - `mode` field surfaced in all response payloads: `list_conversations`,
+    `get_conversation`, `list_peers` — additive, backward-compatible.
+- Tests: 8 new cases in `test_dashboard_api.py` covering all-four-modes
+  discovery, per-mode transcript path resolution, mixed-fleet end-to-end,
+  legacy-no-mode graceful exclusion, and `mode` in API responses.
+  Full suite: 348 passed.
+
 ## v0.8.0 — in progress (issue #75)
 
 - Added Google Antigravity CLI (`agy`) as a fourth managed repo-scoped executor

@@ -1,9 +1,11 @@
 """a2a_fleet dashboard API — read-only A2A conversation feed.
 
 Surfaces the back-and-forth between Hermes (orchestrator) and the deployed
-Claude Code executor receivers, sourced from each managed peer's per-repo
-transcript (``<repo>/.hermes/a2a-transcript.jsonl`` — one JSON line per message,
-both directions, including the ``[queued]`` ack and the real reply).
+managed executor receivers (Claude Code, OpenCode, Codex CLI, agy), sourced
+from each managed peer's per-repo transcript (one JSON line per message, both
+directions, including the ``[queued]`` ack and the real reply).  Each mode
+writes a DISTINCT transcript file; the filename is resolved via
+``managed_peers.transcript_filename_for(mode)``.
 
 Mounted by web_server._mount_plugin_api_routes() under ``/api/plugins/a2a_fleet``
 (bundled plugin → backend auto-imports; project plugins do not). Behind the
@@ -11,13 +13,13 @@ dashboard session auth like every other ``/api/plugins/*`` route — read-only G
 
 Endpoints (front-end polls these; a 2s interval is plenty for a live tab):
   GET /api/plugins/a2a_fleet/conversations
-      -> {"conversations": [{contextId, peer, repo_path, message_count,
-                             last_ts, last_dir, last_text}], "generated_ts": ...}
+      -> {"conversations": [{contextId, peer, repo_path, mode, message_count,
+                             last_ts, last_dir, last_text}], "count": ...}
   GET /api/plugins/a2a_fleet/conversations/{context_id}
-      -> {"contextId", "peer", "repo_path",
+      -> {"contextId", "peer", "repo_path", "mode",
           "messages": [{ts, dir, from, to, text}]}
   GET /api/plugins/a2a_fleet/peers
-      -> {"peers": [{name, repo_path, transcript_exists, message_count}]}
+      -> {"peers": [{name, repo_path, mode, transcript_exists, message_count}]}
 """
 from __future__ import annotations
 
@@ -47,6 +49,7 @@ _MAX_MESSAGES_PER_CONTEXT = 2000
 # Above this size, read only the TAIL (bounds memory/latency before the per-context
 # cap kicks in — the cap alone fires after the whole file is already in memory).
 _MAX_TRANSCRIPT_BYTES = 5_000_000  # ~5 MB
+# Legacy constant kept for back-compat; new code uses transcript_filename_for(mode).
 TRANSCRIPT_RELPATH = (".hermes", "a2a-transcript.jsonl")
 
 router = APIRouter()
@@ -79,9 +82,13 @@ def _fleet_yaml_candidates() -> List[Path]:
     return [c for c in candidates if c.is_file()]
 
 
-def _managed_repos() -> List[Tuple[str, str]]:
-    """Return ``[(peer_name, repo_path)]`` for managed claude_code peers across all
+def _managed_repos() -> List[Tuple[str, str, str]]:
+    """Return ``[(peer_name, repo_path, mode)]`` for ALL managed peers across all
     profiles' fleet.yaml — deduped by repo_path.
+
+    Covers every mode in ``managed_peers.SUPPORTED_MANAGED_MODES`` (claude_code,
+    opencode, codex, agy) so the dashboard surfaces the full fleet, not just
+    Claude Code receivers.
 
     Profile-agnostic (see :func:`_fleet_yaml_candidates`) so a global dashboard
     surfaces every profile's receivers. Parses raw YAML leniently — no token_env /
@@ -90,8 +97,9 @@ def _managed_repos() -> List[Tuple[str, str]]:
     unreadable/invalid file is skipped and yields no peers.
     """
     import yaml  # noqa: PLC0415
+    from a2a_fleet.managed_peers import supports_managed_mode  # noqa: PLC0415
 
-    out: List[Tuple[str, str]] = []
+    out: List[Tuple[str, str, str]] = []
     seen: set = set()
     for path in _fleet_yaml_candidates():
         try:
@@ -106,21 +114,30 @@ def _managed_repos() -> List[Tuple[str, str]]:
             if not isinstance(entry, dict):
                 continue
             repo = entry.get("repo_path")
-            if entry.get("managed") is True and entry.get("mode") == "claude_code" and repo:
+            mode = entry.get("mode") or ""
+            if entry.get("managed") is True and supports_managed_mode(mode) and repo:
                 key = str(repo)
                 if key not in seen:
                     seen.add(key)
-                    out.append((str(name), key))
+                    out.append((str(name), key, mode))
     return out
 
 
-def _transcript_path(repo_path: str) -> Path:
-    return Path(repo_path).joinpath(*TRANSCRIPT_RELPATH)
+def _transcript_path(repo_path: str, mode: str = "claude_code") -> Path:
+    """Return the transcript path for ``repo_path`` + ``mode``.
+
+    Uses the per-mode filename from ``managed_peers.transcript_filename_for``
+    so each executor type's transcript is read correctly.  Falls back to the
+    claude_code filename for unknown/legacy modes (graceful back-compat).
+    """
+    from a2a_fleet.managed_peers import transcript_filename_for  # noqa: PLC0415
+    filename = transcript_filename_for(mode)
+    return Path(repo_path) / ".hermes" / filename
 
 
-def _read_transcript(repo_path: str) -> List[Dict[str, Any]]:
+def _read_transcript(repo_path: str, mode: str = "claude_code") -> List[Dict[str, Any]]:
     """Parse a receiver transcript JSONL into a list of message dicts (best-effort)."""
-    path = _transcript_path(repo_path)
+    path = _transcript_path(repo_path, mode)
     msgs: List[Dict[str, Any]] = []
     try:
         size = path.stat().st_size
@@ -164,13 +181,19 @@ def _collect() -> List[Dict[str, Any]]:
     """
     buckets: Dict[Tuple[str, str], Dict[str, Any]] = {}
     order: List[Tuple[str, str]] = []
-    for peer_name, repo in _managed_repos():
-        for msg in _read_transcript(repo):
+    for peer_name, repo, mode in _managed_repos():
+        for msg in _read_transcript(repo, mode):
             cid = msg.get("contextId") or "(no-context)"
             key = (repo, cid)
             bucket = buckets.get(key)
             if bucket is None:
-                bucket = {"contextId": cid, "peer": peer_name, "repo_path": repo, "messages": []}
+                bucket = {
+                    "contextId": cid,
+                    "peer": peer_name,
+                    "repo_path": repo,
+                    "mode": mode,
+                    "messages": [],
+                }
                 buckets[key] = bucket
                 order.append(key)
             if len(bucket["messages"]) < _MAX_MESSAGES_PER_CONTEXT:
@@ -191,6 +214,7 @@ async def list_conversations() -> Dict[str, Any]:
             "contextId": bucket["contextId"],
             "peer": bucket["peer"],
             "repo_path": bucket["repo_path"],
+            "mode": bucket["mode"],
             "message_count": len(msgs),
             "last_ts": last.get("ts"),
             "last_dir": last.get("dir"),
@@ -234,20 +258,22 @@ async def get_conversation(
         "contextId": bucket["contextId"],
         "peer": bucket["peer"],
         "repo_path": bucket["repo_path"],
+        "mode": bucket["mode"],
         "messages": bucket["messages"],
     }
 
 
 @router.get("/peers")
 async def list_peers() -> Dict[str, Any]:
-    """Managed Claude Code receivers + whether each has a readable transcript."""
+    """All managed receivers (every mode) + whether each has a readable transcript."""
     peers: List[Dict[str, Any]] = []
-    for name, repo in _managed_repos():
-        msgs = _read_transcript(repo)
+    for name, repo, mode in _managed_repos():
+        msgs = _read_transcript(repo, mode)
         peers.append({
             "name": name,
             "repo_path": repo,
-            "transcript_exists": _transcript_path(repo).is_file(),
+            "mode": mode,
+            "transcript_exists": _transcript_path(repo, mode).is_file(),
             "message_count": len(msgs),
         })
     return {"peers": peers, "count": len(peers)}
