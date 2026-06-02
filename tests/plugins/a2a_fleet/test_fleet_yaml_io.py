@@ -6,12 +6,19 @@ Covers the v0.4 onboarding fixes:
   * upsert_cc_peer(): surgically wires a managed claude_code peer while preserving
     the operator's comments; idempotent; no_auth -> plain url peer; name-collision
     across repos gets a distinct peer name.
+
+Covers the v0.8.4 security fix (#83):
+  * _yaml() rejects !!python/ tags to block the RCE primitive.
+  * Round-trip comment preservation is unaffected.
+  * upsert_managed_peer() returns {"error": ...} on a malicious fleet.yaml.
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import pytest
+from ruamel.yaml.constructor import ConstructorError
 
 import a2a_fleet.cc_deploy as cc_deploy
 import a2a_fleet.fleet_config as fleet_config
@@ -225,3 +232,63 @@ def test_upsert_managed_peer_generic_honors_requested_mode(home: Path, tmp_path:
     assert peer["managed"] is True
     assert peer["mode"] == "opencode"
     assert peer["token_env"] == token_env
+
+
+# --------------------------------------------------------------------------- #
+# v0.8.4 security: !!python/ tag rejection (#83)
+# --------------------------------------------------------------------------- #
+
+def test_yaml_rejects_python_object_apply_tag():
+    """!!python/object/apply executes arbitrary Python — must be blocked."""
+    y = fyio._yaml()
+    with pytest.raises(ConstructorError, match="unsafe python tag"):
+        y.load(io.StringIO('x: !!python/object/apply:os.listdir ["."]'))
+
+
+def test_yaml_rejects_python_name_tag():
+    """!!python/name is another code-execution vector — must also be blocked."""
+    y = fyio._yaml()
+    with pytest.raises(ConstructorError, match="unsafe python tag"):
+        y.load(io.StringIO('x: !!python/name:os.system'))
+
+
+def test_yaml_round_trip_preserves_comments_after_security_fix():
+    """The multi-constructor must not break comment-preserving round-trip."""
+    yaml_src = (
+        "# full-line comment\n"
+        "fleet:\n"
+        "  enabled: true  # inline comment\n"
+        "  name: test\n"
+    )
+    y = fyio._yaml()
+    data = y.load(io.StringIO(yaml_src))
+    data["fleet"]["name"] = "changed"
+    buf = io.StringIO()
+    y.dump(data, buf)
+    out = buf.getvalue()
+    assert "# full-line comment" in out
+    assert "# inline comment" in out
+    assert "changed" in out
+
+
+def test_upsert_managed_peer_returns_error_on_python_tag_in_fleet_yaml(
+    home: Path, tmp_path: Path
+):
+    """A fleet.yaml containing a !!python/ tag must yield {"error": ...}, not execute."""
+    malicious = (
+        "fleet:\n"
+        "  enabled: true\n"
+        "  x: !!python/object/apply:os.listdir [\".\"]\n"
+    )
+    path = home / "fleet.yaml"
+    path.write_text(malicious)
+
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    token_env = _stable_env(repo)
+
+    res = fyio.upsert_cc_peer(
+        repo_path=str(repo), url="http://127.0.0.1:9300", token_env=token_env,
+    )
+    assert "error" in res
+    assert "forbidden" in res["error"].lower() or "unsafe" in res["error"].lower() or "python" in res["error"].lower()
