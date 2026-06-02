@@ -80,7 +80,7 @@ def test_plugin_register_source_includes_codex_tool_handlers() -> None:
     assert 'name="codex_receiver_status"' in source
     assert 'name="codex_receiver_stop"' in source
     assert "Codex" in source
-    assert "9311" in source
+    assert "9320" in source  # codex band start (9320-9329)
 
 
 def test_receiver_config_keys_and_cwd_pinned(tmp_path: Path) -> None:

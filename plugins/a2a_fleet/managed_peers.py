@@ -10,10 +10,24 @@ import hashlib
 import importlib
 import os
 import re
+import socket
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Tuple
 
 SUPPORTED_MANAGED_MODES = frozenset({"claude_code", "opencode", "codex", "agy"})
+
+# Each managed mode owns a contiguous 10-port band so multiple same-mode
+# receivers (one per repo) can coexist without colliding with another mode's
+# band. The band's first port IS that mode's DEFAULT_BIND_PORT. Keep the deploy
+# modules' DEFAULT_BIND_PORT constants in sync with these starts (guarded by a
+# parity test). Adding a 5th mode = add its band here.
+PORT_BAND_SIZE = 10
+_MODE_PORT_BANDS: Dict[str, Tuple[int, int]] = {
+    "claude_code": (9300, 9309),
+    "opencode": (9310, 9319),
+    "codex": (9320, 9329),
+    "agy": (9330, 9339),
+}
 
 _MODE_SPECS: Dict[str, Dict[str, str]] = {
     "claude_code": {
@@ -50,6 +64,55 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
 def supports_managed_mode(mode: str | None) -> bool:
     """True when ``mode`` is a Hermes-managed receiver mode we understand."""
     return bool(mode in SUPPORTED_MANAGED_MODES)
+
+
+def port_band_for(mode: str) -> Tuple[int, int]:
+    """Return the inclusive ``(low, high)`` TCP port band owned by ``mode``."""
+    if mode not in _MODE_PORT_BANDS:
+        raise ValueError(f"unsupported managed peer mode: {mode!r}")
+    return _MODE_PORT_BANDS[mode]
+
+
+def default_port_for(mode: str) -> int:
+    """Return the default bind port for ``mode`` (the start of its band)."""
+    return port_band_for(mode)[0]
+
+
+def _port_is_free(port: int, host: str = "127.0.0.1") -> bool:
+    """True when ``port`` can be bound on ``host`` right now (nothing listening)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def allocate_band_port(
+    mode: str,
+    *,
+    claimed: Iterable[int] = (),
+    probe: Optional[Callable[[int], bool]] = None,
+) -> Optional[int]:
+    """Return the first free port in ``mode``'s band, else ``None`` if exhausted.
+
+    A port is skipped when it is in ``claimed`` (reserved by another known peer,
+    even if currently down) or when ``probe(port)`` reports it unbindable
+    (something is already listening). ``probe`` defaults to a live socket bind
+    test; tests inject a deterministic stub.
+    """
+    probe = probe or _port_is_free
+    claimed_set = {int(p) for p in claimed}
+    low, high = port_band_for(mode)
+    for port in range(low, high + 1):
+        if port in claimed_set:
+            continue
+        if probe(port):
+            return port
+    return None
 
 
 def managed_peer_default_name(mode: str) -> str:

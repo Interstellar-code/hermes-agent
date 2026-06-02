@@ -1,5 +1,26 @@
 # a2a_fleet — Changelog
 
+## v0.8.5 — per-mode port bands + auto-allocation (multi-session safe)
+
+- **Port bands**: each managed mode now owns a contiguous 10-port band so
+  multiple same-mode receivers (one per repo) can run without colliding with a
+  neighbouring mode's port — `claude_code` 9300-9309, `opencode` 9310-9319,
+  `codex` 9320-9329, `agy` 9330-9339. The band start is the mode's
+  `DEFAULT_BIND_PORT`; **codex default moves 9311→9320 and agy 9313→9330** (cc/oc
+  unchanged). Single source of truth: `managed_peers._MODE_PORT_BANDS`, with a
+  parity test asserting each deploy module's `DEFAULT_BIND_PORT` equals its band
+  start.
+- **Auto-allocation**: deploy handlers now take `bind_port` as optional. When
+  omitted, `resolve_managed_bind_port()` (a) reuses this repo's existing
+  configured port if present (idempotent re-deploy), else (b) picks the first
+  free port in the mode's band, skipping ports already claimed by other repos'
+  managed peers (read from fleet.yaml, best-effort) and any port currently bound
+  (live socket probe). Band exhausted → a clear error instead of a silent
+  collision. An explicit `bind_port` is still honored verbatim (may sit outside
+  the band for power users).
+- Tool schemas + README updated to document the bands and the omit-to-auto-pick
+  behaviour. Boot-reconcile is unaffected (it always passes an explicit port).
+
 ## v0.8.3 — security: system_prompt_file path-traversal guard + deploy schema regression guard (#84, #72)
 
 - **Security fix (#84)**: `load_fleet()` now validates `llm.system_prompt_file` against

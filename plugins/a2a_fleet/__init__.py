@@ -221,7 +221,7 @@ def register(ctx) -> None:
                 },
                 "bind_port": {
                     "type": "integer",
-                    "description": "Port the receiver binds on (default 9300).",
+                    "description": "Port the receiver binds on. Omit to reuse this repo's existing port or auto-pick a free one in the claude_code band (9300-9309).",
                 },
                 "model": {
                     "type": "string",
@@ -291,7 +291,7 @@ def register(ctx) -> None:
                 },
                 "bind_port": {
                     "type": "integer",
-                    "description": "Port the receiver binds on (default 9310).",
+                    "description": "Port the receiver binds on. Omit to reuse this repo's existing port or auto-pick a free one in the opencode band (9310-9319).",
                 },
                 "model": {
                     "type": "string",
@@ -361,7 +361,7 @@ def register(ctx) -> None:
                 },
                 "bind_port": {
                     "type": "integer",
-                    "description": "Port the receiver binds on (default 9311).",
+                    "description": "Port the receiver binds on. Omit to reuse this repo's existing port or auto-pick a free one in the codex band (9320-9329).",
                 },
                 "model": {
                     "type": "string",
@@ -442,7 +442,7 @@ def register(ctx) -> None:
                 },
                 "bind_port": {
                     "type": "integer",
-                    "description": "Port the receiver binds on (default 9313).",
+                    "description": "Port the receiver binds on. Omit to reuse this repo's existing port or auto-pick a free one in the agy band (9330-9339).",
                 },
                 "sandbox": {
                     "type": "boolean",

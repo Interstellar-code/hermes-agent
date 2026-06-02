@@ -72,7 +72,9 @@ A2A_ROLE_TEXT = (
     "blocked) so Hermes can summarize them to the user and decide the next step.\n"
 )
 
-DEFAULT_BIND_PORT = 9313
+# Start of the agy port band (9330-9339); see managed_peers._MODE_PORT_BANDS.
+# A parity test asserts this equals managed_peers.default_port_for("agy").
+DEFAULT_BIND_PORT = 9330
 DEFAULT_HERMES_URL = "http://127.0.0.1:9219/jsonrpc"
 PID_FILENAME = "agy_receiver.pid"
 RECEIVER_FILENAME = "agy_receiver.py"
@@ -443,7 +445,7 @@ def _autowire_managed_peer(repo: Path, bind_port: int, token_env: str) -> Tuple[
 
 async def deploy_agy_receiver_handler(
     repo_path: str,
-    bind_port: int = DEFAULT_BIND_PORT,
+    bind_port: Optional[int] = None,
     sandbox: bool = DEFAULT_SANDBOX,
     no_auth: bool = False,
     hermes_auth_token_env: str = "",
@@ -456,7 +458,9 @@ async def deploy_agy_receiver_handler(
     if isinstance(repo_path, dict):
         _p = repo_path
         repo_path = _p.get("repo_path") or _p.get("path") or ""
-        bind_port = int(_p.get("bind_port") or bind_port)
+        _bp = _p.get("bind_port")
+        if _bp is not None:
+            bind_port = int(_bp)
         if "sandbox" in _p:
             sandbox = bool(_p.get("sandbox"))
         no_auth = bool(_p.get("no_auth", no_auth))
@@ -466,6 +470,14 @@ async def deploy_agy_receiver_handler(
         repo, err = canonicalize_repo_path(repo_path)
         if err is not None or repo is None:
             return {"error": err or "invalid repo_path"}
+
+        # bind_port=None -> reuse this repo's existing port or auto-pick a free
+        # one in the agy band (9330-9339); explicit value honored verbatim.
+        from .cc_deploy import resolve_managed_bind_port  # noqa: PLC0415,WPS433
+
+        bind_port, port_err = resolve_managed_bind_port(repo, "agy", bind_port)
+        if port_err is not None:
+            return {"error": port_err}
 
         if not _is_git_repo(repo):
             warnings.append(f"{repo} does not look like a git repo (.git missing)")
