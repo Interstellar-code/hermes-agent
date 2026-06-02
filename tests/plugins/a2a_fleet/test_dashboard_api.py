@@ -219,6 +219,50 @@ def test_managed_repos_skips_non_managed_and_bad_files(monkeypatch, tmp_path):
     assert mod._managed_repos() == []
 
 
+def test_managed_repos_keeps_multiple_modes_in_one_repo(monkeypatch, tmp_path):
+    """Issue #95: a cc + codex peer in the SAME repo must both surface.
+
+    Regression guard — dedup is keyed by (repo, mode), so a second mode in the
+    same repo is NOT dropped the way a repo-only key dropped it.
+    """
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    (tmp_path / "fleet.yaml").write_text(
+        "fleet:\n"
+        "  agents:\n"
+        "    claude-code:\n"
+        "      url: http://127.0.0.1:9300\n"
+        "      managed: true\n"
+        "      mode: claude_code\n"
+        "      repo_path: /repos/shared\n"
+        "    codex:\n"
+        "      url: http://127.0.0.1:9320\n"
+        "      managed: true\n"
+        "      mode: codex\n"
+        "      repo_path: /repos/shared\n",
+        encoding="utf-8",
+    )
+    rows = mod._managed_repos()
+    modes = {mode for _name, _repo, mode in rows}
+    assert modes == {"claude_code", "codex"}, (
+        f"both modes for the shared repo must appear; got {rows}"
+    )
+    assert all(repo == "/repos/shared" for _n, repo, _m in rows)
+
+
+def test_managed_repos_dedupes_same_repo_AND_mode_across_profiles(monkeypatch, tmp_path):
+    """(repo, mode) dedup still collapses the SAME mode for the SAME repo seen in
+    two profiles — only the mode dimension is newly distinguishing."""
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_managed_fleet(tmp_path / "profiles" / "p1" / "fleet.yaml", "codex", "/repos/shared")
+    _write_managed_fleet(tmp_path / "profiles" / "p2" / "fleet.yaml", "codex", "/repos/shared")
+    # _write_managed_fleet hardcodes mode: claude_code, so both rows share the
+    # same (repo, mode) -> one row, proving same-mode dedup is intact.
+    assert mod._managed_repos() == [("codex", "/repos/shared", "claude_code")]
+
+
 # ---------------------------------------------------------------------------
 # Mode-aware tests: _managed_repos includes all 4 modes; transcript path is
 # per-mode; mixed fleet surfaces all modes in list_conversations / list_peers.
