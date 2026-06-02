@@ -22,7 +22,8 @@
     transcript (newline-separated assistant replies, no role markers) on every
     resume, then appends the new reply. The receiver persists the full prior
     stdout per contextId and strips it as a literal prefix to recover only the
-    latest reply; falls back to the last non-empty line if the prefix drifts.
+    latest reply; if the prefix drifts it returns the FULL stdout (never just
+    the tail line) so multi-line replies are never silently truncated.
   - never uses `--continue` (cwd-global, unsafe for concurrent contexts sharing a
     cwd); always pins an explicit `--conversation <uuid>` under the per-context
     lock.
@@ -43,6 +44,13 @@
   positional (registry dispatch shape) and extract all params (`repo_path`,
   `bind_port`, `sandbox`, `no_auth`, `hermes_auth_token_env` — note: no model).
   (Regression test asserts a non-default `bind_port=9314` is honored.)
+- **PR #88 review fixes (D1, D2)**: (1) cross-context conversation bleed — a
+  process-global `_FIRST_TURN_LOCK` now serializes the first-turn mint section
+  [spawn -> read `last_conversations.json` -> persist `contextId->uuid`] so two
+  different contextIds doing their first turn in the shared repo cwd can no
+  longer cross-capture each other's minted uuid; resume turns skip the lock for
+  full concurrency. (2) `extract_reply` no longer truncates a multi-line reply
+  to its last line when the stored prefix drifts — it returns the full stdout.
 - **agy_extra_flags sanitized**: forbidden session/print selectors
   (`--continue`/`-c`, `--conversation`, `--print`/`-p`/`--prompt`,
   `--prompt-interactive`/`-i`) are stripped so a stale config cannot break the

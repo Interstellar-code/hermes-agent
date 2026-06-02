@@ -156,11 +156,13 @@ def test_extract_reply_resume_third_turn(agr) -> None:
     assert agr.extract_reply(TURN3_STDOUT, TURN2_STDOUT) == "THIRD"
 
 
-def test_extract_reply_prefix_drift_falls_back_to_last_line(agr) -> None:
-    # If the stored prefix does not match (e.g. restart lost prior_stdout), fall
-    # back to the last non-empty line.
-    out = "line one\nline two\nFINAL\n"
-    assert agr.extract_reply(out, "totally different prior text") == "FINAL"
+def test_extract_reply_prefix_drift_returns_full_text(agr) -> None:
+    # D2 regression: when the stored prefix does NOT match (e.g. restart lost
+    # prior_stdout), return the FULL stdout, not just the last line. Dropping
+    # earlier lines of a genuine multi-line reply silently loses content;
+    # over-returning the re-echoed transcript is visible and recoverable.
+    out = "para1\npara2\nFINAL\n"
+    assert agr.extract_reply(out, "WRONG PRIOR") == "para1\npara2\nFINAL"
 
 
 def test_extract_reply_empty_returns_none(agr) -> None:
@@ -322,6 +324,46 @@ def test_run_agy_turn_remints_on_dead_conversation(agr, tmp_path, monkeypatch) -
     assert reply == "Hello! I am ready to pair program with you."
     # New uuid captured (not the dead one).
     assert agr.get_conversation_id_for_context("ctx-dead", path) == "uuid-new"
+
+
+# ---------------------------------------------------------------------------
+# D1 regression: first-turn uuid discovery is serialized by _FIRST_TURN_LOCK
+# (cwd-keyed last_conversations.json is shared by all contextIds in this
+# one-process-per-repo receiver, so concurrent first turns would cross-capture).
+# ---------------------------------------------------------------------------
+
+def test_run_agy_turn_first_turn_holds_first_turn_lock(agr, tmp_path, monkeypatch) -> None:
+    """On a FIRST turn the discover+persist critical section runs while
+    _FIRST_TURN_LOCK is held; a RESUME turn does NOT hold it (and does not even
+    invoke discovery). Made to genuinely fail if the lock is removed."""
+    cfg = _base_cfg(agr, tmp_path)
+    observed = {}
+
+    def recording_discover(repo_path, *a, **k):
+        # Record whether the global first-turn lock is held when discovery runs.
+        observed["locked_at_discovery"] = agr._FIRST_TURN_LOCK.locked()
+        observed["discover_called"] = observed.get("discover_called", 0) + 1
+        return "uuid-first"
+
+    monkeypatch.setattr(agr, "discover_conversation_id", recording_discover)
+
+    def fake_runner(cmd, cwd, timeout):
+        if "--conversation" in cmd:
+            return (TURN2_STDOUT, 0, "")
+        return (TURN1_STDOUT, 0, "")
+
+    # First turn: discovery must run with the lock held.
+    agr.run_agy_turn("remember BANANA", "ctx-lock", cfg, runner=fake_runner)
+    assert observed["discover_called"] == 1
+    assert observed["locked_at_discovery"] is True
+    # Lock released after the turn (no leak).
+    assert agr._FIRST_TURN_LOCK.locked() is False
+
+    # Resume turn: stored uuid known -> discovery is NOT invoked and the lock is
+    # not taken for the resume path.
+    agr.run_agy_turn("what word?", "ctx-lock", cfg, runner=fake_runner)
+    assert observed["discover_called"] == 1  # unchanged: no discovery on resume
+    assert agr._FIRST_TURN_LOCK.locked() is False
 
 
 def test_run_agy_turn_remint_clears_stale_id_when_no_new_uuid(agr, tmp_path, monkeypatch) -> None:

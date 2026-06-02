@@ -245,6 +245,20 @@ def resolve_hermes_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
 
 _SESSION_MAP_LOCK = threading.Lock()
 
+# Process-global FIRST-TURN lock. agy records its minted conversation uuid in
+# last_conversations.json keyed ONLY by repo cwd. This receiver is
+# one-process-per-repo, so EVERY contextId shares that single cwd key. Two
+# DIFFERENT contextIds doing their FIRST turn concurrently would both read the
+# same cwd key and cross-capture each other's uuid. We serialize ONLY the
+# first-turn critical section [spawn first turn -> read last_conversations.json
+# -> persist contextId->uuid]; RESUME turns (stored uuid already known) skip
+# this lock entirely so the common path keeps full concurrency. Because one
+# receiver == one cwd, a single global lock is sufficient — no per-cwd dict
+# needed. Ordering: process_message acquires the per-context lock FIRST, then
+# run_agy_turn acquires this lock (first turns only); nothing acquires them in
+# the opposite order, so no deadlock.
+_FIRST_TURN_LOCK = threading.Lock()
+
 
 def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]:
     """Load the durable agy conversation map. Malformed content -> empty map.
@@ -501,7 +515,10 @@ def extract_reply(stdout: str, prior_stdout: Optional[str]) -> Optional[str]:
     then appends the new reply. So we strip ``prior_stdout`` from the front of
     ``stdout``. Fallbacks (in order) when the prefix does not match exactly:
       1. prior_stdout (rstrip) is a prefix -> strip that.
-      2. No prefix match -> last non-empty line of stdout (best-effort tail).
+      2. No prefix match -> return the FULL stdout (stripped). We deliberately
+         do NOT fall back to the last line: over-returning the re-echoed
+         transcript is visible and recoverable, whereas dropping earlier lines
+         of a genuine multi-line reply silently loses content.
 
     Returns the stripped reply, or None when stdout has no usable text.
     """
@@ -517,11 +534,9 @@ def extract_reply(stdout: str, prior_stdout: Optional[str]) -> Optional[str]:
         if rprior and text.startswith(rprior):
             tail = text[len(rprior):]
             return tail.strip() or None
-        # Prefix drifted (e.g. restart lost prior_stdout): fall back to last line.
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        if lines:
-            return lines[-1].strip() or None
-        return None
+        # Prefix drifted (e.g. restart lost prior_stdout): return the WHOLE
+        # stdout rather than just the tail line, so multi-line replies survive.
+        return text.strip() or None
     return text.strip() or None
 
 
@@ -623,56 +638,75 @@ def run_agy_turn(
         cmd = build_agy_command(prompt, cfg, conversation_id=conversation_id)
         return _call_runner(runner, cmd, str(repo_path), timeout)
 
+    # A turn that has no stored uuid MUST mint one (agy keys it by cwd, which is
+    # shared by all contextIds in this one-process-per-repo receiver). Serialize
+    # the mint critical section [spawn -> discover -> persist] under the global
+    # first-turn lock so two different contextIds can't cross-capture each
+    # other's uuid. Resume turns (stored_cid known) skip the lock for full
+    # concurrency. The per-context lock is already held by process_message; we
+    # acquire the first-turn lock strictly inside it, never the reverse.
+    is_first_turn = stored_cid is None
+    if is_first_turn:
+        _FIRST_TURN_LOCK.acquire()
     try:
-        stdout, rc, stderr = _invoke(stored_cid)
-    except subprocess.TimeoutExpired:
-        # A hang to timeout is the canonical agy auth-failure symptom.
-        return f"[error] agy turn timed out after {timeout}s ({AUTH_HELP})"
-    except (FileNotFoundError, AgyCLINotFound):
-        return "[error] agy CLI not found on PATH"
-    except Exception as exc:  # noqa: BLE001
-        log.warning("agy invocation failed (%s)", exc)
-        return f"[error] agy invocation failed: {exc}"
+        try:
+            stdout, rc, stderr = _invoke(stored_cid)
+        except subprocess.TimeoutExpired:
+            # A hang to timeout is the canonical agy auth-failure symptom.
+            return f"[error] agy turn timed out after {timeout}s ({AUTH_HELP})"
+        except (FileNotFoundError, AgyCLINotFound):
+            return "[error] agy CLI not found on PATH"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("agy invocation failed (%s)", exc)
+            return f"[error] agy invocation failed: {exc}"
 
-    # REMINT: a resume against a dead uuid prints the not-found warning then runs
-    # fresh in the SAME invocation. Clear the stale entry so a failed discovery
-    # does not re-persist the dead uuid; capture the new uuid below. We do NOT
-    # re-run (agy already executed the prompt fresh — a second run would
-    # double-execute a side-effecting turn). When stored_cid is None this never
-    # fires.
-    reminted = False
-    if stored_cid and is_session_not_found(stdout):
-        log.info("stored conversation %s missing for ctx=%s; reminting", stored_cid, context_id)
-        clear_session_for_context(context_id, session_map_path)
-        stored_cid = None
-        prior_stdout = None
-        reminted = True
+        # REMINT: a resume against a dead uuid prints the not-found warning then
+        # runs fresh in the SAME invocation. It mints a NEW uuid keyed by cwd, so
+        # its discover+persist needs the same first-turn serialization. Acquire
+        # the lock now (we did not hold it, since this began as a resume). Clear
+        # the stale entry so a failed discovery does not re-persist the dead uuid.
+        # We do NOT re-run (agy already executed the prompt fresh — a second run
+        # would double-execute a side-effecting turn). When stored_cid is None at
+        # entry this never fires (already under the lock).
+        reminted = False
+        if stored_cid and is_session_not_found(stdout):
+            log.info("stored conversation %s missing for ctx=%s; reminting", stored_cid, context_id)
+            _FIRST_TURN_LOCK.acquire()
+            is_first_turn = True  # ensure release in finally
+            clear_session_for_context(context_id, session_map_path)
+            stored_cid = None
+            prior_stdout = None
+            reminted = True
 
-    # Auth-failure heuristic: empty/failed turn that looks like a sign-in issue.
-    if (not stdout.strip()) and looks_like_auth_failure(stdout, stderr):
-        return f"[error] {AUTH_HELP}"
+        # Auth-failure heuristic: empty/failed turn that looks like a sign-in issue.
+        if (not stdout.strip()) and looks_like_auth_failure(stdout, stderr):
+            return f"[error] {AUTH_HELP}"
 
-    # Reply extraction. On a remint the warning line is stripped and there is no
-    # valid prior prefix, so use first-turn semantics on the stripped text.
-    if reminted:
-        cleaned = strip_not_found_warning(stdout)
-        reply: Optional[str] = cleaned.strip() or None
-        full_stdout_for_persist = cleaned
-    else:
-        reply = extract_reply(stdout, prior_stdout)
-        full_stdout_for_persist = stdout
+        # Reply extraction. On a remint the warning line is stripped and there is
+        # no valid prior prefix, so use first-turn semantics on the stripped text.
+        if reminted:
+            cleaned = strip_not_found_warning(stdout)
+            reply: Optional[str] = cleaned.strip() or None
+            full_stdout_for_persist = cleaned
+        else:
+            reply = extract_reply(stdout, prior_stdout)
+            full_stdout_for_persist = stdout
 
-    # Capture + persist the conversation uuid for the next resume. On a fresh
-    # first turn (or a remint) agy minted a NEW uuid recorded in
-    # last_conversations.json; on a resume the uuid is unchanged (reuse stored).
-    new_cid = stored_cid or discover_conversation_id(repo_path)
-    if new_cid:
-        store_session_for_context(context_id, new_cid, full_stdout_for_persist, session_map_path)
-    else:
-        log.warning(
-            "could not discover agy conversation uuid for ctx=%s (cwd=%s); "
-            "continuity disabled for this turn", context_id, repo_path,
-        )
+        # Capture + persist the conversation uuid for the next resume. On a fresh
+        # first turn (or a remint) agy minted a NEW uuid recorded in
+        # last_conversations.json; on a resume the uuid is unchanged (reuse
+        # stored).
+        new_cid = stored_cid or discover_conversation_id(repo_path)
+        if new_cid:
+            store_session_for_context(context_id, new_cid, full_stdout_for_persist, session_map_path)
+        else:
+            log.warning(
+                "could not discover agy conversation uuid for ctx=%s (cwd=%s); "
+                "continuity disabled for this turn", context_id, repo_path,
+            )
+    finally:
+        if is_first_turn:
+            _FIRST_TURN_LOCK.release()
 
     if reply is None and rc != 0:
         snippet = (stderr or "").strip().replace("\n", " ")[:300]
