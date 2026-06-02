@@ -231,9 +231,64 @@ def store_session_id_for_context(context_id: str, session_id: str, path: Path = 
                 pass
 
 
+def clear_session_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> None:
+    """Remove a stale/dead session_id entry for ``context_id`` from the session map.
+
+    Atomic tmp+os.replace write, same as ``store_session_id_for_context``.
+    Called under the per-contextId lock BEFORE a remint retry so that a failed
+    remint leaves the map clean (no stale id re-persisted on the next turn).
+    """
+    with _SESSION_MAP_LOCK:
+        data = load_session_map(path)
+        if context_id not in data:
+            return
+        del data[context_id]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+            os.replace(tmp, path)
+        except OSError as exc:
+            log.warning("session map clear failed for ctx=%s (%s)", context_id, exc)
+
+
 # ---------------------------------------------------------------------------
 # Command builder
 # ---------------------------------------------------------------------------
+
+# Flags that oc_receiver manages itself — must never be injected via opencode_extra_flags.
+_FORBIDDEN_OC: frozenset[str] = frozenset({
+    "--session", "-s",
+    "--continue", "-c",
+    "run",          # subcommand — positional, but guard against it in flags list
+    "--print",
+    "--format",
+})
+
+
+def _sanitize_extra_flags(extra: List[str]) -> List[str]:
+    """Return a copy of ``extra`` with flags managed by oc_receiver removed.
+
+    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one token).
+    Logs a warning per dropped token so operators notice stale configs.
+    """
+    result: List[str] = []
+    tokens = [str(x) for x in extra]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        base = tok.split("=", 1)[0] if "=" in tok else tok
+        if base in _FORBIDDEN_OC:
+            log.warning("dropping forbidden opencode_extra_flags token %r", tok)
+            i += 1
+            # --flag value form: also consume the following value token if it
+            # does not look like a flag itself.
+            if "=" not in tok and i < len(tokens) and not tokens[i].startswith("-"):
+                log.warning("dropping forbidden opencode_extra_flags value token %r", tokens[i])
+                i += 1
+            continue
+        result.append(tok)
+        i += 1
+    return result
 
 
 def _prompt_with_role(prompt: str, cfg: Dict[str, Any]) -> str:
@@ -267,7 +322,7 @@ def build_opencode_command(
         cmd += ["--model", str(model)]
     extra = cfg.get("opencode_extra_flags") or []
     if isinstance(extra, list):
-        cmd += [str(x) for x in extra]
+        cmd += _sanitize_extra_flags(extra)
     return cmd
 
 
@@ -418,6 +473,7 @@ def run_opencode_turn(
 
     if stored_session_id and _is_session_not_found(reply, stderr):
         log.info("stored session %s missing for ctx=%s; reminting new OpenCode session", stored_session_id, context_id)
+        clear_session_id_for_context(context_id)
         try:
             parsed_session_id, reply, rc, stderr = _invoke(None)
         except subprocess.TimeoutExpired:
