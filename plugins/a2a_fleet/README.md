@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.6.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 dual managed executors (Claude Code + OpenCode)
+Version: `0.8.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 OpenCode executor + v0.7 Codex executor + v0.8 Antigravity (`agy`) executor — four managed executor modes (Claude Code + OpenCode + Codex + agy)
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -350,6 +350,64 @@ persist a durable `contextId -> sessionID` map in
 `Error: Session not found`, the receiver remints once under the same
 per-context lock and updates the map.
 
+## v0.8 — Google Antigravity CLI (`agy`) as a managed A2A executor (issue #75)
+
+- Tools: `deploy_agy_receiver`, `agy_receiver_status`, `agy_receiver_stop`
+- Template: `templates/agy_receiver.py`
+- Deploy module: `agy_deploy.py`
+- Default peer name / mode / port: `agy` / `agy` / `9313`
+
+Example managed peer block in `fleet.yaml` (auto-wired by `deploy_agy_receiver`,
+you do NOT hand-edit it):
+
+```yaml
+agents:
+  agy:
+    url: http://127.0.0.1:9313
+    agent_card_url: http://127.0.0.1:9313/.well-known/agent-card.json
+    token_env: A2A_AGY_TOKEN_<REPO>
+    managed: true
+    mode: agy
+    repo_path: /abs/path/to/repo
+    description: "Google Antigravity CLI executor receiver (repo: ...)"
+```
+
+Deploy params: `repo_path` (required), `bind_port` (default 9313), and
+`sandbox` (a **boolean** toggle that passes agy's `--sandbox`). There is **NO
+model selection** — agy has no `--model` flag, so the deploy tool exposes no
+model param.
+
+**Requires an interactive `agy` sign-in once on the host** — agy authenticates
+via the macOS Keychain (no file, no headless login, no `agy auth` subcommand).
+Run `agy` interactively once to sign in before deploying. A turn that fails for
+lack of auth surfaces a clear "agy not authenticated — run `agy` interactively
+once to sign in" error rather than hanging silently.
+
+agy mirrors the security model of the other receivers (loopback-by-default,
+bearer auth, cwd pinned to the configured repo, bounded concurrency, idle
+teardown, reply-retry parity), but its session + output model differs:
+
+- **Session id is not caller-assignable.** The first turn runs WITHOUT a
+  conversation id; agy mints a uuid and records `cwd -> uuid` in
+  `~/.gemini/antigravity-cli/cache/last_conversations.json`. The receiver reads
+  that file (keyed by the pinned repo cwd) to capture the uuid and persists
+  `contextId -> {conversation_id, last_stdout}` in
+  `<repo>/.hermes/a2a-agy-sessions.json`. Later turns pass
+  `agy --conversation <uuid> --print ...` (never `--continue`, which is
+  cwd-global and unsafe for concurrent contexts).
+- **Plain-text transcript-tail extraction.** On every resume agy re-echoes the
+  ENTIRE prior transcript (newline-separated assistant replies, no role markers)
+  and then appends the new reply, with no delimiter. The receiver persists the
+  full prior stdout per contextId and strips it as a literal prefix to recover
+  only the latest reply (falling back to the last non-empty line if the prefix
+  drifts after a restart).
+- **Remint.** If a stored uuid is dead, agy prints
+  `Warning: conversation "<id>" not found.` as the first stdout line and then
+  runs fresh in the same invocation. The receiver clears the stale entry, strips
+  the warning from the reply, and captures the new uuid.
+
+The agy subprocess always runs with `AGY_CLI_DISABLE_LATEX=1` in its environment.
+
 ### How it works (end-to-end flow)
 
 Hermes is the **orchestrator** (its own LLM); Claude Code is the **executor**
@@ -633,3 +691,5 @@ venv/bin/python -m pytest tests/plugins/a2a_fleet/ -q
 | Route B | ✅ shipped | `agent` response handler — inbound dispatched into the real Hermes agent via the `a2a_fleet` platform adapter + `run_coroutine_threadsafe` bridge to the gateway loop |
 | v0.3 | ✅ shipped | `deploy_cc_receiver` — Claude Code executor receiver deployed into a target repo's `.hermes/`, repo-aware `fleet.yaml` (`repo_path`/`managed`/`mode`), handshake, managed daemon lifecycle |
 | v0.6 | ✅ shipped | `deploy_oc_receiver` — OpenCode executor receiver deployed into a target repo's `.hermes/`, durable OpenCode session map, mode-aware peer upsert/load/reconcile, coexistence with Claude receiver in one repo |
+| v0.7 | ✅ shipped | `deploy_codex_receiver` — Codex CLI executor receiver (`mode: codex`, port 9311), durable thread map, JSONL parsing, thread remint, coexistence with cc/oc in one repo |
+| v0.8 | ✅ shipped | `deploy_agy_receiver` — Google Antigravity CLI executor receiver (`mode: agy`, port 9313), conversation-id discovery from `last_conversations.json`, plain-text prefix-strip transcript-tail extraction, remint on `not found`, boolean sandbox toggle, NO model selection, coexistence with cc/oc/codex in one repo |

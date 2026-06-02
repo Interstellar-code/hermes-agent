@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, Optional, Tuple
 
-SUPPORTED_MANAGED_MODES = frozenset({"claude_code", "opencode", "codex"})
+SUPPORTED_MANAGED_MODES = frozenset({"claude_code", "opencode", "codex", "agy"})
 
 _MODE_SPECS: Dict[str, Dict[str, str]] = {
     "claude_code": {
@@ -33,6 +33,12 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "description": "Codex CLI executor receiver",
         "token_prefix": "A2A_CODEX_TOKEN_",
         "deploy_module": "codex_deploy",
+    },
+    "agy": {
+        "default_name": "agy",
+        "description": "Google Antigravity CLI executor receiver",
+        "token_prefix": "A2A_AGY_TOKEN_",
+        "deploy_module": "agy_deploy",
     },
 }
 

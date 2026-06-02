@@ -80,6 +80,12 @@ def _expected_registered_tool_names() -> set[str]:
             "codex_receiver_status",
             "codex_receiver_stop",
         })
+    if importlib.util.find_spec("a2a_fleet.agy_deploy") is not None:
+        names.update({
+            "deploy_agy_receiver",
+            "agy_receiver_status",
+            "agy_receiver_stop",
+        })
     return names
 
 
