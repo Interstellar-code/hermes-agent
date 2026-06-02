@@ -1,5 +1,18 @@
 # a2a_fleet — Changelog
 
+## v0.8.6 — dashboard: dedup managed peers by (repo, mode), not repo alone (#95)
+
+- **Bug fix (#95)**: the read-only dashboard API `_managed_repos()` deduped
+  managed peers by `repo_path` alone, so a repo running more than one mode
+  (e.g. a `claude_code` + `codex` peer in the same repo) had every mode after
+  the first silently dropped from the conversations/peers feed — and therefore
+  from the Matrix3D A2A page. Dedup is now keyed by `(repo_path, mode)`; each
+  mode in a repo surfaces as its own peer. Docstring corrected (it claimed
+  "covers all 4 modes" while the key contradicted it). No front-end change
+  needed (switchui #183 was already correct); restart the dashboard to pick up
+  the fix. Note: `opencode`/`agy` still need their own `fleet.yaml` entries to
+  appear — they were genuinely unconfigured, not dedup casualties.
+
 ## v0.8.5 — per-mode port bands + auto-allocation (multi-session safe)
 
 - **Port bands**: each managed mode now owns a contiguous 10-port band so

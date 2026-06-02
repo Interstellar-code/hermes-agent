@@ -84,11 +84,14 @@ def _fleet_yaml_candidates() -> List[Path]:
 
 def _managed_repos() -> List[Tuple[str, str, str]]:
     """Return ``[(peer_name, repo_path, mode)]`` for ALL managed peers across all
-    profiles' fleet.yaml — deduped by repo_path.
+    profiles' fleet.yaml — deduped by ``(repo_path, mode)``.
 
     Covers every mode in ``managed_peers.SUPPORTED_MANAGED_MODES`` (claude_code,
     opencode, codex, agy) so the dashboard surfaces the full fleet, not just
-    Claude Code receivers.
+    Claude Code receivers. Dedup MUST be keyed by ``(repo_path, mode)`` and not
+    by ``repo_path`` alone: multiple modes legitimately coexist in one repo
+    (e.g. a cc + codex peer for the same repo), and a repo-only key silently
+    drops every non-first mode (issue #95).
 
     Profile-agnostic (see :func:`_fleet_yaml_candidates`) so a global dashboard
     surfaces every profile's receivers. Parses raw YAML leniently — no token_env /
@@ -116,10 +119,11 @@ def _managed_repos() -> List[Tuple[str, str, str]]:
             repo = entry.get("repo_path")
             mode = entry.get("mode") or ""
             if entry.get("managed") is True and supports_managed_mode(mode) and repo:
-                key = str(repo)
+                repo_str = str(repo)
+                key = (repo_str, mode)  # (repo, mode) — NOT repo alone (issue #95)
                 if key not in seen:
                     seen.add(key)
-                    out.append((str(name), key, mode))
+                    out.append((str(name), repo_str, mode))
     return out
 
 
