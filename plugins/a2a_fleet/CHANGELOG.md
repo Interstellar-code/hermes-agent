@@ -1,5 +1,59 @@
 # a2a_fleet — Changelog
 
+## v0.8.0 — in progress (issue #75)
+
+- Added Google Antigravity CLI (`agy`) as a fourth managed repo-scoped executor
+  peer (`mode: agy`, default port 9313):
+  - new standalone template `templates/agy_receiver.py` (STDLIB-only, no
+    a2a_fleet import dependency; injects `AGY_CLI_DISABLE_LATEX=1` into the agy
+    subprocess env)
+  - new deploy/manage module `agy_deploy.py` with
+    `deploy_agy_receiver_handler`, `agy_receiver_status_handler`,
+    `agy_receiver_stop_handler`; full dict-unwrap for all params
+  - command builder: first turn `agy --print "<prompt>" --dangerously-skip-permissions`,
+    resume turn `agy --conversation <uuid> --print ...`. `sandbox` is a BOOLEAN
+    toggle (`--sandbox`); there is **NO model selection** (agy has no `--model`).
+  - **conversation-id discovery**: agy does not let the caller assign the id on
+    turn 1. After a first turn the receiver reads
+    `~/.gemini/antigravity-cli/cache/last_conversations.json` (keyed by the
+    pinned repo cwd) to capture the uuid agy minted, persisting
+    `contextId -> {conversation_id, last_stdout}` in `a2a-agy-sessions.json`.
+  - **plain-text transcript-tail extraction**: agy re-echoes the ENTIRE prior
+    transcript (newline-separated assistant replies, no role markers) on every
+    resume, then appends the new reply. The receiver persists the full prior
+    stdout per contextId and strips it as a literal prefix to recover only the
+    latest reply; falls back to the last non-empty line if the prefix drifts.
+  - never uses `--continue` (cwd-global, unsafe for concurrent contexts sharing a
+    cwd); always pins an explicit `--conversation <uuid>` under the per-context
+    lock.
+
+### Bug fixes / hardening (baked in from start)
+
+- **remint clears stale conversation_id**: when a stored uuid is dead, agy emits
+  `Warning: conversation "<id>" not found.` as the first stdout line and then
+  runs fresh in the SAME invocation. The receiver clears the stale entry from
+  `a2a-agy-sessions.json` before persisting, strips the warning line from the
+  reply, and captures the NEW uuid agy minted. If discovery yields no new uuid,
+  the dead id is NOT re-persisted. (Regression test asserts this.)
+- **auth-failure surfacing**: agy auth is macOS Keychain (no headless login). A
+  turn that hangs to timeout or emits an auth signal surfaces a clear
+  "agy not authenticated — run `agy` interactively once to sign in" error rather
+  than hanging silently.
+- **dict-dispatch unwrap**: the deploy/status/stop handlers detect a dict first
+  positional (registry dispatch shape) and extract all params (`repo_path`,
+  `bind_port`, `sandbox`, `no_auth`, `hermes_auth_token_env` — note: no model).
+  (Regression test asserts a non-default `bind_port=9314` is honored.)
+- **agy_extra_flags sanitized**: forbidden session/print selectors
+  (`--continue`/`-c`, `--conversation`, `--print`/`-p`/`--prompt`,
+  `--prompt-interactive`/`-i`) are stripped so a stale config cannot break the
+  explicit `--conversation`/`--print` the receiver always sets.
+
+### Runtime files (coexist with cc/oc/codex in one `.hermes/`)
+
+- `agy_receiver.json`, `a2a-agy-inbox.jsonl`, `a2a-agy-inbox.offset`,
+  `a2a-agy-transcript.jsonl`, `agy_receiver.pid`, `a2a-agy-sessions.json`,
+  `.agy-token`.
+
 ## v0.7.0 — in progress (PR #79)
 
 - Added OpenAI Codex CLI as a third managed repo-scoped executor peer

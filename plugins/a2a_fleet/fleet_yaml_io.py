@@ -332,3 +332,24 @@ def upsert_codex_peer(
         description=description,
         profile=profile,
     )
+
+
+def upsert_agy_peer(
+    *,
+    repo_path: str,
+    url: str,
+    token_env: str = "",
+    name: str = "agy",
+    description: str = "",
+    profile: str | None = None,
+) -> Dict[str, Any]:
+    """Google Antigravity CLI wrapper around ``upsert_managed_peer()``."""
+    return upsert_managed_peer(
+        repo_path=repo_path,
+        url=url,
+        token_env=token_env,
+        name=name or managed_peer_default_name("agy"),
+        mode="agy",
+        description=description,
+        profile=profile,
+    )

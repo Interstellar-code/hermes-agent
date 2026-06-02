@@ -199,6 +199,7 @@ def register(ctx) -> None:
     # v0.3 deploy/manage tools: stand up a Claude Code executor receiver in a
     # target repo. Lazy-import keeps the import cost off the hot path / avoids
     # cycles. Additive — never touches the fleet_send registration above.
+    from . import agy_deploy  # noqa: WPS433 — lazy import is the contract.
     from . import cc_deploy  # noqa: WPS433 — lazy import is the contract.
     from . import codex_deploy  # noqa: WPS433 — lazy import is the contract.
     from . import oc_deploy  # noqa: WPS433 — lazy import is the contract.
@@ -422,6 +423,84 @@ def register(ctx) -> None:
         check_fn=None,
         is_async=True,
         description="Stop the repo's Codex receiver via its PID file and remove the pidfile.",
+        emoji="🛑",
+    )
+    ctx.register_tool(
+        name="deploy_agy_receiver",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to the target repo Antigravity CLI (agy) is "
+                        "set up + signed in (macOS Keychain). Symlinked inputs are "
+                        "RESOLVED to their real on-disk target and the receiver cwd "
+                        "is pinned there (security preserved)."
+                    ),
+                },
+                "bind_port": {
+                    "type": "integer",
+                    "description": "Port the receiver binds on (default 9313).",
+                },
+                "sandbox": {
+                    "type": "boolean",
+                    "description": (
+                        "Pass agy's --sandbox toggle (terminal restrictions). Boolean, "
+                        "default false. agy has NO model selection (no --model flag). "
+                        "Requires an interactive `agy` sign-in once on this host."
+                    ),
+                },
+                "hermes_auth_token_env": {
+                    "type": "string",
+                    "description": "Env var name holding the outbound bearer token for replies to Hermes.",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(agy_deploy.deploy_agy_receiver_handler),
+        check_fn=None,
+        is_async=True,
+        description="Deploy + launch a Google Antigravity CLI (agy) A2A executor receiver in a target repo.",
+        emoji="🚀",
+    )
+    ctx.register_tool(
+        name="agy_receiver_status",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose agy receiver to check (PID + /health).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(agy_deploy.agy_receiver_status_handler),
+        check_fn=None,
+        is_async=True,
+        description="Report whether the repo's Antigravity CLI receiver is running (PID alive AND /health).",
+        emoji="🩺",
+    )
+    ctx.register_tool(
+        name="agy_receiver_stop",
+        toolset="a2a",
+        schema={
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repo whose agy receiver to stop (SIGTERM via PID file).",
+                },
+            },
+            "required": ["repo_path"],
+        },
+        handler=_json_tool_result(agy_deploy.agy_receiver_stop_handler),
+        check_fn=None,
+        is_async=True,
+        description="Stop the repo's Antigravity CLI receiver via its PID file and remove the pidfile.",
         emoji="🛑",
     )
 

@@ -874,6 +874,10 @@ def _managed_receiver_module(mode: str):
         from . import codex_deploy  # noqa: PLC0415,WPS433
 
         return codex_deploy
+    if mode == "agy":
+        from . import agy_deploy  # noqa: PLC0415,WPS433
+
+        return agy_deploy
     raise ValueError(f"unsupported managed receiver mode: {mode!r}")
 
 
@@ -919,6 +923,10 @@ def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]
         from . import codex_deploy  # noqa: PLC0415,WPS433
 
         return asyncio.run(codex_deploy.deploy_codex_receiver_handler(str(repo), bind_port=port))
+    if mode == "agy":
+        from . import agy_deploy  # noqa: PLC0415,WPS433
+
+        return asyncio.run(agy_deploy.deploy_agy_receiver_handler(str(repo), bind_port=port))
     raise ValueError(f"unsupported managed receiver mode: {mode!r}")
 
 
