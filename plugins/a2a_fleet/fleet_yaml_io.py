@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from ruamel.yaml import YAML
+from ruamel.yaml.constructor import ConstructorError
 
 # Reuse the single source of truth for path resolution so scaffold + upsert + load
 # all agree on WHERE fleet.yaml lives for the active profile.
@@ -160,6 +161,14 @@ def _yaml() -> YAML:
     y = YAML()  # round-trip mode (preserves comments + formatting)
     y.preserve_quotes = True
     y.indent(mapping=2, sequence=4, offset=2)
+
+    def _reject_python_tag(constructor, tag_suffix, node):
+        raise ConstructorError(
+            None, None,
+            f"unsafe python tag '!!python/{tag_suffix}' is forbidden in fleet.yaml",
+            node.start_mark,
+        )
+    y.constructor.add_multi_constructor("tag:yaml.org,2002:python/", _reject_python_tag)
     return y
 
 
