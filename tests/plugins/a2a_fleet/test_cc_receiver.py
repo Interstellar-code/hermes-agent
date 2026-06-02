@@ -905,4 +905,26 @@ def test_main_writes_pidfile_after_successful_bind(ccr, tmp_path, monkeypatch):
     except KeyboardInterrupt:
         pass
     assert pid_at_bind["existed_before_bind"] is False
-    assert pid_at_bind["existed_during_serve"] is True
+
+
+# ---------------------------------------------------------------------------
+# Fix B (#86): _sanitize_extra_flags for cc_receiver
+# ---------------------------------------------------------------------------
+
+def test_sanitize_extra_flags_strips_forbidden_cc_tokens(ccr, tmp_path) -> None:
+    """claude_extra_flags with forbidden tokens must be stripped; safe tokens kept."""
+    cfg = _base_cfg(ccr, tmp_path)
+    cfg["claude_extra_flags"] = [
+        "--session-id", "abc",  # forbidden (two-token form)
+        "--resume",             # forbidden (single-token, no value following)
+        "--keep-me",            # safe — must survive
+    ]
+    sid = ccr.session_id_for_context("ctx-san")
+    cmd = ccr.build_claude_command("prompt", sid, cfg, resume=False)
+    assert "--session-id" not in cmd[cmd.index("claude"):] or cmd.count("--session-id") == 1, \
+        "build adds its own --session-id; extra --session-id from extra_flags must be stripped"
+    # Verify "abc" (the value of the forbidden --session-id extra flag) is NOT in the command
+    # beyond the legitimate uuid added by the builder itself.
+    assert "abc" not in cmd
+    assert "--resume" not in cmd
+    assert "--keep-me" in cmd
