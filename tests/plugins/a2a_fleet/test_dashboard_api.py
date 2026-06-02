@@ -59,7 +59,7 @@ def api(monkeypatch, tmp_path):
          "to": "claude-code", "contextId": "ctx-2", "text": "second thread"},
         "}{ this line is corrupt and must be skipped",
     ])
-    monkeypatch.setattr(mod, "_managed_repos", lambda: [("claude-code", str(repo))])
+    monkeypatch.setattr(mod, "_managed_repos", lambda: [("claude-code", str(repo), "claude_code")])
     return mod, repo
 
 
@@ -133,7 +133,7 @@ def multirepo(monkeypatch, tmp_path):
         {"ts": "2026-05-31 11:00:00", "dir": "hermes->claude", "contextId": "handshake:sw", "text": "B-only"},
     ])
     monkeypatch.setattr(mod, "_managed_repos", lambda: [
-        ("cc-a", str(repo_a)), ("cc-b", str(repo_b)),
+        ("cc-a", str(repo_a), "claude_code"), ("cc-b", str(repo_b), "claude_code"),
     ])
     return mod, repo_a, repo_b
 
@@ -192,7 +192,7 @@ def test_managed_repos_scans_all_profiles(monkeypatch, tmp_path):
     _write_managed_fleet(tmp_path / "profiles" / "switch" / "fleet.yaml", "claude-code", "/repos/switch")
     _write_managed_fleet(tmp_path / "profiles" / "other" / "fleet.yaml", "claude-code", "/repos/other")
 
-    repos = {repo: name for name, repo in mod._managed_repos()}
+    repos = {repo: name for name, repo, _mode in mod._managed_repos()}
     assert set(repos) == {"/repos/home", "/repos/switch", "/repos/other"}
 
 
@@ -201,7 +201,7 @@ def test_managed_repos_dedupes_same_repo_across_profiles(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _write_managed_fleet(tmp_path / "profiles" / "p1" / "fleet.yaml", "claude-code", "/repos/shared")
     _write_managed_fleet(tmp_path / "profiles" / "p2" / "fleet.yaml", "claude-code", "/repos/shared")
-    assert mod._managed_repos() == [("claude-code", "/repos/shared")]
+    assert mod._managed_repos() == [("claude-code", "/repos/shared", "claude_code")]
 
 
 def test_managed_repos_skips_non_managed_and_bad_files(monkeypatch, tmp_path):
@@ -217,3 +217,172 @@ def test_managed_repos_skips_non_managed_and_bad_files(monkeypatch, tmp_path):
     bad.parent.mkdir(parents=True)
     bad.write_text("}{ not yaml", encoding="utf-8")
     assert mod._managed_repos() == []
+
+
+# ---------------------------------------------------------------------------
+# Mode-aware tests: _managed_repos includes all 4 modes; transcript path is
+# per-mode; mixed fleet surfaces all modes in list_conversations / list_peers.
+# ---------------------------------------------------------------------------
+
+def _write_mode_fleet(path: Path, peer_name: str, mode: str, repo: str):
+    """Write a minimal fleet.yaml with one managed peer of the given mode."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "fleet:\n"
+        "  agents:\n"
+        f"    {peer_name}:\n"
+        f"      url: http://127.0.0.1:9300\n"
+        f"      managed: true\n"
+        f"      mode: {mode}\n"
+        f"      repo_path: {repo}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_mode_transcript(repo: Path, filename: str, rows):
+    """Write rows as JSONL to repo/.hermes/<filename>."""
+    hermes_dir = repo / ".hermes"
+    hermes_dir.mkdir(parents=True, exist_ok=True)
+    (hermes_dir / filename).write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+
+
+def test_managed_repos_returns_all_four_modes(monkeypatch, tmp_path):
+    """_managed_repos() must surface claude_code, opencode, codex, and agy peers."""
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    modes = {
+        "claude_code": "cc-peer",
+        "opencode": "oc-peer",
+        "codex": "codex-peer",
+        "agy": "agy-peer",
+    }
+    for i, (mode, name) in enumerate(modes.items()):
+        _write_mode_fleet(
+            tmp_path / "profiles" / f"p{i}" / "fleet.yaml",
+            name, mode, f"/repos/{mode}",
+        )
+    results = mod._managed_repos()
+    found_modes = {mode for _name, _repo, mode in results}
+    assert found_modes == {"claude_code", "opencode", "codex", "agy"}
+
+
+def test_managed_repos_excludes_unmanaged_and_unknown_mode(monkeypatch, tmp_path):
+    """Peers with managed=false or unsupported/missing mode must be excluded."""
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "fleet.yaml").write_text(
+        "fleet:\n"
+        "  agents:\n"
+        "    no-managed:\n"
+        "      url: http://x\n"
+        "      mode: claude_code\n"
+        "      repo_path: /repos/nm\n"
+        "    unknown-mode:\n"
+        "      url: http://x\n"
+        "      managed: true\n"
+        "      mode: future_mode\n"
+        "      repo_path: /repos/fm\n"
+        "    no-mode:\n"
+        "      url: http://x\n"
+        "      managed: true\n"
+        "      repo_path: /repos/nomode\n",
+        encoding="utf-8",
+    )
+    assert mod._managed_repos() == []
+
+
+def test_transcript_path_per_mode():
+    """Each mode resolves to its own transcript filename under .hermes/."""
+    mod = _load_module()
+    expected = {
+        "claude_code": "a2a-transcript.jsonl",
+        "opencode": "a2a-oc-transcript.jsonl",
+        "codex": "a2a-codex-transcript.jsonl",
+        "agy": "a2a-agy-transcript.jsonl",
+    }
+    for mode, filename in expected.items():
+        p = mod._transcript_path("/some/repo", mode)
+        assert p == Path("/some/repo/.hermes") / filename, (
+            f"mode={mode!r}: expected {filename!r}, got {p.name!r}"
+        )
+
+
+def test_transcript_path_unknown_mode_falls_back_to_claude():
+    """An unknown/legacy mode must fall back to the claude_code filename, not crash."""
+    mod = _load_module()
+    p = mod._transcript_path("/some/repo", "future_unknown_mode")
+    assert p.name == "a2a-transcript.jsonl"
+
+
+@pytest.fixture
+def mixed_fleet(monkeypatch, tmp_path):
+    """Four repos, one per mode, each with one transcript message."""
+    mod = _load_module()
+    mode_filename = {
+        "claude_code": "a2a-transcript.jsonl",
+        "opencode":    "a2a-oc-transcript.jsonl",
+        "codex":       "a2a-codex-transcript.jsonl",
+        "agy":         "a2a-agy-transcript.jsonl",
+    }
+    peers = []
+    for mode, filename in mode_filename.items():
+        repo = tmp_path / mode
+        repo.mkdir()
+        _write_mode_transcript(repo, filename, [
+            {"ts": "2026-06-01 10:00:00", "dir": "hermes->peer",
+             "contextId": f"ctx-{mode}", "text": f"hello from {mode}"},
+        ])
+        peers.append((f"peer-{mode}", str(repo), mode))
+    monkeypatch.setattr(mod, "_managed_repos", lambda: peers)
+    return mod, peers
+
+
+def test_mixed_fleet_list_conversations_includes_all_modes(mixed_fleet):
+    """list_conversations must surface all 4 modes and include the mode field."""
+    mod, peers = mixed_fleet
+    res = _run(mod.list_conversations())
+    assert res["count"] == 4
+    found = {c["mode"] for c in res["conversations"]}
+    assert found == {"claude_code", "opencode", "codex", "agy"}
+    for conv in res["conversations"]:
+        assert "mode" in conv
+
+
+def test_mixed_fleet_list_peers_includes_all_modes(mixed_fleet):
+    """list_peers must surface all 4 modes and include the mode field."""
+    mod, peers = mixed_fleet
+    res = _run(mod.list_peers())
+    assert res["count"] == 4
+    found = {p["mode"] for p in res["peers"]}
+    assert found == {"claude_code", "opencode", "codex", "agy"}
+    for peer in res["peers"]:
+        assert "mode" in peer
+        assert peer["transcript_exists"] is True
+        assert peer["message_count"] == 1
+
+
+def test_get_conversation_includes_mode(mixed_fleet):
+    """get_conversation must include the mode field in the response."""
+    mod, _peers = mixed_fleet
+    res = _run(mod.get_conversation("ctx-claude_code"))
+    assert res["mode"] == "claude_code"
+
+
+def test_legacy_peer_no_mode_field_does_not_crash(monkeypatch, tmp_path):
+    """A peer entry without a mode field must not crash; it is simply excluded."""
+    mod = _load_module()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "fleet.yaml").write_text(
+        "fleet:\n"
+        "  agents:\n"
+        "    legacy:\n"
+        "      url: http://127.0.0.1:9300\n"
+        "      managed: true\n"
+        "      repo_path: /repos/legacy\n",
+        encoding="utf-8",
+    )
+    # Must not raise; legacy peer with no mode is excluded (mode=None fails supports_managed_mode).
+    result = mod._managed_repos()
+    assert result == []

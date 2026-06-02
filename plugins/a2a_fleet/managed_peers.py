@@ -21,24 +21,28 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "description": "Claude Code executor receiver",
         "token_prefix": "A2A_CC_TOKEN_",
         "deploy_module": "cc_deploy",
+        "transcript_filename": "a2a-transcript.jsonl",
     },
     "opencode": {
         "default_name": "opencode",
         "description": "OpenCode executor receiver",
         "token_prefix": "A2A_OC_TOKEN_",
         "deploy_module": "oc_deploy",
+        "transcript_filename": "a2a-oc-transcript.jsonl",
     },
     "codex": {
         "default_name": "codex",
         "description": "Codex CLI executor receiver",
         "token_prefix": "A2A_CODEX_TOKEN_",
         "deploy_module": "codex_deploy",
+        "transcript_filename": "a2a-codex-transcript.jsonl",
     },
     "agy": {
         "default_name": "agy",
         "description": "Google Antigravity CLI executor receiver",
         "token_prefix": "A2A_AGY_TOKEN_",
         "deploy_module": "agy_deploy",
+        "transcript_filename": "a2a-agy-transcript.jsonl",
     },
 }
 
@@ -57,6 +61,18 @@ def managed_peer_description(mode: str, repo_path: str) -> str:
     """Return the default human-readable description for ``mode`` + repo."""
     label = _MODE_SPECS[mode]["description"]
     return f"{label} (repo: {repo_path})"
+
+
+def transcript_filename_for(mode: str) -> str:
+    """Return the transcript JSONL filename written by the receiver for ``mode``.
+
+    Falls back to the claude_code filename for unknown/legacy modes so callers
+    that hold an old peer entry without a recognised mode degrade gracefully.
+    """
+    spec = _MODE_SPECS.get(mode)
+    if spec is None:
+        return _MODE_SPECS["claude_code"]["transcript_filename"]
+    return spec["transcript_filename"]
 
 
 def canonicalize_managed_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str]]:

@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.8.x` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 OpenCode executor + v0.7 Codex executor + v0.8 Antigravity (`agy`) executor — four managed executor modes (Claude Code + OpenCode + Codex + agy)
+Version: `0.8.1` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 OpenCode executor + v0.7 Codex executor + v0.8 Antigravity (`agy`) executor + v0.8.1 mode-aware dashboard — all four managed executor modes (Claude Code + OpenCode + Codex + agy) appear in the conversations/peers tab
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
