@@ -80,7 +80,7 @@ def test_plugin_register_source_includes_agy_tool_handlers() -> None:
     assert 'name="agy_receiver_status"' in source
     assert 'name="agy_receiver_stop"' in source
     assert "Antigravity" in source
-    assert "9313" in source
+    assert "9330" in source  # agy band start (9330-9339)
     # agy has NO model param — the deploy tool schema must not advertise one.
     # (codex/cc do; agy explicitly does not.)
 

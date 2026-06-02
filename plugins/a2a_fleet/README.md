@@ -355,7 +355,7 @@ per-context lock and updates the map.
 - Tools: `deploy_agy_receiver`, `agy_receiver_status`, `agy_receiver_stop`
 - Template: `templates/agy_receiver.py`
 - Deploy module: `agy_deploy.py`
-- Default peer name / mode / port: `agy` / `agy` / `9313`
+- Default peer name / mode / port: `agy` / `agy` / `9330` (band 9330-9339)
 
 Example managed peer block in `fleet.yaml` (auto-wired by `deploy_agy_receiver`,
 you do NOT hand-edit it):
@@ -363,8 +363,8 @@ you do NOT hand-edit it):
 ```yaml
 agents:
   agy:
-    url: http://127.0.0.1:9313
-    agent_card_url: http://127.0.0.1:9313/.well-known/agent-card.json
+    url: http://127.0.0.1:9330
+    agent_card_url: http://127.0.0.1:9330/.well-known/agent-card.json
     token_env: A2A_AGY_TOKEN_<REPO>
     managed: true
     mode: agy
@@ -372,8 +372,10 @@ agents:
     description: "Google Antigravity CLI executor receiver (repo: ...)"
 ```
 
-Deploy params: `repo_path` (required), `bind_port` (default 9313), and
-`sandbox` (a **boolean** toggle that passes agy's `--sandbox`). There is **NO
+Deploy params: `repo_path` (required), `bind_port` (omit to auto-pick a free
+port in the agy band 9330-9339, or reuse this repo's existing port on
+re-deploy), and `sandbox` (a **boolean** toggle that passes agy's `--sandbox`).
+There is **NO
 model selection** — agy has no `--model` flag, so the deploy tool exposes no
 model param.
 
@@ -691,5 +693,6 @@ venv/bin/python -m pytest tests/plugins/a2a_fleet/ -q
 | Route B | ✅ shipped | `agent` response handler — inbound dispatched into the real Hermes agent via the `a2a_fleet` platform adapter + `run_coroutine_threadsafe` bridge to the gateway loop |
 | v0.3 | ✅ shipped | `deploy_cc_receiver` — Claude Code executor receiver deployed into a target repo's `.hermes/`, repo-aware `fleet.yaml` (`repo_path`/`managed`/`mode`), handshake, managed daemon lifecycle |
 | v0.6 | ✅ shipped | `deploy_oc_receiver` — OpenCode executor receiver deployed into a target repo's `.hermes/`, durable OpenCode session map, mode-aware peer upsert/load/reconcile, coexistence with Claude receiver in one repo |
-| v0.7 | ✅ shipped | `deploy_codex_receiver` — Codex CLI executor receiver (`mode: codex`, port 9311), durable thread map, JSONL parsing, thread remint, coexistence with cc/oc in one repo |
-| v0.8 | ✅ shipped | `deploy_agy_receiver` — Google Antigravity CLI executor receiver (`mode: agy`, port 9313), conversation-id discovery from `last_conversations.json`, plain-text prefix-strip transcript-tail extraction, remint on `not found`, boolean sandbox toggle, NO model selection, coexistence with cc/oc/codex in one repo |
+| v0.7 | ✅ shipped | `deploy_codex_receiver` — Codex CLI executor receiver (`mode: codex`, codex band 9320-9329, default 9320), durable thread map, JSONL parsing, thread remint, coexistence with cc/oc in one repo |
+| v0.8 | ✅ shipped | `deploy_agy_receiver` — Google Antigravity CLI executor receiver (`mode: agy`, agy band 9330-9339, default 9330), conversation-id discovery from `last_conversations.json`, plain-text prefix-strip transcript-tail extraction, remint on `not found`, boolean sandbox toggle, NO model selection, coexistence with cc/oc/codex in one repo |
+| v0.8.5 | ✅ shipped | Per-mode 10-port bands (cc 9300-9309, oc 9310-9319, codex 9320-9329, agy 9330-9339) + `bind_port` auto-allocation: omit it to reuse this repo's existing port or auto-pick a free port in the band, skipping ports claimed by other repos' peers; explicit `bind_port` still honored. Multiple same-mode receivers across repos no longer collide |
