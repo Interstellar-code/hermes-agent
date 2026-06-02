@@ -161,3 +161,36 @@ def test_auth_required_without_token_env_returns_jsonrpc_envelope(
     body = response.json()
     assert "error" in body
     assert "token_env" not in body["error"]
+
+
+# Issue #72 — deploy tool schemas must include repo_path in properties + required
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_receiver_tools_have_repo_path_in_schema(fleet_home: Path) -> None:
+    """Each deploy_*_receiver tool must expose repo_path in its schema properties
+    AND in its required list.  Guards against #72 regression."""
+    from a2a_fleet import register
+
+    ctx = _StubCtx()
+    register(ctx)
+
+    deploy_tools = {
+        call["name"]: call
+        for call in ctx.calls
+        if call["name"].startswith("deploy_") and call["name"].endswith("_receiver")
+    }
+
+    # At minimum the cc receiver must always be present.
+    assert "deploy_cc_receiver" in deploy_tools, "deploy_cc_receiver must be registered"
+
+    for name, call in deploy_tools.items():
+        schema = call.get("schema", {})
+        props = schema.get("properties", {})
+        required = schema.get("required", [])
+        assert "repo_path" in props, (
+            f"{name}: 'repo_path' missing from schema properties (issue #72 regression)"
+        )
+        assert "repo_path" in required, (
+            f"{name}: 'repo_path' missing from schema required list (issue #72 regression)"
+        )
