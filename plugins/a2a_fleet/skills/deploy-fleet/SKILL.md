@@ -21,13 +21,12 @@ Two layers live here:
    `deploy_*_receiver`, which auto-wires `fleet.yaml` + launches the daemon; then
    handshake, smoke-test, and drive tasks (see **Managed executors** below).
 
-> **Capability caveat (read first).** As of 2026-06-03, **only `claude_code` has
-> full tool/file/`gh` access** to do real repo work. The other three modes
-> round-trip messages (a "reply PONG" smoke test passes) but the current shims do
-> NOT yet give the CLI real tool access for substantive tasks. **Route real repo
-> work — audits, edits, reviews — to `claude_code`. Treat `opencode` / `codex` /
-> `agy` as EXPERIMENTAL/limited** until their tracking issues land (details and
-> issue links in the **Managed executors** section).
+> **Capability status (read first).** `claude_code`, `opencode`, and `agy` all
+> do real repo work (full tool/file/`gh` access) — opencode (#99) and agy (#100)
+> were fixed and live-verified running `gh`. `codex` (#97) has the fix landed
+> (unit + falsification verified) but its live turn is **pending a codex-cli auth
+> refresh** — hold real codex work until re-confirmed. Details + exact
+> invocations in the **Capability status** + **Managed executors** sections.
 
 ## Key facts
 
@@ -181,27 +180,28 @@ the host** (macOS Keychain — run `agy` once before deploying). If the CLI is
 missing/unauthed the receiver still **deploys and shows healthy**, but every turn
 errors — so a healthy `/health` is necessary but not sufficient; smoke-test first.
 
-### Capability caveat — what actually works today
+### Capability status — what does real repo work
 
-As of **2026-06-03**, **only `claude_code`** (`claude -p` with
-`--permission-mode bypassPermissions`) has full tool/file/`gh` access for real
-repo work. The other three round-trip messages (the "reply PONG" smoke test
-passes) but the current shims do NOT yet give the CLI real tool access for
-substantive tasks:
+All receivers run their CLI with skip-permissions + a PATH augmented with the
+common tool dirs (so `gh`/`git`/node resolve even under a launchd daemon).
 
-- **`codex`** — receives messages but the CLI returns "no parseable output"
-  (exec arg-contract drift) — issue
-  [#97](https://github.com/Interstellar-code/hermes-agent/issues/97) (open).
-- **`opencode`** — replies to simple prompts but has no `gh` CLI / no file access
-  in the shim — issue
-  [#99](https://github.com/Interstellar-code/hermes-agent/issues/99) (open).
-- **`agy`** — replies in ~5s but is TUI-only, returns only a plan, no tool
-  execution — issue
-  [#100](https://github.com/Interstellar-code/hermes-agent/issues/100) (open).
+- **`claude_code`** — full tool/file/`gh` access (`claude -p
+  --permission-mode bypassPermissions`). The reference mode.
+- **`opencode`** — ✅ real tool access. Runs under opencode's default primary
+  agent (full tools) with `--dangerously-skip-permissions --format json`; the
+  augmented PATH fixed the "no `gh`" failure. Verified live: ran `gh issue list`
+  and returned the count ([#99](https://github.com/Interstellar-code/hermes-agent/issues/99) fixed).
+- **`agy`** — ✅ real tool access. `--print --dangerously-skip-permissions
+  --add-dir <repo> --print-timeout <budget>`; `--add-dir` grants workspace
+  access and the raised timeout stops the 5m plan-only exits. Verified live: ran
+  `gh issue list` and returned the count ([#100](https://github.com/Interstellar-code/hermes-agent/issues/100) fixed).
+- **`codex`** — fix landed (prompt as positional + `stdin=DEVNULL`; codex-cli
+  ≥0.136 otherwise blocks on stdin → rc=1). Unit-tested + falsification-verified;
+  **live re-verify pending** a codex-cli auth refresh
+  ([#97](https://github.com/Interstellar-code/hermes-agent/issues/97)).
 
-**Guidance:** route real repo work (audits, edits, reviews) to **`claude_code`**;
-treat `opencode` / `codex` / `agy` as **EXPERIMENTAL/limited** until #97 / #99 /
-#100 land.
+**Guidance:** `claude_code`, `opencode`, and `agy` are cleared for real repo work
+(audits, edits, reviews). Use `codex` once its live PONG+tool turn is re-confirmed.
 
 ### Multi-mode deploy + verify procedure
 

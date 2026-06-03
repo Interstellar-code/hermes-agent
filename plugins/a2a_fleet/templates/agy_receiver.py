@@ -167,12 +167,41 @@ DEFAULTS: Dict[str, Any] = {
     "auth_token_env": None,       # env var name holding the INBOUND bearer token (POST /jsonrpc)
     "hermes_auth_token_env": None,  # env var name holding the bearer token for OUTBOUND replies to Hermes
     "poll_interval_s": 2.0,
-    "agy_timeout_s": 300,
+    # Real repo work (multi-file edits, gh calls) routinely exceeds agy's own 5m
+    # --print-timeout default, which is what produced plan-only/no-result turns
+    # (#100). 15m is a sane budget for autonomous tasks; raise per deploy if needed.
+    "agy_timeout_s": 900,
     "context_lock_wait_s": 600.0,  # how long a queued same-context turn waits for the lock
     "max_concurrent_turns": 3,     # global cap on simultaneous agy subprocesses
     "max_tracked_contexts": 1024,  # bound on the per-context lock registry
     "idle_timeout_s": 1800,        # self-teardown after this many idle seconds (0 = disabled)
 }
+
+# Receiver subprocess backstop = agy_timeout_s + this grace, so agy reaches its
+# OWN --print-timeout first and exits cleanly instead of being killpg'd mid-write.
+AGY_TIMEOUT_GRACE_S = 60.0
+
+# Common tool dirs appended to PATH for the spawned agy process. A receiver
+# launched by launchd (or any non-login daemon) inherits a minimal PATH, so
+# agy's terminal/tool calls can't find `gh`/`git`/node. We APPEND (never shadow)
+# so an explicit parent PATH still wins; only missing dirs are added.
+_EXTRA_PATH_DIRS = (
+    "/opt/homebrew/bin", "/opt/homebrew/sbin",
+    "/usr/local/bin", "/usr/local/sbin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+)
+
+
+def _tool_env() -> Dict[str, str]:
+    """os.environ copy with AGY_CLI_DISABLE_LATEX=1 + common tool dirs on PATH."""
+    env = dict(os.environ)
+    env["AGY_CLI_DISABLE_LATEX"] = "1"
+    parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    for d in (os.path.expanduser("~/.local/bin"), *_EXTRA_PATH_DIRS):
+        if d and d not in parts and os.path.isdir(d):
+            parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
 
 log = logging.getLogger("agy_receiver")
 
@@ -407,22 +436,38 @@ def build_agy_command(
     """Build the ``agy --print`` argv for one turn.
 
     First turn (no conversation_id):
-        agy --print "<prompt>" --dangerously-skip-permissions [--sandbox]
+        agy --print "<prompt>" --dangerously-skip-permissions --add-dir <repo> --print-timeout <N>s [--sandbox]
     Resume turn (conversation_id stored):
-        agy --conversation <uuid> --print "<prompt>" --dangerously-skip-permissions [--sandbox]
+        agy --conversation <uuid> --print "<prompt>" --dangerously-skip-permissions --add-dir <repo> --print-timeout <N>s [--sandbox]
 
     IMPORTANT:
       * NO --model flag exists in agy.
+      * --add-dir <repo_path> grants agy read/write access to the pinned repo so
+        tool calls (file ops, terminal) operate on it — WITHOUT it agy treats the
+        task as out-of-workspace and returns only a plan (issue #100).
+      * --print-timeout caps agy's own non-interactive wait. agy's DEFAULT is 5m;
+        real repo tasks routinely exceed that and exit plan-only. We pin it to the
+        receiver's configured turn budget (cfg["agy_timeout_s"]); the receiver's
+        own subprocess backstop is set strictly LONGER (grace) so agy self-exits
+        first with a clean result rather than being killpg'd mid-write.
       * --sandbox is a BOOLEAN toggle (added when cfg["agy_sandbox"] is truthy).
+        Do NOT rely on --sandbox + --dangerously-skip-permissions together —
+        skip-permissions also auto-approves sandbox-escape (upstream agy bug);
+        they are independent knobs here and sandbox defaults off.
       * --conversation pins an explicit uuid (never --continue, which is
         cwd-global and unsafe for concurrent contexts sharing a cwd).
       * AGY_CLI_DISABLE_LATEX=1 is set in the subprocess ENV, not as a flag.
     """
     full_prompt = _prompt_with_role(prompt, cfg)
+    repo_path = str(cfg.get("repo_path") or "")
+    print_timeout_s = int(float(cfg.get("agy_timeout_s") or DEFAULTS["agy_timeout_s"]))
     cmd: List[str] = ["agy"]
     if conversation_id:
         cmd += ["--conversation", conversation_id]
     cmd += ["--print", full_prompt, "--dangerously-skip-permissions"]
+    if repo_path:
+        cmd += ["--add-dir", repo_path]
+    cmd += ["--print-timeout", f"{print_timeout_s}s"]
     if cfg.get("agy_sandbox"):
         cmd += ["--sandbox"]
     extra = cfg.get("agy_extra_flags") or []
@@ -435,7 +480,12 @@ def build_agy_command(
 # flags we always set. Stripped from agy_extra_flags so a stale config cannot
 # inject a conflicting session selector.
 _FORBIDDEN_EXTRA: frozenset = frozenset(
-    {"--continue", "-c", "--conversation", "--print", "-p", "--prompt", "--prompt-interactive", "-i"}
+    {
+        "--continue", "-c", "--conversation", "--print", "-p", "--prompt",
+        "--prompt-interactive", "-i",
+        # Managed by build_agy_command — must not be overridden via extra_flags.
+        "--add-dir", "--print-timeout",
+    }
 )
 
 
@@ -629,6 +679,11 @@ def run_agy_turn(
     session_map_path: Path = SESSION_MAP_PATH  # may be monkeypatched in tests
     repo_path = Path(cfg["repo_path"])
     timeout = float(cfg.get("agy_timeout_s") or DEFAULTS["agy_timeout_s"])
+    # agy gets --print-timeout == `timeout` (see build_agy_command); the receiver's
+    # own subprocess backstop must be strictly longer so agy hits its OWN timeout
+    # and self-exits with a clean partial/final result, instead of being killpg'd
+    # mid-turn by the receiver. The grace also covers agy's shutdown/flush.
+    backstop = timeout + AGY_TIMEOUT_GRACE_S
 
     entry = get_session_entry(context_id, session_map_path) or {}
     stored_cid = entry.get("conversation_id") if isinstance(entry.get("conversation_id"), str) else None
@@ -636,7 +691,7 @@ def run_agy_turn(
 
     def _invoke(conversation_id: Optional[str]) -> Tuple[str, int, str]:
         cmd = build_agy_command(prompt, cfg, conversation_id=conversation_id)
-        return _call_runner(runner, cmd, str(repo_path), timeout)
+        return _call_runner(runner, cmd, str(repo_path), backstop)
 
     # A turn that has no stored uuid MUST mint one (agy keys it by cwd, which is
     # shared by all contextIds in this one-process-per-repo receiver). Serialize
@@ -1264,8 +1319,7 @@ def probe_agy_cli() -> bool:
     cannot be probed without an interactive sign-in, so we only check presence.
     """
     try:
-        env = dict(os.environ)
-        env["AGY_CLI_DISABLE_LATEX"] = "1"
+        env = _tool_env()
         proc = subprocess.run(
             ["agy", "--help"],
             capture_output=True, text=True, timeout=10, env=env,

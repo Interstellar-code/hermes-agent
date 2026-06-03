@@ -1,5 +1,37 @@
 # a2a_fleet — Changelog
 
+## v0.8.7 — executor tool-parity: opencode/codex/agy do real repo work (#97, #99, #100)
+
+Brings the three non-Claude executors up to the `claude_code` bar — real
+tool/file/`gh` access driven non-interactively, not chat-only.
+
+- **Shared PATH augmentation** (all three receiver runners): a receiver launched
+  by launchd inherits a minimal PATH, so the agent's bash/tool calls couldn't
+  find `gh`/`git`/node. Each runner now appends the common tool dirs
+  (`/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin`, …) to PATH without
+  shadowing an explicit parent PATH.
+- **codex (#97)**: prompt is passed as a positional arg AND the subprocess runner
+  closes stdin (`stdin=subprocess.DEVNULL`). codex-cli ≥0.136 inspects whether
+  stdin is a pipe; a daemon's inherited pipe made it block "Reading additional
+  input from stdin..." and exit rc=1 with no parseable output. Unit + falsification
+  verified; **live re-verify pending a codex-cli auth refresh.**
+- **opencode (#99)**: removed the forced `--agent build` (it is a *subagent* in
+  some installs, e.g. 1.15.13, and triggers a fallback-to-default warning). The
+  default primary agent already has the full tool set; the real fix was PATH.
+  `opencode_agent` defaults to `None` (use opencode's default) and is honored only
+  when an operator pins a specific tool-enabled primary agent. **Verified live**:
+  ran `gh issue list … | grep -c .` and returned the count.
+- **agy (#100)**: `build_agy_command` now adds `--add-dir <repo>` (workspace
+  access — without it agy treats the task as out-of-workspace and returns only a
+  plan) and `--print-timeout <budget>` (agy's 5m default produced plan-only/no-
+  result turns on real tasks). Default `agy_timeout_s` raised 300→900; the
+  receiver's subprocess backstop is now `agy_timeout_s + 60s` grace so agy reaches
+  its own timeout and self-exits cleanly instead of being killpg'd mid-write.
+  **Verified live**: ran `gh issue list` and returned the count.
+- New `tests/plugins/a2a_fleet/test_executor_capabilities.py`: command-build +
+  stdin/PATH guards for all three modes, the agy backstop invariant, and a
+  live-smoke (gated behind `A2A_LIVE_SMOKE=1`). Full suite 393 passed.
+
 ## v0.8.6 — dashboard: dedup managed peers by (repo, mode), not repo alone (#95)
 
 - **Bug fix (#95)**: the read-only dashboard API `_managed_repos()` deduped
