@@ -1,6 +1,6 @@
 ---
 name: deploy-fleet
-description: End-to-end procedure for bringing up an a2a_fleet node and testing peer communication — fleet.yaml layout, bearer tokens, server verification, ping/pong via fleet_send. Use when asked to deploy, configure, set up, or test an A2A fleet / agent-to-agent connection.
+description: End-to-end procedure for bringing up an a2a_fleet node, deploying any of the FOUR managed executor modes (Claude Code / OpenCode / Codex / Antigravity) into a target repo, and testing peer communication — fleet.yaml layout, the four deploy_*_receiver tools, per-mode port bands + params + transcripts + session models, bearer tokens, server verification, ping/pong via fleet_send. Use when asked to deploy, configure, set up, or test an A2A fleet / agent-to-agent connection or a repo-scoped executor (claude_code, opencode, codex, agy).
 metadata:
   hermes:
     tags: [a2a_fleet, a2a, agent-to-agent]
@@ -8,9 +8,26 @@ metadata:
 
 # a2a_fleet: deploy-fleet
 
-How to stand up an A2A fleet node and verify it talks to a peer. The
-`fleet_send` tool schema is already in context — this fills the procedural gap:
-config layout, startup, discovery verification, and the ping/pong smoke test.
+How to stand up an A2A fleet node, deploy a repo-scoped **managed executor**, and
+verify it talks to a peer. The `fleet_send` tool schema is already in context —
+this fills the procedural gap: config layout, startup, discovery verification, the
+ping/pong smoke test, and the **canonical multi-mode deploy procedure** for all
+four managed executor modes (Claude Code, OpenCode, Codex, Antigravity / `agy`).
+
+Two layers live here:
+
+1. **Bring up this node** — `fleet.yaml`, tokens, server verify, ping/pong (below).
+2. **Deploy a managed executor into a target repo** — pick a mode, call its
+   `deploy_*_receiver`, which auto-wires `fleet.yaml` + launches the daemon; then
+   handshake, smoke-test, and drive tasks (see **Managed executors** below).
+
+> **Capability caveat (read first).** As of 2026-06-03, **only `claude_code` has
+> full tool/file/`gh` access** to do real repo work. The other three modes
+> round-trip messages (a "reply PONG" smoke test passes) but the current shims do
+> NOT yet give the CLI real tool access for substantive tasks. **Route real repo
+> work — audits, edits, reviews — to `claude_code`. Treat `opencode` / `codex` /
+> `agy` as EXPERIMENTAL/limited** until their tracking issues land (details and
+> issue links in the **Managed executors** section).
 
 ## Key facts
 
@@ -111,10 +128,127 @@ fleet:
   terminate TLS in front when binding to a non-loopback address.
 - **No CORS** → expected; A2A is server-to-server, browsers are not clients.
 
+## Managed executors (the four deploy modes)
+
+Beyond the `echo`/`llm`/`agent` inbound handlers above, Hermes can deploy a
+repo-scoped **managed executor** — a standalone receiver dropped into
+`<repo>/.hermes/` that spawns a real CLI agent (`claude` / `opencode` / `codex` /
+`agy`) with the repo's harness and POSTs replies back to this node on `:9219`.
+Each mode has a deploy/status/stop tool trio:
+
+| Tool trio | Mode | Port band | Default | Deploy params (beyond `repo_path`) | Transcript file | Session continuity |
+|-----------|------|-----------|---------|------------------------------------|-----------------|--------------------|
+| `deploy_cc_receiver` · `cc_receiver_status` · `cc_receiver_stop` | `claude_code` | `9300-9309` | `9300` | `bind_port?`, `model?`, `no_auth?`, `hermes_auth_token_env?` | `a2a-transcript.jsonl` | `uuid5(contextId)` → `claude -p --session-id` (1st) / `--resume` |
+| `deploy_oc_receiver` · `oc_receiver_status` · `oc_receiver_stop` | `opencode` | `9310-9319` | `9310` | `bind_port?`, `model?`, `no_auth?`, `hermes_auth_token_env?` | `a2a-oc-transcript.jsonl` | captured `sessionID` → `opencode run --session <id>` |
+| `deploy_codex_receiver` · `codex_receiver_status` · `codex_receiver_stop` | `codex` | `9320-9329` | `9320` | `bind_port?`, `model?`, `sandbox?` (**string**, default `workspace-write`), `no_auth?`, `hermes_auth_token_env?` | `a2a-codex-transcript.jsonl` | `thread.started` id → `codex exec resume <id>` |
+| `deploy_agy_receiver` · `agy_receiver_status` · `agy_receiver_stop` | `agy` | `9330-9339` | `9330` | `bind_port?`, `sandbox?` (**boolean** toggle), `no_auth?`, `hermes_auth_token_env?` — **NO `model`** | `a2a-agy-transcript.jsonl` | `cwd`-keyed uuid from `~/.gemini/antigravity-cli/cache/last_conversations.json` → `agy --conversation <uuid>` |
+
+**Param notes:**
+- `repo_path` (required) — absolute path; symlinks/`..` are RESOLVED to the real
+  on-disk dir and the receiver cwd is pinned there.
+- `bind_port` (optional, all modes) — **omit** to reuse this repo's existing port
+  (idempotent re-deploy) else auto-pick the first free port in the mode's band;
+  an explicit value is honored verbatim. Band exhausted → clear error.
+- `model` — cc + oc only. **codex** takes both `sandbox` (a **string**:
+  `read-only` / `workspace-write` / `danger-full-access`) and `model`. **agy**
+  takes `sandbox` as a **boolean** toggle and has **no model param** (the agy CLI
+  has no `--model` flag).
+- `no_auth` (all) — loopback dev opt-out: receiver starts with NO inbound token
+  and the auto-wired peer is a plain `url` entry. `hermes_auth_token_env` (all) —
+  env var name holding the bearer the receiver presents on replies to an
+  auth-enabled Hermes.
+
+**Auto-wire (all modes):** each `deploy_*_receiver` **auto-upserts its peer into
+`fleet.yaml`** (surgical, comment-preserving ruamel round-trip; returned under
+`fleet_peer`) — with auth a managed peer (`url` + `token_env` + `managed: true` +
+`mode` + `repo_path`), without auth a plain `url` peer. **You do NOT hand-edit
+`fleet.yaml`.** Default peer names are `claude-code` / `opencode` / `codex` /
+`agy`; a second repo reusing a default name gets a distinct `-<repo>` suffix.
+
+**Session continuity (all modes):** the same `context_id` = the same persistent
+CLI session — context accumulates across turns; a fresh `context_id` starts an
+independent thread. Each mode reuses its native session id (table above) and
+**re-mints on a session-not-found** error under the same per-context lock.
+
+**Security model (shared, all modes):** loopback-only bind by default; a random
+inbound bearer token is auto-provisioned (the env-var NAME recorded in the peer
+config, the VALUE injected into the child process); cwd is pinned to the canonical
+`repo_path` (never an inbound message path); symlinks are resolved at deploy.
+
+**CLI prerequisites:** the matching CLI (`claude` / `opencode` / `codex` / `agy`)
+must be on `PATH`; **`agy` additionally needs a one-time interactive sign-in on
+the host** (macOS Keychain — run `agy` once before deploying). If the CLI is
+missing/unauthed the receiver still **deploys and shows healthy**, but every turn
+errors — so a healthy `/health` is necessary but not sufficient; smoke-test first.
+
+### Capability caveat — what actually works today
+
+As of **2026-06-03**, **only `claude_code`** (`claude -p` with
+`--permission-mode bypassPermissions`) has full tool/file/`gh` access for real
+repo work. The other three round-trip messages (the "reply PONG" smoke test
+passes) but the current shims do NOT yet give the CLI real tool access for
+substantive tasks:
+
+- **`codex`** — receives messages but the CLI returns "no parseable output"
+  (exec arg-contract drift) — issue
+  [#97](https://github.com/Interstellar-code/hermes-agent/issues/97) (open).
+- **`opencode`** — replies to simple prompts but has no `gh` CLI / no file access
+  in the shim — issue
+  [#99](https://github.com/Interstellar-code/hermes-agent/issues/99) (open).
+- **`agy`** — replies in ~5s but is TUI-only, returns only a plan, no tool
+  execution — issue
+  [#100](https://github.com/Interstellar-code/hermes-agent/issues/100) (open).
+
+**Guidance:** route real repo work (audits, edits, reviews) to **`claude_code`**;
+treat `opencode` / `codex` / `agy` as **EXPERIMENTAL/limited** until #97 / #99 /
+#100 land.
+
+### Multi-mode deploy + verify procedure
+
+For any mode the procedure is the same — substitute the mode's `deploy_*_receiver`
+tool and params from the table above:
+
+1. **Confirm the repo path with the user.** The executor runs there with full
+   permissions; deploy only to a repo the user authorized. (For `agy`, confirm the
+   host has completed the one-time `agy` sign-in.)
+2. **Pick the mode and deploy** — call the matching tool, e.g.:
+   ```
+   deploy_cc_receiver(repo_path="/Users/you/dev/repo")                       # claude_code
+   deploy_oc_receiver(repo_path="/Users/you/dev/repo", model="...")          # opencode
+   deploy_codex_receiver(repo_path="/Users/you/dev/repo", sandbox="read-only")  # codex (sandbox = STRING)
+   deploy_agy_receiver(repo_path="/Users/you/dev/repo", sandbox=true)        # agy (sandbox = BOOLEAN, no model)
+   ```
+   The tool resolves the bind port (band auto-pick unless `bind_port` given),
+   launches the detached receiver, health-checks it, and **auto-wires the peer into
+   `fleet.yaml`** (`fleet_peer` in the result). If `status` is not healthy, surface
+   the error — do not relay tasks.
+3. **Set `agent.timeout_s` to 300+** — tool-using turns run 30s–5min; a short
+   timeout looks like a failure when the executor is still working. A no-reply-yet
+   is NOT an error: replies POST back to `:9219` minutes later.
+4. **Handshake** — send one structured message on a reserved
+   `context_id` (e.g. `handshake:<repo-slug>`) declaring Hermes' role
+   (orchestrator on `:9219`), the bound repo, the comm contract (same `context_id`
+   = same session), and the purpose; read the executor's role/cwd/harness/ready
+   confirmation. Do NOT use a `handshake:*` context for work whose reply must
+   surface to the user.
+5. **Smoke-test transport** — `fleet_send(agent="<peer>", message="reply PONG")`
+   and confirm the round-trip reply. (For the three experimental modes this is the
+   most you can currently expect — see the caveat.)
+6. **Drive tasks** — per user instruction,
+   `fleet_send(agent="<peer>", message="<task>", context_id="<thread-id>")`,
+   reusing the SAME `context_id` to continue a thread. **Anti-loop:** summarize
+   each reply to the user and await direction before the next `fleet_send`; never
+   auto-ping-pong. Surface `[error] ...` replies and stop — don't retry-storm.
+
+The per-mode status/stop tools (`*_receiver_status` / `*_receiver_stop`) check
+`{PID alive AND /health}` and SIGTERM-via-PID-file respectively. On a gateway
+restart, boot-reconcile re-publishes each managed peer's persisted token and
+leaves a healthy receiver running, relaunching only a peer that is down.
+
 ## Related
 
 - To make this node answer with real reasoning/tools, set `response_handler: llm`
   (Route A — stateless model call) or `agent` (Route B — real Hermes agent). See
   the README "Inbound response handlers" section.
-- To orchestrate **Claude Code** as a repo-scoped executor peer, see
-  `deploy-cc-receiver` **(v0.3 — planned)**.
+- For the **Claude Code** deep dive (topology, `bypassPermissions`, harness load,
+  autonomous-operation guardrails), see `deploy-cc-receiver`.

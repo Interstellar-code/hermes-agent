@@ -8,9 +8,12 @@ metadata:
 
 # a2a_fleet: deploy-cc-receiver
 
-> **Status: v0.3.** The `deploy_cc_receiver` tool and the standalone receiver
-> ship in v0.3. This skill is the orchestration procedure Hermes follows to bring
-> up and drive the receiver.
+> **Status: shipped.** `deploy_cc_receiver` / `cc_receiver_status` /
+> `cc_receiver_stop` are live tools and the standalone receiver ships in
+> `templates/cc_receiver.py`. This skill is the Claude-Code-specific deep dive.
+> **Claude Code is the ONLY mode with full tool/file/gh access today** — for the
+> three EXPERIMENTAL modes (opencode / codex / agy) and the canonical multi-mode
+> deploy procedure, see the `deploy-fleet` skill.
 
 How to make **Claude Code** a repo-scoped executor in the fleet. Hermes is the
 **orchestrator**; Claude Code is the **executor** running inside one specific
@@ -23,7 +26,7 @@ have manually, now driven by Hermes over A2A.
 
 ```
               fleet_send (outbound)
-Hermes agent ───────────────────────────▶  cc_receiver :9300  (deployed in <repo>/.hermes/)
+Hermes agent ──────────────────────────▶  cc_receiver :930x  (deployed in <repo>/.hermes/)
 (:9219, response_handler: agent)                    │  spawns claude -p  cwd=<repo>
       ▲                                             │  (full repo harness, persistent session)
       └──────── reply POST :9219 ◀──────────────────┘
@@ -31,12 +34,19 @@ Hermes agent ──────────────────────�
 
 - This node (Hermes, `:9219`, `response_handler: agent`) receives Claude's
   replies as real Hermes-agent turns (Route B — see `deploy-fleet` / README).
-- The `cc_receiver` (`:9300`) is a NEW standalone Claude-side peer, NOT a Hermes
-  `response_handler`. Hermes deploys, owns, and launches it as a managed daemon.
+- The `cc_receiver` (`:930x` — auto-allocated in the `9300-9309` band) is a NEW
+  standalone Claude-side peer, NOT a Hermes `response_handler`. Hermes deploys,
+  owns, and launches it as a managed daemon.
 
 ## Key facts
 
-- **One repo at a time** (single receiver on `:9300`); multi-repo is deferred.
+- **Many repos, one band.** Claude Code receivers own the **`9300-9309`** port
+  band (10 ports). `deploy_cc_receiver` with no `bind_port` **reuses this repo's
+  existing port** on re-deploy (idempotent) else **auto-picks the first free port
+  in the band**, skipping ports claimed by other repos' peers; an explicit
+  `bind_port` is honored verbatim. Band start (`9300`) is the default. Multiple
+  same-mode receivers across different repos coexist without colliding; the band
+  being exhausted yields a clear error.
 - **cwd is pinned at deploy time** to `repo_path` — NEVER taken from an inbound
   message. Claude runs with `bypassPermissions` inside that repo, so it can do
   anything there: only deploy to repos the user has explicitly authorized.
@@ -52,28 +62,37 @@ Hermes agent ──────────────────────�
   Hermes redeploys on the next request.
 - Replies are POSTed back to Hermes on `:9219` with the same `context_id`.
 
-## fleet.yaml peer schema (repo-aware — v0.3)
+## fleet.yaml peer schema (repo-aware) — AUTO-WIRED
 
-A Claude Code peer gains repo binding; `load_fleet()` surfaces these fields:
+A Claude Code peer carries repo binding; `load_fleet()` surfaces these fields:
 
 ```yaml
 fleet:
   agents:
     claude-code:
-      url: http://127.0.0.1:9300
-      repo_path: /Users/you/dev/some-repo   # the bound repo (cwd of claude -p)
+      url: http://127.0.0.1:9301             # the auto-allocated band port
+      repo_path: /Users/you/dev/some-repo    # the bound repo (cwd of claude -p)
       managed: true                          # Hermes owns/launches the daemon
       mode: claude_code                      # distinguishes from plain url/token peers
+      token_env: A2A_CC_TOKEN_SOME_REPO_1A2B3C4D   # the receiver's stable token env name
 ```
 
-### fleet.yaml peer entry (after deploy)
+### fleet.yaml peer entry (after deploy) — written FOR you
 
-`deploy_cc_receiver` does **NOT** auto-edit `fleet.yaml` — it preserves your
-comments and hand-maintained structure. After a successful deploy, ensure the
-`claude-code` peer exists in `fleet.yaml` so `fleet_send` authenticates and
-boot-reconcile manages it. The deploy result returns the exact values to wire:
+`deploy_cc_receiver` **auto-upserts** this peer into `fleet.yaml` for you — a
+surgical ruamel round-trip that **preserves your comments and formatting**. You
+do **NOT** hand-edit `fleet.yaml`. The upsert result is returned under
+`fleet_peer`; a config-write hiccup is a non-fatal warning (the receiver is
+already healthy). With auth it writes a managed peer (`url` + `token_env` +
+`managed: true` + `mode: claude_code` + `repo_path`); a `no_auth` deploy writes a
+plain `url` peer. The default peer name is `claude-code`; a second repo reusing
+that default name gets a distinct `-<repo>` suffix.
 
-- `repo_path` — the canonical repo path (echoed in the result),
+The deploy result also echoes the exact values it wired:
+
+- `repo_path` — the canonical repo path,
+- `port` — the bound port (auto-allocated in the `9300-9309` band, or your
+  explicit `bind_port`),
 - `receiver_token_env` — the **stable** inbound-token env var NAME (e.g.
   `A2A_CC_TOKEN_<SLUG>_<HASH12>`); the same name every redeploy, so it can be
   referenced persistently. The token VALUE is fresh per deploy and is published
@@ -84,22 +103,9 @@ boot-reconcile manages it. The deploy result returns the exact values to wire:
   transcript runtime files are never committed (the tracked `A2A.md` @import is
   fine to commit).
 
-Add (or confirm) this block, using the `receiver_token_env` deploy returned:
-
-```yaml
-fleet:
-  agents:
-    claude-code:
-      url: http://127.0.0.1:9300
-      repo_path: /Users/you/dev/some-repo
-      managed: true
-      mode: claude_code
-      token_env: A2A_CC_TOKEN_SOME_REPO_1A2B3C4D   # <- receiver_token_env from deploy
-```
-
 With `token_env` set, `fleet_send(agent="claude-code", ...)` resolves the bearer
-from the gateway environment and presents it on `POST :9300/jsonrpc`. With
-`managed: true` + `mode: claude_code` + `repo_path`, boot-reconcile on the next
+from the gateway environment and presents it on the receiver's `POST /jsonrpc`.
+With `managed: true` + `mode: claude_code` + `repo_path`, boot-reconcile on the next
 gateway start **leaves a healthy receiver running** (it re-publishes the persisted
 `.token` so in-session `fleet_send` keeps working — it does NOT kill an executor
 that may be mid-task) and only redeploys when the receiver is down (then the token
@@ -108,14 +114,15 @@ the claude `--resume` session files). The desired bind port comes from this peer
 `url`, not from on-disk state.
 
 `token_env` for a managed `claude_code` peer **must** equal the `receiver_token_env`
-the deploy returned (the stable per-repo name); `load_fleet` rejects a mismatch so
-the gateway and receiver never resolve different vars.
+the deploy wrote (the stable per-repo name); `load_fleet` rejects a mismatch so
+the gateway and receiver never resolve different vars. Because the deploy
+auto-wires this peer, the mismatch only arises if you later hand-edit `fleet.yaml`.
 
 ## Procedure
 
-End-to-end: **confirm repo → `deploy_cc_receiver` → ensure `fleet.yaml` peer entry
-(with `token_env`) → handshake → (per task) `fleet_send` + monitor + summarize to
-the user + await direction.**
+End-to-end: **confirm repo → `deploy_cc_receiver` (auto-wires `fleet.yaml`) →
+handshake → (per task) `fleet_send` + monitor + summarize to the user + await
+direction.**
 
 1. **Ask the user for the target repo path, then CONFIRM it back before acting.**
    Do not proceed on an assumed path. Example:
@@ -140,27 +147,37 @@ the user + await direction.**
      idempotent `@import .hermes/A2A.md` line to `<repo>/CLAUDE.md` (between
      `<!-- a2a-fleet:start -->` / `:end -->`; creates `CLAUDE.md` if absent,
      never clobbers existing content) — role text stays out of tracked files,
+   - resolves the bind port: an explicit `bind_port` is honored verbatim; omit it
+     to reuse this repo's already-configured port (idempotent re-deploy) or
+     auto-pick the first free port in the `claude_code` band `9300-9309`,
    - stops any existing receiver for this repo before launching a fresh one,
-   - launches the receiver **detached** (survives gateway restart) on `:9300`,
-     records `<repo>/.hermes/cc_receiver.pid`, health-checks `:9300/health`,
+   - launches the receiver **detached** (survives gateway restart) on the resolved
+     `:930x`, records `<repo>/.hermes/cc_receiver.pid`, health-checks `/health`,
    - on a SUCCESSFUL deploy (after health passes) persists the provisioned token
      to `<repo>/.hermes/.token` (chmod 0600) and writes/updates
      `<repo>/.hermes/.gitignore` (`.token`, `*.pid`, `*.log`, `a2a-inbox*`,
      `a2a-transcript*`, `a2a-inbox.offset`). On a failed/unhealthy deploy NO token
-     is published to the gateway env and NO `.token` is written (no secret leak).
+     is published to the gateway env and NO `.token` is written (no secret leak),
+   - **auto-upserts the `claude-code` peer into `fleet.yaml`** (comment-preserving
+     ruamel round-trip; result under `fleet_peer`) — you do NOT hand-edit it.
 
-   Returns `{deployed, pid, port, repo_path, status, receiver_token_env}`. If
-   `status` is not healthy, surface the error to the user — do not start relaying
+   Optional params: `bind_port` (see above), `model` (pin a claude model, e.g.
+   `"sonnet"` / `"opus"`), `no_auth` (loopback dev opt-out — receiver starts with
+   NO inbound token; writes a plain `url` peer), `hermes_auth_token_env` (env var
+   name holding the bearer the receiver presents on replies to an auth-enabled
+   Hermes).
+
+   Returns `{deployed, pid, port, repo_path, status, receiver_token_env, fleet_peer}`.
+   If `status` is not healthy, surface the error to the user — do not start relaying
    tasks.
 
-3. **Ensure the `fleet.yaml` peer entry** (see schema above). Confirm the
-   `claude-code` peer block exists with the `token_env` the deploy returned, and
-   set a generous turn timeout — **`agent.timeout_s` must be 300+** (a `claude -p`
-   turn that uses tools runs 30s–5min; a short timeout will look like a failure
-   when the executor is simply still working). `load_fleet` logs a warning (not an
-   error) when a managed `claude_code` peer is configured with `agent.timeout_s`
-   below 300. A no-reply-yet is NOT an error: the async reply POSTs back to `:9219`
-   minutes later.
+3. **Set the turn timeout.** The peer block is already wired by the deploy, so the
+   only thing to confirm is a generous turn timeout — **`agent.timeout_s` must be
+   300+** (a `claude -p` turn that uses tools runs 30s–5min; a short timeout will
+   look like a failure when the executor is simply still working). `load_fleet`
+   logs a warning (not an error) when a managed `claude_code` peer is configured
+   with `agent.timeout_s` below 300. A no-reply-yet is NOT an error: the async
+   reply POSTs back to `:9219` minutes later.
 
 4. **Handshake** — one-shot, before any real task. Send the executor a structured
    first message on a reserved `context_id` (e.g. `handshake:<repo-slug>`) and read
@@ -249,8 +266,9 @@ the user + await direction.**
 
 ## Success criteria
 
-- `deploy_cc_receiver` returns `{status: healthy}`; `:9300/health` is up; the
-  managed `CLAUDE.md` block is present; a PID is tracked.
+- `deploy_cc_receiver` returns `{status: healthy}`; the receiver's `/health` is
+  up; the `claude-code` peer is wired in `fleet.yaml` (`fleet_peer` in the
+  result); the managed `CLAUDE.md` block is present; a PID is tracked.
 - Handshake confirms roles (orchestrator / executor), the bound repo, and the
   comm contract; harness inventory reported.
 - `fleet_send(agent="claude-code", ...)` runs `claude -p` IN the repo with its
@@ -263,7 +281,7 @@ the user + await direction.**
 - **Harness silently not loaded** → check `--setting-sources` / `--mcp-config`;
   the handshake harness inventory should list the repo's skills/MCP. A reduced
   inventory means the repo settings didn't load.
-- **"busy, retry" on `:9300`** → a turn for that `context_id` is still running;
+- **"busy, retry" on the receiver** → a turn for that `context_id` is still running;
   wait for it, don't fire a second concurrent turn on the same context.
 - **Gateway restart** → boot-reconcile re-publishes each managed peer's persisted
   `.token` and **leaves a healthy receiver running** (it never kills an executor
