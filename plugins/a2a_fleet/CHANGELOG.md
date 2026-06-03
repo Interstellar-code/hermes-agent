@@ -1,5 +1,27 @@
 # a2a_fleet — Changelog
 
+## v0.8.11 — agy empty-output is actionable (#105) + spawners pin HERMES_HOME (#98)
+
+- **#105 — agy `--print` rc=0 + empty stdout is now actionable.** agy v1.0.4 in
+  `--print` mode exits `rc=0` with EMPTY stdout/stderr when not signed in — a
+  SILENT failure (no hang, no marker string). The receiver's auth heuristic
+  required `empty stdout AND an auth-marker`, so this case slipped through to the
+  opaque `[no reply produced by agy]`. `run_agy_turn` now treats ANY empty turn
+  as the actionable sign-in failure and returns the existing
+  `agy not authenticated — run \`agy\` interactively once...` hint. (The root
+  cause is host onboarding — agy must be signed in once via Keychain; the code
+  just surfaces it clearly instead of an opaque fallback.)
+- **#98 — receiver spawners pin `HERMES_HOME` in the child env.** All four
+  `deploy_*_receiver` handlers now always build the child env and set
+  `HERMES_HOME = str(get_hermes_home())` (previously the env was only built when
+  a token was provisioned, and `HERMES_HOME` was never set explicitly). A
+  detached receiver therefore resolves the SAME profile the deployer did, never
+  the silent `~/.hermes` default-profile fallback that would write state to the
+  wrong profile.
+- Tests: agy empty-output → auth hint (not opaque fallback); cc deploy child env
+  always carries `HERMES_HOME` (incl. the `no_auth` path). Both
+  falsification-verified. Full suite 401 passed.
+
 ## v0.8.10 — managed-peer token resolves from persisted .token (token-drift fix, #104)
 
 - **Bug fix (#104)**: `fleet_send` could send no bearer → HTTP 401 against a

@@ -716,9 +716,13 @@ async def deploy_cc_receiver_handler(
     # launch fails or the child never becomes healthy, we must leave no token
     # leak behind (#7). The doomed child still got the token at launch, but it is
     # torn down below, so that copy is harmless.
-    child_env: Optional[Dict[str, str]] = None
+    # Always pin HERMES_HOME so the detached receiver resolves the SAME profile
+    # the deployer did, never the silent ~/.hermes default-profile fallback (#98).
+    from hermes_constants import get_hermes_home  # noqa: PLC0415,WPS433
+
+    child_env: Dict[str, str] = dict(os.environ)
+    child_env["HERMES_HOME"] = str(get_hermes_home())
     if receiver_token is not None:
-        child_env = dict(os.environ)
         child_env[receiver_token_env] = receiver_token
     try:
         pid = _launch_receiver(repo, receiver_dest, log_path, env=child_env)
