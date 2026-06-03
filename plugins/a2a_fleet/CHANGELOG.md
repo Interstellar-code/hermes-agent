@@ -1,5 +1,30 @@
 # a2a_fleet — Changelog
 
+## v0.8.8 — agy runner env fix + timeout normalization (Codex review of v0.8.7)
+
+Follow-up to v0.8.7 from a skeptical Codex review of the merge:
+
+- **HIGH — agy `_subprocess_runner` ignored the augmented env.** v0.8.7 added
+  `_tool_env()` (PATH + `AGY_CLI_DISABLE_LATEX`) but the real turn runner still
+  built `env = dict(os.environ)` directly, so live agy turns launched with the
+  raw (launchd-minimal) PATH while only the CLI probe saw the augmentation — the
+  exact regression v0.8.7 claimed to fix. The v0.8.7 live proof masked it (the
+  ad-hoc test ran with an ambient PATH that already had `gh`). The runner now
+  uses `env=_tool_env()` and `stdin=subprocess.DEVNULL`. (Caught by Codex; the
+  unit suite missed it because agy lacked the runner-env test codex/opencode had.)
+- **MEDIUM — `--print-timeout` could truncate to `0s`.** The flag value
+  (`int(float(agy_timeout_s))`) and the receiver backstop (`float + 60`) were
+  computed independently, so a fractional/tiny budget broke the invariant
+  (`0.5 → --print-timeout 0s` but backstop `60.5s`). Both now derive from one
+  `_print_timeout_s()` helper (ceil, min 1s); backstop = that + 60s grace.
+- **LOW — added the missing agy runner-env test** (mirrors codex/opencode):
+  patches `Popen`, asserts the augmented PATH + `AGY_CLI_DISABLE_LATEX` + closed
+  stdin reach the child. Plus a `--print-timeout` floor test. Falsification-verified.
+
+Codex confirmed sound: append-vs-prepend PATH (no hijack), codex `stdin=DEVNULL`
+on both first+resume turns, `opencode_agent=None` keeps tool access, and the
+forbidden-flag stripping. Full suite 395 passed.
+
 ## v0.8.7 — executor tool-parity: opencode/codex/agy do real repo work (#97, #99, #100)
 
 Brings the three non-Claude executors up to the `claude_code` bar — real
