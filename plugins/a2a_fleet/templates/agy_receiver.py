@@ -329,11 +329,21 @@ def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]
         if isinstance(conversation_id, str) and conversation_id.strip():
             last_stdout = entry.get("last_stdout")
             updated_at = entry.get("updated_at")
-            clean[context_id] = {
+            rec: Dict[str, Any] = {
                 "conversation_id": conversation_id.strip(),
                 "last_stdout": last_stdout if isinstance(last_stdout, str) else "",
                 "updated_at": int(updated_at) if isinstance(updated_at, (int, float)) else int(time.time()),
             }
+            # Preserve the drift flag (#108/#109) across reads — it is what makes
+            # the silent extractor fallback observable to the dashboard / Hermes.
+            if entry.get("prefix_drifted") is True:
+                rec["prefix_drifted"] = True
+                drifted_at = entry.get("drifted_at")
+                if isinstance(drifted_at, (int, float)):
+                    rec["drifted_at"] = int(drifted_at)
+            else:
+                rec["prefix_drifted"] = False
+            clean[context_id] = rec
     return clean
 
 
@@ -370,17 +380,31 @@ def store_session_for_context(
     conversation_id: str,
     last_stdout: str,
     path: Path = SESSION_MAP_PATH,
+    *,
+    prefix_drifted: bool = False,
 ) -> None:
-    """Persist contextId -> {conversation_id, last_stdout} atomically."""
+    """Persist contextId -> {conversation_id, last_stdout, prefix_drifted} atomically.
+
+    ``prefix_drifted`` records whether THIS turn's resume output failed to match
+    the persisted ``last_stdout`` prefix (issue #108) — a restart/crash left the
+    receiver's baseline out of sync with agy's server-side conversation. The flag
+    (+ ``drifted_at`` when set) turns a previously-silent extractor fallback into
+    a machine-observable event the dashboard / Hermes can surface (#109).
+    """
     if not conversation_id.strip():
         return
+    now = int(time.time())
     with _SESSION_MAP_LOCK:
         data = load_session_map(path)
-        data[context_id] = {
+        record = {
             "conversation_id": conversation_id.strip(),
             "last_stdout": last_stdout if isinstance(last_stdout, str) else "",
-            "updated_at": int(time.time()),
+            "prefix_drifted": bool(prefix_drifted),
+            "updated_at": now,
         }
+        if prefix_drifted:
+            record["drifted_at"] = now
+        data[context_id] = record
         _write_session_map(data, path)
 
 
@@ -605,6 +629,31 @@ def extract_reply(stdout: str, prior_stdout: Optional[str]) -> Optional[str]:
     return text.strip() or None
 
 
+# Returned (instead of the opaque "[no reply produced by agy]") when a drifted
+# resume turn yields no extractable reply — tells the reader the receiver lost
+# its prefix baseline, not that agy failed to answer (#108/#109).
+DRIFT_REPLY_MSG = (
+    "[drift detected — persisted last_stdout does not match agy's cumulative "
+    "output; receiver baseline lost after a restart]"
+)
+
+
+def _prefix_drifted(stdout: str, prior_stdout: Optional[str]) -> bool:
+    """True when a RESUME turn's stdout does not start with the persisted prior
+    transcript — the receiver's baseline drifted from agy's server-side
+    conversation (e.g. after a restart, #108). Mirrors extract_reply's prefix
+    match (exact, then rstripped). First turns (no prior) never drift.
+    """
+    if not prior_stdout or stdout is None:
+        return False
+    if stdout.startswith(prior_stdout):
+        return False
+    rprior = prior_stdout.rstrip("\n")
+    if rprior and stdout.startswith(rprior):
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Per-contextId serialization
 # ---------------------------------------------------------------------------
@@ -767,13 +816,31 @@ def run_agy_turn(
             reply = extract_reply(stdout, prior_stdout)
             full_stdout_for_persist = stdout
 
+        # Prefix drift (#108): a resume turn whose stdout is not the persisted
+        # prior transcript means the receiver's baseline is out of sync with
+        # agy's server-side conversation (typically after a restart). Record it
+        # as a first-class flag (#109) so the silent extractor fallback becomes
+        # observable, and give an honest reply if nothing extractable came out.
+        drifted = (not reminted) and _prefix_drifted(stdout, prior_stdout)
+        if drifted:
+            log.warning(
+                "prefix drift for ctx=%s: persisted last_stdout is not a prefix "
+                "of agy's resume output (receiver likely restarted mid-session, #108)",
+                context_id,
+            )
+            if reply is None:
+                reply = DRIFT_REPLY_MSG
+
         # Capture + persist the conversation uuid for the next resume. On a fresh
         # first turn (or a remint) agy minted a NEW uuid recorded in
         # last_conversations.json; on a resume the uuid is unchanged (reuse
         # stored).
         new_cid = stored_cid or discover_conversation_id(repo_path)
         if new_cid:
-            store_session_for_context(context_id, new_cid, full_stdout_for_persist, session_map_path)
+            store_session_for_context(
+                context_id, new_cid, full_stdout_for_persist, session_map_path,
+                prefix_drifted=drifted,
+            )
         else:
             log.warning(
                 "could not discover agy conversation uuid for ctx=%s (cwd=%s); "

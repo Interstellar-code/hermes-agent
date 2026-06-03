@@ -189,6 +189,51 @@ def test_agy_print_timeout_never_truncates_to_zero(agr, tmp_path):
     assert cmd[cmd.index("--print-timeout") + 1] == "1s"
 
 
+def test_agy_prefix_drift_detection(agr):
+    # #108: a resume whose stdout is not the persisted prefix = drift.
+    assert agr._prefix_drifted("TOTALLY NEW", "OLD PREFIX") is True
+    assert agr._prefix_drifted("OLD PREFIX\nmore", "OLD PREFIX") is False   # exact prefix
+    assert agr._prefix_drifted("OLD PREFIX\nmore", "OLD PREFIX\n") is False  # rstripped prefix
+    assert agr._prefix_drifted("anything", None) is False                    # first turn never drifts
+    assert agr._prefix_drifted("", "OLD") is True                            # empty resume = drift
+
+
+def test_agy_store_persists_prefix_drifted_flag(agr, tmp_path, monkeypatch):
+    path = tmp_path / "sessions.json"
+    monkeypatch.setattr(agr, "SESSION_MAP_PATH", path, raising=False)
+    agr.store_session_for_context("ctx-1", "uuid-1", "out", path, prefix_drifted=True)
+    rec = agr.get_session_entry("ctx-1", path)
+    assert rec["prefix_drifted"] is True
+    assert "drifted_at" in rec
+    # clean turn clears the flag, drops drifted_at
+    agr.store_session_for_context("ctx-1", "uuid-1", "out2", path, prefix_drifted=False)
+    rec = agr.get_session_entry("ctx-1", path)
+    assert rec["prefix_drifted"] is False
+    assert "drifted_at" not in rec
+
+
+def test_agy_run_turn_flags_drift_on_restart_resume(agr, tmp_path, monkeypatch):
+    # #108 reproduction: a resume turn lands at a receiver whose persisted
+    # last_stdout no longer prefixes agy's cumulative output -> flag drift, and
+    # the reply is the (visible) full output, not a silent empty.
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    path = runtime / "sessions.json"
+    monkeypatch.setattr(agr, "SESSION_MAP_PATH", path, raising=False)
+    monkeypatch.setattr(agr, "TRANSCRIPT_PATH", runtime / "t.jsonl", raising=False)
+    monkeypatch.setattr(agr, "discover_conversation_id", lambda *a, **k: "uuid-1", raising=False)
+    # Pre-seed a resume session whose stored prefix will NOT match the new output.
+    agr.store_session_for_context("ctx-drift", "uuid-1", "STALE TURN-1 TRANSCRIPT", path)
+
+    cfg = _cfg(agr, tmp_path)
+    reply = agr.run_agy_turn(
+        "next", "ctx-drift", cfg,
+        runner=lambda c, w, t: ("COMPLETELY DIFFERENT CUMULATIVE OUTPUT", 0, ""),
+    )
+    assert reply == "COMPLETELY DIFFERENT CUMULATIVE OUTPUT"  # visible, not empty
+    assert agr.get_session_entry("ctx-drift", path)["prefix_drifted"] is True
+
+
 def test_agy_empty_output_returns_actionable_auth_error(agr, tmp_path, monkeypatch):
     # #105: agy v1.0.4 --print exits rc=0 with EMPTY stdout/stderr when not
     # signed in (silent, no marker). The turn must surface the actionable

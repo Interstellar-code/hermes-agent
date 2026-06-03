@@ -1,5 +1,28 @@
 # a2a_fleet — Changelog
 
+## v0.8.13 — agy prefix-drift made observable (#108) + #109 near-term
+
+Addresses the agy intermittent `[no reply produced by agy]` / stale-context
+replies after a mid-session receiver restart (#108), via the #109 near-term plan.
+
+- **`prefix_drifted` flag (the key fix).** When a resume turn's stdout is NOT a
+  prefix of the persisted `last_stdout` (baseline lost after a restart),
+  `run_agy_turn` now records `prefix_drifted: true` + `drifted_at` in
+  `a2a-agy-sessions.json` and logs a warning. A clean turn records
+  `prefix_drifted: false`. This converts a previously-silent extractor fallback
+  into a machine-observable event the dashboard / Hermes can surface.
+  `load_session_map` preserves the flag across reads.
+- **Honest reply on drift.** A drifted turn that yields nothing extractable now
+  returns `[drift detected — persisted last_stdout does not match agy's
+  cumulative output...]` instead of the opaque `[no reply produced by agy]`.
+  (In practice the extractor already returns the full cumulative output on a
+  prefix mismatch — visible, not empty — so this is the belt-and-suspenders edge.)
+- **Atomic persistence** (#109 item 1) was already in place — `_write_session_map`
+  uses tmp + `os.replace` under the per-context lock; no change needed.
+- Long-term (#71 handshake v2) remains the durable fix and is out of scope here.
+- Tests: drift detection, flag persist/clear + read-back, run_agy_turn flags a
+  restart-resume drift. Falsification-verified. Full suite 405 passed.
+
 ## v0.8.12 — managed-token resolution prefers the authoritative .token (P0-3)
 
 - **Token precedence inverted for managed peers.** `_resolve_managed_token` now
