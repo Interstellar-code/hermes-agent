@@ -546,9 +546,13 @@ async def deploy_agy_receiver_handler(
         if stopped is not None:
             warnings.append(f"stopped previous receiver pid={stopped}")
 
-        child_env: Optional[Dict[str, str]] = None
+        # Always pin HERMES_HOME so the detached receiver resolves the SAME
+        # profile the deployer did, never the ~/.hermes default fallback (#98).
+        from hermes_constants import get_hermes_home  # noqa: PLC0415,WPS433
+
+        child_env: Dict[str, str] = dict(os.environ)
+        child_env["HERMES_HOME"] = str(get_hermes_home())
         if receiver_token is not None:
-            child_env = dict(os.environ)
             child_env[receiver_token_env] = receiver_token
         try:
             pid = _launch_receiver(repo, receiver_dest, log_path, env=child_env)

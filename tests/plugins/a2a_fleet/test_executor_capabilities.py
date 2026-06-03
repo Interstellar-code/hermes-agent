@@ -189,6 +189,24 @@ def test_agy_print_timeout_never_truncates_to_zero(agr, tmp_path):
     assert cmd[cmd.index("--print-timeout") + 1] == "1s"
 
 
+def test_agy_empty_output_returns_actionable_auth_error(agr, tmp_path, monkeypatch):
+    # #105: agy v1.0.4 --print exits rc=0 with EMPTY stdout/stderr when not
+    # signed in (silent, no marker). The turn must surface the actionable
+    # "agy not authenticated — run agy interactively..." hint, NOT the opaque
+    # "[no reply produced by agy]" fallback.
+    runtime = tmp_path / "rt"
+    runtime.mkdir()
+    monkeypatch.setattr(agr, "SESSION_MAP_PATH", runtime / "s.json", raising=False)
+    monkeypatch.setattr(agr, "TRANSCRIPT_PATH", runtime / "t.jsonl", raising=False)
+    monkeypatch.setattr(agr, "discover_conversation_id", lambda *a, **k: None, raising=False)
+
+    cfg = _cfg(agr, tmp_path)
+    res = agr.run_agy_turn("hi", "ctx-empty", cfg, runner=lambda c, w, t: ("", 0, ""))
+    assert res is not None
+    assert "not authenticated" in res.lower(), f"expected actionable auth hint, got {res!r}"
+    assert "no reply produced" not in res.lower()
+
+
 def test_agy_receiver_backstop_outlives_print_timeout(agr, tmp_path, monkeypatch):
     """run_agy_turn must hand the runner a backstop = agy_timeout_s + grace, so
     agy reaches its own --print-timeout and self-exits before being killed."""

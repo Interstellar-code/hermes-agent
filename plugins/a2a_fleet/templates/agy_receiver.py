@@ -748,8 +748,13 @@ def run_agy_turn(
             prior_stdout = None
             reminted = True
 
-        # Auth-failure heuristic: empty/failed turn that looks like a sign-in issue.
-        if (not stdout.strip()) and looks_like_auth_failure(stdout, stderr):
+        # Empty output = failed turn. agy v1.0.4 `--print` exits rc=0 with EMPTY
+        # stdout/stderr when not signed in — a SILENT failure with no marker
+        # string and no hang, so the old `empty AND auth-marker` heuristic missed
+        # it and the turn fell through to the opaque "[no reply produced by agy]"
+        # fallback (#105). Treat ANY empty turn as the actionable sign-in failure;
+        # a non-empty turn carrying an explicit auth marker is surfaced the same.
+        if (not stdout.strip()) or looks_like_auth_failure(stdout, stderr):
             return f"[error] {AUTH_HELP}"
 
         # Reply extraction. On a remint the warning line is stripped and there is

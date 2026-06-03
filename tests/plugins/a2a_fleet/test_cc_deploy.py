@@ -516,6 +516,10 @@ def test_deploy_provisions_inbound_token(tmp_path: Path, stub_template, monkeypa
 
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
     assert res["deployed"] is True
+    # #98: the detached receiver's env always pins HERMES_HOME so it resolves the
+    # deployer's profile, not the silent ~/.hermes default-profile fallback.
+    assert captured["env"] is not None
+    assert "HERMES_HOME" in captured["env"]
     # Returned to Hermes for fleet_send wiring.
     token = res["receiver_token"]
     token_env = res["receiver_token_env"]
@@ -601,8 +605,11 @@ def test_deploy_no_auth_opt_out(tmp_path: Path, stub_template, monkeypatch: pyte
     assert "receiver_token" not in res
     cfg = json.loads((repo / ".hermes" / "a2a_receiver.json").read_text())
     assert "auth_token_env" not in cfg
-    # No injected env override (full os.environ not copied).
-    assert captured["env"] is None
+    # no_auth opt-out is enforced by the absence of receiver_token (result) and
+    # auth_token_env (config), asserted above. #98: the child env is still built
+    # to pin HERMES_HOME even on the no_auth path.
+    assert captured["env"] is not None
+    assert "HERMES_HOME" in captured["env"]
     assert any("no_auth" in w for w in res["warnings"])
 
 
