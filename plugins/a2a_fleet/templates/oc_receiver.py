@@ -93,6 +93,14 @@ DEFAULTS: Dict[str, Any] = {
     ),
     "role_file": None,            # if set, read role prompt from this path (overrides role_prompt)
     "opencode_model": None,
+    # Agent profile opencode runs under. None = opencode's OWN default primary
+    # agent, which already has the full tool set (read/edit/bash). Do NOT force
+    # "build": in some installs (e.g. 1.15.13) "build" is registered as a
+    # SUBAGENT, and `--agent build` then warns + falls back to default anyway.
+    # The real #99 fix is PATH augmentation (gh/git reach the daemon), not the
+    # agent. Set this only to pin a specific tool-enabled primary agent; never a
+    # restricted/plan agent (the model would reply "I don't have access").
+    "opencode_agent": None,
     "opencode_extra_flags": [],     # list[str] appended verbatim to the command
     "auth_token_env": None,       # env var name holding the INBOUND bearer token (POST /jsonrpc)
     "hermes_auth_token_env": None,  # env var name holding the bearer token for OUTBOUND replies to Hermes
@@ -262,6 +270,7 @@ _FORBIDDEN_OC: frozenset[str] = frozenset({
     "run",          # subcommand — positional, but guard against it in flags list
     "--print",
     "--format",
+    "--agent",      # managed via cfg["opencode_agent"]
 })
 
 
@@ -317,6 +326,12 @@ def build_opencode_command(
         "json",
         "--dangerously-skip-permissions",
     ]
+    # Optional explicit agent. Default (None) uses opencode's own default primary
+    # agent, which already has the full tool set. Only pinned when an operator
+    # sets a specific tool-enabled primary agent (see DEFAULTS note, issue #99).
+    agent = cfg.get("opencode_agent") or DEFAULTS["opencode_agent"]
+    if agent:
+        cmd += ["--agent", str(agent)]
     model = cfg.get("opencode_model")
     if model:
         cmd += ["--model", str(model)]
@@ -523,21 +538,47 @@ def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
     return False
 
 
+# Common tool dirs appended to PATH for spawned CLIs. A receiver launched by
+# launchd (or any non-login daemon) inherits a minimal PATH, so the agent's
+# bash/tool calls can't find `gh`/`git`/node — which surfaces as "I don't have
+# access to the gh CLI" (issue #99). We APPEND (never shadow) so an explicit
+# PATH from the parent still wins; only missing dirs are added as fallbacks.
+_EXTRA_PATH_DIRS: Tuple[str, ...] = (
+    "/opt/homebrew/bin", "/opt/homebrew/sbin",
+    "/usr/local/bin", "/usr/local/sbin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+)
+
+
+def _tool_env() -> Dict[str, str]:
+    """os.environ copy with common tool dirs appended to PATH (gh/git/node)."""
+    env = dict(os.environ)
+    parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    for d in (os.path.expanduser("~/.local/bin"), *_EXTRA_PATH_DIRS):
+        if d and d not in parts and os.path.isdir(d):
+            parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
     """Real subprocess invocation of ``opencode run``.
 
     Uses ``Popen`` + ``start_new_session=True`` so the whole process tree lands in
     its own process group; on timeout we ``killpg`` the group to reap orphans.
-    Returns (stdout, rc, stderr). Buffers are capped defensively.
+    Returns (stdout, rc, stderr). Buffers are capped defensively. ``env`` carries
+    an augmented PATH so opencode's bash/tool calls can find gh/git (issue #99).
     """
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            env=_tool_env(),
         )
     except FileNotFoundError:
         raise OpenCodeCLINotFound("opencode") from None

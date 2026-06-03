@@ -592,23 +592,53 @@ def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
     return False
 
 
+# Common tool dirs appended to PATH for the spawned codex process. A receiver
+# launched by launchd (or any non-login daemon) inherits a minimal PATH, so
+# codex's tool/command_execution calls can't find `gh`/`git`/node. We APPEND
+# (never shadow) so an explicit parent PATH still wins; only missing dirs are
+# added as fallbacks.
+_EXTRA_PATH_DIRS: Tuple[str, ...] = (
+    "/opt/homebrew/bin", "/opt/homebrew/sbin",
+    "/usr/local/bin", "/usr/local/sbin",
+    "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+)
+
+
+def _tool_env() -> Dict[str, str]:
+    """os.environ copy with common tool dirs appended to PATH (gh/git/node)."""
+    env = dict(os.environ)
+    parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    for d in (os.path.expanduser("~/.local/bin"), *_EXTRA_PATH_DIRS):
+        if d and d not in parts and os.path.isdir(d):
+            parts.append(d)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
     """Real subprocess invocation of ``codex exec``.
 
     Uses ``Popen`` + ``start_new_session=True`` so the whole process tree lands in
     its own process group; on timeout we ``killpg`` the group to reap orphans.
     Returns (stdout, rc, stderr). Buffers are capped defensively.
-    stderr note: codex writes "Reading additional input from stdin..." to stderr
-    as benign noise; we capture it for session-not-found detection only.
+
+    stdin=DEVNULL is REQUIRED (codex-cli >= 0.136). codex exec inspects whether
+    stdin is a pipe; if it is (which a detached daemon's inherited stdin is) and
+    the positional prompt isn't consumed, codex blocks "Reading additional input
+    from stdin..." and exits rc=1 with no parseable output (issue #97). Closing
+    stdin forces codex to use the positional prompt argument. The prompt is ALWAYS
+    passed as a positional arg (see build_codex_command), never via stdin.
     """
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
+            env=_tool_env(),
         )
     except FileNotFoundError:
         raise CodexCLINotFound("codex") from None
