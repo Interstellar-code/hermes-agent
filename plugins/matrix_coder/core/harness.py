@@ -1,11 +1,16 @@
-"""Phase 0 walking-skeleton harness for Matrix Coder.
+"""Harness for Matrix Coder: parse a trigger and compose the specialist persona.
 
-Wires the pieces end-to-end without a real LLM dispatch:
+Phase 1 main path (:func:`handle_trigger`):
 
-  load base contracts + the ``_passthrough`` persona
+  parse the user message for a trigger
+    -> run the intake gate (explicit trigger -> always MATRIX)
+    -> load base contracts + the role persona (+ the review lens text)
     -> compose persona text
-    -> mark the dispatch active (so the ``pre_llm_call`` hook would inject it)
-    -> return a :class:`SpecialistResult` shaped per the output contract.
+    -> mark the dispatch active (so the ``pre_llm_call`` hook injects it this turn)
+    -> return the composed persona string for same-turn injection.
+
+The Phase 0 :func:`run_passthrough` walking skeleton is retained for the
+``/matrix`` smoke path and the older tests; it is no longer the main route.
 
 Import-light by design: only depends on sibling ``core`` modules.
 """
@@ -13,10 +18,12 @@ Import-light by design: only depends on sibling ``core`` modules.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from . import registry
 from .hermes_bridge import bridge
-from .models import IntakeDecision, SpecialistResult, Verdict
+from .intake import intake_gate, parse_trigger
+from .models import SpecialistResult
 from .prompts import compose_persona
 
 logger = logging.getLogger(__name__)
@@ -24,17 +31,38 @@ logger = logging.getLogger(__name__)
 _PASSTHROUGH = "_passthrough"
 
 
-def intake_gate(goal: str) -> IntakeDecision:
-    """Decide whether *goal* is handled directly or routed through the matrix.
+def handle_trigger(user_message: str) -> Optional[str]:
+    """Parse *user_message*; if it triggers Matrix Coder, compose + activate.
 
-    Phase 0 stub: always route through the MATRIX so the walking skeleton is
-    exercised.  Real heuristics arrive in a later phase.
+    Returns the composed persona text (to be injected into the SAME turn) when
+    a trigger is present, else ``None``. On the ``None`` path the caller is
+    responsible for the defensive ``clear_active_persona`` (the hook does this);
+    on the trigger path this sets the active persona via the bridge.
+
+    Defensive: never raises on the hot path — any error returns ``None``.
     """
-    return IntakeDecision(
-        verdict=Verdict.MATRIX,
-        reason="Phase 0 stub: all goals route through the matrix.",
-        proposed_route=_PASSTHROUGH,
-    )
+    try:
+        parsed = parse_trigger(user_message)
+        if parsed is None:
+            return None
+
+        # Explicit trigger -> intake gate always routes through the matrix.
+        intake_gate(parsed)
+
+        base = registry.load_base_contracts()
+        persona = registry.load_persona(parsed.role)
+        lens_text = (
+            registry.load_lens(parsed.lens)
+            if (parsed.role == "review" and parsed.lens)
+            else None
+        )
+
+        composed = compose_persona(base, persona, lens=lens_text)
+        bridge.set_active_persona(composed)
+        return composed
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("matrix_coder: handle_trigger suppressed error: %s", exc)
+        return None
 
 
 def run_passthrough(goal: str) -> SpecialistResult:
@@ -49,9 +77,6 @@ def run_passthrough(goal: str) -> SpecialistResult:
     cleared before returning, so the ``pre_llm_call`` hook correctly no-ops once
     the dispatch is over and never leaks into ordinary conversation turns.
     """
-    # Exercise the intake gate so the wired path matches the documented flow.
-    intake_gate(goal)
-
     base = registry.load_base_contracts()
     persona = registry.load_persona(_PASSTHROUGH)
     composed = compose_persona(base, persona)

@@ -1,14 +1,17 @@
 """Thin adapter between Matrix Coder and the Hermes runtime + per-dispatch state.
 
-Phase 0 does NOT perform a real subagent dispatch.  This module provides the
-shared, in-memory bookkeeping the harness and the hooks both read:
+Matrix Coder does NOT perform a real subagent dispatch (not available from
+hooks); specialists are bound by text composition injected via ``pre_llm_call``.
+This module provides the shared, in-memory bookkeeping the harness and the hooks
+both read:
 
-* the currently-active composed persona text (set when a dispatch starts,
-  cleared when it ends) — the ``pre_llm_call`` hook reads this to inject
-  persona text per turn;
+* the currently-active composed persona text (set when a trigger turn fires,
+  cleared on the next non-trigger turn) — the ``pre_llm_call`` hook reads this
+  to inject persona text for the current turn;
 * a per-dispatch FILE-CLAIM set — the foundation of the single-writer-per-file
-  guardrail.  Phase 0 only does the bookkeeping (claim / release / query /
-  conflict-check); no hook enforces it yet.
+  guardrail.  Only bookkeeping today (claim / release / query / conflict-check);
+  no hook enforces it — single-writer is advisory, enforced at orchestration
+  time.
 
 A single module-level :data:`bridge` instance is shared across the plugin so
 the synchronous hooks and the harness see the same state.

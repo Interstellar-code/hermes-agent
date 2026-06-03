@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 _PERSONAS_DIR = _PLUGIN_DIR / "personas"
 _BASE_DIR = _PERSONAS_DIR / "_base"
+_LENSES_DIR = _PERSONAS_DIR / "review-lenses"
 
 # Ordered _base contracts composed into every persona.
 _BASE_CONTRACTS = (
@@ -52,6 +53,15 @@ def load_base_contracts() -> List[str]:
 def load_persona(name: str) -> str:
     """Read ``personas/<name>.md`` and return its text (``""`` if missing)."""
     return _read(_PERSONAS_DIR / f"{name}.md")
+
+
+def load_lens(name: str) -> str:
+    """Read ``personas/review-lenses/<name>.md`` and return it (``""`` if missing).
+
+    Defensive on a missing file, like every other loader here — lens text feeds
+    the hot path and must never crash it.
+    """
+    return _read(_LENSES_DIR / f"{name}.md")
 
 
 def available_personas() -> List[str]:
