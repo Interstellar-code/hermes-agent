@@ -27,7 +27,11 @@ from urllib.parse import urlparse
 
 import yaml
 
-from .managed_peers import stable_token_env_name, supports_managed_mode
+from .managed_peers import (
+    stable_token_env_name,
+    supports_managed_mode,
+    token_filename_for,
+)
 
 
 log = logging.getLogger("a2a_fleet.fleet_config")
@@ -101,6 +105,34 @@ def _resolve_token(token_env: str | None) -> str | None:
     if not token_env:
         return None
     return os.environ.get(token_env)
+
+
+def _resolve_managed_token(
+    token_env: str | None, mode: object, repo_path: object
+) -> str | None:
+    """Resolve a MANAGED peer's inbound bearer token.
+
+    Prefers the canonical env var, but falls back to the persisted
+    ``<repo>/.hermes/<token_filename>`` the receiver was launched with when the
+    env var is unset in this process. Without the fallback, any process that did
+    not itself run ``deploy_*_receiver`` (e.g. fleet_send in a fresh/worker
+    process, or the gateway before boot-reconcile) resolves ``None`` and sends no
+    bearer -> HTTP 401 against the receiver (issue #104). The ``.token`` file is
+    the source of truth; the env var is just an in-process cache/override.
+    """
+    tok = _resolve_token(token_env)
+    if tok:
+        return tok
+    if not (supports_managed_mode(mode) and repo_path):
+        return None
+    fname = token_filename_for(str(mode))
+    if not fname:
+        return None
+    try:
+        raw = (Path(str(repo_path)) / ".hermes" / fname).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return raw or None
 
 
 def load_fleet(profile: str | None = None) -> Dict[str, Any]:
@@ -206,7 +238,13 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         agents_out[name] = {
             "url": peer_url,
             "agent_card_url": peer_card_url,
-            "token": _resolve_token(token_env),
+            # Managed peers fall back to the persisted .token (issue #104); plain
+            # peers resolve from the env var only.
+            "token": (
+                _resolve_managed_token(token_env, mode, repo_path)
+                if managed_raw
+                else _resolve_token(token_env)
+            ),
             "token_env": token_env,
             "description": entry.get("description", ""),
             "repo_path": str(repo_path) if repo_path else None,
