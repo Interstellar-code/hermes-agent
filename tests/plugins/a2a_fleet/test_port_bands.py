@@ -160,6 +160,51 @@ def test_resolve_errors_when_band_exhausted(tmp_path: Path, monkeypatch) -> None
     assert "9310-9319" in err
 
 
+def test_claimed_ports_are_cross_mode(monkeypatch) -> None:
+    """A managed peer of ANY mode squatting in the target band must be claimed.
+
+    Regression: a claude_code peer historically bound on 9310 (inside the
+    opencode band) must block an opencode allocation there — the claim scan is
+    cross-mode, not same-mode-only.
+    """
+    from a2a_fleet import cc_deploy
+    import a2a_fleet.fleet_config as fc
+
+    agents = {
+        "cc-other": {
+            "managed": True, "mode": "claude_code",
+            "repo_path": "/other-repo", "url": "http://127.0.0.1:9310",
+        },
+        "oc-other": {
+            "managed": True, "mode": "opencode",
+            "repo_path": "/other-repo2", "url": "http://127.0.0.1:9312",
+        },
+    }
+    monkeypatch.setattr(fc, "load_fleet", lambda: {"agents": agents})
+    monkeypatch.setattr(cc_deploy, "canonicalize_repo_path", lambda p: (Path(p), None))
+
+    claimed = cc_deploy._ports_claimed_by_other_repos("opencode", Path("/me"))
+    assert 9310 in claimed, "a claude_code peer on 9310 must be claimed cross-mode"
+    assert 9312 in claimed
+
+
+def test_claimed_ports_exclude_same_repo_and_mode(monkeypatch) -> None:
+    from a2a_fleet import cc_deploy
+    import a2a_fleet.fleet_config as fc
+
+    agents = {
+        "oc-self": {
+            "managed": True, "mode": "opencode",
+            "repo_path": "/me", "url": "http://127.0.0.1:9311",
+        },
+    }
+    monkeypatch.setattr(fc, "load_fleet", lambda: {"agents": agents})
+    monkeypatch.setattr(cc_deploy, "canonicalize_repo_path", lambda p: (Path(p), None))
+
+    claimed = cc_deploy._ports_claimed_by_other_repos("opencode", Path("/me"))
+    assert 9311 not in claimed, "our own (repo, mode) slot must not be self-claimed"
+
+
 def test_resolve_skips_port_claimed_by_other_repo(tmp_path: Path, monkeypatch) -> None:
     from a2a_fleet import cc_deploy
 

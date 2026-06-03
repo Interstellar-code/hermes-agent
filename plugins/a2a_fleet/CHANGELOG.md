@@ -1,5 +1,19 @@
 # a2a_fleet — Changelog
 
+## v0.8.9 — port allocation claims peers cross-mode (collision fix)
+
+- **Bug fix**: `resolve_managed_bind_port` / `_ports_claimed_by_other_repos`
+  only treated **same-mode** peers as claiming a port, so a managed peer of a
+  *different* mode sitting inside the target band got handed out again. Observed
+  live: a `claude_code` peer bound on `9310` (inside the opencode band) let a
+  fresh `opencode` deploy allocate `9310` too → two fleet.yaml peers on the same
+  port, and `fleet_send` to either could cross-wire. The claim scan is now
+  **cross-mode** — every managed peer's port (any mode) is claimed; only this
+  exact `(repo, mode)` slot is excluded (its own reuse is handled by
+  `_configured_bind_port` upstream). The live socket probe remains the backstop.
+- Tests: cross-mode claim + same-(repo,mode) exclusion in
+  `test_port_bands.py`. Falsification-verified. Full suite 397 passed.
+
 ## v0.8.8 — agy runner env fix + timeout normalization (Codex review of v0.8.7)
 
 Follow-up to v0.8.7 from a skeptical Codex review of the merge:
