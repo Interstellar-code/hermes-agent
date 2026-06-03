@@ -169,6 +169,26 @@ def test_agy_managed_flags_cannot_be_overridden_via_extra(agr, tmp_path):
     assert cmd.count("--print-timeout") == 1 and "1s" not in cmd
 
 
+def test_agy_runner_augments_path_and_keeps_latex(agr, tmp_path, monkeypatch):
+    # Guards the HIGH bug: _subprocess_runner must launch with the AUGMENTED env
+    # (PATH + AGY_CLI_DISABLE_LATEX), not raw os.environ — else gh/git are missing
+    # under a launchd daemon and the #100 fix is dead on the real path.
+    monkeypatch.setattr(agr.subprocess, "Popen", _FakePopen)
+    agr._subprocess_runner(["agy", "--print", "hi"], str(tmp_path), 5.0)
+    env = _FakePopen.last_kwargs.get("env") or {}
+    assert env.get("AGY_CLI_DISABLE_LATEX") == "1"
+    assert "/usr/bin" in env.get("PATH", "").split(os.pathsep)
+    assert _FakePopen.last_kwargs.get("stdin") is subprocess.DEVNULL
+
+
+def test_agy_print_timeout_never_truncates_to_zero(agr, tmp_path):
+    # MEDIUM: a tiny/fractional budget must floor at 1s, not 0s.
+    cfg = _cfg(agr, tmp_path)
+    cfg["agy_timeout_s"] = 0.5
+    cmd = agr.build_agy_command("x", cfg, conversation_id=None)
+    assert cmd[cmd.index("--print-timeout") + 1] == "1s"
+
+
 def test_agy_receiver_backstop_outlives_print_timeout(agr, tmp_path, monkeypatch):
     """run_agy_turn must hand the runner a backstop = agy_timeout_s + grace, so
     agy reaches its own --print-timeout and self-exits before being killed."""

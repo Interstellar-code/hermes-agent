@@ -177,9 +177,24 @@ DEFAULTS: Dict[str, Any] = {
     "idle_timeout_s": 1800,        # self-teardown after this many idle seconds (0 = disabled)
 }
 
-# Receiver subprocess backstop = agy_timeout_s + this grace, so agy reaches its
-# OWN --print-timeout first and exits cleanly instead of being killpg'd mid-write.
+# Receiver subprocess backstop = agy_print_timeout + this grace, so agy reaches
+# its OWN --print-timeout first and exits cleanly instead of being killpg'd.
 AGY_TIMEOUT_GRACE_S = 60.0
+
+
+def _print_timeout_s(cfg: Dict[str, Any]) -> int:
+    """agy --print-timeout in whole seconds, ceil'd, min 1.
+
+    Single source for BOTH the flag value (build_agy_command) and the receiver
+    backstop (run_agy_turn) so the invariant `backstop > print_timeout` holds for
+    any configured value — a fractional/tiny agy_timeout_s must not truncate to
+    `0s` (agy would self-timeout immediately / reject the arg).
+    """
+    raw = float(cfg.get("agy_timeout_s") or DEFAULTS["agy_timeout_s"])
+    whole = int(raw)
+    if raw > whole:
+        whole += 1  # ceil
+    return max(1, whole)
 
 # Common tool dirs appended to PATH for the spawned agy process. A receiver
 # launched by launchd (or any non-login daemon) inherits a minimal PATH, so
@@ -460,7 +475,7 @@ def build_agy_command(
     """
     full_prompt = _prompt_with_role(prompt, cfg)
     repo_path = str(cfg.get("repo_path") or "")
-    print_timeout_s = int(float(cfg.get("agy_timeout_s") or DEFAULTS["agy_timeout_s"]))
+    print_timeout_s = _print_timeout_s(cfg)
     cmd: List[str] = ["agy"]
     if conversation_id:
         cmd += ["--conversation", conversation_id]
@@ -678,11 +693,11 @@ def run_agy_turn(
 
     session_map_path: Path = SESSION_MAP_PATH  # may be monkeypatched in tests
     repo_path = Path(cfg["repo_path"])
-    timeout = float(cfg.get("agy_timeout_s") or DEFAULTS["agy_timeout_s"])
-    # agy gets --print-timeout == `timeout` (see build_agy_command); the receiver's
-    # own subprocess backstop must be strictly longer so agy hits its OWN timeout
-    # and self-exits with a clean partial/final result, instead of being killpg'd
-    # mid-turn by the receiver. The grace also covers agy's shutdown/flush.
+    # agy gets --print-timeout == _print_timeout_s(cfg) (see build_agy_command);
+    # the receiver's own subprocess backstop must be strictly longer so agy hits
+    # its OWN timeout and self-exits with a clean result instead of being killpg'd
+    # mid-turn. Same source on both sides keeps the invariant for any config value.
+    timeout = _print_timeout_s(cfg)
     backstop = timeout + AGY_TIMEOUT_GRACE_S
 
     entry = get_session_entry(context_id, session_map_path) or {}
@@ -789,20 +804,20 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
 
     Uses ``Popen`` + ``start_new_session=True`` so the whole process tree lands in
     its own process group; on timeout we ``killpg`` the group to reap orphans.
-    AGY_CLI_DISABLE_LATEX=1 is injected into the child env. Returns (stdout, rc,
+    AGY_CLI_DISABLE_LATEX=1 + an augmented PATH (gh/git/node under a launchd
+    daemon) are injected into the child env via _tool_env(). Returns (stdout, rc,
     stderr). Buffers are capped defensively.
     """
-    env = dict(os.environ)
-    env["AGY_CLI_DISABLE_LATEX"] = "1"
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env=env,
+            env=_tool_env(),
         )
     except FileNotFoundError:
         raise AgyCLINotFound("agy") from None
