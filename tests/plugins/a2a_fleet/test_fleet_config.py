@@ -363,14 +363,27 @@ def test_managed_token_falls_back_to_token_file(tmp_path: Path, monkeypatch: pyt
     assert _resolve_managed_token("A2A_OC_TOKEN_X", "opencode", str(repo)) == "FILE_TOKEN_123"
 
 
-def test_managed_token_env_takes_precedence_over_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_token_file_takes_precedence_over_stale_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # P0-3: the persisted .token is authoritative (what the running receiver
+    # requires; every deploy writes it last). A STALE env var from an
+    # out-of-process redeploy must NOT shadow it (that sent the wrong bearer -> 401).
     from a2a_fleet.fleet_config import _resolve_managed_token
 
     repo = tmp_path / "repo"
     (repo / ".hermes").mkdir(parents=True)
-    (repo / ".hermes" / ".codex-token").write_text("STALE_FILE\n", encoding="utf-8")
-    monkeypatch.setenv("A2A_CODEX_TOKEN_X", "LIVE_ENV")
-    assert _resolve_managed_token("A2A_CODEX_TOKEN_X", "codex", str(repo)) == "LIVE_ENV"
+    (repo / ".hermes" / ".codex-token").write_text("FRESH_FILE\n", encoding="utf-8")
+    monkeypatch.setenv("A2A_CODEX_TOKEN_X", "STALE_ENV")
+    assert _resolve_managed_token("A2A_CODEX_TOKEN_X", "codex", str(repo)) == "FRESH_FILE"
+
+
+def test_managed_token_env_fallback_when_no_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # File absent (receiver not deployed on this host yet) -> env var is used.
+    from a2a_fleet.fleet_config import _resolve_managed_token
+
+    repo = tmp_path / "repo"
+    (repo / ".hermes").mkdir(parents=True)
+    monkeypatch.setenv("A2A_OC_TOKEN_X", "ENV_ONLY")
+    assert _resolve_managed_token("A2A_OC_TOKEN_X", "opencode", str(repo)) == "ENV_ONLY"
 
 
 def test_managed_token_none_for_unknown_mode_or_missing_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
