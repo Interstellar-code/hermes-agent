@@ -347,3 +347,35 @@ def test_managed_oc_peer_token_env_matching_ok(tmp_path: Path, fleet_home: Path)
     assert peer["managed"] is True
     assert peer["mode"] == "opencode"
     assert peer["token_env"] == stable
+
+
+# Issue #104 — managed-peer token resolves from the persisted .token file when
+# the canonical env var is unset in this process (no bearer -> 401 otherwise).
+def test_managed_token_falls_back_to_token_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from a2a_fleet.fleet_config import _resolve_managed_token
+
+    repo = tmp_path / "repo"
+    (repo / ".hermes").mkdir(parents=True)
+    (repo / ".hermes" / ".oc-token").write_text("FILE_TOKEN_123\n", encoding="utf-8")
+
+    monkeypatch.delenv("A2A_OC_TOKEN_X", raising=False)
+    # env unset -> read from <repo>/.hermes/.oc-token
+    assert _resolve_managed_token("A2A_OC_TOKEN_X", "opencode", str(repo)) == "FILE_TOKEN_123"
+
+
+def test_managed_token_env_takes_precedence_over_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from a2a_fleet.fleet_config import _resolve_managed_token
+
+    repo = tmp_path / "repo"
+    (repo / ".hermes").mkdir(parents=True)
+    (repo / ".hermes" / ".codex-token").write_text("STALE_FILE\n", encoding="utf-8")
+    monkeypatch.setenv("A2A_CODEX_TOKEN_X", "LIVE_ENV")
+    assert _resolve_managed_token("A2A_CODEX_TOKEN_X", "codex", str(repo)) == "LIVE_ENV"
+
+
+def test_managed_token_none_for_unknown_mode_or_missing_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from a2a_fleet.fleet_config import _resolve_managed_token
+
+    monkeypatch.delenv("A2A_X_TOKEN", raising=False)
+    assert _resolve_managed_token("A2A_X_TOKEN", "bogus_mode", str(tmp_path)) is None
+    assert _resolve_managed_token("A2A_OC_TOKEN_X", "opencode", None) is None

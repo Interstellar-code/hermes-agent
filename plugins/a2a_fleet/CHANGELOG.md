@@ -1,5 +1,24 @@
 # a2a_fleet — Changelog
 
+## v0.8.10 — managed-peer token resolves from persisted .token (token-drift fix, #104)
+
+- **Bug fix (#104)**: `fleet_send` could send no bearer → HTTP 401 against a
+  freshly (re)deployed managed receiver. `fleet_config.load_fleet` resolved a
+  peer's token **only** from `os.environ[token_env]`, so any process that did
+  not itself run `deploy_*_receiver` — a fresh/worker process, or the gateway
+  before boot-reconcile — resolved `None`. The persisted
+  `<repo>/.hermes/<token_file>` (`.token`/`.oc-token`/`.codex-token`/`.agy-token`)
+  the receiver was launched with was ignored. Managed peers now fall back to that
+  file when the env var is unset (`_resolve_managed_token`); the env var stays an
+  in-process cache/override and still wins when set. Plain (non-managed) peers
+  are unchanged (env-only). The `.token` file is the source of truth — the same
+  one boot-reconcile already republishes — so a redeploy is usable immediately,
+  no gateway restart and no manual token sync.
+- Adds `managed_peers.token_filename_for(mode)` (single source for the per-mode
+  token filename) and `_resolve_managed_token` tests (file fallback, env
+  precedence, unknown-mode/missing-repo → None). Falsification-verified. Full
+  suite 400 passed.
+
 ## v0.8.9 — port allocation claims peers cross-mode (collision fix)
 
 - **Bug fix**: `resolve_managed_bind_port` / `_ports_claimed_by_other_repos`

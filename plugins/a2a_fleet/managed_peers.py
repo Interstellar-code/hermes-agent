@@ -36,6 +36,7 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "token_prefix": "A2A_CC_TOKEN_",
         "deploy_module": "cc_deploy",
         "transcript_filename": "a2a-transcript.jsonl",
+        "token_filename": ".token",
     },
     "opencode": {
         "default_name": "opencode",
@@ -43,6 +44,7 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "token_prefix": "A2A_OC_TOKEN_",
         "deploy_module": "oc_deploy",
         "transcript_filename": "a2a-oc-transcript.jsonl",
+        "token_filename": ".oc-token",
     },
     "codex": {
         "default_name": "codex",
@@ -50,6 +52,7 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "token_prefix": "A2A_CODEX_TOKEN_",
         "deploy_module": "codex_deploy",
         "transcript_filename": "a2a-codex-transcript.jsonl",
+        "token_filename": ".codex-token",
     },
     "agy": {
         "default_name": "agy",
@@ -57,6 +60,7 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
         "token_prefix": "A2A_AGY_TOKEN_",
         "deploy_module": "agy_deploy",
         "transcript_filename": "a2a-agy-transcript.jsonl",
+        "token_filename": ".agy-token",
     },
 }
 
@@ -136,6 +140,21 @@ def transcript_filename_for(mode: str) -> str:
     if spec is None:
         return _MODE_SPECS["claude_code"]["transcript_filename"]
     return spec["transcript_filename"]
+
+
+def token_filename_for(mode: str) -> Optional[str]:
+    """Return the persisted inbound-token filename (under ``<repo>/.hermes/``) for
+    ``mode``, or ``None`` for an unknown mode.
+
+    This is the file the receiver was launched with; it is the authoritative
+    live token value when the canonical env var is unset in a given process
+    (e.g. fleet_send running in a worker that did not run the deploy) — see
+    fleet_config token resolution / issue #104.
+    """
+    spec = _MODE_SPECS.get(mode)
+    if spec is None:
+        return None
+    return spec.get("token_filename")
 
 
 def canonicalize_managed_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str]]:
