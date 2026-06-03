@@ -112,27 +112,26 @@ def _resolve_managed_token(
 ) -> str | None:
     """Resolve a MANAGED peer's inbound bearer token.
 
-    Prefers the canonical env var, but falls back to the persisted
-    ``<repo>/.hermes/<token_filename>`` the receiver was launched with when the
-    env var is unset in this process. Without the fallback, any process that did
-    not itself run ``deploy_*_receiver`` (e.g. fleet_send in a fresh/worker
-    process, or the gateway before boot-reconcile) resolves ``None`` and sends no
-    bearer -> HTTP 401 against the receiver (issue #104). The ``.token`` file is
-    the source of truth; the env var is just an in-process cache/override.
+    The persisted ``<repo>/.hermes/<token_filename>`` is AUTHORITATIVE: it is
+    exactly the token the currently-running receiver was launched requiring, and
+    every deploy writes it last. ``os.environ[token_env]`` is only an in-process
+    cache — it is correct in the process that ran the deploy, but goes STALE in
+    any other process across an out-of-process redeploy. Resolving the stale env
+    value sends the wrong bearer -> HTTP 401 (P0-3); resolving an UNSET env value
+    sends no bearer -> 401 (issue #104). So prefer the file, and fall back to the
+    env var only when the file is absent/unreadable (e.g. a managed peer whose
+    receiver has not been deployed on this host yet).
     """
-    tok = _resolve_token(token_env)
-    if tok:
-        return tok
-    if not (supports_managed_mode(mode) and repo_path):
-        return None
-    fname = token_filename_for(str(mode))
-    if not fname:
-        return None
-    try:
-        raw = (Path(str(repo_path)) / ".hermes" / fname).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return raw or None
+    if supports_managed_mode(mode) and repo_path:
+        fname = token_filename_for(str(mode))
+        if fname:
+            try:
+                raw = (Path(str(repo_path)) / ".hermes" / fname).read_text(encoding="utf-8").strip()
+            except OSError:
+                raw = ""
+            if raw:
+                return raw
+    return _resolve_token(token_env)
 
 
 def load_fleet(profile: str | None = None) -> Dict[str, Any]:

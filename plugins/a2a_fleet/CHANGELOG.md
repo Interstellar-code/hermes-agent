@@ -1,5 +1,22 @@
 # a2a_fleet — Changelog
 
+## v0.8.12 — managed-token resolution prefers the authoritative .token (P0-3)
+
+- **Token precedence inverted for managed peers.** `_resolve_managed_token` now
+  prefers the persisted `<repo>/.hermes/<token_filename>` over `os.environ`,
+  falling back to the env var only when the file is absent/unreadable. The
+  `.token` is authoritative — it is exactly what the currently-running receiver
+  requires and every deploy writes it last; `os.environ[token_env]` is only an
+  in-process cache that goes STALE across an out-of-process redeploy. The old
+  env-first order meant a stale env value shadowed a fresh `.token` and sent the
+  wrong bearer → HTTP 401 (operator-reported P0-3). This still satisfies #104
+  (file present → used; only when the receiver was never deployed on this host
+  does it fall back to the env var). Falsification-verified.
+- **Docs:** `deploy-fleet` skill documents the `connection refused` mid-session
+  cause (`idle_timeout_s` self-teardown, default 1800s) and the `idle_timeout_s: 0`
+  knob / idempotent re-deploy mitigation (operator-reported P0-1).
+- Full suite 402 passed.
+
 ## v0.8.11 — agy empty-output is actionable (#105) + spawners pin HERMES_HOME (#98)
 
 - **#105 — agy `--print` rc=0 + empty stdout is now actionable.** agy v1.0.4 in

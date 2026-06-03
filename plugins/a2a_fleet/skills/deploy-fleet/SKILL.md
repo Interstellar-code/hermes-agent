@@ -126,6 +126,11 @@ fleet:
 - **Cross-machine bearer over plain HTTP** → tokens travel in cleartext;
   terminate TLS in front when binding to a non-loopback address.
 - **No CORS** → expected; A2A is server-to-server, browsers are not clients.
+- **`connection refused` mid-session** → a managed receiver self-tears-down
+  after `idle_timeout_s` (default **1800s**) of no traffic; the next request hits
+  a dead port until it is re-deployed. For a long interactive session, set
+  `idle_timeout_s: 0` in that mode's deploy config to disable teardown, or simply
+  re-run `deploy_*_receiver` (idempotent — it reuses the same port + token).
 
 ## Managed executors (the four deploy modes)
 
