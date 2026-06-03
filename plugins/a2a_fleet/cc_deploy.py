@@ -924,13 +924,19 @@ def _configured_bind_port(repo: Path, mode: str) -> Optional[int]:
 
 
 def _ports_claimed_by_other_repos(mode: str, this_repo: Path) -> set:
-    """Ports already assigned to OTHER repos' receivers in ``mode`` (best-effort).
+    """Ports already assigned to OTHER managed peers — ACROSS ALL MODES.
 
-    Reading sibling peers' configured ports lets us avoid handing a band slot to
-    a new repo when a currently-DOWN peer of another repo already owns it (its
-    socket would otherwise test free). Never raises — a missing/garbled
-    fleet.yaml just yields an empty claim set, and the live socket probe in
-    ``allocate_band_port`` remains the backstop.
+    A TCP port is a port regardless of which mode owns it: a new allocation in
+    ``mode``'s band must never land on a port another managed peer holds, even
+    a currently-DOWN peer (its socket would test free) or a peer of a DIFFERENT
+    mode that sits inside this band (e.g. a legacy/out-of-band entry — a
+    claude_code peer historically bound on 9310 would otherwise be handed out
+    again to an opencode deploy). We therefore claim every managed peer's port
+    and exclude only this exact ``(repo, mode)`` slot (its own reuse is handled
+    by ``_configured_bind_port`` upstream).
+
+    Best-effort: a missing/garbled fleet.yaml yields an empty set, and the live
+    socket probe in ``allocate_band_port`` remains the backstop.
     """
     claimed: set = set()
     try:
@@ -939,14 +945,15 @@ def _ports_claimed_by_other_repos(mode: str, this_repo: Path) -> set:
 
         cfg = fleet_config.load_fleet()
         for _name, entry in iter_supported_managed_peers(cfg.get("agents") or {}):
-            if str(entry.get("mode") or "") != mode:
-                continue
+            peer_mode = str(entry.get("mode") or "")
             peer_repo, err = canonicalize_repo_path(str(entry.get("repo_path")))
-            if err is not None or peer_repo is None or peer_repo == this_repo:
+            if err is not None or peer_repo is None:
                 continue
+            if peer_repo == this_repo and peer_mode == mode:
+                continue  # our own (repo, mode) slot — reuse handled upstream
             port = _port_from_peer_url(entry.get("url"))
             if port is None:
-                port = _configured_bind_port(peer_repo, mode)
+                port = _configured_bind_port(peer_repo, peer_mode)
             if port is not None:
                 claimed.add(int(port))
     except Exception:  # noqa: BLE001 — claim discovery is advisory only.
