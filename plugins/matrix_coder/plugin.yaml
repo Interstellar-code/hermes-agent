@@ -1,0 +1,16 @@
+name: matrix_coder
+version: "0.0.1"
+description: "Matrix Coder — a specialist-coder layer for Hermes. Turns a generic Hermes subagent into a focused specialist (explore, plan, executor, review, debug, test, verify, simplify) by composing a PERSONA as text into the child's context and re-asserting it per turn via the pre_llm_call hook. Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. Phase 0 ships scaffold only: entrypoint + manifest, shared _base contracts, one _passthrough persona, the core/ package, and a walking-skeleton /matrix command. Tracks epic #76."
+author: Interstellar-code
+kind: standalone
+
+# Lifecycle hooks this plugin registers (doc-only list; register() is authoritative).
+hooks:
+  - pre_llm_call
+  - transform_llm_output
+
+# Tools registered with the Hermes agent (none in Phase 0).
+provides_tools: []
+
+# Environment variables read at runtime (none in Phase 0).
+requires_env: []
