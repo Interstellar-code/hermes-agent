@@ -1,5 +1,39 @@
 # a2a_fleet — Changelog
 
+## v0.8.14 — A2A listener starts on adapter.connect() (bind-race + bridge-colocation fix) + Hermes↔Hermes peering docs (#120)
+
+- **Bind-race / bridge-colocation fix (blocker, proven broken at runtime):**
+  `register()` called `_start_server_in_thread()` unconditionally, but
+  `register(ctx)` runs in EVERY process that loads the plugin (gateway, CLI tool
+  startup, dashboard web tier). They raced to bind `fleet.server.bind_port`; the
+  **bridge-less dashboard process won**, so a direct `agent` SendMessage to the
+  A2A port returned `-32000 "agent bridge not ready"` — Route B (and therefore
+  Hermes↔Hermes) was non-functional. (A `hasattr(ctx, "register_platform")` gate
+  was attempted first but is a no-op — that method exists on every
+  `PluginContext`; caught by a Codex review.) **Fix:** the listener now starts in
+  `A2AFleetAdapter.connect()` — the one place that runs ONLY in the gateway/agent
+  process, on the gateway loop, exactly where the Route B bridge is wired — so
+  listener + bridge are co-located by construction. `register()` no longer starts
+  the server; `disconnect()` stops it.
+  - **Behavior change:** an A2A node's listener now comes up when the
+    `a2a_fleet` platform connects (gateway with `platforms.a2a_fleet` enabled),
+    not at plugin import. For `response_handler: agent` that platform was already
+    required; `echo`/`llm` nodes must now enable the platform too. (Supersedes the
+    issue-#33 register()-starts-server behavior.)
+  - Tests: `register()` does NOT start the server; `connect()` starts it + wires
+    the bridge; integration — register leaves the port closed, connect yields a
+    reachable `/health`. All falsification-verified.
+- **Docs:** corrected the stale `references/hermes-gateway-plugin-guide.md` — it
+  described a never-implemented `/api/plugins/a2a_fleet/jsonrpc|sse|tasks` mount;
+  the real transport is the standalone uvicorn (`server.py`, `/jsonrpc` +
+  `/.well-known/agent-card.json` + `/health`) with an in-process Route B bridge.
+  Added a "Hermes↔Hermes peering" section to the `deploy-fleet` skill (per-profile
+  `bind_port` map, plain-agent-peer shape with BASE url, profile-scoped token
+  envs, the gateway-run prereq, handshake convention).
+- Groundwork for Hermes↔Hermes profile-to-profile A2A (#120). No new server — it
+  reuses the existing `agent` protocol pointed at another profile.
+- Full suite 406 passed.
+
 ## v0.8.13 — agy prefix-drift made observable (#108) + #109 near-term
 
 Addresses the agy intermittent `[no reply produced by agy]` / stale-context

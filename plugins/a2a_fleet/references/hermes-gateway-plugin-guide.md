@@ -96,20 +96,28 @@ async def health():
 | `hermes_cli/web_server.py` | ~4340 | `_mount_plugin_api_routes()` — router mounting |
 | `hermes_cli/web_server.py` | ~4384 | Mount call (before SPA catch-all) |
 
-## A2A Fleet Plugin Mount Points
+## A2A Fleet Plugin endpoints — AS SHIPPED (not /api/plugins/)
 
-For the A2A fleet plugin, routes will be:
+> ⚠️ Historical note: an earlier draft of this section proposed mounting A2A under
+> `/api/plugins/a2a_fleet/*` (jsonrpc / sse / tasks). **That was never implemented and
+> is wrong** — do not use it as the architecture source. The A2A transport is a
+> **standalone uvicorn server** (`plugins/a2a_fleet/server.py`), bound to
+> `fleet.server.bind_host:bind_port` (default `:9219`), started in the gateway/agent
+> process only (`__init__.py register()`, gated on the gateway context, #120).
+
+Actual endpoints on that standalone server:
 
 ```
-GET  /api/plugins/a2a_fleet/health                    → Health check
-GET  /api/plugins/a2a_fleet/.well-known/agent-card     → Agent Card (or redirect to /.well-known/)
-POST /api/plugins/a2a_fleet/jsonrpc                    → JSON-RPC 2.0 endpoint
-GET  /api/plugins/a2a_fleet/sse/{task_id}              → SSE streaming for task updates
-GET  /api/plugins/a2a_fleet/agents                     → List fleet agents (from config)
-GET  /api/plugins/a2a_fleet/agents/{name}/card         → Cached Agent Card for named agent
-GET  /api/plugins/a2a_fleet/tasks                      → List tasks
-GET  /api/plugins/a2a_fleet/tasks/{task_id}            → Get task state
-POST /api/plugins/a2a_fleet/tasks/{task_id}/cancel     → Cancel task
+GET  /.well-known/agent-card.json   → Agent Card (top-level, RFC 8615)   server.py:167
+GET  /health                        → {"ok", "version", "peer_count"}    server.py:177
+POST /jsonrpc                       → JSON-RPC 2.0 SendMessage            server.py:181
 ```
 
-Note: The well-known URI (`/.well-known/agent-card.json`) would need a top-level route rewrite or redirect. For MVP, the Agent Card lives under the plugin prefix.
+`response_handler: agent` (Route B) bridges an inbound `SendMessage` into the real
+Hermes agent **in-process** via `asyncio.run_coroutine_threadsafe(..., gateway_loop)`
+(`adapter.py`), so the listener must run in the gateway/agent process.
+
+Streaming (`message/stream`), and the async Task lifecycle (`tasks/*`) are **not
+implemented** — they return JSON-RPC `-32601` (deferred). The read-only dashboard
+feed (`/api/plugins/a2a_fleet/conversations` and `/peers`) is a SEPARATE surface on
+the dashboard web server (`dashboard/plugin_api.py`), not the A2A transport.

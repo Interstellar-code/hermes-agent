@@ -102,6 +102,7 @@ def _start_server_in_thread() -> None:
             daemon=True,
         )
         _server_thread.start()
+        atexit.register(_atexit_stop)
     logger.info("a2a_fleet: server thread spawned")
 
 
@@ -517,6 +518,9 @@ def register(ctx) -> None:
         except Exception:
             logger.debug("a2a_fleet: register_skill failed", exc_info=True)
 
+    # ``register_platform`` exists on every PluginContext, so this attempt runs
+    # in any context; it is a no-op / debug-logged failure outside the gateway.
+    # The gateway is the process that later calls A2AFleetAdapter.connect().
     if hasattr(ctx, "register_platform"):
         from . import adapter as _adapter  # noqa: WPS433 — lazy import is the contract.
         try:
@@ -536,13 +540,19 @@ def register(ctx) -> None:
     # restart). Runs on its own
     # daemon thread so it never blocks plugin load; a clean no-op when there are no
     # managed peers (the common case / fresh installs). Guarded so a failure here
-    # never disrupts the server thread / tools / skill / platform above.
+    # never disrupts the tools / skill / platform above.
     try:
         if hasattr(cc_deploy, "reconcile_managed_receivers_in_thread"):
             cc_deploy.reconcile_managed_receivers_in_thread()
     except Exception:  # noqa: BLE001 — additive, must never break register().
         logger.debug("a2a_fleet: boot-reconcile spawn failed", exc_info=True)
 
-    _start_server_in_thread()
-    atexit.register(_atexit_stop)
-    logger.info("a2a_fleet: registered fleet_send tool + spawned A2A server thread")
+    # NOTE: the A2A uvicorn listener is deliberately NOT started here. register()
+    # runs in EVERY process that loads the plugin (gateway, CLI tool startup,
+    # dashboard web tier); starting the listener here raced all of them to bind
+    # fleet.server.bind_port, and a bridge-less winner (e.g. the dashboard
+    # process) then answered inbound `agent` requests with "bridge not ready"
+    # (proven at runtime). The listener now starts from A2AFleetAdapter.connect()
+    # — which runs ONLY in the gateway/agent process, right where the Route B
+    # bridge is wired — so listener + bridge are co-located by construction (#120).
+    logger.info("a2a_fleet: registered fleet_send + deploy tools (A2A server starts on gateway platform connect)")

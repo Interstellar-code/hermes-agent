@@ -102,17 +102,37 @@ class A2AFleetAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> bool:
-        """Capture the gateway event loop and register as the global bridge."""
+        """Capture the gateway event loop, register the bridge, AND start the
+        A2A listener here — this is the ONLY place that runs exclusively in the
+        gateway/agent process. Starting the uvicorn server from plugin
+        ``register()`` instead raced every process that loads the plugin (CLI
+        tool startup, dashboard web tier) to bind ``fleet.server.bind_port``; a
+        bridge-less winner then answered inbound ``agent`` requests with "bridge
+        not ready". Starting it on connect co-locates the listener with the
+        bridge by construction (#120)."""
         self._gateway_loop = asyncio.get_running_loop()
         set_agent_bridge(self)
-        log.info("a2a_fleet: adapter connected; bridge ready")
+        try:
+            from . import _start_server_in_thread  # noqa: PLC0415,WPS433 — lazy, avoids import cycle.
+
+            _start_server_in_thread()
+        except Exception:  # noqa: BLE001 — never let server start break platform connect.
+            log.exception("a2a_fleet: failed to start A2A server thread on connect")
+        log.info("a2a_fleet: adapter connected; bridge ready; A2A server started")
         return True
 
     async def disconnect(self) -> None:
-        """Deregister the global bridge reference."""
+        """Deregister the bridge and stop the A2A listener (lifecycle tied to the
+        gateway platform, mirroring connect())."""
         set_agent_bridge(None)
         self._gateway_loop = None
-        log.info("a2a_fleet: adapter disconnected; bridge cleared")
+        try:
+            from .server import stop_server_sync  # noqa: PLC0415,WPS433
+
+            stop_server_sync()
+        except Exception:  # noqa: BLE001 — best-effort teardown.
+            log.debug("a2a_fleet: A2A server stop on disconnect failed", exc_info=True)
+        log.info("a2a_fleet: adapter disconnected; bridge cleared; A2A server stopped")
 
     async def send(
         self,
