@@ -1,6 +1,6 @@
 # a2a_fleet
 
-Version: `0.8.1` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 OpenCode executor + v0.7 Codex executor + v0.8 Antigravity (`agy`) executor + v0.8.1 mode-aware dashboard — all four managed executor modes (Claude Code + OpenCode + Codex + agy) appear in the conversations/peers tab
+Version: `0.8.14` · v0.3 executor + v0.4 config bootstrap + v0.5 dashboard API + v0.6 OpenCode executor + v0.7 Codex executor + v0.8 Antigravity (`agy`) executor + v0.8.1 mode-aware dashboard + v0.8.5 per-mode port bands + v0.8.6 dashboard dedup-by-(repo,mode) + v0.8.7–0.8.8 executor tool-parity (gh/git PATH, codex stdin, agy add-dir/timeout) + v0.8.9 cross-mode port-claim + v0.8.10/0.8.12 managed-token resolves from `.token` + v0.8.11 agy empty-output/HERMES_HOME + v0.8.13 agy prefix-drift flag + v0.8.14 A2A listener starts on `adapter.connect()` (bind-race fix) + Hermes↔Hermes peering docs. All four managed executor modes (Claude Code + OpenCode + Codex + agy) appear in the conversations/peers tab. See `CHANGELOG.md` for per-version detail.
 
 Agent-to-Agent (A2A) communication for Hermes Agent. The plugin makes a Hermes
 profile a **fleet member**: it runs its own embedded uvicorn A2A server, exposes
@@ -108,28 +108,35 @@ validation, all of which would block cross-machine peer access.
 │                  Hermes Agent Process                     │
 │                                                           │
 │  ┌────────────────────┐                                   │
-│  │  Dashboard Gateway  │  localhost:8642                  │
-│  │  (agent loop, SOUL, │                                  │
-│  │   tools, memory)    │◀───┐                             │
-│  └────────────────────┘     │ run_coroutine_threadsafe    │
-│                             │ (adapter.bridge_sync,        │
-│  ┌──────────────────────────┴──────────────┐  Route B)    │
+│  │  Gateway agent loop │  (SOUL, tools, memory)           │
+│  │  + a2a_fleet        │◀───┐                             │
+│  │  platform adapter   │    │ run_coroutine_threadsafe     │
+│  └────────────────────┘     │ (adapter.bridge_sync,        │
+│                             │ in-process, Route B)         │
+│  ┌──────────────────────────┴──────────────┐              │
 │  │  a2a_fleet server (server.py)            │              │
 │  │  uvicorn on its own event loop / daemon  │              │
 │  │  thread, bound to fleet.yaml host:port   │              │
+│  │  STARTED by adapter.connect() (gateway)  │              │
 │  │  inbound → echo | llm | agent handler    │              │
 │  └──────────────────────────────────────────┘              │
 └──────────────────────────────────────────────────────────┘
 ```
 
-- `register(ctx)` registers the `fleet_send` tool, registers the `a2a_fleet`
-  platform adapter (via `ctx.register_platform`, when available), registers the
-  `deploy-fleet` skill, and spawns the server on a **named daemon thread** with
-  its own `asyncio` event loop (`_start_server_in_thread`). The daemon-thread
-  design works whether `register()` is called from a synchronous context or
-  inside a running loop.
-- An `atexit` handler (`_atexit_stop`) signals uvicorn to exit on process
-  shutdown; the daemon thread is reaped by the OS on exit.
+- `register(ctx)` registers the `fleet_send` tool, the `a2a_fleet` platform
+  adapter (via `ctx.register_platform`), and the `deploy-fleet` skill. It does
+  **NOT** start the server — `register()` runs in every process that loads the
+  plugin (gateway, CLI tool startup, dashboard web tier), so starting the
+  listener there raced them all to bind the port and a bridge-less winner broke
+  Route B (#120).
+- The uvicorn listener is started by **`A2AFleetAdapter.connect()`** — the one
+  path that runs only in the gateway/agent process, on the gateway loop, right
+  where the Route B bridge is wired (`set_agent_bridge`). So the listener and the
+  bridge are co-located by construction; `disconnect()` stops it. The server runs
+  on a named daemon thread with its own event loop (`_start_server_in_thread`),
+  and an `atexit` handler (`_atexit_stop`) signals uvicorn to exit on shutdown.
+  **Consequence:** an A2A node's listener comes up when the `a2a_fleet` platform
+  connects (gateway with `platforms.a2a_fleet` enabled), not at plugin import.
 - Config (`fleet.yaml`) is re-read on **every request**, so handler/peer edits
   take effect without a server restart.
 
@@ -194,8 +201,21 @@ second overlapping turn on the same context gets an `A2ABusyError` (JSON-RPC
 
 Route B requires the gateway to have the adapter connected — i.e.
 `platforms.a2a_fleet.enabled=true` in the active profile config so the gateway
-calls `adapter.connect()` and registers the bridge. If the bridge is not ready,
-`/jsonrpc` returns a JSON-RPC error telling you to enable it.
+calls `adapter.connect()`, which both registers the bridge **and starts the A2A
+listener** (v0.8.14 — see Architecture). If the platform is not connected the
+listener never comes up; if it is up but the bridge isn't ready, `/jsonrpc`
+returns a JSON-RPC error telling you to enable it.
+
+### Hermes↔Hermes peering (profile-to-profile / cross-LAN)
+
+`response_handler: agent` is also how one Hermes profile reaches **another
+profile's agent** — same-host or across two PCs on a LAN. Each receiving profile
+runs its own A2A listener (unique `bind_port`; LAN bind + `auth_required: true`
+off-loopback) and each sender lists the others as **plain agent peers** (`url`
+base + `token_env`, no `managed`/`mode`). Full setup — per-profile/port map,
+same-host + cross-PC + bidirectional `fleet.yaml` snippets, profile-scoped
+tokens, and the handshake convention — is in the **`deploy-fleet` skill**
+("Hermes↔Hermes peering" section).
 
 ---
 
@@ -724,7 +744,7 @@ curl http://<bind_host>:<bind_port>/health
 
 | Path | Purpose |
 |------|---------|
-| `__init__.py` | `register(ctx)` — registers `fleet_send`, the `deploy-fleet` skill, the `a2a_fleet` platform adapter, spawns the server daemon thread, registers `atexit` stop |
+| `__init__.py` | `register(ctx)` — registers `fleet_send`, deploy tools, the `deploy-fleet` skill, and the `a2a_fleet` platform adapter. Does NOT start the server (that's `adapter.connect()`, gateway-only, v0.8.14). `_start_server_in_thread()` spawns the uvicorn daemon thread + registers the `atexit` stop |
 | `server.py` | FastAPI app factory (`build_app`), Agent Card builder, JSON-RPC handler (echo/llm/agent dispatch), uvicorn lifecycle |
 | `fleet_config.py` | `fleet.yaml` loader, env-var token resolution, validation, `SUPPORTED_HANDLERS = {"echo", "llm", "agent"}`, `llm`/`agent` blocks |
 | `fleet_tools.py` | `fleet_send_handler` — wraps the client in a `{reply}`/`{error}` dict, threads `context_id` |

@@ -280,9 +280,64 @@ no new server, just the `agent` protocol pointed at the other profile.
   `os.environ` names shared across the host. With multiple profiles on one
   machine use **profile-scoped** names (`A2A_HERMES_TOKEN_NEO`, not a generic
   `SWITCH_A2A_TOKEN`). Loopback dev may set `auth_required: false`.
-- **Handshake**: reuse the executor convention — first message on a reserved
-  contextId `handshake:hermes-<peer>` declaring role/purpose; the receiver
-  confirms `role=agent` + profile name + ready before any real task.
+
+### Across two PCs (same LAN)
+
+Same as above, plus: the receiver's `fleet.server.bind_host` must be its **LAN
+IP** (or `0.0.0.0`), `auth_required: true` (mandatory off-loopback — fail-closed),
+the sender's peer `url` is the receiver's **LAN IP** (base, no `/jsonrpc`), and
+the receiver's firewall must allow inbound TCP on the bind_port from the peer.
+Bearer travels **cleartext over plain HTTP** — trusted LAN only, else put TLS in
+front / tunnel (WireGuard/SSH).
+
+**Token-per-direction (bidirectional):** each PC has its OWN inbound token
+(`server.token_env`); the *other* PC references it in its peer entry. Both token
+env vars exist on both machines (own = to serve, other's = to call out).
+
+| Token | Owner inbound | `server.token_env` on | peer-entry `token_env` on |
+|-------|---------------|------------------------|----------------------------|
+| `A2A_TOKEN_A` | PC-A | PC-A | PC-B's `pc-a` peer |
+| `A2A_TOKEN_B` | PC-B | PC-B | PC-A's `pc-b` peer |
+
+### Handshake (canonical first message — do before any real task)
+
+Send on reserved contextId `handshake:hermes-<peer>` (own session thread). The
+peer's `agent` handler reads it and confirms; no code enforces it.
+
+Initiator → peer:
+```
+[A2A HANDSHAKE v1 — Hermes↔Hermes peer]
+From: Hermes profile "<me>" @ <my-host>:<port> (orchestrator/initiator for this thread).
+Contract:
+  - Transport: A2A JSON-RPC SendMessage; bearer-authenticated.
+  - Continuity: same contextId = same ongoing session (a repeat = continuation, not a fresh start).
+  - Replies: concise, result-oriented (status / what changed / what is blocked).
+  - Scope: you act only within YOUR repo/profile; never act on a path I name that isn't yours.
+Purpose: establish a peer link so I can delegate tasks to your agent and relay results.
+
+Do NOT start work on this message. Reply with a confirmation containing:
+  1. role = peer (full Hermes agent, not a managed CLI executor);
+  2. your profile name + cwd/working directory;
+  3. harness inventory — active skills, MCP servers, CLAUDE.md/AGENTS.md loaded?;
+  4. ready / not-ready (and why, if not ready).
+```
+
+Peer → initiator (expected ACK):
+```
+[A2A HANDSHAKE ACK v1]
+role: peer (Hermes agent, profile "<peer>")
+cwd: /abs/path
+harness: skills=[...], mcp=[...], CLAUDE.md=loaded
+ready: yes        # or: ready: no — <reason>
+```
+
+Send it:
+```
+fleet_send(agent="pc-b", message="<handshake text>", context_id="handshake:hermes-pc-b")
+```
+One handshake per peer per session; both directions handshake independently. After
+`ready: yes`, drive real tasks on NEW contextIds (not the handshake one). The
+structured `SESSION_ANNOUNCE` form is future work (#71).
 
 ## Related
 
