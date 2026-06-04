@@ -21,11 +21,11 @@ Grammar::
 
 * trigger word ``matrix`` (case-insensitive) ONLY when the stripped message
   starts with it;
-* ``<role>`` ∈ {review, executor} for Phase 1. If the first token after the
-  trigger is NOT a known role, the role defaults to ``review`` and the entire
-  remainder becomes the goal;
+* ``<role>`` ∈ {review, executor, explore, plan, debug, test, verify,
+  simplify}. If the first token after the trigger is NOT a known role, the role
+  defaults to ``review`` and the entire remainder becomes the goal;
 * ``<lens>`` applies ONLY when ``role == review`` and the next token ∈
-  {security, code}; otherwise there is no lens;
+  {security, code, api, performance, quality, deps}; otherwise there is no lens;
 * an optional ``:`` separates the header from the goal and is stripped.
 """
 
@@ -42,8 +42,17 @@ logger = logging.getLogger(__name__)
 # -- grammar constants ------------------------------------------------------
 
 TRIGGER = "matrix"
-ROLES = {"review", "executor"}
-REVIEW_LENSES = {"security", "code"}
+ROLES = {
+    "review",
+    "executor",
+    "explore",
+    "plan",
+    "debug",
+    "test",
+    "verify",
+    "simplify",
+}
+REVIEW_LENSES = {"security", "code", "api", "performance", "quality", "deps"}
 _DEFAULT_ROLE = "review"
 
 # Cheap keyword/substring patterns that flag a goal as touching a

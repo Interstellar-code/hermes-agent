@@ -103,6 +103,56 @@ def test_parse_review_lens_only_empty_goal():
     assert parsed.goal == ""
 
 
+# -- parse_trigger: the six Phase-1.5 roles ---------------------------------
+
+def test_parse_each_new_role():
+    cases = {
+        "matrix explore: map auth": ("explore", "map auth"),
+        "matrix plan break down the export feature": (
+            "plan",
+            "break down the export feature",
+        ),
+        "matrix debug: why does login 500": ("debug", "why does login 500"),
+        "matrix test add coverage for parser": (
+            "test",
+            "add coverage for parser",
+        ),
+        "matrix verify the fix landed": ("verify", "the fix landed"),
+        "matrix simplify the auth helper": ("simplify", "the auth helper"),
+    }
+    for message, (role, goal) in cases.items():
+        parsed = parse_trigger(message)
+        assert parsed is not None, message
+        assert parsed.role == role, message
+        assert parsed.lens is None, message
+        assert parsed.goal == goal, message
+
+
+# -- parse_trigger: the four Phase-1.5 review lenses ------------------------
+
+def test_parse_each_new_review_lens():
+    cases = {
+        "matrix review api: check the schema": "api",
+        "matrix review performance: the hot loop": "performance",
+        "matrix review quality: the new abstraction": "quality",
+        "matrix review deps: the new package": "deps",
+    }
+    for message, lens in cases.items():
+        parsed = parse_trigger(message)
+        assert parsed is not None, message
+        assert parsed.role == "review", message
+        assert parsed.lens == lens, message
+        assert parsed.goal, message
+
+
+def test_parse_non_review_role_followed_by_lens_word_is_goal():
+    # A lens only applies to review; for any other role the lens-word is goal.
+    parsed = parse_trigger("matrix explore security")
+    assert parsed.role == "explore"
+    assert parsed.lens is None
+    assert parsed.goal == "security"
+
+
 # -- looks_sensitive --------------------------------------------------------
 
 def test_looks_sensitive_flags_security_goals():

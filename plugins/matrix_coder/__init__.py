@@ -5,16 +5,22 @@ composing a PERSONA (text) into the child's context and re-asserting it per
 turn via the ``pre_llm_call`` hook.  There is no subagent persona API — the
 persona is pure text composition (see ``core/prompts.py``).
 
-Phase 1 ships two usable roles invoked by an EXPLICIT trigger word ``matrix``
-at the start of a user message (parsed in ``core/intake.py``, composed by
+Roles are invoked by an EXPLICIT trigger word ``matrix`` at the start of a user
+message (parsed in ``core/intake.py``, composed by
 ``core/harness.handle_trigger`` and injected this turn by the ``pre_llm_call``
 hook):
 
-* ``review`` (lenses: security, code) — read-only specialist reviewer,
-* ``executor`` — surgical implementer (the role that edits files).
+* ``review`` (lenses: security, code, api, performance, quality, deps) —
+  read-only specialist reviewer (default role),
+* ``executor`` — surgical implementer (the one role that edits files),
+* ``explore`` — read-only territory mapper (files, flows, deps, risks),
+* ``plan`` — read-only planner (dependency-aware tasks + design + go/no-go),
+* ``debug`` — read-only root-cause hunter (proposes a fix strategy),
+* ``test`` — adds/strengthens tests (edits test files when asked),
+* ``verify`` — read-only evidence auditor (pass/fail ledger),
+* ``simplify`` — behavior-preserving reducer (edits when asked).
 
-The remaining roles (explore, plan, debug, test, verify, simplify) arrive in
-later phases.  This package ships:
+This package ships:
 
 * the plugin entrypoint + manifest,
 * the shared ``_base/`` specialist contracts, the real ``review`` / ``executor``
@@ -117,11 +123,25 @@ _HELP_TEXT = (
     "Invoke by starting your message with the trigger word `matrix`:\n"
     "  matrix <role> [<lens>] [:] <goal...>\n\n"
     "Roles:\n"
-    "  review [security|code]   — read-only specialist reviewer (default role)\n"
-    "  executor                 — surgical implementer (the role that edits files)\n\n"
+    "  review [<lens>]  — read-only specialist reviewer (default role)\n"
+    "  executor         — surgical implementer (the one role that edits files)\n"
+    "  explore          — read-only: map files, flows, dependencies, risks\n"
+    "  plan             — read-only: dependency-aware tasks + design + go/no-go\n"
+    "  debug            — read-only: isolate root cause, propose a fix strategy\n"
+    "  test             — add/strengthen tests (edits test files when asked)\n"
+    "  verify           — read-only: pass/fail evidence ledger for claims\n"
+    "  simplify         — behavior-preserving reduction (edits when asked)\n\n"
+    "Review lenses (only apply to `review`):\n"
+    "  security     — auth, injection, secrets, unsafe defaults, crypto\n"
+    "  code         — general correctness + maintainability (default review)\n"
+    "  api          — compatibility, schema drift, error semantics, versioning\n"
+    "  performance  — hot paths, N+1, algorithmic cost, allocation/I-O, caching\n"
+    "  quality      — logic defects, SOLID, brittle abstractions, anti-patterns\n"
+    "  deps         — package health, licenses, CVEs, pinning, supply-chain\n\n"
     "Examples:\n"
     "  matrix review security: check auth in login.py\n"
     "  matrix executor add a CSV export endpoint\n"
+    "  matrix explore: map the auth flow\n"
     "  matrix is this safe?            (defaults to review)\n\n"
     "The `/matrix` command is STATUS/HELP only — it is not the trigger path.\n"
     "  /matrix          — this help\n"
