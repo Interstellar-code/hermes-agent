@@ -250,6 +250,40 @@ The per-mode status/stop tools (`*_receiver_status` / `*_receiver_stop`) check
 restart, boot-reconcile re-publishes each managed peer's persisted token and
 leaves a healthy receiver running, relaunching only a peer that is down.
 
+## Hermes↔Hermes peering (profile-to-profile, response_handler: agent)
+
+One Hermes profile can dispatch a task to **another profile's agent** over A2A —
+no new server, just the `agent` protocol pointed at the other profile.
+
+- **Receiver side** (a profile that should be reachable): in its
+  `$HERMES_HOME/profiles/<p>/fleet.yaml` set `fleet.enabled: true`,
+  `fleet.response_handler: agent`, and a UNIQUE `fleet.server.bind_port`
+  (e.g. `switch 9219, neo 9220, morpheus 9221, trinity 9222`). The profile MUST
+  be running `gateway run` with `platforms.a2a_fleet` connected — the A2A
+  listener starts only in the gateway/agent process (it co-locates with the
+  in-process Route B bridge), and inbound `agent` requests fail "bridge not
+  ready" without a connected platform.
+- **Sender side**: list the other profiles as **plain agent peers** under
+  `fleet.agents` — `url` + optional `agent_card_url` + `token_env`. Do NOT add
+  `managed`/`mode`/`repo_path` (those are for deployed CLI executor receivers):
+
+  ```yaml
+  agents:
+    neo:
+      url: http://127.0.0.1:9220/jsonrpc
+      agent_card_url: http://127.0.0.1:9220/.well-known/agent-card.json
+      token_env: A2A_HERMES_TOKEN_NEO   # PROFILE-SCOPED name (see below)
+  ```
+  Then `fleet_send("neo", "...")` reaches Neo's agent; the reply comes back.
+  Bidirectional = both profiles list each other AND both run a listener.
+- **Tokens**: `fleet.server.token_env` and plain-peer `token_env` resolve as raw
+  `os.environ` names shared across the host. With multiple profiles on one
+  machine use **profile-scoped** names (`A2A_HERMES_TOKEN_NEO`, not a generic
+  `SWITCH_A2A_TOKEN`). Loopback dev may set `auth_required: false`.
+- **Handshake**: reuse the executor convention — first message on a reserved
+  contextId `handshake:hermes-<peer>` declaring role/purpose; the receiver
+  confirms `role=agent` + profile name + ready before any real task.
+
 ## Related
 
 - To make this node answer with real reasoning/tools, set `response_handler: llm`

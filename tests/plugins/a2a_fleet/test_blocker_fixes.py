@@ -60,6 +60,12 @@ class _StubCtx:
     def register_tool(self, **kwargs) -> None:
         self.calls.append(kwargs)
 
+    # Presence of register_platform = "gateway/agent process" — the only context
+    # in which register() starts the A2A listener (co-located with the Route B
+    # bridge, #120). Tests exercising the server-start path use this gateway stub.
+    def register_platform(self, **kwargs) -> None:
+        pass
+
 
 def _expected_registered_tool_names() -> set[str]:
     names = {
@@ -124,6 +130,40 @@ def test_register_logs_when_start_server_fails(
 
 
 # MAJ-6 -----------------------------------------------------------------
+
+
+def test_server_starts_only_in_gateway_context(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#120: the A2A listener is started ONLY in the gateway/agent context
+    (ctx has register_platform). A non-gateway plugin-load context (CLI tool
+    startup, dashboard web tier) must register tools but NOT start the server —
+    otherwise multiple processes race to bind fleet.server.bind_port and a
+    bridge-less listener can win the port.
+    """
+    import a2a_fleet
+
+    starts: list = []
+    monkeypatch.setattr(a2a_fleet, "_start_server_in_thread", lambda: starts.append(True))
+    monkeypatch.setattr(a2a_fleet, "_server_thread", None)
+
+    # Non-gateway ctx: register_tool only, NO register_platform.
+    class _ToolOnlyCtx:
+        def __init__(self) -> None:
+            self.calls: list = []
+
+        def register_tool(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    tool_only = _ToolOnlyCtx()
+    a2a_fleet.register(tool_only)
+    assert tool_only.calls, "tools must still register in a non-gateway context"
+    assert starts == [], "server must NOT start without a gateway (register_platform) context"
+
+    # Gateway ctx: has register_platform -> server start fires exactly once.
+    gw = _StubCtx()
+    a2a_fleet.register(gw)
+    assert starts == [True], "server must start exactly once in the gateway context"
 
 
 def test_register_skips_when_fleet_disabled(fleet_home: Path) -> None:

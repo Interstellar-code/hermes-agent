@@ -1,5 +1,29 @@
 # a2a_fleet — Changelog
 
+## v0.8.14 — A2A listener starts only in the gateway context (bind-race fix) + Hermes↔Hermes peering docs (#120)
+
+- **Bind-race fix (blocker for multi-process / multi-profile):** `register()`
+  called `_start_server_in_thread()` unconditionally, but `register(ctx)` runs in
+  EVERY process that loads the plugin (gateway, CLI tool startup, dashboard web
+  tier). Multiple processes therefore raced to bind `fleet.server.bind_port`; if a
+  non-gateway process won, its standalone uvicorn listener had no Route B bridge
+  (the in-process `run_coroutine_threadsafe` to the agent loop) and served inbound
+  `agent` requests with "bridge not ready". The listener now starts **only in the
+  gateway/agent context** (gated on `hasattr(ctx, "register_platform")`, the same
+  signal that wires the bridge), co-locating listener + bridge. Non-gateway
+  contexts register tools but skip the server with an info log. Regression test:
+  server starts in a gateway-ctx stub, not in a tool-only stub; falsification-verified.
+- **Docs:** corrected the stale `references/hermes-gateway-plugin-guide.md` — it
+  described a never-implemented `/api/plugins/a2a_fleet/jsonrpc|sse|tasks` mount;
+  the real transport is the standalone uvicorn (`server.py`, `/jsonrpc` +
+  `/.well-known/agent-card.json` + `/health`) with an in-process Route B bridge.
+  Added a "Hermes↔Hermes peering" section to the `deploy-fleet` skill (per-profile
+  `bind_port` map, plain-agent-peer shape, profile-scoped token envs, the
+  gateway-run prereq, handshake convention).
+- Groundwork for Hermes↔Hermes profile-to-profile A2A (#120). No new server: it
+  reuses the existing `agent` protocol pointed at another profile.
+- Full suite 406 passed.
+
 ## v0.8.13 — agy prefix-drift made observable (#108) + #109 near-term
 
 Addresses the agy intermittent `[no reply produced by agy]` / stale-context

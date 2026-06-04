@@ -40,6 +40,11 @@ class _StubCtx:
     def register_tool(self, **kwargs) -> None:
         pass
 
+    # Gateway/agent context signal — register() starts the A2A listener only when
+    # this is present (co-located with the Route B bridge, #120).
+    def register_platform(self, **kwargs) -> None:
+        pass
+
 
 def test_register_from_sync_context_starts_server(fleet_home: Path) -> None:
     """Calling register() with no running asyncio loop must still start the server."""
