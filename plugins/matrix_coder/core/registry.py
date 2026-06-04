@@ -51,8 +51,16 @@ def load_base_contracts() -> List[str]:
 
 
 def load_persona(name: str) -> str:
-    """Read ``personas/<name>.md`` and return its text (``""`` if missing)."""
-    return _read(_PERSONAS_DIR / f"{name}.md")
+    """Read ``personas/<name>.md`` and return its text (``""`` if missing).
+
+    Falls back to ``personas/workflows/<name>.md`` when the top-level file is
+    absent, so workflow personas resolve without the caller needing to know
+    their sub-directory.
+    """
+    text = _read(_PERSONAS_DIR / f"{name}.md")
+    if not text:
+        text = _read(_PERSONAS_DIR / "workflows" / f"{name}.md")
+    return text
 
 
 def load_lens(name: str) -> str:

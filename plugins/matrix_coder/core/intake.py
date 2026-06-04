@@ -22,10 +22,13 @@ Grammar::
 * trigger word ``matrix`` (case-insensitive) ONLY when the stripped message
   starts with it;
 * ``<role>`` ∈ {review, executor, explore, plan, debug, test, verify,
-  simplify}. If the first token after the trigger is NOT a known role, the role
-  defaults to ``review`` and the entire remainder becomes the goal;
+  simplify} OR a workflow ∈ {ralph, autopilot, ultrawork, ultraqa}. If the first
+  token after the trigger is NOT a known role/workflow, the role defaults to
+  ``review`` and the entire remainder becomes the goal;
 * ``<lens>`` applies ONLY when ``role == review`` and the next token ∈
-  {security, code, api, performance, quality, deps}; otherwise there is no lens;
+  {security, code, api, performance, quality, deps}; otherwise there is no lens
+  (workflows never take a lens — any token after a workflow name is part of the
+  goal);
 * an optional ``:`` separates the header from the goal and is stripped.
 """
 
@@ -53,6 +56,7 @@ ROLES = {
     "simplify",
 }
 REVIEW_LENSES = {"security", "code", "api", "performance", "quality", "deps"}
+WORKFLOWS = {"ralph", "autopilot", "ultrawork", "ultraqa"}
 _DEFAULT_ROLE = "review"
 
 # Cheap keyword/substring patterns that flag a goal as touching a
@@ -77,7 +81,7 @@ SENSITIVE_PATH_PATTERNS = [
     "ci/cd",
     "ci config",
     "github actions",
-    "workflow",
+    "ci workflow",
     "dockerfile",
     "kubernetes",
     "k8s",
@@ -88,8 +92,9 @@ SENSITIVE_PATH_PATTERNS = [
 class ParsedInvocation:
     """A parsed Matrix Coder trigger.
 
-    ``role`` is one of :data:`ROLES`; ``lens`` is set only for a review role
-    whose header named a Phase-1 lens; ``goal`` is the remaining free-form text.
+    ``role`` is one of :data:`ROLES` or :data:`WORKFLOWS`; ``lens`` is set only
+    for a review role whose header named a lens; ``goal`` is the remaining
+    free-form text.
     """
 
     role: str
@@ -131,17 +136,17 @@ def parse_trigger(message: str) -> Optional[ParsedInvocation]:
         # (e.g. ``matrix review security: goal``), so compare against a
         # colon-trimmed form when classifying header tokens.
         first = rest[0].lower().rstrip(":")
-        if first in ROLES:
+        if first in ROLES or first in WORKFLOWS:
             role = first
             idx = 1
-            # A lens only applies to the review role.
+            # A lens only applies to the review role; workflows never get a lens.
             if role == "review" and idx < len(rest):
                 candidate = rest[idx].lower().rstrip(":")
                 if candidate in REVIEW_LENSES:
                     lens = candidate
                     idx += 1
-        # else: first token is not a known role -> default role, whole
-        # remainder (including that token) is the goal.
+        # else: first token is not a known role or workflow -> default role,
+        # whole remainder (including that token) is the goal.
 
         goal_tokens = rest[idx:]
         goal = " ".join(goal_tokens).strip()
@@ -197,7 +202,9 @@ def intake_gate(parsed: ParsedInvocation) -> IntakeDecision:
     the Phase-5 IMPLICIT path and is intentionally NOT wired here: an explicit
     trigger is never silently downgraded to a direct answer.
     """
-    if parsed.role == "review" and parsed.lens:
+    if parsed.role in WORKFLOWS:
+        route = parsed.role
+    elif parsed.role == "review" and parsed.lens:
         route = f"{parsed.role}:{parsed.lens}"
     else:
         route = parsed.role

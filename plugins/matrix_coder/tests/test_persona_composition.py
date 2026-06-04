@@ -109,3 +109,38 @@ def test_review_with_each_new_lens_includes_lens_text():
         assert "Review Specialist" in composed, name
         assert title in composed, name
         assert "# LENS" in composed, name
+
+
+# -- Phase 3: workflow personas ---------------------------------------------
+
+# workflow name -> distinctive title string from its persona file.
+_WORKFLOW_PERSONAS = {
+    "ralph": "Ralph Workflow",
+    "autopilot": "Autopilot Workflow",
+    "ultrawork": "Ultrawork Workflow",
+    "ultraqa": "UltraQA Workflow",
+}
+
+
+def test_workflow_personas_load_nonempty_and_compose():
+    base = registry.load_base_contracts()
+    for name, title in _WORKFLOW_PERSONAS.items():
+        persona = registry.load_persona(name)
+        assert persona.strip(), f"{name} persona should not be empty"
+        composed = compose_persona(base, persona)
+        assert "Specialist Contract" in composed, name
+        assert title in composed, name
+        # Workflows never use a lens -> no LENS section.
+        assert "# LENS" not in composed, name
+
+
+def test_load_persona_fallback_does_not_break_specialist_lookup():
+    # The Phase-3 two-step fallback (top-level -> workflows/) must NOT shadow or
+    # break the top-level specialist personas.
+    assert registry.load_persona("executor").strip()
+    assert registry.load_persona("review").strip()
+
+
+def test_load_persona_missing_returns_empty():
+    # Defensive: a name in neither location returns "" (never raises).
+    assert registry.load_persona("__does_not_exist__") == ""

@@ -20,6 +20,15 @@ hook):
 * ``verify`` — read-only evidence auditor (pass/fail ledger),
 * ``simplify`` — behavior-preserving reducer (edits when asked).
 
+Workflow skills compose the specialist roles into multi-step procedures and
+instruct the live Hermes agent (which IS the parent agent with full tool
+access) to execute the loop. No lens applies to workflows.
+
+* ``ralph`` — iterative executor→verify loop until pass or cap (5 iterations),
+* ``autopilot`` — full end-to-end plan→executor→test→review→verify chain,
+* ``ultrawork`` — parallel fan-out via delegate_task with disjoint file sets,
+* ``ultraqa`` — test→verify→fix cycle until suite is green or cap (5 cycles).
+
 This package ships:
 
 * the plugin entrypoint + manifest,
@@ -168,6 +177,16 @@ _HELP_TEXT = (
     "  performance  — hot paths, N+1, algorithmic cost, allocation/I-O, caching\n"
     "  quality      — logic defects, SOLID, brittle abstractions, anti-patterns\n"
     "  deps         — package health, licenses, CVEs, pinning, supply-chain\n\n"
+    "Workflows (multi-step procedures; no lens applies):\n"
+    "  ralph       — loop executor→verify until pass or 5-iteration cap\n"
+    "  autopilot   — full chain plan→executor→test→review→verify end-to-end\n"
+    "  ultrawork   — fan-out via delegate_task with disjoint file sets, then aggregate\n"
+    "  ultraqa     — cycle test→verify→fix until suite is green or 5-cycle cap\n\n"
+    "Workflow examples:\n"
+    "  matrix ralph: make the auth tests pass\n"
+    "  matrix autopilot: add a CSV export endpoint with tests\n"
+    "  matrix ultrawork: refactor the three parser modules\n"
+    "  matrix ultraqa: get the integration suite green\n\n"
     "Examples:\n"
     "  matrix review security: check auth in login.py\n"
     "  matrix executor add a CSV export endpoint\n"

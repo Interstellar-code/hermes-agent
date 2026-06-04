@@ -22,6 +22,7 @@ if str(_PLUGIN_DIR) not in sys.path:
 
 from core.intake import (  # noqa: E402
     ParsedInvocation,
+    WORKFLOWS,
     intake_gate,
     looks_sensitive,
     parse_trigger,
@@ -189,3 +190,57 @@ def test_intake_gate_executor_route():
     )
     assert decision.verdict is Verdict.MATRIX
     assert decision.proposed_route == "executor"
+
+
+# -- Phase 3: workflow parsing + intake gate --------------------------------
+
+def test_workflows_constant_contains_four_names():
+    assert WORKFLOWS == {"ralph", "autopilot", "ultrawork", "ultraqa"}
+
+
+def test_parse_workflow_ralph():
+    parsed = parse_trigger("matrix ralph: make the auth tests pass")
+    assert parsed is not None
+    assert parsed.role == "ralph"
+    assert parsed.lens is None
+    assert parsed.goal == "make the auth tests pass"
+
+
+def test_parse_workflow_autopilot():
+    parsed = parse_trigger("matrix autopilot: add a CSV export endpoint with tests")
+    assert parsed is not None
+    assert parsed.role == "autopilot"
+    assert parsed.lens is None
+    assert parsed.goal == "add a CSV export endpoint with tests"
+
+
+def test_parse_workflow_ultrawork():
+    parsed = parse_trigger("matrix ultrawork: refactor the three parser modules")
+    assert parsed is not None
+    assert parsed.role == "ultrawork"
+    assert parsed.lens is None
+    assert parsed.goal == "refactor the three parser modules"
+
+
+def test_parse_workflow_ultraqa():
+    parsed = parse_trigger("matrix ultraqa: get the integration suite green")
+    assert parsed is not None
+    assert parsed.role == "ultraqa"
+    assert parsed.lens is None
+    assert parsed.goal == "get the integration suite green"
+
+
+def test_parse_workflow_plus_lens_word_treats_lens_as_goal():
+    # Lenses never apply to workflows; a lens-word after a workflow is goal text.
+    parsed = parse_trigger("matrix ralph security")
+    assert parsed is not None
+    assert parsed.role == "ralph"
+    assert parsed.lens is None
+    assert parsed.goal == "security"
+
+
+def test_intake_gate_workflow_route():
+    for name in ("ralph", "autopilot", "ultrawork", "ultraqa"):
+        decision = intake_gate(ParsedInvocation(role=name, lens=None, goal="x"))
+        assert decision.verdict is Verdict.MATRIX, name
+        assert decision.proposed_route == name, name
