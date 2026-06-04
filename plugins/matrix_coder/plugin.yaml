@@ -1,0 +1,17 @@
+name: matrix_coder
+version: "0.5.0"
+description: "Matrix Coder — a specialist-coder layer for Hermes. Turns a generic Hermes subagent into a focused specialist by composing a PERSONA as text into the child's context and re-asserting it per turn via the pre_llm_call hook. Ships eight roles invoked by an EXPLICIT trigger word 'matrix' at the start of a message: review (lenses: security, code, api, performance, quality, deps), executor, explore, plan, debug, test, verify, simplify. Also ships four workflow skills (ralph, autopilot, ultrawork, ultraqa) that compose specialist roles into multi-step procedures executed by the live Hermes parent agent using its own tools (delegate_task, edit, test, search). Phase 4 adds five DOMAIN PACKS (frontend, backend-api, data-db, infra-cli, plugin-skill-authoring) — composable @domain context layers that add stack-specific conventions and checklists on top of any role or workflow without changing the role contract. Each invocation is mirrored as a Hermes Kanban audit card (running -> done) for live observability on the Switch UI — a defensive, optional observability layer, never control flow (created with no assignee so the dispatcher never re-runs it). Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. The /matrix command is STATUS/HELP only. Tracks epic #76."
+author: Interstellar-code
+kind: standalone
+
+# Lifecycle hooks this plugin registers (doc-only list; register() is authoritative).
+hooks:
+  - pre_llm_call
+  - post_llm_call
+  - transform_llm_output
+
+# Tools registered with the Hermes agent (none in Phase 0).
+provides_tools: []
+
+# Environment variables read at runtime (none in Phase 0).
+requires_env: []
