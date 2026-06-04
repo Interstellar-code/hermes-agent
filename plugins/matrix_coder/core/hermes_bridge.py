@@ -51,6 +51,7 @@ class HermesBridge:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._active_persona: Optional[str] = None
+        self._active_card_id: Optional[str] = None
         self._claimed: Set[str] = set()
 
     # -- active dispatch / persona injection --------------------------------
@@ -76,6 +77,32 @@ class HermesBridge:
     def is_active(self) -> bool:
         with self._lock:
             return self._active_persona is not None
+
+    # -- audit-mirror card bookkeeping (Phase 2) ----------------------------
+
+    def set_active_card(self, card_id: Optional[str]) -> None:
+        """Record the audit-mirror card id for the active dispatch.
+
+        Tracked alongside the active persona so the hooks can later close the
+        matching card. Setting ``None`` records "no card" (e.g. mirroring was
+        disabled or card creation failed) without auto-closing anything.
+        """
+        with self._lock:
+            self._active_card_id = card_id
+
+    def active_card_id(self) -> Optional[str]:
+        """Return the active dispatch's audit-mirror card id, or ``None``."""
+        with self._lock:
+            return self._active_card_id
+
+    def clear_active_card(self) -> None:
+        """Forget the active card id WITHOUT closing it.
+
+        Closing a card requires a kanban call — that is the hooks' job. This
+        only drops the local bookkeeping so a stale id can't be reused.
+        """
+        with self._lock:
+            self._active_card_id = None
 
     # -- single-writer-per-file bookkeeping ---------------------------------
 

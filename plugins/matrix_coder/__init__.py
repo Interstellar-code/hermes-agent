@@ -47,7 +47,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from .core import harness
+from .core import harness, kanban_audit
 from .core.hermes_bridge import bridge
 
 logger = logging.getLogger(__name__)
@@ -65,13 +65,29 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
     persona and returns it for SAME-turn injection. If there is NO trigger, we
     defensively clear any active persona and return ``None`` — so a persona is
     active ONLY on the turn whose message carried the trigger.
+
+    Phase 2 audit-mirror: on the non-trigger path, any still-open audit card is
+    an orphan (a prior dispatch never produced a completion signal). We close it
+    ``done`` and clear the bookkeeping — self-correcting cleanup mirroring the
+    persona leak guard. Kanban failures are swallowed.
     """
     try:
         user_message = kwargs.get("user_message", "") or ""
-        composed = harness.handle_trigger(user_message=user_message)
+        composed = harness.handle_trigger(
+            user_message=user_message, session_id=kwargs.get("session_id")
+        )
         if composed:
             return composed
-        # No trigger this turn -> defensive clear so nothing leaks forward.
+        # No trigger this turn -> close any orphan card, then defensive clear so
+        # neither a persona nor a card leaks forward.
+        orphan_id = bridge.active_card_id()
+        if orphan_id:
+            kanban_audit.close_card(
+                orphan_id,
+                summary="(closed: no completion signal)",
+                status="done",
+            )
+            bridge.clear_active_card()
         bridge.clear_active_persona()
         return None
     except Exception as exc:  # pragma: no cover - defensive
@@ -87,8 +103,22 @@ def _clear_persona(**kwargs: Any) -> Optional[str]:
     backstop fires after a completed, non-interrupted turn (the core gates
     ``post_llm_call`` on ``final_response and not interrupted``), so it does NOT
     run on interrupted/empty turns — leak-proofness does not depend on it.
-    Defensive — never raises.
+
+    Phase 2 audit-mirror: this is the normal close path for a card opened on the
+    trigger turn — close it ``done`` with the assistant's response as the
+    summary, then clear the card bookkeeping. Defensive — never raises.
     """
+    try:
+        card_id = bridge.active_card_id()
+        if card_id:
+            kanban_audit.close_card(
+                card_id,
+                summary=kwargs.get("assistant_response"),
+                status="done",
+            )
+            bridge.clear_active_card()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("matrix_coder: _clear_persona card-close suppressed error: %s", exc)
     try:
         bridge.clear_active_persona()
     except Exception as exc:  # pragma: no cover - defensive

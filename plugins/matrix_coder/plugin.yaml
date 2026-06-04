@@ -1,6 +1,6 @@
 name: matrix_coder
-version: "0.2.0"
-description: "Matrix Coder — a specialist-coder layer for Hermes. Turns a generic Hermes subagent into a focused specialist by composing a PERSONA as text into the child's context and re-asserting it per turn via the pre_llm_call hook. Ships eight roles invoked by an EXPLICIT trigger word 'matrix' at the start of a message: review (lenses: security, code, api, performance, quality, deps), executor, explore, plan, debug, test, verify, simplify. Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. The /matrix command is STATUS/HELP only. Tracks epic #76."
+version: "0.3.0"
+description: "Matrix Coder — a specialist-coder layer for Hermes. Turns a generic Hermes subagent into a focused specialist by composing a PERSONA as text into the child's context and re-asserting it per turn via the pre_llm_call hook. Ships eight roles invoked by an EXPLICIT trigger word 'matrix' at the start of a message: review (lenses: security, code, api, performance, quality, deps), executor, explore, plan, debug, test, verify, simplify. Each invocation is mirrored as a Hermes Kanban audit card (running -> done) for live observability on the Switch UI — a defensive, optional observability layer, never control flow (created with no assignee so the dispatcher never re-runs it). Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. The /matrix command is STATUS/HELP only. Tracks epic #76."
 author: Interstellar-code
 kind: standalone
 

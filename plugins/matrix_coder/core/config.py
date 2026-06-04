@@ -34,4 +34,8 @@ def load_config() -> Dict[str, Any]:
         # Single-writer-per-file guardrail is enforced at orchestration time;
         # this flag exists so later phases can toggle the bookkeeping.
         "single_writer_per_file": True,
+        # Phase 2 audit-mirror: mirror each matrix invocation as a Hermes Kanban
+        # card for live observability on the Switch UI. Purely an audit layer,
+        # never control flow. Set False to disable mirroring entirely.
+        "KANBAN_AUDIT_ENABLED": True,
     }
