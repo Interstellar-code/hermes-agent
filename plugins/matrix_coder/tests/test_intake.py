@@ -21,6 +21,7 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 from core.intake import (  # noqa: E402
+    DOMAINS,
     ParsedInvocation,
     WORKFLOWS,
     intake_gate,
@@ -244,3 +245,99 @@ def test_intake_gate_workflow_route():
         decision = intake_gate(ParsedInvocation(role=name, lens=None, goal="x"))
         assert decision.verdict is Verdict.MATRIX, name
         assert decision.proposed_route == name, name
+
+
+# -- Phase 4: @domain token parsing -----------------------------------------
+
+def test_domains_constant_contains_five_names():
+    assert DOMAINS == {
+        "frontend",
+        "backend-api",
+        "data-db",
+        "infra-cli",
+        "plugin-skill-authoring",
+    }
+
+
+def test_parse_domain_with_role():
+    parsed = parse_trigger("matrix executor @backend-api: add a CSV export endpoint")
+    assert parsed is not None
+    assert parsed.role == "executor"
+    assert parsed.domain == "backend-api"
+    assert parsed.goal == "add a CSV export endpoint"
+    assert parsed.lens is None
+
+
+def test_parse_domain_with_review_and_lens():
+    parsed = parse_trigger("matrix review security @frontend: audit the login form")
+    assert parsed is not None
+    assert parsed.role == "review"
+    assert parsed.lens == "security"
+    assert parsed.domain == "frontend"
+    assert parsed.goal == "audit the login form"
+
+
+def test_parse_domain_with_workflow():
+    parsed = parse_trigger("matrix ralph @data-db: z")
+    assert parsed is not None
+    assert parsed.role == "ralph"
+    assert parsed.domain == "data-db"
+    assert parsed.goal == "z"
+    assert parsed.lens is None
+
+
+def test_parse_unknown_at_token_stays_in_goal():
+    parsed = parse_trigger("matrix executor @bogus: x")
+    assert parsed is not None
+    assert parsed.role == "executor"
+    assert parsed.domain is None
+    assert parsed.goal == "@bogus: x"
+
+
+def test_parse_domain_with_default_role():
+    # @domain works with no explicit role token -> default role (review).
+    parsed = parse_trigger("matrix @frontend: do work")
+    assert parsed is not None
+    assert parsed.role == "review"
+    assert parsed.domain == "frontend"
+    assert parsed.lens is None
+    assert parsed.goal == "do work"
+
+
+def test_parse_no_domain_gives_none():
+    parsed = parse_trigger("matrix executor: add endpoint")
+    assert parsed is not None
+    assert parsed.domain is None
+    assert parsed.goal == "add endpoint"
+
+
+def test_parse_all_domain_names():
+    for name in DOMAINS:
+        msg = f"matrix executor @{name}: do work"
+        parsed = parse_trigger(msg)
+        assert parsed is not None, name
+        assert parsed.domain == name, name
+        assert parsed.goal == "do work", name
+
+
+def test_intake_gate_domain_included_in_route():
+    decision = intake_gate(
+        ParsedInvocation(role="executor", lens=None, goal="x", domain="backend-api")
+    )
+    assert decision.verdict is Verdict.MATRIX
+    assert decision.proposed_route == "executor@backend-api"
+
+
+def test_intake_gate_review_lens_domain_route():
+    decision = intake_gate(
+        ParsedInvocation(role="review", lens="security", goal="y", domain="frontend")
+    )
+    assert decision.verdict is Verdict.MATRIX
+    assert decision.proposed_route == "review:security@frontend"
+
+
+def test_intake_gate_no_domain_route_unchanged():
+    decision = intake_gate(
+        ParsedInvocation(role="executor", lens=None, goal="x", domain=None)
+    )
+    assert decision.proposed_route == "executor"

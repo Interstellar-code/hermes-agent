@@ -1,10 +1,10 @@
-"""Invocation parsing + intake gate for Matrix Coder (Phase 1).
+"""Invocation parsing + intake gate for Matrix Coder (Phase 1 / Phase 4).
 
 Matrix Coder is invoked EXPLICITLY: the user's message starts with the trigger
 word ``matrix`` followed by an optional role, an optional review lens, an
-optional ``:`` separator, and the goal text. The ``pre_llm_call`` hook parses
-that message and, when a trigger is present, composes the matching persona into
-the same turn.
+optional ``@domain``, an optional ``:`` separator, and the goal text. The
+``pre_llm_call`` hook parses that message and, when a trigger is present,
+composes the matching persona (+ optional domain pack) into the same turn.
 
 This module owns:
 
@@ -17,7 +17,7 @@ This module owns:
 
 Grammar::
 
-    matrix <role> [<lens>] [:] <goal...>
+    matrix <role> [<lens>] [@<domain>] [:] <goal...>
 
 * trigger word ``matrix`` (case-insensitive) ONLY when the stripped message
   starts with it;
@@ -29,6 +29,13 @@ Grammar::
   {security, code, api, performance, quality, deps}; otherwise there is no lens
   (workflows never take a lens — any token after a workflow name is part of the
   goal);
+* ``@<domain>`` is an OPTIONAL composable context layer token. It appears after
+  the role (and after the lens for review), before the optional ``:``/goal. The
+  ``<name>`` part must be in :data:`DOMAINS`; if the ``@``-prefixed token is not
+  a known domain it is left in the goal unchanged. Domain applies to any role
+  OR workflow, and also works with the default role (``matrix @frontend: ...``).
+  A trailing ``:`` glued to the token (``@backend-api:``) is stripped before the
+  domain lookup;
 * an optional ``:`` separates the header from the goal and is stripped.
 """
 
@@ -57,6 +64,7 @@ ROLES = {
 }
 REVIEW_LENSES = {"security", "code", "api", "performance", "quality", "deps"}
 WORKFLOWS = {"ralph", "autopilot", "ultrawork", "ultraqa"}
+DOMAINS = {"frontend", "backend-api", "data-db", "infra-cli", "plugin-skill-authoring"}
 _DEFAULT_ROLE = "review"
 
 # Cheap keyword/substring patterns that flag a goal as touching a
@@ -93,13 +101,15 @@ class ParsedInvocation:
     """A parsed Matrix Coder trigger.
 
     ``role`` is one of :data:`ROLES` or :data:`WORKFLOWS`; ``lens`` is set only
-    for a review role whose header named a lens; ``goal`` is the remaining
-    free-form text.
+    for a review role whose header named a lens; ``domain`` is set when an
+    ``@<name>`` token matching :data:`DOMAINS` appears after the role/lens and
+    before the goal; ``goal`` is the remaining free-form text.
     """
 
     role: str
     lens: Optional[str]
     goal: str
+    domain: Optional[str] = None
 
 
 def parse_trigger(message: str) -> Optional[ParsedInvocation]:
@@ -148,6 +158,18 @@ def parse_trigger(message: str) -> Optional[ParsedInvocation]:
         # else: first token is not a known role or workflow -> default role,
         # whole remainder (including that token) is the goal.
 
+        # Optional @domain token: must appear before the goal/colon separator.
+        # Only consumed when the name (without leading @) is in DOMAINS; otherwise
+        # the token stays in the goal unchanged.
+        domain: Optional[str] = None
+        if idx < len(rest):
+            candidate_raw = rest[idx]
+            if candidate_raw.startswith("@"):
+                candidate_name = candidate_raw[1:].lower().rstrip(":")
+                if candidate_name in DOMAINS:
+                    domain = candidate_name
+                    idx += 1
+
         goal_tokens = rest[idx:]
         goal = " ".join(goal_tokens).strip()
 
@@ -155,7 +177,7 @@ def parse_trigger(message: str) -> Optional[ParsedInvocation]:
         if goal.startswith(":"):
             goal = goal[1:].strip()
 
-        return ParsedInvocation(role=role, lens=lens, goal=goal)
+        return ParsedInvocation(role=role, lens=lens, goal=goal, domain=domain)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: parse_trigger suppressed error: %s", exc)
         return None
@@ -208,6 +230,9 @@ def intake_gate(parsed: ParsedInvocation) -> IntakeDecision:
         route = f"{parsed.role}:{parsed.lens}"
     else:
         route = parsed.role
+
+    if parsed.domain:
+        route = f"{route}@{parsed.domain}"
 
     # Phase-5 preview, log-only: would we have recommended a direct answer if
     # this had arrived via the implicit path? (Never acted on in Phase 1.)

@@ -74,8 +74,11 @@ def handle_trigger(
             if (parsed.role == "review" and parsed.lens)
             else None
         )
+        domain_text = (
+            registry.load_domain(parsed.domain) if parsed.domain else None
+        )
 
-        composed = compose_persona(base, persona, lens=lens_text)
+        composed = compose_persona(base, persona, lens=lens_text, domain_pack=domain_text)
         bridge.set_active_persona(composed)
 
         # Mirror this invocation as ONE running audit card (best-effort).

@@ -19,6 +19,7 @@ _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 _PERSONAS_DIR = _PLUGIN_DIR / "personas"
 _BASE_DIR = _PERSONAS_DIR / "_base"
 _LENSES_DIR = _PERSONAS_DIR / "review-lenses"
+_DOMAINS_DIR = _PERSONAS_DIR / "domains"
 
 # Ordered _base contracts composed into every persona.
 _BASE_CONTRACTS = (
@@ -70,6 +71,16 @@ def load_lens(name: str) -> str:
     the hot path and must never crash it.
     """
     return _read(_LENSES_DIR / f"{name}.md")
+
+
+def load_domain(name: str) -> str:
+    """Read ``personas/domains/<name>.md`` and return it (``""`` if missing).
+
+    Domain packs are composable context layers layered on top of a role persona.
+    Defensive: a missing or unreadable file returns ``""`` — domain text feeds
+    the hot path and must never crash it.
+    """
+    return _read(_DOMAINS_DIR / f"{name}.md")
 
 
 def available_personas() -> List[str]:

@@ -29,6 +29,16 @@ access) to execute the loop. No lens applies to workflows.
 * ``ultrawork`` — parallel fan-out via delegate_task with disjoint file sets,
 * ``ultraqa`` — test→verify→fix cycle until suite is green or cap (5 cycles).
 
+Domain packs (Phase 4) are composable context layers that add stack-specific
+conventions, checklists, and pitfalls ON TOP OF any role or workflow — they
+do NOT change the role's contract or output format. Specify with ``@<name>``:
+
+* ``@frontend`` — UI/UX, components, state, a11y, browser, bundling,
+* ``@backend-api`` — HTTP design, contracts, validation, auth, persistence,
+* ``@data-db`` — schema/migrations, queries, indexing, transactions, N+1,
+* ``@infra-cli`` — CLI ergonomics, packaging, config/env, deployment, observability,
+* ``@plugin-skill-authoring`` — Hermes plugin/skill authoring conventions.
+
 This package ships:
 
 * the plugin entrypoint + manifest,
@@ -160,7 +170,7 @@ def _normalize_output(**kwargs: Any) -> Optional[str]:
 _HELP_TEXT = (
     "Matrix Coder — specialist coder layer\n\n"
     "Invoke by starting your message with the trigger word `matrix`:\n"
-    "  matrix <role> [<lens>] [:] <goal...>\n\n"
+    "  matrix <role> [<lens>] [@<domain>] [:] <goal...>\n\n"
     "Roles:\n"
     "  review [<lens>]  — read-only specialist reviewer (default role)\n"
     "  executor         — surgical implementer (the one role that edits files)\n"
@@ -177,6 +187,12 @@ _HELP_TEXT = (
     "  performance  — hot paths, N+1, algorithmic cost, allocation/I-O, caching\n"
     "  quality      — logic defects, SOLID, brittle abstractions, anti-patterns\n"
     "  deps         — package health, licenses, CVEs, pinning, supply-chain\n\n"
+    "Domain packs (add stack context on top of any role or workflow):\n"
+    "  @frontend              — components, state, a11y, browser, bundling\n"
+    "  @backend-api           — HTTP design, contracts, validation, auth, persistence\n"
+    "  @data-db               — schema/migrations, queries, indexing, transactions, N+1\n"
+    "  @infra-cli             — CLI ergonomics, packaging, config/env, deployment, observability\n"
+    "  @plugin-skill-authoring — Hermes plugin/skill authoring conventions\n\n"
     "Workflows (multi-step procedures; no lens applies):\n"
     "  ralph       — loop executor→verify until pass or 5-iteration cap\n"
     "  autopilot   — full chain plan→executor→test→review→verify end-to-end\n"
@@ -187,6 +203,11 @@ _HELP_TEXT = (
     "  matrix autopilot: add a CSV export endpoint with tests\n"
     "  matrix ultrawork: refactor the three parser modules\n"
     "  matrix ultraqa: get the integration suite green\n\n"
+    "Domain pack examples:\n"
+    "  matrix executor @backend-api: add a CSV export endpoint\n"
+    "  matrix review security @frontend: audit the login form\n"
+    "  matrix debug @data-db: why is the user query slow\n"
+    "  matrix ralph @infra-cli: make the deploy script idempotent\n\n"
     "Examples:\n"
     "  matrix review security: check auth in login.py\n"
     "  matrix executor add a CSV export endpoint\n"

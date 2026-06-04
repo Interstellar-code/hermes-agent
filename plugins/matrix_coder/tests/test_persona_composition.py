@@ -144,3 +144,52 @@ def test_load_persona_fallback_does_not_break_specialist_lookup():
 def test_load_persona_missing_returns_empty():
     # Defensive: a name in neither location returns "" (never raises).
     assert registry.load_persona("__does_not_exist__") == ""
+
+
+# -- Phase 4: domain packs --------------------------------------------------
+
+_DOMAIN_PACKS = {
+    "frontend": "Domain Pack: Frontend",
+    "backend-api": "Domain Pack: Backend API",
+    "data-db": "Domain Pack: Data / Database",
+    "infra-cli": "Domain Pack: Infra / CLI",
+    "plugin-skill-authoring": "Domain Pack: Plugin / Skill Authoring",
+}
+
+
+def test_domain_packs_load_nonempty():
+    for name, title in _DOMAIN_PACKS.items():
+        text = registry.load_domain(name)
+        assert text.strip(), f"{name} domain pack should not be empty"
+        assert title in text, f"{name}: expected title '{title}' in pack text"
+
+
+def test_compose_persona_with_domain_pack_includes_domain_section():
+    base = registry.load_base_contracts()
+    persona = registry.load_persona("executor")
+    pack = registry.load_domain("backend-api")
+
+    composed = compose_persona(base, persona, domain_pack=pack)
+
+    assert "Executor Specialist" in composed
+    assert "# DOMAIN PACK" in composed
+    assert "Domain Pack: Backend API" in composed
+
+
+def test_compose_review_lens_and_domain_includes_all_three():
+    base = registry.load_base_contracts()
+    persona = registry.load_persona("review")
+    lens = registry.load_lens("security")
+    pack = registry.load_domain("frontend")
+
+    composed = compose_persona(base, persona, lens=lens, domain_pack=pack)
+
+    assert "Review Specialist" in composed
+    assert "# LENS" in composed
+    assert "Review Lens: Security" in composed
+    assert "# DOMAIN PACK" in composed
+    assert "Domain Pack: Frontend" in composed
+
+
+def test_load_domain_missing_returns_empty():
+    assert registry.load_domain("__does_not_exist__") == ""

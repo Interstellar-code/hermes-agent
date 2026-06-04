@@ -23,9 +23,9 @@ def compose_persona(
 ) -> str:
     """Concatenate base contracts + persona (+ optional lens/domain) into one prompt.
 
-    Phase 0 only needs ``base_contracts`` + ``persona``; ``lens`` and
-    ``domain_pack`` are accepted now so the signature is stable, and are
-    emitted as clearly-marked placeholder sections when provided.
+    ``lens`` and ``domain_pack`` are active parameters: when provided, their
+    content is emitted as ``# LENS`` and ``# DOMAIN PACK`` sections respectively,
+    after the base contracts and the ``# PERSONA`` section.
     """
     sections: List[str] = []
 
