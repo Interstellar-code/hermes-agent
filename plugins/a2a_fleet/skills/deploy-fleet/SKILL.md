@@ -270,9 +270,9 @@ no new server, just the `agent` protocol pointed at the other profile.
   ```yaml
   agents:
     neo:
-      url: http://127.0.0.1:9220/jsonrpc
+      url: http://127.0.0.1:9220                 # BASE url — fleet_send appends /jsonrpc
       agent_card_url: http://127.0.0.1:9220/.well-known/agent-card.json
-      token_env: A2A_HERMES_TOKEN_NEO   # PROFILE-SCOPED name (see below)
+      token_env: A2A_HERMES_TOKEN_NEO            # PROFILE-SCOPED name (see below)
   ```
   Then `fleet_send("neo", "...")` reaches Neo's agent; the reply comes back.
   Bidirectional = both profiles list each other AND both run a listener.

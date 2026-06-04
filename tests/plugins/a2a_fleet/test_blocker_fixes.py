@@ -95,75 +95,56 @@ def _expected_registered_tool_names() -> set[str]:
     return names
 
 
-def test_register_logs_when_start_server_fails(
-    fleet_home: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    import a2a_fleet
-    from a2a_fleet import register
-    from a2a_fleet import server as server_module
-
-    def boom(*_args, **_kwargs):
-        raise RuntimeError("simulated bind failure")
-
-    # Patch start_server so the daemon thread logs the failure.
-    monkeypatch.setattr(server_module, "start_server", boom)
-    # Reset thread state so register() always spawns a fresh thread.
-    monkeypatch.setattr(a2a_fleet, "_server_thread", None)
-
-    ctx = _StubCtx()
-    with caplog.at_level(logging.ERROR, logger="a2a_fleet.plugin"):
-        register(ctx)
-        import time; time.sleep(0.2)  # let the daemon thread log
-
-    # fleet_send + the mode-specific deploy/status/stop tools register before the
-    # server thread is spawned, so a server-start failure must not prevent any of
-    # them from being registered.
-    expected = _expected_registered_tool_names()
-    actual = {call["name"] for call in ctx.calls}
-    assert actual == expected, "tool registration should keep fleet/deploy parity even when the server thread fails"
-    assert any(
-        "server failed to start" in rec.message
-        for rec in caplog.records
-    ), "register() must log the swallowed start_server exception"
-
-
-# MAJ-6 -----------------------------------------------------------------
-
-
-def test_server_starts_only_in_gateway_context(
+def test_register_does_not_start_a2a_server(
     fleet_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#120: the A2A listener is started ONLY in the gateway/agent context
-    (ctx has register_platform). A non-gateway plugin-load context (CLI tool
-    startup, dashboard web tier) must register tools but NOT start the server —
-    otherwise multiple processes race to bind fleet.server.bind_port and a
-    bridge-less listener can win the port.
+    """#120: register() must NOT start the A2A listener. register() runs in EVERY
+    process that loads the plugin (gateway, CLI tool startup, dashboard web tier);
+    starting the uvicorn server here raced them all to bind the port and a
+    bridge-less winner served inbound `agent` with "bridge not ready" (proven at
+    runtime). The listener is now started by A2AFleetAdapter.connect() instead.
+    register() must still register all tools.
     """
     import a2a_fleet
+    from a2a_fleet import register
 
     starts: list = []
     monkeypatch.setattr(a2a_fleet, "_start_server_in_thread", lambda: starts.append(True))
     monkeypatch.setattr(a2a_fleet, "_server_thread", None)
 
-    # Non-gateway ctx: register_tool only, NO register_platform.
-    class _ToolOnlyCtx:
-        def __init__(self) -> None:
-            self.calls: list = []
+    ctx = _StubCtx()
+    register(ctx)
 
-        def register_tool(self, **kwargs) -> None:
-            self.calls.append(kwargs)
+    assert starts == [], "register() must NOT start the A2A server (connect() owns that)"
+    expected = _expected_registered_tool_names()
+    actual = {call["name"] for call in ctx.calls}
+    assert actual == expected, "register() must still register fleet/deploy tools"
 
-    tool_only = _ToolOnlyCtx()
-    a2a_fleet.register(tool_only)
-    assert tool_only.calls, "tools must still register in a non-gateway context"
-    assert starts == [], "server must NOT start without a gateway (register_platform) context"
 
-    # Gateway ctx: has register_platform -> server start fires exactly once.
-    gw = _StubCtx()
-    a2a_fleet.register(gw)
-    assert starts == [True], "server must start exactly once in the gateway context"
+# MAJ-6 -----------------------------------------------------------------
+
+
+def test_adapter_connect_starts_server_and_sets_bridge(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The A2A listener starts from A2AFleetAdapter.connect() — the one place that
+    runs only in the gateway/agent process, co-located with the Route B bridge."""
+    import a2a_fleet
+    from a2a_fleet.adapter import A2AFleetAdapter
+    from a2a_fleet.agent_bridge import get_agent_bridge, set_agent_bridge
+    from gateway.config import PlatformConfig
+
+    starts: list = []
+    monkeypatch.setattr(a2a_fleet, "_start_server_in_thread", lambda: starts.append(True))
+
+    adapter = A2AFleetAdapter(PlatformConfig())
+    try:
+        ok = asyncio.run(adapter.connect())
+        assert ok is True
+        assert starts == [True], "connect() must start the A2A server exactly once"
+        assert get_agent_bridge() is adapter, "connect() must wire the bridge"
+    finally:
+        set_agent_bridge(None)
 
 
 def test_register_skips_when_fleet_disabled(fleet_home: Path) -> None:

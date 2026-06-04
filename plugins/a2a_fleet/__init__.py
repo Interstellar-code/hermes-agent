@@ -102,6 +102,7 @@ def _start_server_in_thread() -> None:
             daemon=True,
         )
         _server_thread.start()
+        atexit.register(_atexit_stop)
     logger.info("a2a_fleet: server thread spawned")
 
 
@@ -517,13 +518,10 @@ def register(ctx) -> None:
         except Exception:
             logger.debug("a2a_fleet: register_skill failed", exc_info=True)
 
-    # ``register_platform`` is present ONLY in the gateway/agent process — it is
-    # how the Route B ``agent`` bridge gets wired (the adapter connects the
-    # uvicorn worker thread to the gateway's agent loop, in-process). We use it as
-    # the single "this is the gateway process" signal below.
-    is_gateway_ctx = hasattr(ctx, "register_platform")
-
-    if is_gateway_ctx:
+    # ``register_platform`` exists on every PluginContext, so this attempt runs
+    # in any context; it is a no-op / debug-logged failure outside the gateway.
+    # The gateway is the process that later calls A2AFleetAdapter.connect().
+    if hasattr(ctx, "register_platform"):
         from . import adapter as _adapter  # noqa: WPS433 — lazy import is the contract.
         try:
             ctx.register_platform(
@@ -542,25 +540,19 @@ def register(ctx) -> None:
     # restart). Runs on its own
     # daemon thread so it never blocks plugin load; a clean no-op when there are no
     # managed peers (the common case / fresh installs). Guarded so a failure here
-    # never disrupts the server thread / tools / skill / platform above.
+    # never disrupts the tools / skill / platform above.
     try:
         if hasattr(cc_deploy, "reconcile_managed_receivers_in_thread"):
             cc_deploy.reconcile_managed_receivers_in_thread()
     except Exception:  # noqa: BLE001 — additive, must never break register().
         logger.debug("a2a_fleet: boot-reconcile spawn failed", exc_info=True)
 
-    # The A2A listener (uvicorn on fleet.server.bind_port) MUST be co-located with
-    # the Route B bridge, which lives only in the gateway/agent process. register()
-    # also runs in non-gateway plugin-load contexts (CLI tool startup, dashboard
-    # web tier); starting the listener there would race the gateway for the bind
-    # port and, if it won, serve inbound `agent` requests with no bridge attached
-    # ("bridge not ready"). So start the server ONLY in the gateway context. (#120)
-    if is_gateway_ctx:
-        _start_server_in_thread()
-        atexit.register(_atexit_stop)
-        logger.info("a2a_fleet: registered fleet_send tool + spawned A2A server thread")
-    else:
-        logger.info(
-            "a2a_fleet: non-gateway plugin-load context; tools registered, A2A "
-            "server NOT started here (hosted by the gateway process)."
-        )
+    # NOTE: the A2A uvicorn listener is deliberately NOT started here. register()
+    # runs in EVERY process that loads the plugin (gateway, CLI tool startup,
+    # dashboard web tier); starting the listener here raced all of them to bind
+    # fleet.server.bind_port, and a bridge-less winner (e.g. the dashboard
+    # process) then answered inbound `agent` requests with "bridge not ready"
+    # (proven at runtime). The listener now starts from A2AFleetAdapter.connect()
+    # — which runs ONLY in the gateway/agent process, right where the Route B
+    # bridge is wired — so listener + bridge are co-located by construction (#120).
+    logger.info("a2a_fleet: registered fleet_send + deploy tools (A2A server starts on gateway platform connect)")

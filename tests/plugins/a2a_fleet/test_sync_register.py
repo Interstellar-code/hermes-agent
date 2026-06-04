@@ -46,44 +46,48 @@ class _StubCtx:
         pass
 
 
-def test_register_from_sync_context_starts_server(fleet_home: Path) -> None:
-    """Calling register() with no running asyncio loop must still start the server."""
+def test_register_does_not_bind_and_connect_starts_reachable_server(fleet_home: Path) -> None:
+    """#120: register() must NOT bind the A2A port (it runs in every process that
+    loads the plugin — racing them broke Route B). The listener now binds when
+    A2AFleetAdapter.connect() runs in the gateway/agent process. This verifies
+    both halves: register() alone leaves the port closed; connect() brings up a
+    reachable server. (Supersedes the issue-#33 register()-starts-server guard.)
+    """
     import a2a_fleet
     from a2a_fleet import server as server_mod
-
-    # Confirm there is no running loop in this thread.
-    try:
-        asyncio.get_running_loop()
-        pytest.skip("test must run outside an active event loop")
-    except RuntimeError:
-        pass
+    from a2a_fleet.adapter import A2AFleetAdapter
+    from a2a_fleet.agent_bridge import set_agent_bridge
+    from gateway.config import PlatformConfig
 
     port = _free_port()
     _rewrite_port(fleet_home, port)
-
-    # Reset module-level thread state so this test is isolated.
-    import a2a_fleet
     a2a_fleet._server_thread = None
 
-    ctx = _StubCtx()
-    a2a_fleet.register(ctx)
+    # 1) register() alone must NOT bind the port.
+    a2a_fleet.register(_StubCtx())
+    time.sleep(0.3)
+    try:
+        httpx.get(f"http://127.0.0.1:{port}/health", timeout=0.5)
+        bound_after_register = True
+    except Exception:
+        bound_after_register = False
+    assert not bound_after_register, "register() must not start/bind the A2A server"
 
-    # Give the daemon thread time to bind and start serving.
-    deadline = time.monotonic() + 8.0
+    # 2) connect() (gateway/agent process) must bring up a reachable server.
+    adapter = A2AFleetAdapter(PlatformConfig())
     reachable = False
-    while time.monotonic() < deadline:
-        try:
-            resp = httpx.get(f"http://127.0.0.1:{port}/health", timeout=1.0)
-            if resp.status_code == 200:
-                reachable = True
-                break
-        except Exception:
-            time.sleep(0.1)
+    try:
+        asyncio.run(adapter.connect())
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/health", timeout=1.0).status_code == 200:
+                    reachable = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+    finally:
+        server_mod.stop_server_sync()
+        set_agent_bridge(None)
 
-    # Clean up — signal server to stop.
-    server_mod.stop_server_sync()
-
-    assert reachable, (
-        "Server must be reachable after register() is called from a plain sync context "
-        "(regression guard for issue #33)"
-    )
+    assert reachable, "A2A server must be reachable after A2AFleetAdapter.connect()"
