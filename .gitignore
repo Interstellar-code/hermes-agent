@@ -110,3 +110,6 @@ hindsight.py
 
 # Local tool/CLI runtime cache (regenerated; not source).
 cache/
+
+# OMC run-continuation local state
+.omo/

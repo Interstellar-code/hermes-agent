@@ -35,6 +35,10 @@ dependencies = [
   "python-dotenv==1.2.2",
   "fire==0.7.1",
   "httpx[socks]==0.28.1",
+  # brotli decoder for httpx — Manifest brotli-compresses LLM responses; without this
+  # httpx hands raw brotli bytes to the JSON parser and consolidation calls fail with
+  # "'utf-8' codec can't decode byte 0xd7". brotlicffi alone did not satisfy httpx 0.28.1.
+  "brotli==1.2.0",
   "rich==14.3.3",
   "tenacity==9.1.4",
   "pyyaml==6.0.3",
