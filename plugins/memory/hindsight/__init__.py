@@ -96,7 +96,6 @@ def _check_local_runtime() -> tuple[bool, str | None]:
         importlib.import_module("hindsight_embed.daemon_embed_manager")
         return True, None
     except Exception as exc:
-        logger.warning("Hindsight local runtime check failed: %s", exc)
         return False, str(exc)
 
 
@@ -606,13 +605,7 @@ class HindsightMemoryProvider(MemoryProvider):
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
             if mode in {"local", "local_embedded"}:
-                available, reason = _check_local_runtime()
-                if not available:
-                    logger.warning(
-                        "Hindsight provider unavailable (mode=%s): %s — "
-                        "hindsight_recall/hindsight_retain will not be registered",
-                        mode, reason,
-                    )
+                available, _ = _check_local_runtime()
                 return available
             if mode == "local_external":
                 return True
@@ -623,8 +616,7 @@ class HindsightMemoryProvider(MemoryProvider):
             )
             has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
             return has_key or has_url
-        except Exception as exc:
-            logger.warning("Hindsight is_available() check raised: %s", exc)
+        except Exception:
             return False
 
     def save_config(self, values, hermes_home):
@@ -641,7 +633,8 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 pass
         existing.update(values)
-        config_path.write_text(json.dumps(existing, indent=2))
+        from utils import atomic_json_write
+        atomic_json_write(config_path, existing, mode=0o600)
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
