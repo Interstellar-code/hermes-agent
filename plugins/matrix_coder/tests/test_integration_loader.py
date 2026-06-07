@@ -5,8 +5,8 @@ loads the plugin EXACTLY as the Hermes runtime does — via
 ``PluginManager._load_directory_module`` + ``register(ctx)`` — and drives the
 REAL hook machinery (``PluginManager.invoke_hook``). It proves the end-to-end
 path: a trigger message injects the composed persona this turn; a non-trigger
-message injects nothing (leak-proof); a workflow composes; and the ``/matrix``
-command registers.
+message injects nothing (leak-proof); an implicit coding request routes; a
+workflow composes; and the ``/matrix`` command registers.
 
 Skips cleanly when ``hermes_cli`` is not importable (e.g. a bare CI box), so it
 never fails the suite for environment reasons.
@@ -59,6 +59,26 @@ def test_real_loader_non_trigger_injects_nothing():
         return
     pm, _ = loaded
     assert _injected(pm, "just a normal question") == ""
+
+
+def test_real_loader_implicit_request_injects_inferred_persona():
+    loaded = _load()
+    if loaded is None:
+        return
+    pm, _ = loaded
+    out = _injected(pm, "is this auth safe?")
+    assert out and "Review Specialist" in out
+    assert "Review Lens: Security" in out
+
+
+def test_real_loader_direct_candidate_injects_right_sizing_question():
+    loaded = _load()
+    if loaded is None:
+        return
+    pm, _ = loaded
+    out = _injected(pm, "fix README typo")
+    assert "<verdict>direct</verdict>" in out
+    assert "Invoke Matrix Coder anyway" in out
 
 
 def test_real_loader_workflow_composes():

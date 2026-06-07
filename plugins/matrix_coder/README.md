@@ -1,13 +1,12 @@
 # Matrix Coder
 
-A specialist-coder layer for Hermes. Matrix Coder turns a generic Hermes
-subagent into a focused **specialist** for a single coding task.
+A specialist-coder layer for Hermes. Matrix Coder turns the active Hermes agent
+into a focused **specialist** for a coding task by injecting a composed persona
+as ephemeral turn context.
 
-> **Phase 0 — scaffold only.** This directory currently ships the skeleton:
-> the plugin entrypoint/manifest, the shared `_base/` specialist contracts,
-> one `_passthrough` smoke persona, the `core/` package, and a walking-skeleton
-> `/matrix` command. The 8 role personas, per-role skills, scripts, and tools
-> arrive in later phases. Tracks epic issue **#76**.
+Phases 0–5 are implemented: explicit and implicit invocation, eight roles,
+review lenses, Kanban audit mirroring, workflow personas, and domain packs.
+Tracks epic issue **#76**.
 
 ## The persona model
 
@@ -26,7 +25,7 @@ A composed persona = shared `_base/` contracts + the role persona
 - **`_base/boundary-table.md`** — what specialists may/may not do, advisory
   per-role read vs write, the single-writer-per-file rule, escalate-don't-guess.
 
-### The 8 roles (Phase 1 / 1.5 — not yet populated)
+### The 8 roles
 
 `explore`, `plan`, `executor`, `review` (lenses: security / code / api /
 performance / quality / deps), `debug`, `test`, `verify`, `simplify`.
@@ -53,16 +52,31 @@ future enforcement builds on.
 
 ## Invocation (conversational)
 
-Matrix Coder is invoked conversationally. Examples (later phases):
+Matrix Coder supports two conversational paths:
+
+- **Implicit (default):** a cheap deterministic IntentGate recognizes plain
+  coding requests and infers a role, optional review lens, and optional domain
+  pack. Matrix-worthy work silently receives the specialist persona.
+- **Explicit override:** start with `matrix`; explicit role/lens/domain parsing
+  always wins over inference.
+
+Examples:
 
 ```
+is this auth safe?                              # review + security lens
+why does the API endpoint crash?               # debug + backend-api domain
 matrix review this for security
 matrix explore how auth flows through the gateway
-matrix plan the refactor of the dispatch layer
+matrix executor @backend-api: add CSV export   # explicit always wins
 ```
 
-The `/matrix <goal>` slash command is the explicit entrypoint. In Phase 0 it
-runs the passthrough harness, which echoes the goal back in the output contract.
+The implicit intake gate is conservative. Clear, mechanical, low-risk work
+(for example, `fix README typo`) injects a visible recommendation asking
+whether Hermes should handle it directly; sensitive or nontrivial coding work
+silently routes through Matrix Coder. Unrelated chat receives no injection.
+
+The `/matrix` slash command displays status/help; conversational messages are
+the dispatch path.
 
 ## Layout
 
@@ -74,7 +88,7 @@ matrix_coder/
   core/                # pure-Python building blocks (no Hermes runtime imports)
   personas/
     _base/             # shared specialist contracts
-    _passthrough.md    # Phase 0 smoke persona
-  skills/ scripts/ tools/ templates/ examples/   # later phases
-  tests/               # walking-skeleton tests
+    _passthrough.md    # walking-skeleton smoke persona
+  skills/ scripts/ tools/ templates/ examples/
+  tests/
 ```
