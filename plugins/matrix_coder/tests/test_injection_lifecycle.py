@@ -57,6 +57,37 @@ def test_pre_llm_call_hook_injects_on_trigger():
     assert bridge.is_active() is True
 
 
+def test_pre_llm_call_hook_implicitly_routes_security_review():
+    bridge.clear_active_persona()
+    injected = plugin._inject_persona(user_message="is this auth safe?")
+
+    assert injected is not None
+    assert "Review Specialist" in injected
+    assert "Review Lens: Security" in injected
+    assert bridge.is_active() is True
+
+
+def test_pre_llm_call_hook_explicit_trigger_overrides_inference():
+    bridge.clear_active_persona()
+    injected = plugin._inject_persona(
+        user_message="matrix executor: is this auth safe?"
+    )
+
+    assert injected is not None
+    assert "Executor Specialist" in injected
+    assert "Review Specialist" not in injected
+    assert bridge.is_active() is True
+
+
+def test_pre_llm_call_hook_direct_recommendation_does_not_activate_persona():
+    bridge.clear_active_persona()
+    injected = plugin._inject_persona(user_message="fix README typo")
+
+    assert injected is not None
+    assert "<verdict>direct</verdict>" in injected
+    assert bridge.is_active() is False
+
+
 def test_pre_llm_call_hook_clears_on_non_trigger():
     # Simulate a stale active persona from a prior turn; a non-trigger turn must
     # clear it and return None (no leak forward).

@@ -5,10 +5,10 @@ composing a PERSONA (text) into the child's context and re-asserting it per
 turn via the ``pre_llm_call`` hook.  There is no subagent persona API — the
 persona is pure text composition (see ``core/prompts.py``).
 
-Roles are invoked by an EXPLICIT trigger word ``matrix`` at the start of a user
-message (parsed in ``core/intake.py``, composed by
-``core/harness.handle_trigger`` and injected this turn by the ``pre_llm_call``
-hook):
+Roles are invoked either by an EXPLICIT trigger word ``matrix`` at the start of
+a user message or, in Phase 5, by the conservative implicit IntentGate for
+plain coding requests. Explicit parsing always runs first and overrides
+inference. Both paths inject ephemeral context this turn via ``pre_llm_call``:
 
 * ``review`` (lenses: security, code, api, performance, quality, deps) —
   read-only specialist reviewer (default role),
@@ -77,13 +77,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _inject_persona(**kwargs: Any) -> Optional[str]:
-    """``pre_llm_call`` hook: parse the trigger and inject the persona this turn.
+    """``pre_llm_call`` hook: explicit trigger first, then implicit IntentGate.
 
-    Leak-proof lifecycle: parse the ``user_message`` kwarg. If it carries a
-    Matrix Coder trigger, :func:`harness.handle_trigger` activates the composed
-    persona and returns it for SAME-turn injection. If there is NO trigger, we
-    defensively clear any active persona and return ``None`` — so a persona is
-    active ONLY on the turn whose message carried the trigger.
+    Leak-proof lifecycle: explicit ``matrix ...`` parsing always wins. On the
+    non-explicit path, any stale persona/card is cleared before conservative
+    implicit routing. A MATRIX verdict activates the inferred persona; a DIRECT
+    verdict injects only the visible right-sizing recommendation; unrelated
+    chat injects nothing.
 
     Phase 2 audit-mirror: on the non-trigger path, any still-open audit card is
     an orphan (a prior dispatch never produced a completion signal). We close it
@@ -97,8 +97,8 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
         )
         if composed:
             return composed
-        # No trigger this turn -> close any orphan card, then defensive clear so
-        # neither a persona nor a card leaks forward.
+        # No explicit trigger this turn -> close any orphan card and clear stale
+        # persona state before implicit routing, so neither leaks forward.
         orphan_id = bridge.active_card_id()
         if orphan_id:
             kanban_audit.close_card(
@@ -108,7 +108,9 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
             )
             bridge.clear_active_card()
         bridge.clear_active_persona()
-        return None
+        return harness.handle_implicit(
+            user_message=user_message, session_id=kwargs.get("session_id")
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: _inject_persona suppressed error: %s", exc)
         return None

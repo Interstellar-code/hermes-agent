@@ -1,6 +1,6 @@
-"""Harness for Matrix Coder: parse a trigger and compose the specialist persona.
+"""Harness for Matrix Coder: resolve a request and compose a specialist persona.
 
-Phase 1 main path (:func:`handle_trigger`):
+Explicit path (:func:`handle_trigger`):
 
   parse the user message for a trigger
     -> run the intake gate (explicit trigger -> always MATRIX)
@@ -8,6 +8,13 @@ Phase 1 main path (:func:`handle_trigger`):
     -> compose persona text
     -> mark the dispatch active (so the ``pre_llm_call`` hook injects it this turn)
     -> return the composed persona string for same-turn injection.
+
+Phase 5 implicit path (:func:`handle_implicit`):
+
+  cheap coding-intent prefilter
+    -> infer role + optional lens/domain
+    -> right-size as DIRECT or MATRIX
+    -> return a visible direct recommendation OR compose/activate the persona.
 
 The Phase 0 :func:`run_passthrough` walking skeleton is retained for the
 ``/matrix`` smoke path and the older tests; it is no longer the main route.
@@ -22,13 +29,37 @@ from typing import Optional
 
 from . import kanban_audit, registry
 from .hermes_bridge import bridge
-from .intake import intake_gate, parse_trigger
-from .models import SpecialistResult
+from .intake import ParsedInvocation, intake_gate, parse_trigger
+from .intent_gate import (
+    direct_recommendation_context,
+    implicit_intake_gate,
+    infer_implicit_invocation,
+)
+from .models import SpecialistResult, Verdict
 from .prompts import compose_persona
 
 logger = logging.getLogger(__name__)
 
 _PASSTHROUGH = "_passthrough"
+
+
+def _compose_and_activate(parsed: ParsedInvocation, session_id: Optional[str]) -> str:
+    """Compose *parsed* into an active persona and open its audit card."""
+    base = registry.load_base_contracts()
+    persona = registry.load_persona(parsed.role)
+    lens_text = (
+        registry.load_lens(parsed.lens)
+        if (parsed.role == "review" and parsed.lens)
+        else None
+    )
+    domain_text = registry.load_domain(parsed.domain) if parsed.domain else None
+
+    composed = compose_persona(base, persona, lens=lens_text, domain_pack=domain_text)
+    bridge.set_active_persona(composed)
+
+    cid = kanban_audit.open_card(parsed.role, parsed.lens, parsed.goal, session_id)
+    bridge.set_active_card(cid)
+    return composed
 
 
 def handle_trigger(
@@ -67,28 +98,32 @@ def handle_trigger(
         # Explicit trigger -> intake gate always routes through the matrix.
         intake_gate(parsed)
 
-        base = registry.load_base_contracts()
-        persona = registry.load_persona(parsed.role)
-        lens_text = (
-            registry.load_lens(parsed.lens)
-            if (parsed.role == "review" and parsed.lens)
-            else None
-        )
-        domain_text = (
-            registry.load_domain(parsed.domain) if parsed.domain else None
-        )
-
-        composed = compose_persona(base, persona, lens=lens_text, domain_pack=domain_text)
-        bridge.set_active_persona(composed)
-
-        # Mirror this invocation as ONE running audit card (best-effort).
-        cid = kanban_audit.open_card(
-            parsed.role, parsed.lens, parsed.goal, session_id
-        )
-        bridge.set_active_card(cid)
-        return composed
+        return _compose_and_activate(parsed, session_id)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: handle_trigger suppressed error: %s", exc)
+        return None
+
+
+def handle_implicit(
+    user_message: str, session_id: Optional[str] = None
+) -> Optional[str]:
+    """Infer and right-size a plain coding request.
+
+    MATRIX decisions silently compose and activate the inferred specialist.
+    DIRECT decisions inject a visible recommendation/question without
+    activating a persona or creating an audit card. Non-coding messages return
+    ``None``. Explicit ``matrix ...`` triggers are excluded by the IntentGate.
+    """
+    try:
+        parsed = infer_implicit_invocation(user_message)
+        if parsed is None:
+            return None
+        decision = implicit_intake_gate(parsed)
+        if decision.verdict is Verdict.DIRECT:
+            return direct_recommendation_context(decision)
+        return _compose_and_activate(parsed, session_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("matrix_coder: handle_implicit suppressed error: %s", exc)
         return None
 
 
