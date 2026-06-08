@@ -157,6 +157,50 @@ class TestFindStaleDashboardPids:
             pids = _find_stale_dashboard_pids()
         assert pids == [12345]
 
+    def test_status_shell_wrapper_is_not_mistaken_for_dashboard(self):
+        """A parent shell containing the status command is not a server."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="\n".join([
+                    _ps_line(
+                        22222,
+                        "/bin/zsh -c 'python -m hermes_cli.main dashboard --status'",
+                    ),
+                    _ps_line(
+                        12345,
+                        "/venv/bin/python /usr/local/bin/hermes dashboard --port 9119",
+                    ),
+                ]) + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == [12345]
+
+    def test_lifecycle_commands_are_not_running_dashboards(self):
+        """Direct --status/--stop processes must not count as servers."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="\n".join([
+                    _ps_line(
+                        22222,
+                        "python -m hermes_cli.main dashboard --status",
+                    ),
+                    _ps_line(
+                        33333,
+                        "hermes dashboard --stop",
+                    ),
+                    _ps_line(
+                        12345,
+                        "hermes dashboard --port 9119",
+                    ),
+                ]) + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+        assert pids == [12345]
+
     def test_grep_lines_ignored(self):
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(

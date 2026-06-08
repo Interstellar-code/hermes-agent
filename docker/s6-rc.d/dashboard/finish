@@ -18,6 +18,12 @@
 
 case "${HERMES_DASHBOARD:-}" in
     1|true|TRUE|True|yes|YES|Yes)
+        # Exit 98 is Hermes' dedicated dashboard startup-conflict code.
+        # A profile lock or occupied port will not heal through retries, so
+        # mark the service permanently failed instead of flooding logs.
+        case "${1:-}" in
+            98) exit 125 ;;
+        esac
         # Dashboard was enabled — let s6-supervise restart on crash by
         # exiting non-125. (Pass-through any sensible default.)
         exit 0

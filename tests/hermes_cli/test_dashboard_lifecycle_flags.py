@@ -16,6 +16,10 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from hermes_cli.main import cmd_dashboard
+from hermes_cli.dashboard_lifecycle import (
+    DASHBOARD_CONFLICT_EXIT_CODE,
+    DashboardStartupConflict,
+)
 
 
 def _ns(**kw):
@@ -156,6 +160,38 @@ class TestLifecycleFlagsTakePrecedence:
              pytest.raises(SystemExit):
             cmd_dashboard(_ns(stop=True))
         assert called["start"] is False
+
+
+class TestDashboardStartupGuard:
+    def test_conflict_exits_once_before_server_start(self, capsys):
+        conflict = DashboardStartupConflict(
+            "Dashboard address 127.0.0.1:9119 is already in use."
+        )
+        with patch(
+            "hermes_cli.dashboard_lifecycle.acquire_dashboard_startup_guard",
+            side_effect=conflict,
+        ), patch("hermes_cli.main._cmd_dashboard_unlocked") as mock_start, \
+             pytest.raises(SystemExit) as exc:
+            cmd_dashboard(_ns())
+
+        assert exc.value.code == DASHBOARD_CONFLICT_EXIT_CODE
+        mock_start.assert_not_called()
+        err = capsys.readouterr().err
+        assert err.count("already in use") == 1
+
+    def test_guard_is_released_when_server_returns(self):
+        lease = MagicMock()
+        with patch(
+            "hermes_cli.dashboard_lifecycle.acquire_dashboard_startup_guard",
+            return_value=lease,
+        ), patch(
+            "hermes_cli.main._cmd_dashboard_unlocked",
+            return_value=None,
+        ) as mock_start:
+            cmd_dashboard(_ns())
+
+        mock_start.assert_called_once()
+        lease.release.assert_called_once()
 
 
 class TestArgparseWiring:

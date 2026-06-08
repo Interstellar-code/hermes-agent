@@ -5,6 +5,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DASHBOARD_RUN = REPO_ROOT / "docker" / "s6-rc.d" / "dashboard" / "run"
+DASHBOARD_FINISH = REPO_ROOT / "docker" / "s6-rc.d" / "dashboard" / "finish"
 MAIN_WRAPPER = REPO_ROOT / "docker" / "main-wrapper.sh"
 
 
@@ -77,3 +78,11 @@ def test_dashboard_run_does_not_derive_insecure_from_bind_host() -> None:
         assert truthy in text, (
             f"HERMES_DASHBOARD_INSECURE should accept truthy value {truthy!r}"
         )
+
+
+def test_dashboard_finish_stops_restarting_on_startup_conflict() -> None:
+    """Port/lock conflicts are configuration failures, not crash loops."""
+    text = DASHBOARD_FINISH.read_text(encoding="utf-8")
+
+    assert "98)" in text
+    assert "exit 125" in text

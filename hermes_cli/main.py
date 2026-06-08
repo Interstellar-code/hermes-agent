@@ -7675,11 +7675,6 @@ def _find_stale_dashboard_pids(
 
     Returns an empty list on any scan error (missing ps/wmic, timeout, etc.).
     """
-    patterns = [
-        "hermes dashboard",
-        "hermes_cli.main dashboard",
-        "hermes_cli/main.py dashboard",
-    ]
     self_pid = os.getpid()
     dashboard_pids: list[int] = []
 
@@ -7710,7 +7705,7 @@ def _find_stale_dashboard_pids(
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId=") :]
                     if (
-                        any(p in current_cmd for p in patterns)
+                        _looks_like_dashboard_server_command(current_cmd)
                         and int(pid_str) != self_pid
                     ):
                         try:
@@ -7743,7 +7738,10 @@ def _find_stale_dashboard_pids(
                     except ValueError:
                         continue
                     command = parts[1]
-                    if any(p in command for p in patterns) and pid != self_pid:
+                    if (
+                        _looks_like_dashboard_server_command(command)
+                        and pid != self_pid
+                    ):
                         dashboard_pids.append(pid)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
@@ -7751,6 +7749,50 @@ def _find_stale_dashboard_pids(
     if exclude_pids:
         dashboard_pids = [p for p in dashboard_pids if p not in exclude_pids]
     return dashboard_pids
+
+
+def _looks_like_dashboard_server_command(command: str) -> bool:
+    """Return True only for a real dashboard server invocation.
+
+    Process-table substring matching used to count the parent shell running
+    ``hermes dashboard --status`` as another dashboard. Parse the supported
+    launch forms and explicitly exclude lifecycle-only commands instead.
+    """
+    import shlex
+
+    try:
+        tokens = shlex.split(command, posix=sys.platform != "win32")
+    except ValueError:
+        tokens = command.split()
+    if not tokens or "--status" in tokens or "--stop" in tokens:
+        return False
+
+    basenames = [os.path.basename(token).lower() for token in tokens]
+    if basenames[0] in {"sh", "bash", "zsh", "dash", "fish", "cmd.exe"}:
+        return False
+
+    for index, basename in enumerate(basenames[:-1]):
+        if (
+            basename in {"hermes", "hermes.exe"}
+            and index <= 1
+            and tokens[index + 1] == "dashboard"
+        ):
+            return True
+        if (
+            tokens[index] == "-m"
+            and index + 2 < len(tokens)
+            and tokens[index + 1] == "hermes_cli.main"
+            and tokens[index + 2] == "dashboard"
+        ):
+            return True
+        normalized = tokens[index].replace("\\", "/")
+        if (
+            normalized.endswith("hermes_cli/main.py")
+            and index <= 1
+            and tokens[index + 1] == "dashboard"
+        ):
+            return True
+    return False
 
 
 def _print_curator_first_run_notice() -> None:
@@ -12305,6 +12347,28 @@ def _report_dashboard_status() -> int:
 
 
 def cmd_dashboard(args):
+    """Start or manage the dashboard with profile and port ownership guards."""
+    if getattr(args, "status", False) or getattr(args, "stop", False):
+        return _cmd_dashboard_unlocked(args)
+
+    from hermes_cli.dashboard_lifecycle import (
+        DashboardStartupConflict,
+        acquire_dashboard_startup_guard,
+    )
+
+    try:
+        lease = acquire_dashboard_startup_guard(args.host, args.port)
+    except DashboardStartupConflict as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        sys.exit(exc.exit_code)
+
+    try:
+        return _cmd_dashboard_unlocked(args)
+    finally:
+        lease.release()
+
+
+def _cmd_dashboard_unlocked(args):
     """Start the web UI server, or (with --stop/--status) manage running ones."""
     # --status: report running dashboards and exit, no deps needed.
     if getattr(args, "status", False):
