@@ -1003,31 +1003,31 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         Combined reasoning text, or None if no reasoning found
     """
     reasoning_parts = []
-    
+
+    def append_text(value) -> bool:
+        """Append a non-empty string once; reject mock/object placeholders."""
+        if not isinstance(value, str) or not value:
+            return False
+        if value not in reasoning_parts:
+            reasoning_parts.append(value)
+        return True
+
     # Check direct reasoning field
-    if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
-        reasoning_parts.append(assistant_message.reasoning)
-    
+    append_text(getattr(assistant_message, "reasoning", None))
+
     # Check reasoning_content field (alternative name used by some providers)
-    if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
-        # Don't duplicate if same as reasoning
-        if assistant_message.reasoning_content not in reasoning_parts:
-            reasoning_parts.append(assistant_message.reasoning_content)
+    append_text(getattr(assistant_message, "reasoning_content", None))
     
     # Check reasoning_details array (OpenRouter unified format)
     # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
-    if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
-        for detail in assistant_message.reasoning_details:
+    reasoning_details = getattr(assistant_message, "reasoning_details", None)
+    if reasoning_details:
+        for detail in reasoning_details:
             if isinstance(detail, dict):
-                # Extract summary from reasoning detail object
-                summary = (
-                    detail.get('summary')
-                    or detail.get('thinking')
-                    or detail.get('content')
-                    or detail.get('text')
-                )
-                if summary and summary not in reasoning_parts:
-                    reasoning_parts.append(summary)
+                # Extract the first usable text field from the detail object.
+                for key in ("summary", "thinking", "content", "text"):
+                    if append_text(detail.get(key)):
+                        break
 
     # Some providers embed reasoning directly inside assistant content
     # instead of returning structured reasoning fields.  Only fall back
@@ -1042,10 +1042,10 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         # Refs #21944.
         for block in content:
             if isinstance(block, dict) and block.get("type") == "thinking":
-                thinking_text = block.get("thinking") or block.get("text") or ""
-                thinking_text = thinking_text.strip()
-                if thinking_text and thinking_text not in reasoning_parts:
-                    reasoning_parts.append(thinking_text)
+                for key in ("thinking", "text"):
+                    value = block.get(key)
+                    if isinstance(value, str) and append_text(value.strip()):
+                        break
     if not reasoning_parts and isinstance(content, str) and content:
         inline_patterns = (
             r"<think>(.*?)</think>",
@@ -1057,9 +1057,7 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
         for pattern in inline_patterns:
             flags = re.DOTALL | re.IGNORECASE
             for block in re.findall(pattern, content, flags=flags):
-                cleaned = block.strip()
-                if cleaned and cleaned not in reasoning_parts:
-                    reasoning_parts.append(cleaned)
+                append_text(block.strip())
     
     # Combine all reasoning parts
     if reasoning_parts:

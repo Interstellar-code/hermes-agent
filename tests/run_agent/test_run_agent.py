@@ -469,6 +469,33 @@ class TestStripThinkBlocks:
 
 
 class TestExtractReasoning:
+    def test_bare_magicmock_does_not_fabricate_reasoning(self, agent):
+        """Unspecced mocks auto-create truthy attributes for missing fields."""
+        msg = MagicMock()
+        msg.content = "plain answer"
+
+        assert agent._extract_reasoning(msg) is None
+
+    def test_magicmock_with_real_reasoning_ignores_fabricated_fields(self, agent):
+        msg = MagicMock()
+        msg.content = "answer"
+        msg.reasoning = "real reasoning"
+
+        assert agent._extract_reasoning(msg) == "real reasoning"
+
+    def test_non_string_reasoning_values_are_ignored(self, agent):
+        msg = SimpleNamespace(
+            content="answer",
+            reasoning={"unexpected": "object"},
+            reasoning_content=42,
+            reasoning_details=[
+                {"summary": MagicMock(), "text": "valid detail text"},
+                {"summary": ["not", "text"]},
+            ],
+        )
+
+        assert agent._extract_reasoning(msg) == "valid detail text"
+
     def test_reasoning_field(self, agent):
         msg = _mock_assistant_msg(reasoning="thinking hard")
         assert agent._extract_reasoning(msg) == "thinking hard"
@@ -542,6 +569,19 @@ class TestExtractReasoning:
             ]
         )
         assert agent._extract_reasoning(msg) is None
+
+    def test_content_list_ignores_non_string_thinking_value(self, agent):
+        msg = _mock_assistant_msg(
+            content=[
+                {
+                    "type": "thinking",
+                    "thinking": MagicMock(),
+                    "text": "typed fallback",
+                },
+            ]
+        )
+
+        assert agent._extract_reasoning(msg) == "typed fallback"
 
     def test_content_list_thinking_prefers_structured_field(self, agent):
         """Structured ``reasoning`` field wins over content-list thinking blocks."""
