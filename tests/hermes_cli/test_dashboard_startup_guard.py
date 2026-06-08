@@ -71,3 +71,39 @@ def test_released_lock_can_be_acquired_again(tmp_path, monkeypatch):
     first.release()
     second = acquire_dashboard_startup_guard("127.0.0.1", 0)
     second.release()
+
+
+def test_port_probe_enables_address_reuse(tmp_path, monkeypatch):
+    """A just-stopped dashboard port must be reusable on macOS."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-home"))
+    calls = []
+    real_socket = socket.socket
+
+    class RecordingSocket:
+        def __init__(self, *args):
+            self._socket = real_socket(*args)
+
+        def setsockopt(self, level, option, value):
+            calls.append((level, option, value))
+            return self._socket.setsockopt(level, option, value)
+
+        def bind(self, address):
+            return self._socket.bind(address)
+
+        def close(self):
+            return self._socket.close()
+
+    monkeypatch.setattr(socket, "socket", RecordingSocket)
+    lease = acquire_dashboard_startup_guard("127.0.0.1", 0)
+    lease.release()
+
+    # Port 0 skips the probe, so exercise a concrete free port.
+    holder = real_socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    holder.close()
+
+    lease = acquire_dashboard_startup_guard("127.0.0.1", port)
+    lease.release()
+    assert (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) in calls

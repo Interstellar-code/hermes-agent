@@ -189,6 +189,7 @@ def _assert_port_available(host: str, port: int) -> None:
     for family, socktype, proto, _, address in addresses:
         probe = socket.socket(family, socktype, proto)
         try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(address)
         except OSError as exc:
             owner = _port_owner(host, port)
