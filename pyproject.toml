@@ -219,7 +219,14 @@ youtube = [
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
 # starlette==1.0.1 pinned for CVE-2026-48710 (BadHost) — fastapi pulls Starlette
 # transitively and pre-1.0.1 is the vulnerable range. See the mcp extra above.
-web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0", "starlette==1.0.1"]
+web = [
+  "fastapi==0.133.1",
+  "uvicorn[standard]==0.41.0",
+  "starlette==1.0.1",
+  # FastAPI form-data routes (kanban plugin API) need python-multipart;
+  # fastapi does not pull it in itself and route mounting fails without it.
+  "python-multipart>=0.0.9",
+]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
   # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every
