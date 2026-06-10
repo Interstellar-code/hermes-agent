@@ -129,3 +129,5 @@ RELEASE_v*.md
 # Local agent/runtime indexes
 .codegraph/
 .omo/
+/*.log
+cache/
