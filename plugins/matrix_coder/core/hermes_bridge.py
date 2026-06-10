@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import Iterable, Optional, Set
+from typing import Iterable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ class HermesBridge:
         self._lock = threading.Lock()
         self._active_persona: Optional[str] = None
         self._active_card_id: Optional[str] = None
+        self._active_child_ids: List[str] = []
         self._claimed: Set[str] = set()
 
     # -- active dispatch / persona injection --------------------------------
@@ -96,13 +97,34 @@ class HermesBridge:
             return self._active_card_id
 
     def clear_active_card(self) -> None:
-        """Forget the active card id WITHOUT closing it.
+        """Forget the active card id and all child ids WITHOUT closing them.
 
-        Closing a card requires a kanban call — that is the hooks' job. This
-        only drops the local bookkeeping so a stale id can't be reused.
+        Closing cards requires a kanban call — that is the hooks' job. This
+        only drops the local bookkeeping so stale ids can't be reused.
         """
         with self._lock:
             self._active_card_id = None
+            self._active_child_ids = []
+
+    def register_child_card(self, child_id: str) -> None:
+        """Record an open child dispatch card id for the active invocation.
+
+        Called by the loop driver (Phase 3) after opening a child card for each
+        specialist dispatch, so the hooks can later close any orphaned children.
+        """
+        with self._lock:
+            self._active_child_ids.append(child_id)
+
+    def pop_child_card_ids(self) -> List[str]:
+        """Return and clear all open child card ids for the active invocation.
+
+        Returns the list at the moment of the call and immediately empties the
+        internal list, so a second call returns ``[]``.
+        """
+        with self._lock:
+            ids = list(self._active_child_ids)
+            self._active_child_ids = []
+            return ids
 
     # -- single-writer-per-file bookkeeping ---------------------------------
 

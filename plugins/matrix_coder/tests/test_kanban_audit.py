@@ -305,6 +305,147 @@ def test_audit_kwargs_bind_to_real_kanban_db_signatures():
     inspect.signature(realkb.connect).bind()
 
 
+# ---------------------------------------------------------------------------
+# open_child_card
+# ---------------------------------------------------------------------------
+
+def test_open_child_card_creates_running_card_with_parent():
+    fake = FakeKb()
+    prev = _install(fake)
+    try:
+        child_id = kanban_audit.open_child_card(
+            "parent-1", "review", "security", "check auth", "s1"
+        )
+        assert child_id == "card-123"
+        assert len(fake.create_calls) == 1
+        kw = fake.create_calls[0]
+        assert kw["initial_status"] == "running"
+        assert kw["created_by"] == "matrix_coder"
+        assert kw["tenant"] == "matrix_coder"
+        assert kw["session_id"] == "s1"
+        assert kw["parents"] == ["parent-1"]
+        assert "review/security" in kw["title"]
+        assert kw["body"] == "check auth"
+        assert kw.get("idempotency_key")
+    finally:
+        kanban_audit._kb = prev
+
+
+def test_open_child_card_no_lens():
+    fake = FakeKb()
+    prev = _install(fake)
+    try:
+        kanban_audit.open_child_card("parent-1", "executor", None, "add export", None)
+        assert fake.create_calls[0]["title"].startswith("  ↳ executor:")
+        assert "parents" in fake.create_calls[0]
+        assert fake.create_calls[0]["parents"] == ["parent-1"]
+    finally:
+        kanban_audit._kb = prev
+
+
+def test_open_child_card_disabled_returns_none():
+    prev = _install(None)
+    try:
+        assert kanban_audit.open_child_card("p", "review", None, "x", "s") is None
+    finally:
+        kanban_audit._kb = prev
+
+
+def test_open_child_card_empty_parent_returns_none():
+    fake = FakeKb()
+    prev = _install(fake)
+    try:
+        # empty-string parent_id is falsy -> should return None without calling create
+        result = kanban_audit.open_child_card("", "review", None, "x", "s")
+        assert result is None
+        assert fake.create_calls == []
+    finally:
+        kanban_audit._kb = prev
+
+
+def test_open_child_card_raising_backend_swallowed():
+    prev = _install(RaisingKb())
+    try:
+        assert kanban_audit.open_child_card("parent-1", "review", None, "x", "s") is None
+    finally:
+        kanban_audit._kb = prev
+
+
+# ---------------------------------------------------------------------------
+# HermesBridge child-card bookkeeping
+# ---------------------------------------------------------------------------
+
+def test_bridge_register_and_pop_child_card_ids():
+    bridge.clear_active_card()
+    assert bridge.pop_child_card_ids() == []
+
+    bridge.register_child_card("child-1")
+    bridge.register_child_card("child-2")
+    ids = bridge.pop_child_card_ids()
+    assert ids == ["child-1", "child-2"]
+    # pop clears the list
+    assert bridge.pop_child_card_ids() == []
+
+
+def test_bridge_clear_active_card_also_clears_children():
+    bridge.register_child_card("child-a")
+    bridge.set_active_card("parent-x")
+    bridge.clear_active_card()
+    assert bridge.active_card_id() is None
+    assert bridge.pop_child_card_ids() == []
+
+
+# ---------------------------------------------------------------------------
+# single-dispatch collapse: handle_trigger produces exactly one card, no child
+# ---------------------------------------------------------------------------
+
+def test_single_dispatch_no_child_card():
+    fake = FakeKb(card_id="only-card")
+    prev = _install(fake)
+    bridge.clear_active_persona()
+    bridge.clear_active_card()
+    try:
+        composed = harness.handle_trigger(
+            "matrix review security: check auth", session_id="s1"
+        )
+        assert composed is not None
+        # Only one card created — the parent invocation card
+        assert len(fake.create_calls) == 1
+        assert bridge.active_card_id() == "only-card"
+        # No child cards registered
+        assert bridge.pop_child_card_ids() == []
+    finally:
+        kanban_audit._kb = prev
+        bridge.clear_active_persona()
+        bridge.clear_active_card()
+
+
+# ---------------------------------------------------------------------------
+# signature-drift guard: parents kwarg must bind to the REAL kanban_db.create_task
+# ---------------------------------------------------------------------------
+
+def test_create_task_accepts_parents_kwarg():
+    import inspect
+
+    try:
+        from hermes_cli import kanban_db as realkb  # type: ignore
+    except Exception:
+        return  # real module unavailable in this env -> skip (no failure)
+
+    _conn = object()
+    inspect.signature(realkb.create_task).bind(
+        _conn,
+        title="t",
+        body="b",
+        created_by="matrix_coder",
+        tenant="matrix_coder",
+        session_id="s",
+        initial_status="running",
+        idempotency_key="k",
+        parents=["parent-id"],
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover - stdlib smoke runner
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

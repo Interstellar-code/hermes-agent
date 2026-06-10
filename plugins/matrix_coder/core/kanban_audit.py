@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 from .config import load_config
 
@@ -88,6 +88,54 @@ def open_card(
         return card_id
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: kanban_audit.open_card suppressed error: %s", exc)
+        return None
+
+
+def open_child_card(
+    parent_id: str,
+    role: str,
+    lens: Optional[str],
+    goal: str,
+    session_id: Optional[str],
+) -> Optional[str]:
+    """Open a ``running`` child card under *parent_id* for one specialist dispatch.
+
+    Returns the child card id, or ``None`` if mirroring is disabled or fails.
+    The card is created with ``initial_status="running"``,
+    ``created_by="matrix_coder"``, no assignee, and ``parents=[parent_id]`` so
+    the Switch UI shows the invocation → dispatch hierarchy.
+
+    For single-specialist invocations the caller should NOT create a child card
+    (collapse to one card per spec). Use this only when there are two or more
+    parallel/sequential dispatches within the same invocation.
+    """
+    if not is_enabled() or not parent_id:
+        return None
+    try:
+        title = f"  ↳ {role}{'/' + lens if lens else ''}: {goal[:60]}"
+        conn = _kb.connect()
+        try:
+            card_id = _kb.create_task(
+                conn,
+                title=title,
+                body=goal,
+                created_by="matrix_coder",
+                tenant="matrix_coder",
+                session_id=session_id,
+                initial_status="running",
+                idempotency_key=uuid.uuid4().hex,
+                parents=[parent_id],
+            )
+        finally:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        return card_id
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug(
+            "matrix_coder: kanban_audit.open_child_card suppressed error: %s", exc
+        )
         return None
 
 
