@@ -1831,6 +1831,85 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
+async def _ollama_context_preflight(config: "GatewayConfig") -> None:
+    """Warn at gateway startup if Ollama is configured with an insufficient context window.
+
+    Probes the Ollama server's ``/api/show`` endpoint (via the existing
+    ``query_ollama_num_ctx`` helper) and emits a single WARNING when the
+    runtime context is below ``MINIMUM_CONTEXT_LENGTH`` and tools are
+    effectively enabled (i.e. not a quiet/no-tool session).
+
+    Fail-open: any network error, import error, or unexpected exception is
+    caught and logged at DEBUG level — the gateway startup always proceeds.
+    """
+    try:
+        raw = config.get("model", {}) if hasattr(config, "get") else {}
+        if not isinstance(raw, dict):
+            return
+
+        base_url: str = raw.get("base_url", "") or ""
+        model: str = (
+            raw.get("default") or raw.get("model") or ""
+        )
+
+        # Skip when no local/Ollama-style base_url is configured.
+        if not base_url:
+            return
+
+        # Quick port-level check before doing a full probe: Ollama's default
+        # port is 11434.  Also accept anything that explicitly names "ollama"
+        # in the URL (e.g. custom hostnames like ollama.internal:8080).
+        if "11434" not in base_url and "ollama" not in base_url.lower():
+            return
+
+        if not model:
+            logger.debug("ollama preflight skipped (no model configured)")
+            return
+
+        # Check whether tools are disabled globally — quiet_mode agents skip
+        # tools, so the context floor doesn't apply to them.
+        agent_cfg = config.get("agent", {}) if hasattr(config, "get") else {}
+        if isinstance(agent_cfg, dict) and agent_cfg.get("quiet_mode"):
+            logger.debug("ollama preflight skipped (quiet_mode)")
+            return
+
+        from agent.model_metadata import query_ollama_num_ctx, MINIMUM_CONTEXT_LENGTH  # noqa: PLC0415
+
+        # Run the blocking HTTP probe in a thread so we don't block the event loop.
+        import asyncio
+        import functools
+
+        api_key: str = raw.get("api_key", "") or ""
+        loop = asyncio.get_event_loop()
+        runtime_ctx = await loop.run_in_executor(
+            None,
+            functools.partial(query_ollama_num_ctx, model, base_url, api_key),
+        )
+
+        if runtime_ctx is None:
+            # Not an Ollama server, or probe failed — already logged by query_ollama_num_ctx.
+            logger.debug("ollama preflight skipped (probe returned None for %s @ %s)", model, base_url)
+            return
+
+        if runtime_ctx >= MINIMUM_CONTEXT_LENGTH:
+            # Context is sufficient — no warning needed.
+            return
+
+        logger.warning(
+            "Ollama context window too small for tool use: "
+            "model=%s base_url=%s runtime_context=%d minimum=%d. "
+            "Increase context before the first request: set "
+            "`model.ollama_num_ctx: 65536` in config.yaml, or add "
+            "`PARAMETER num_ctx 65536` to the Ollama Modelfile.",
+            model,
+            base_url,
+            runtime_ctx,
+            MINIMUM_CONTEXT_LENGTH,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ollama preflight skipped (%s)", exc)
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -4512,6 +4591,8 @@ class GatewayRunner:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
         except Exception as e:
             logger.debug("Stuck-loop detection failed: %s", e)
+
+        await _ollama_context_preflight(self.config)
 
         connected_count = 0
         enabled_platform_count = 0
