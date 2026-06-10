@@ -107,6 +107,17 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
     """
     try:
         user_message = kwargs.get("user_message", "") or ""
+        session_id = str(kwargs.get("session_id") or "")
+        # Bypass: cron sessions (session_id built as "cron_{job_id}_{ts}")
+        if session_id.startswith("cron_"):
+            logger.debug(
+                "matrix_coder: skipping injection — cron session (%s)", session_id
+            )
+            return None
+        # Belt-and-suspenders: system/scheduled preamble marker
+        if user_message.strip().startswith("[IMPORTANT:"):
+            logger.debug("matrix_coder: skipping injection — system preamble")
+            return None
         composed = harness.handle_trigger(
             user_message=user_message, session_id=kwargs.get("session_id")
         )
