@@ -76,6 +76,21 @@ logger = logging.getLogger(__name__)
 # Hooks (sync, defensive — never raise on the hot path)
 # ---------------------------------------------------------------------------
 
+def _log_injection(composed: str, mode: str) -> None:
+    """Emit an INFO log line describing the injected persona."""
+    # Extract role and lens from the marker line prepended by _compose_and_activate.
+    # Marker format: [matrix-coder active: role=<role>, lens=<lens>]
+    import re as _re
+    m = _re.search(r"\[matrix-coder active: role=([^,\]]+), lens=([^\]]+)\]", composed)
+    if m:
+        role, lens = m.group(1), m.group(2)
+    else:
+        role, lens = "unknown", "none"
+    logger.info(
+        "matrix_coder: persona injected role=%s lens=%s mode=%s", role, lens, mode
+    )
+
+
 def _inject_persona(**kwargs: Any) -> Optional[str]:
     """``pre_llm_call`` hook: explicit trigger first, then implicit IntentGate.
 
@@ -96,6 +111,7 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
             user_message=user_message, session_id=kwargs.get("session_id")
         )
         if composed:
+            _log_injection(composed, mode="explicit")
             return composed
         # No explicit trigger this turn -> close any orphan card and clear stale
         # persona state before implicit routing, so neither leaks forward.
@@ -108,9 +124,17 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
             )
             bridge.clear_active_card()
         bridge.clear_active_persona()
-        return harness.handle_implicit(
+        result = harness.handle_implicit(
             user_message=user_message, session_id=kwargs.get("session_id")
         )
+        if result is None:
+            logger.debug("matrix_coder: no injection (no coding intent)")
+        elif not bridge.is_active():
+            # DIRECT verdict: recommendation injected, no persona activated.
+            logger.debug("matrix_coder: no injection (direct verdict)")
+        else:
+            _log_injection(result, mode="implicit")
+        return result
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: _inject_persona suppressed error: %s", exc)
         return None
