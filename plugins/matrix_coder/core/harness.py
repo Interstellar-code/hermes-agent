@@ -55,6 +55,16 @@ def _compose_and_activate(parsed: ParsedInvocation, session_id: Optional[str]) -
     domain_text = registry.load_domain(parsed.domain) if parsed.domain else None
 
     composed = compose_persona(base, persona, lens=lens_text, domain_pack=domain_text)
+
+    # Prepend a visible activation marker and instruct the agent to echo it.
+    lens_part = parsed.lens if parsed.lens else "none"
+    marker = f"[matrix-coder active: role={parsed.role}, lens={lens_part}]"
+    composed = (
+        f"{marker}\n"
+        "Begin your reply with the line above exactly as written.\n\n"
+        + composed
+    )
+
     bridge.set_active_persona(composed)
 
     cid = kanban_audit.open_card(parsed.role, parsed.lens, parsed.goal, session_id)
