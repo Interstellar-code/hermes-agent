@@ -31,6 +31,15 @@ _GIT_TIMEOUT = 30  # seconds
 # Tests may monkeypatch _PROFILES_ROOT to a tmp_path.
 _PROFILES_ROOT: Path = Path.home() / ".hermes" / "profiles"
 
+# The default profile root (the hermes home itself, e.g. ~/.hermes).
+# Resolved via the canonical source so it respects HERMES_HOME.
+# Tests may monkeypatch _DEFAULT_HOME to a tmp_path.
+try:
+    from hermes_constants import get_default_hermes_root as _get_default_hermes_root
+    _DEFAULT_HOME: Path = _get_default_hermes_root()
+except Exception:  # pragma: no cover — bare-test / import-unavailable contexts
+    _DEFAULT_HOME = Path.home() / ".hermes"
+
 # Exactly 40 lowercase hex chars — git SHA-1.
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -47,13 +56,26 @@ def _assert_contained(root: Path, relpath: str) -> None:
 
 
 def _assert_profile_root(root: Path) -> None:
-    """Raise ValueError if *root* is not under _PROFILES_ROOT."""
+    """Raise ValueError if *root* is not under _PROFILES_ROOT or equal to _DEFAULT_HOME.
+
+    Named profiles live under _PROFILES_ROOT.
+    The "default" profile IS _DEFAULT_HOME (e.g. ~/.hermes itself).
+    Both are accepted; all other paths are rejected.
+    """
+    resolved = root.resolve()
+    # Accept: default home (equality check — the root IS the hermes home)
+    if resolved == _DEFAULT_HOME.resolve():
+        return
+    # Accept: named profile under profiles root
     try:
-        root.resolve().relative_to(_PROFILES_ROOT.resolve())
+        resolved.relative_to(_PROFILES_ROOT.resolve())
+        return
     except ValueError:
-        raise ValueError(
-            f"profile_root {root!r} is not inside {_PROFILES_ROOT}"
-        )
+        pass
+    raise ValueError(
+        f"profile_root {root!r} is not inside {_PROFILES_ROOT} "
+        f"and is not the default home {_DEFAULT_HOME}"
+    )
 
 
 def _validate_sha(sha: str, label: str = "commit_sha") -> None:

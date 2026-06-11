@@ -530,11 +530,18 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
         # prior experiment had populated target_profile_root — a bootstrap
         # deadlock that made /propose 500 on a fresh profile. The "default"
         # profile lives at the ~/.hermes root, not ~/.hermes/profiles/default.
-        hermes_home = Path.home() / ".hermes"
-        if profile == "default":
-            profile_root = str(hermes_home)
-        else:
-            profile_root = str(hermes_home / "profiles" / profile)
+        # Use the canonical resolver so HERMES_HOME is respected in multi-profile
+        # and hermes-switch setups.
+        try:
+            from hermes_cli.profiles import get_profile_dir as _get_profile_dir
+            profile_root = str(_get_profile_dir(profile))
+        except Exception:
+            log.debug("hermes_cli.profiles unavailable; falling back to Path.home() logic")
+            _hermes_home = Path.home() / ".hermes"
+            if profile == "default":
+                profile_root = str(_hermes_home)
+            else:
+                profile_root = str(_hermes_home / "profiles" / profile)
         if rows:
             exp = rows[0]
             target_relpath = exp.get("target_relpath") or target_relpath
