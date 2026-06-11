@@ -258,3 +258,54 @@ def test_detect_manual_conflict_non_git_dir(tmp_path) -> None:
     bad.mkdir()
     result = detect_manual_conflict(bad, "f.py", "abc123")
     assert not result.ok
+
+
+# ---------------------------------------------------------------------------
+# _assert_profile_root — default-home widening (PR #137 fix)
+# ---------------------------------------------------------------------------
+
+def test_assert_profile_root_accepts_default_home(tmp_path, monkeypatch) -> None:
+    """_assert_profile_root must accept a root equal to _DEFAULT_HOME."""
+    import _git_ratchet
+    default_home = tmp_path / "hermes_home"
+    default_home.mkdir()
+    monkeypatch.setattr(_git_ratchet, "_DEFAULT_HOME", default_home)
+    # Patch _PROFILES_ROOT to something unrelated so only _DEFAULT_HOME matches.
+    monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", tmp_path / "profiles")
+    # Should not raise.
+    _git_ratchet._assert_profile_root(default_home)
+
+
+def test_assert_profile_root_accepts_named_profile_subtree(tmp_path, monkeypatch) -> None:
+    """_assert_profile_root must accept a root that is a subtree of _PROFILES_ROOT."""
+    import _git_ratchet
+    profiles_root = tmp_path / "profiles"
+    named = profiles_root / "coder"
+    named.mkdir(parents=True)
+    monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", profiles_root)
+    monkeypatch.setattr(_git_ratchet, "_DEFAULT_HOME", tmp_path / "hermes_home")
+    # Should not raise.
+    _git_ratchet._assert_profile_root(named)
+
+
+def test_assert_profile_root_rejects_arbitrary_path(tmp_path, monkeypatch) -> None:
+    """_assert_profile_root must reject a path that is neither _DEFAULT_HOME nor under _PROFILES_ROOT."""
+    import _git_ratchet
+    monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", tmp_path / "profiles")
+    monkeypatch.setattr(_git_ratchet, "_DEFAULT_HOME", tmp_path / "hermes_home")
+    outside = tmp_path / "random_dir"
+    outside.mkdir()
+    with pytest.raises(ValueError, match="not inside"):
+        _git_ratchet._assert_profile_root(outside)
+
+
+def test_assert_contained_still_rejects_traversal_inside_default_home(tmp_path, monkeypatch) -> None:
+    """_assert_contained must still reject a relpath that escapes default home."""
+    import _git_ratchet
+    default_home = tmp_path / "hermes_home"
+    default_home.mkdir()
+    monkeypatch.setattr(_git_ratchet, "_DEFAULT_HOME", default_home)
+    monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", tmp_path / "profiles")
+    # Traversal relpath escaping default_home — must raise even though root is valid.
+    with pytest.raises(ValueError, match="traversal"):
+        _git_ratchet._assert_contained(default_home, "../../etc/passwd")
