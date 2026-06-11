@@ -133,8 +133,8 @@ def test_propose_sets_sentence_delta_count(db, git_repo):
 
     assert result.ok is True
     assert result.sentence_delta_count is not None
-    # The edit changes <=1 sentence
-    assert result.sentence_delta_count <= 1
+    # The edit rewrites exactly 1 sentence in-place → diff-based count == 1
+    assert result.sentence_delta_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -280,3 +280,202 @@ def test_propose_handles_missing_target_file(db, git_repo):
 
     assert result.ok is False
     assert "not found" in result.error.lower() or "nonexistent" in result.error
+
+
+# ---------------------------------------------------------------------------
+# Pause guard tests (FIX 1)
+# ---------------------------------------------------------------------------
+
+def test_propose_skips_when_profile_paused(db, git_repo):
+    """Paused profile → propose returns skipped with skip_reason 'profile is paused'."""
+    from _proposer import propose_for_profile
+
+    profile = "paused-profile"
+    _make_scenario(db, profile)
+    db.set_paused(profile, True)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: _GOOD_LLM_RESPONSE,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    assert result.ok is True
+    assert result.skipped is True
+    assert result.skip_reason == "profile is paused"
+
+
+def test_propose_proceeds_after_resume(db, git_repo):
+    """After resume, propose proceeds normally (does not skip for pause)."""
+    from _proposer import propose_for_profile
+
+    profile = "resumed-profile"
+    _make_scenario(db, profile)
+    db.set_paused(profile, True)
+    db.set_paused(profile, False)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: _GOOD_LLM_RESPONSE,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    # Should not be skipped due to pause (may still skip for score, but not pause)
+    assert not (result.skipped and result.skip_reason == "profile is paused")
+
+
+# ---------------------------------------------------------------------------
+# Atomicity metric tests (FIX 2)
+# ---------------------------------------------------------------------------
+
+# In-place single-sentence edit: "helpful" → "super helpful" in one sentence.
+_INPLACE_ONE_SENTENCE_DIFF = """\
+--- a/SOUL.md
++++ b/SOUL.md
+@@ -1 +1 @@
+-You are a helpful assistant. Always be concise.
++You are a super helpful assistant. Always be concise.
+"""
+_INPLACE_ONE_SENTENCE_RESPONSE = (
+    f"DIFF:\n{_INPLACE_ONE_SENTENCE_DIFF}\nRATIONALE:\nMakes the assistant more helpful.\n"
+)
+
+
+def test_atomicity_inplace_single_sentence_edit_accepted(db, git_repo):
+    """In-place single-sentence rewrite → accepted, changed-count == 1."""
+    from _proposer import propose_for_profile
+
+    profile = "atomicity-single-profile"
+    _make_scenario(db, profile)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: _INPLACE_ONE_SENTENCE_RESPONSE,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    # Must not be rejected for atomicity (ok=True, not skipped for atomicity)
+    assert result.ok is True
+    assert result.sentence_delta_count == 1
+
+
+# In-place rewrite of two sentences (same total count) — the regression case.
+# Original: 2 sentences. Modified: 2 sentences, both changed.
+_INPLACE_TWO_SENTENCE_DIFF = """\
+--- a/SOUL.md
++++ b/SOUL.md
+@@ -1 +1 @@
+-You are a helpful assistant. Always be concise.
++You are an extremely capable assistant. Always be brief and direct.
+"""
+_INPLACE_TWO_SENTENCE_RESPONSE = (
+    f"DIFF:\n{_INPLACE_TWO_SENTENCE_DIFF}\nRATIONALE:\nRewrites both sentences.\n"
+)
+
+
+def test_atomicity_inplace_two_sentence_rewrite_rejected(db, git_repo):
+    """In-place rewrite of 2 sentences (same count) → REJECTED. Regression test for FIX 2."""
+    from _proposer import propose_for_profile
+
+    profile = "atomicity-two-inplace-profile"
+    _make_scenario(db, profile)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: _INPLACE_TWO_SENTENCE_RESPONSE,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    # Must be rejected: changed-sentence count > 1
+    assert result.ok is False
+    assert result.sentence_delta_count > 1
+    assert "sentences" in result.error.lower() or "atomic" in result.error.lower()
+    # No proposed experiment should remain
+    proposed = db.list_experiments(profile=profile, state="proposed")
+    assert len(proposed) == 0
+
+
+def test_atomicity_net_add_two_sentences_rejected(db, git_repo):
+    """Net add of 2 new sentences → rejected."""
+    from _proposer import propose_for_profile
+
+    net_add_two_diff = """\
+--- a/SOUL.md
++++ b/SOUL.md
+@@ -1 +1,3 @@
+-You are a helpful assistant. Always be concise.
++You are a helpful assistant. Always be concise.
++Be clear.
++Stay on topic.
+"""
+    response = f"DIFF:\n{net_add_two_diff}\nRATIONALE:\nAdds two directives.\n"
+
+    profile = "atomicity-net-add-two-profile"
+    _make_scenario(db, profile)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: response,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    assert result.ok is False
+    assert result.sentence_delta_count > 1
+
+
+def test_atomicity_net_add_one_sentence_accepted(db, git_repo):
+    """Net add of exactly 1 new sentence → accepted, count == 1."""
+    from _proposer import propose_for_profile
+
+    net_add_one_diff = """\
+--- a/SOUL.md
++++ b/SOUL.md
+@@ -1 +1,2 @@
+-You are a helpful assistant. Always be concise.
++You are a helpful assistant. Always be concise.
++Be clear.
+"""
+    response = f"DIFF:\n{net_add_one_diff}\nRATIONALE:\nAdds one directive.\n"
+
+    profile = "atomicity-net-add-one-profile"
+    _make_scenario(db, profile)
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: response,
+        scenario_runner=lambda inp: "hello",
+        proposer_model="a",
+        judge_model="b",
+    )
+
+    # Should not be rejected for atomicity
+    assert result.ok is True
+    assert result.sentence_delta_count == 1

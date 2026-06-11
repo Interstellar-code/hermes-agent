@@ -286,7 +286,7 @@ async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) ->
                     patch_f.write(diff)
                     patch_path = patch_f.name
                 result = subprocess.run(
-                    ["patch", "--no-backup-if-mismatch", "-o", "-", orig_path, patch_path],
+                    ["patch", "--no-backup-if-mismatch", "-s", "-o", "-", orig_path, patch_path],
                     capture_output=True, timeout=10,
                 )
                 if result.returncode == 0:

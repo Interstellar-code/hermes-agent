@@ -12,6 +12,7 @@ Never raises to caller — returns a ProposalResult object.
 """
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -56,9 +57,34 @@ def _count_sentences(text: str) -> int:
     return len([p for p in parts if p.strip()])
 
 
+def _split_sentences(text: str) -> List[str]:
+    """Split text into a list of non-empty sentence strings."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+    parts = _SENTENCE_SPLIT_RE.split(stripped)
+    return [p.strip() for p in parts if p.strip()]
+
+
 def _sentence_delta_count(original: str, modified: str) -> int:
-    """Return the absolute difference in sentence counts between original and modified."""
-    return abs(_count_sentences(modified) - _count_sentences(original))
+    """Return the number of changed sentences between original and modified.
+
+    Uses difflib.SequenceMatcher over sentence lists to count replaced,
+    inserted, and deleted sentences. An in-place rewrite of N sentences
+    (same total count) returns N, not 0.
+    """
+    orig_sents = _split_sentences(original)
+    mod_sents = _split_sentences(modified)
+    matcher = difflib.SequenceMatcher(None, orig_sents, mod_sents, autojunk=False)
+    changed = 0
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        # replace: max(deleted, inserted) sentences changed
+        # insert: j2-j1 new sentences
+        # delete: i2-i1 removed sentences
+        changed += max(i2 - i1, j2 - j1)
+    return changed
 
 
 def _count_diff_hunks(diff: str) -> int:
@@ -169,7 +195,7 @@ def _apply_diff_to_content(original: str, diff: str) -> Optional[str]:
             patch_path = patch_f.name
 
         result = subprocess.run(
-            ["patch", "--no-backup-if-mismatch", "-o", "-", orig_path, patch_path],
+            ["patch", "--no-backup-if-mismatch", "-s", "-o", "-", orig_path, patch_path],
             capture_output=True,
             timeout=10,
         )
@@ -301,6 +327,18 @@ def _propose_for_profile_inner(
     from _git_ratchet import current_commit_sha, blob_sha
 
     now = datetime.now(timezone.utc).isoformat()
+
+    # Skip if the profile is paused.
+    try:
+        if db.is_paused(profile):
+            return ProposalResult(
+                ok=True,
+                skipped=True,
+                skip_reason="profile is paused",
+            )
+    except Exception:  # pylint: disable=broad-except
+        # controls table unavailable — treat as not paused and continue.
+        pass
 
     # Skip if there's already an active experiment.
     if _has_active_experiment(db, profile):
