@@ -524,11 +524,26 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
             return JSONResponse({"error": "profile is required"}, status_code=400)
         rows = db.list_experiments(profile=profile)
         target_relpath = "system_prompt.md"
-        profile_root = "."
+        # Default the profile root to the profile's own directory so the very
+        # first proposal can resolve its target file. Previously this defaulted
+        # to "." (the dashboard process CWD), which only ever worked once a
+        # prior experiment had populated target_profile_root — a bootstrap
+        # deadlock that made /propose 500 on a fresh profile. The "default"
+        # profile lives at the ~/.hermes root, not ~/.hermes/profiles/default.
+        hermes_home = Path.home() / ".hermes"
+        if profile == "default":
+            profile_root = str(hermes_home)
+        else:
+            profile_root = str(hermes_home / "profiles" / profile)
         if rows:
             exp = rows[0]
             target_relpath = exp.get("target_relpath") or target_relpath
             profile_root = exp.get("target_profile_root") or profile_root
+        # Allow explicit overrides via the request body for non-standard layouts.
+        if isinstance(body.get("target_relpath"), str) and body["target_relpath"]:
+            target_relpath = body["target_relpath"]
+        if isinstance(body.get("profile_root"), str) and body["profile_root"]:
+            profile_root = body["profile_root"]
         result = propose_for_profile(
             db=db,
             profile=profile,
