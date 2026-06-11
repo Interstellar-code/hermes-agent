@@ -157,6 +157,11 @@ CREATE TABLE IF NOT EXISTS scenarios (
     holdout    INTEGER NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS controls (
+    profile TEXT    PRIMARY KEY,
+    paused  INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -540,3 +545,52 @@ class KarpathyDB:
         )
         self._conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
+
+    def get_scenario(self, scenario_id: int) -> Optional[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM scenarios WHERE id = ?", (scenario_id,)
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def delete_scenario(self, scenario_id: int) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM scenarios WHERE id = ?", (scenario_id,)
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    # --- controls (pause/resume) ---------------------------------------------
+
+    def set_paused(self, profile: str, paused: bool) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO controls (profile, paused) VALUES (?, ?)
+            ON CONFLICT(profile) DO UPDATE SET paused = excluded.paused
+            """,
+            (profile, 1 if paused else 0),
+        )
+        self._conn.commit()
+
+    def is_paused(self, profile: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT paused FROM controls WHERE profile = ?", (profile,)
+        )
+        row = cur.fetchone()
+        return bool(row and row[0])
+
+    # --- eval_runs query -----------------------------------------------------
+
+    def list_eval_runs(self, experiment_id: int) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM eval_runs WHERE experiment_id = ? ORDER BY id",
+            (experiment_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def list_scenario_results(self, eval_run_id: int) -> List[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM experiment_scenario_results WHERE eval_run_id = ? ORDER BY id",
+            (eval_run_id,),
+        )
+        return [dict(row) for row in cur.fetchall()]

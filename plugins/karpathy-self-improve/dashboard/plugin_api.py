@@ -108,3 +108,409 @@ async def get_experiment(exp_id: int) -> JSONResponse:
     except Exception as exc:
         log.exception("karpathy /experiments/%s error", exp_id)
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments")
+async def create_experiment(body: dict) -> JSONResponse:
+    """Manually create a proposal experiment."""
+    try:
+        from _db import get_db
+        from datetime import datetime, timezone
+        db = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        profile = body.get("profile", "")
+        file = body.get("file", "")
+        diff = body.get("diff", "")
+        rationale = body.get("rationale", "")
+        if not profile:
+            return JSONResponse({"error": "profile is required"}, status_code=400)
+        exp_id = db.insert_experiment(
+            profile=profile,
+            file=file,
+            state="proposed",
+            diff=diff,
+            rationale=rationale,
+            created_at=now,
+            updated_at=now,
+        )
+        return JSONResponse({"experiment_id": exp_id}, status_code=201)
+    except Exception as exc:
+        log.exception("karpathy POST /experiments error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments/{exp_id}/approve")
+async def approve_experiment(exp_id: int, body: dict) -> JSONResponse:
+    try:
+        from _db import get_db
+        from _state_machine import transition
+        db = get_db()
+        actor = body.get("actor", "")
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        transition(db, exp_id, "approved", actor=actor)
+        return JSONResponse({"ok": True, "state": "approved"})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/approve error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments/{exp_id}/reject")
+async def reject_experiment(exp_id: int, body: dict) -> JSONResponse:
+    try:
+        from _db import get_db
+        from _state_machine import transition
+        db = get_db()
+        actor = body.get("actor", "")
+        reason = body.get("reason", "")
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        transition(db, exp_id, "rejected", actor=actor, reason=reason)
+        return JSONResponse({"ok": True, "state": "rejected"})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/reject error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments/{exp_id}/apply")
+async def apply_experiment(exp_id: int) -> JSONResponse:
+    """approved → live: write the proposed content, commit, store apply_commit_sha."""
+    try:
+        from _db import get_db
+        from _state_machine import transition
+        from _git_ratchet import apply_and_commit
+        from datetime import datetime, timezone
+        import json
+
+        db = get_db()
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if exp["state"] != "approved":
+            return JSONResponse(
+                {"error": f"experiment is in state {exp['state']!r}, must be 'approved' to apply"},
+                status_code=422,
+            )
+
+        profile_root = exp.get("target_profile_root") or ""
+        target_relpath = exp.get("target_relpath") or ""
+        diff = exp.get("diff") or ""
+
+        if not profile_root or not target_relpath:
+            return JSONResponse(
+                {"error": "experiment missing target_profile_root or target_relpath"},
+                status_code=422,
+            )
+
+        from pathlib import Path as _Path
+        import subprocess
+        import tempfile
+        import os
+
+        target_path = _Path(profile_root) / target_relpath
+        original_content = ""
+        if target_path.is_file():
+            original_content = target_path.read_text(encoding="utf-8", errors="replace")
+
+        # Apply diff to get new content.
+        new_content = original_content
+        if diff:
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as orig_f:
+                    orig_f.write(original_content)
+                    orig_path = orig_f.name
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as patch_f:
+                    patch_f.write(diff)
+                    patch_path = patch_f.name
+                result = subprocess.run(
+                    ["patch", "--no-backup-if-mismatch", "-o", "-", orig_path, patch_path],
+                    capture_output=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    new_content = result.stdout.decode(errors="replace")
+                else:
+                    log.warning("patch failed: %s", result.stderr.decode(errors="replace"))
+            except Exception as patch_exc:
+                log.warning("apply patch failed: %s", patch_exc)
+            finally:
+                for p in (orig_path, patch_path):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+        apply_result = apply_and_commit(
+            _Path(profile_root),
+            target_relpath,
+            new_content.encode("utf-8"),
+            message=f"feat(karpathy): apply experiment {exp_id}",
+        )
+        if not apply_result.ok:
+            return JSONResponse({"error": f"git apply failed: {apply_result.error}"}, status_code=500)
+
+        now = datetime.now(timezone.utc).isoformat()
+        db.update_experiment_fields(
+            exp_id,
+            apply_commit_sha=apply_result.commit_sha,
+            live_sessions_target=10,
+            updated_at=now,
+        )
+        transition(db, exp_id, "live", actor="api")
+        return JSONResponse({
+            "ok": True,
+            "state": "live",
+            "apply_commit_sha": apply_result.commit_sha,
+        })
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/apply error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments/{exp_id}/verify")
+async def verify_experiment(exp_id: int) -> JSONResponse:
+    """live → verified + insert baseline."""
+    try:
+        from _db import get_db
+        from _state_machine import transition
+        from datetime import datetime, timezone
+        db = get_db()
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        transition(db, exp_id, "verified", actor="api")
+        now = datetime.now(timezone.utc).isoformat()
+        db.insert_baseline(
+            profile=exp["profile"],
+            file=exp.get("target_relpath", ""),
+            commit_sha=exp.get("apply_commit_sha") or "",
+            score=exp.get("live_score") or 1.0,
+            experiment_id=exp_id,
+            created_at=now,
+        )
+        return JSONResponse({"ok": True, "state": "verified"})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/verify error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/experiments/{exp_id}/revert")
+async def revert_experiment(exp_id: int, body: dict) -> JSONResponse:
+    """live/approved → reverted: revert the apply commit."""
+    try:
+        from _db import get_db
+        from _state_machine import transition
+        from _git_ratchet import revert_commit
+        from pathlib import Path as _Path
+        db = get_db()
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        reason = body.get("reason", "")
+        apply_commit_sha = exp.get("apply_commit_sha") or ""
+        profile_root = exp.get("target_profile_root") or ""
+        if apply_commit_sha and profile_root:
+            revert_result = revert_commit(
+                _Path(profile_root),
+                apply_commit_sha,
+                message=f"chore: revert karpathy experiment {exp_id}: {reason}",
+            )
+            if not revert_result.ok:
+                log.warning("revert_commit failed: %s", revert_result.error)
+        transition(db, exp_id, "reverted", actor="api", reason=reason)
+        return JSONResponse({"ok": True, "state": "reverted"})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/revert error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.get("/experiments/{exp_id}/history")
+async def experiment_history(exp_id: int) -> JSONResponse:
+    """Return state transitions + eval runs + scenario results."""
+    try:
+        from _db import get_db
+        db = get_db()
+        exp = db.get_experiment(exp_id)
+        if exp is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        transitions = db.list_state_transitions(exp_id)
+        eval_runs = db.list_eval_runs(exp_id)
+        scenario_results = []
+        for run in eval_runs:
+            results = db.list_scenario_results(run["id"])
+            scenario_results.extend(results)
+        return JSONResponse({
+            "experiment": exp,
+            "transitions": transitions,
+            "eval_runs": eval_runs,
+            "scenario_results": scenario_results,
+        })
+    except Exception as exc:
+        log.exception("karpathy /experiments/%s/history error", exp_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Scenarios
+# ---------------------------------------------------------------------------
+
+@router.get("/scenarios")
+async def list_scenarios(
+    profile: Optional[str] = None,
+    include_holdout: int = 0,
+) -> JSONResponse:
+    try:
+        from _db import get_db
+        db = get_db()
+        rows = db.list_scenarios(profile)
+        if not include_holdout:
+            rows = [r for r in rows if not r.get("holdout")]
+        return JSONResponse({"scenarios": rows})
+    except Exception as exc:
+        log.exception("karpathy GET /scenarios error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/scenarios")
+async def create_scenario(body: dict) -> JSONResponse:
+    try:
+        from _db import get_db
+        from datetime import datetime, timezone
+        import json as _json
+        db = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        profile = body.get("profile", "")
+        name = body.get("name", "")
+        if not profile or not name:
+            return JSONResponse({"error": "profile and name are required"}, status_code=400)
+        checks = body.get("checks", [])
+        if isinstance(checks, str):
+            try:
+                checks = _json.loads(checks)
+            except Exception:
+                checks = []
+        scenario_id = db.insert_scenario(
+            profile=profile,
+            name=name,
+            input=body.get("input", ""),
+            checks=checks,
+            holdout=1 if body.get("holdout") else 0,
+            created_at=now,
+        )
+        return JSONResponse({"scenario_id": scenario_id}, status_code=201)
+    except Exception as exc:
+        log.exception("karpathy POST /scenarios error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.delete("/scenarios/{scenario_id}")
+async def delete_scenario(scenario_id: int) -> JSONResponse:
+    try:
+        from _db import get_db
+        db = get_db()
+        deleted = db.delete_scenario(scenario_id)
+        if not deleted:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        log.exception("karpathy DELETE /scenarios/%s error", scenario_id)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Propose (async trigger)
+# ---------------------------------------------------------------------------
+
+@router.post("/propose")
+async def trigger_propose(body: dict) -> JSONResponse:
+    """Trigger the proposer for a profile (202 Accepted — runs synchronously for now)."""
+    try:
+        from _db import get_db
+        from _proposer import propose_for_profile
+        db = get_db()
+        profile = body.get("profile", "")
+        if not profile:
+            return JSONResponse({"error": "profile is required"}, status_code=400)
+        rows = db.list_experiments(profile=profile)
+        target_relpath = "system_prompt.md"
+        profile_root = "."
+        if rows:
+            exp = rows[0]
+            target_relpath = exp.get("target_relpath") or target_relpath
+            profile_root = exp.get("target_profile_root") or profile_root
+        result = propose_for_profile(
+            db=db,
+            profile=profile,
+            target_relpath=target_relpath,
+            profile_root=profile_root,
+        )
+        if result.skipped:
+            return JSONResponse({"skipped": True, "reason": result.skip_reason}, status_code=200)
+        if not result.ok:
+            return JSONResponse({"error": result.error}, status_code=500)
+        return JSONResponse(
+            {"experiment_id": result.experiment_id, "offline_score": result.offline_score},
+            status_code=202,
+        )
+    except Exception as exc:
+        log.exception("karpathy POST /propose error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Pause / Resume profiles
+# ---------------------------------------------------------------------------
+
+@router.post("/profiles/{profile}/pause")
+async def pause_profile(profile: str) -> JSONResponse:
+    try:
+        from _db import get_db
+        get_db().set_paused(profile, True)
+        return JSONResponse({"ok": True, "profile": profile, "paused": True})
+    except Exception as exc:
+        log.exception("karpathy /profiles/%s/pause error", profile)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@router.post("/profiles/{profile}/resume")
+async def resume_profile(profile: str) -> JSONResponse:
+    try:
+        from _db import get_db
+        get_db().set_paused(profile, False)
+        return JSONResponse({"ok": True, "profile": profile, "paused": False})
+    except Exception as exc:
+        log.exception("karpathy /profiles/%s/resume error", profile)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Baselines
+# ---------------------------------------------------------------------------
+
+@router.get("/baselines")
+async def list_baselines(profile: Optional[str] = None) -> JSONResponse:
+    try:
+        from _db import get_db
+        db = get_db()
+        if profile:
+            rows = db.list_baselines(profile)
+        else:
+            cur = db._conn.execute(
+                "SELECT * FROM baselines ORDER BY created_at DESC"
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+        return JSONResponse({"baselines": rows})
+    except Exception as exc:
+        log.exception("karpathy GET /baselines error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
