@@ -366,10 +366,16 @@ class KarpathyDB:
     def update_experiment_fields(
         self,
         exp_id: int,
+        _commit: bool = True,
         **fields: Any,
     ) -> None:
         """Update arbitrary allowed columns. Does NOT enforce state-machine rules;
-        use _state_machine.transition() for state changes."""
+        use _state_machine.transition() for state changes.
+
+        Pass _commit=False when calling from inside an existing transaction
+        (e.g. _state_machine.transition()) so the caller owns the single commit
+        and all writes remain atomic under BEGIN IMMEDIATE.
+        """
         allowed = {
             "state", "diff", "rationale", "offline_score", "live_score",
             "verdict", "cost", "target_profile_root", "target_relpath",
@@ -390,7 +396,8 @@ class KarpathyDB:
             f"UPDATE experiments SET {', '.join(set_parts)} WHERE id = ?",
             params,
         )
-        self._conn.commit()
+        if _commit:
+            self._conn.commit()
 
     # Legacy alias — kept so existing callers that only change state still work.
     def update_experiment_state(

@@ -18,13 +18,32 @@ _PLUGIN_DIR = Path(__file__).resolve().parent.parent  # plugins/karpathy-self-im
 if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 log = logging.getLogger(__name__)
 
 _VERSION = "0.1.0"
 _PLUGIN_NAME = "karpathy-self-improve"
+
+# ---------------------------------------------------------------------------
+# H-3: Per-route auth dependency
+# ---------------------------------------------------------------------------
+
+def _require_auth(request: Request) -> None:
+    """Raises 401 if the request is not authenticated.
+
+    Tries to reuse the dashboard's own auth helper.  Falls back to pass in
+    test contexts where hermes_cli.web_server is not importable.
+    """
+    try:
+        from hermes_cli.web_server import _is_authenticated  # type: ignore[import]
+        if not _is_authenticated(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    except (ImportError, AttributeError):
+        # Test context or standalone mount — accept without auth.
+        pass
+
 
 # Module-level router — web_server looks for exactly this name.
 router = APIRouter()
@@ -111,7 +130,7 @@ async def get_experiment(exp_id: int) -> JSONResponse:
 
 
 @router.post("/experiments")
-async def create_experiment(body: dict) -> JSONResponse:
+async def create_experiment(body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """Manually create a proposal experiment."""
     try:
         from _db import get_db
@@ -124,6 +143,31 @@ async def create_experiment(body: dict) -> JSONResponse:
         rationale = body.get("rationale", "")
         if not profile:
             return JSONResponse({"error": "profile is required"}, status_code=400)
+
+        # H-4: reject dangerous file paths before storing in DB.
+        if file and (".." in file or file.startswith("/")):
+            return JSONResponse(
+                {"error": "file must be a relative path with no '..' components"},
+                status_code=400,
+            )
+
+        # H-4: validate profile resolves to an existing dir under the profiles root.
+        # Use _git_ratchet._PROFILES_ROOT so tests can monkeypatch it.
+        from _git_ratchet import _PROFILES_ROOT as _profiles_root  # type: ignore[attr-defined]
+        candidate = (_profiles_root / profile).resolve()
+        try:
+            candidate.relative_to(_profiles_root.resolve())
+        except ValueError:
+            return JSONResponse(
+                {"error": f"profile {profile!r} is not inside {_profiles_root}"},
+                status_code=400,
+            )
+        if not candidate.is_dir():
+            return JSONResponse(
+                {"error": f"profile directory does not exist: {candidate}"},
+                status_code=400,
+            )
+
         exp_id = db.insert_experiment(
             profile=profile,
             file=file,
@@ -140,7 +184,7 @@ async def create_experiment(body: dict) -> JSONResponse:
 
 
 @router.post("/experiments/{exp_id}/approve")
-async def approve_experiment(exp_id: int, body: dict) -> JSONResponse:
+async def approve_experiment(exp_id: int, body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         from _state_machine import transition
@@ -159,7 +203,7 @@ async def approve_experiment(exp_id: int, body: dict) -> JSONResponse:
 
 
 @router.post("/experiments/{exp_id}/reject")
-async def reject_experiment(exp_id: int, body: dict) -> JSONResponse:
+async def reject_experiment(exp_id: int, body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         from _state_machine import transition
@@ -179,7 +223,7 @@ async def reject_experiment(exp_id: int, body: dict) -> JSONResponse:
 
 
 @router.post("/experiments/{exp_id}/apply")
-async def apply_experiment(exp_id: int) -> JSONResponse:
+async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """approved → live: write the proposed content, commit, store apply_commit_sha."""
     try:
         from _db import get_db
@@ -261,7 +305,25 @@ async def apply_experiment(exp_id: int) -> JSONResponse:
             live_sessions_target=10,
             updated_at=now,
         )
-        transition(db, exp_id, "live", actor="api")
+        # H-2: if transition fails after the git commit, compensating-revert
+        # to avoid a patched profile with DB still showing 'approved'.
+        try:
+            transition(db, exp_id, "live", actor="api")
+        except Exception:
+            try:
+                from _git_ratchet import revert_commit as _revert_commit
+                _revert_commit(
+                    _Path(profile_root),
+                    apply_result.commit_sha,
+                    f"chore: rollback failed apply of experiment {exp_id}",
+                )
+            except Exception as revert_exc:
+                log.error(
+                    "karpathy compensating revert failed for experiment %d: %s",
+                    exp_id,
+                    revert_exc,
+                )
+            raise
         return JSONResponse({
             "ok": True,
             "state": "live",
@@ -275,7 +337,7 @@ async def apply_experiment(exp_id: int) -> JSONResponse:
 
 
 @router.post("/experiments/{exp_id}/verify")
-async def verify_experiment(exp_id: int) -> JSONResponse:
+async def verify_experiment(exp_id: int, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """live → verified + insert baseline."""
     try:
         from _db import get_db
@@ -304,7 +366,7 @@ async def verify_experiment(exp_id: int) -> JSONResponse:
 
 
 @router.post("/experiments/{exp_id}/revert")
-async def revert_experiment(exp_id: int, body: dict) -> JSONResponse:
+async def revert_experiment(exp_id: int, body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """live/approved → reverted: revert the apply commit."""
     try:
         from _db import get_db
@@ -324,8 +386,13 @@ async def revert_experiment(exp_id: int, body: dict) -> JSONResponse:
                 apply_commit_sha,
                 message=f"chore: revert karpathy experiment {exp_id}: {reason}",
             )
+            # H-6: only transition to 'reverted' when git revert actually succeeded.
             if not revert_result.ok:
-                log.warning("revert_commit failed: %s", revert_result.error)
+                log.error("revert_commit failed for experiment %d: %s", exp_id, revert_result.error)
+                return JSONResponse(
+                    {"error": f"git revert failed: {revert_result.error}"},
+                    status_code=500,
+                )
         transition(db, exp_id, "reverted", actor="api", reason=reason)
         return JSONResponse({"ok": True, "state": "reverted"})
     except ValueError as exc:
@@ -383,7 +450,7 @@ async def list_scenarios(
 
 
 @router.post("/scenarios")
-async def create_scenario(body: dict) -> JSONResponse:
+async def create_scenario(body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         from datetime import datetime, timezone
@@ -415,7 +482,7 @@ async def create_scenario(body: dict) -> JSONResponse:
 
 
 @router.delete("/scenarios/{scenario_id}")
-async def delete_scenario(scenario_id: int) -> JSONResponse:
+async def delete_scenario(scenario_id: int, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         db = get_db()
@@ -433,7 +500,7 @@ async def delete_scenario(scenario_id: int) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 @router.post("/propose")
-async def trigger_propose(body: dict) -> JSONResponse:
+async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """Trigger the proposer for a profile (202 Accepted — runs synchronously for now)."""
     try:
         from _db import get_db
@@ -473,7 +540,7 @@ async def trigger_propose(body: dict) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 @router.post("/profiles/{profile}/pause")
-async def pause_profile(profile: str) -> JSONResponse:
+async def pause_profile(profile: str, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         get_db().set_paused(profile, True)
@@ -484,7 +551,7 @@ async def pause_profile(profile: str) -> JSONResponse:
 
 
 @router.post("/profiles/{profile}/resume")
-async def resume_profile(profile: str) -> JSONResponse:
+async def resume_profile(profile: str, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _db import get_db
         get_db().set_paused(profile, False)

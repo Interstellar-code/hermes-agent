@@ -40,9 +40,13 @@ def _git(args, cwd):
 
 
 @pytest.fixture()
-def git_repo(tmp_path):
-    """Minimal git repo with a committed SOUL.md."""
-    repo = tmp_path / "profile_root"
+def git_repo(tmp_path, patch_profiles_root):
+    """Minimal git repo with a committed SOUL.md, placed under patched profiles root.
+
+    The directory name is 'test-profile' so it matches the profile name used in
+    lifecycle tests when creating experiments via POST /experiments.
+    """
+    repo = patch_profiles_root / "test-profile"
     repo.mkdir()
     _git(["init", "-b", "main"], repo)
     _git(["config", "user.email", "test@example.com"], repo)
@@ -59,10 +63,15 @@ def git_repo(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch, git_repo):
+def client(tmp_path, monkeypatch, git_repo, patch_profiles_root):
     """Return a TestClient with a fresh DB and the plugin router mounted."""
     db_file = str(tmp_path / "api-test.db")
     monkeypatch.setenv("KARPATHY_DB_PATH", db_file)
+
+    # Pre-create profile directories used by lifecycle tests so the H-4
+    # existence check in POST /experiments passes.
+    for _prof in ("revert-profile", "hist-profile", "scen-profile", "my-profile"):
+        (patch_profiles_root / _prof).mkdir(exist_ok=True)
 
     # Reset the DB singleton so each test gets a fresh connection
     import _db as db_mod

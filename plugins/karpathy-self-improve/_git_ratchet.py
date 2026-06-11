@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,46 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 _GIT_TIMEOUT = 30  # seconds
+
+# ---------------------------------------------------------------------------
+# Security helpers — C-1 path containment, C-2 SHA validation
+# ---------------------------------------------------------------------------
+
+# All profile repos must live under this root (or a test-patched override).
+# Tests may monkeypatch _PROFILES_ROOT to a tmp_path.
+_PROFILES_ROOT: Path = Path.home() / ".hermes" / "profiles"
+
+# Exactly 40 lowercase hex chars — git SHA-1.
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _assert_contained(root: Path, relpath: str) -> None:
+    """Raise ValueError if *relpath* escapes *root* (path traversal guard)."""
+    resolved = (root / relpath).resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        raise ValueError(
+            f"Path traversal detected: {relpath!r} escapes {root}"
+        )
+
+
+def _assert_profile_root(root: Path) -> None:
+    """Raise ValueError if *root* is not under _PROFILES_ROOT."""
+    try:
+        root.resolve().relative_to(_PROFILES_ROOT.resolve())
+    except ValueError:
+        raise ValueError(
+            f"profile_root {root!r} is not inside {_PROFILES_ROOT}"
+        )
+
+
+def _validate_sha(sha: str, label: str = "commit_sha") -> None:
+    """Raise ValueError if *sha* is not a 40-hex-char git SHA-1."""
+    if not _SHA_RE.fullmatch(sha):
+        raise ValueError(
+            f"Invalid {label}: {sha!r}. Must be a 40-hex-char SHA-1."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +211,13 @@ def apply_and_commit(
     - Captures base commit SHA before writing.
     - Returns the new commit SHA and the base SHA.
     """
+    # C-1: validate profile root and relpath containment before any write.
+    try:
+        _assert_profile_root(root)
+        _assert_contained(root, relpath)
+    except ValueError as exc:
+        return ApplyResult(ok=False, error=str(exc))
+
     err = _guard(root)
     if err:
         return ApplyResult(ok=False, error=err)
@@ -202,7 +250,7 @@ def apply_and_commit(
 
         # Commit.
         r = _run(
-            ["git", "-C", str(root), "commit", "-m", message, "--no-verify"],
+            ["git", "-C", str(root), "commit", "-m", message],
             root,
         )
         if r.returncode != 0:
@@ -224,12 +272,24 @@ def revert_commit(root: Path, commit_sha: str, message: str) -> RevertResult:
 
     Falls back to a plain `git restore` + commit if revert produces a conflict.
     """
+    # C-1: validate profile root containment before any git operation.
+    try:
+        _assert_profile_root(root)
+    except ValueError as exc:
+        return RevertResult(ok=False, error=str(exc))
+
+    # C-2: validate SHA format before passing it to git.
+    try:
+        _validate_sha(commit_sha)
+    except ValueError as exc:
+        return RevertResult(ok=False, error=str(exc))
+
     err = _guard(root)
     if err:
         return RevertResult(ok=False, error=err)
     try:
         r = _run(
-            ["git", "-C", str(root), "revert", "--no-edit", commit_sha],
+            ["git", "-C", str(root), "revert", "--no-edit", "--", commit_sha],
             root,
         )
         if r.returncode == 0:

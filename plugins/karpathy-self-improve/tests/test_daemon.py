@@ -9,12 +9,35 @@ Tests the tick logic directly without running the asyncio loop:
 """
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+
+# Ensure the karpathy plugin's daemon.py is always used, even if another
+# daemon module (e.g. workflow-engine/daemon.py) was imported earlier in the
+# test session.  We forcibly load it under the 'daemon' key in sys.modules
+# from the known path before any test in this file runs.
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
+_DAEMON_PATH = _PLUGIN_DIR / "daemon.py"
+
+
+def _ensure_karpathy_daemon() -> None:
+    current = sys.modules.get("daemon")
+    if current is not None and getattr(current, "__file__", "") == str(_DAEMON_PATH):
+        return  # already correct
+    spec = importlib.util.spec_from_file_location("daemon", _DAEMON_PATH)
+    mod = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    sys.modules["daemon"] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+
+
+_ensure_karpathy_daemon()
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +61,9 @@ def _git(args, cwd):
 
 
 @pytest.fixture()
-def git_repo(tmp_path):
-    """Minimal git repo with a SOUL.md committed."""
-    repo = tmp_path / "profile_root"
+def git_repo(tmp_path, patch_profiles_root):
+    """Minimal git repo with a SOUL.md committed, placed under patched profiles root."""
+    repo = patch_profiles_root / "profile_root"
     repo.mkdir()
     _git(["init", "-b", "main"], repo)
     _git(["config", "user.email", "test@example.com"], repo)

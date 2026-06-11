@@ -112,7 +112,7 @@ def transition(
     try:
         # Acquire an exclusive write lock before reading + writing.
         db._conn.execute("BEGIN IMMEDIATE")
-        db.update_experiment_fields(experiment_id, **update_fields)
+        db.update_experiment_fields(experiment_id, _commit=False, **update_fields)
         db.insert_state_transition(
             experiment_id=experiment_id,
             from_state=from_state,

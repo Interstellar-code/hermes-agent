@@ -167,8 +167,12 @@ def run_eval(
     Raises:
         ValueError: If proposer_model == judge_model (anti-gaming guard).
     """
-    # Anti-gaming guard.
-    if proposer_model and judge_model and proposer_model == judge_model:
+    # Anti-gaming guard: both models must be explicitly set and must differ.
+    if not proposer_model or not judge_model:
+        raise ValueError(
+            "proposer_model and judge_model must both be explicitly set."
+        )
+    if proposer_model == judge_model:
         raise ValueError(
             f"proposer_model and judge_model must differ; both are {proposer_model!r}. "
             "Using the same model as both proposer and judge defeats the evaluation."

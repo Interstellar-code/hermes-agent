@@ -43,3 +43,22 @@ _register_alias("plugins.karpathy_self_improve", _PLUGIN_DIR)
 # Ensure `plugins` namespace has the attribute so monkeypatch paths resolve.
 import plugins as _plugins_ns  # noqa: E402
 _plugins_ns.karpathy_self_improve = sys.modules["plugins.karpathy_self_improve"]
+
+
+# ---------------------------------------------------------------------------
+# Profile-root patcher — used by git-ratchet and API lifecycle tests.
+#
+# Tests pass tmp_path directories as profile_root, which are not under the
+# real ~/.hermes/profiles.  This fixture patches _git_ratchet._PROFILES_ROOT
+# to tmp_path so _assert_profile_root passes in the test environment.
+# ---------------------------------------------------------------------------
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture()
+def patch_profiles_root(tmp_path, monkeypatch):
+    """Monkeypatch _git_ratchet._PROFILES_ROOT to tmp_path for containment checks."""
+    import _git_ratchet
+    monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", tmp_path)
+    return tmp_path

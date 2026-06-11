@@ -29,9 +29,13 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture()
-def git_repo(tmp_path) -> Path:
-    """Create a minimal git repo with one committed file."""
-    repo = tmp_path / "profile"
+def git_repo(tmp_path, patch_profiles_root) -> Path:
+    """Create a minimal git repo with one committed file.
+
+    Uses patch_profiles_root so the repo lives under the patched profiles root,
+    satisfying _assert_profile_root in test runs.
+    """
+    repo = patch_profiles_root / "profile"
     repo.mkdir()
     _git(["init", "-b", "main"], repo)
     _git(["config", "user.email", "test@example.com"], repo)

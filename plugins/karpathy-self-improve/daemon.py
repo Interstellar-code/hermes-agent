@@ -214,6 +214,12 @@ def _get_latest_sessions_count(db: Any, profile: str) -> int:
     return 0
 
 
+
+# M-4: per-experiment consecutive failure counter (in-process, reset on daemon restart).
+_consecutive_tick_failures: dict[int, int] = {}
+_MAX_CONSECUTIVE_TICK_FAILURES = 3
+
+
 def _tick_live_experiments(db: Any) -> None:
     """Check all 'live' experiments: increment observed count; verify or revert."""
     from _eval_runner import run_eval
@@ -260,12 +266,43 @@ def _tick_live_experiments(db: Any) -> None:
                 judge_model=judge_model,
                 include_holdout=True,
             )
+            # Reset failure counter on success.
+            _consecutive_tick_failures.pop(exp_id, None)
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "karpathy-self-improve: live eval failed for experiment %d: %s",
+            failures = _consecutive_tick_failures.get(exp_id, 0) + 1
+            _consecutive_tick_failures[exp_id] = failures
+            logger.error(
+                "karpathy-self-improve: live eval failed for experiment %d "
+                "(consecutive failures: %d/%d): %s",
                 exp_id,
+                failures,
+                _MAX_CONSECUTIVE_TICK_FAILURES,
                 exc,
             )
+            # M-4: after N consecutive failures, auto-revert the experiment so it
+            # does not loop forever as a poison pill.
+            if failures >= _MAX_CONSECUTIVE_TICK_FAILURES:
+                logger.error(
+                    "karpathy-self-improve: experiment %d exceeded %d consecutive "
+                    "eval failures — auto-reverting",
+                    exp_id,
+                    _MAX_CONSECUTIVE_TICK_FAILURES,
+                )
+                _consecutive_tick_failures.pop(exp_id, None)
+                try:
+                    transition(
+                        db,
+                        exp_id,
+                        "reverted",
+                        actor="daemon",
+                        reason=f"auto-revert: {_MAX_CONSECUTIVE_TICK_FAILURES} consecutive eval failures",
+                    )
+                except Exception as tr_exc:
+                    logger.error(
+                        "karpathy-self-improve: could not auto-revert experiment %d: %s",
+                        exp_id,
+                        tr_exc,
+                    )
             continue
 
         db.update_experiment_fields(exp_id, live_score=live_score, updated_at=now)
