@@ -55,7 +55,20 @@ router = APIRouter()
 
 @router.get("/health")
 async def health() -> dict:
-    return {"ok": True, "plugin": _PLUGIN_NAME, "version": _VERSION}
+    try:
+        from _db import resolve_db_path
+        db_path = resolve_db_path()
+        db_exists = db_path.exists()
+    except Exception:
+        db_path = None
+        db_exists = False
+    return {
+        "ok": True,
+        "plugin": _PLUGIN_NAME,
+        "version": _VERSION,
+        "db_path": str(db_path) if db_path is not None else None,
+        "db_exists": db_exists,
+    }
 
 
 # ---------------------------------------------------------------------------

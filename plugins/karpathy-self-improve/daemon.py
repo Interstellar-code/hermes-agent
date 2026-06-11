@@ -79,6 +79,18 @@ def setup_parser(sub: argparse.ArgumentParser) -> None:
         help="Poll interval in seconds (default: 3600).",
     )
 
+    # hermes karpathy init
+    p_init = daemon_sub.add_parser(
+        "init",
+        help="Initialize (or locate) the metrics DB; optionally persist a custom path to config.yaml.",
+    )
+    p_init.add_argument(
+        "--db-path",
+        dest="db_path",
+        default=None,
+        help="Custom DB path to write into config.yaml under plugins.karpathy_self_improve.db_path.",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Subcommand handlers
@@ -97,8 +109,36 @@ def _cmd_collect() -> None:
         )
 
 
+def _cmd_init(db_path_arg: "str | None") -> None:
+    """Initialize the DB, optionally persisting a custom path to config.yaml."""
+    if db_path_arg is not None:
+        # Persist into config.yaml via the canonical save_config path.
+        try:
+            from hermes_cli.config import load_config, save_config  # type: ignore[import]
+            config = load_config()
+            plugins_section = config.setdefault("plugins", {})
+            ksi_section = plugins_section.setdefault("karpathy_self_improve", {})
+            ksi_section["db_path"] = db_path_arg
+            save_config(config)
+            print(f"Wrote plugins.karpathy_self_improve.db_path = {db_path_arg!r} to config.yaml")
+        except Exception as exc:
+            print(f"Warning: could not save db_path to config.yaml: {exc}", file=sys.stderr)
+
+    # Now resolve + open (triggers announce-on-create if fresh).
+    from _db import resolve_db_path, open_db
+    resolved = resolve_db_path()
+    open_db(resolved)
+    print(f"DB path: {resolved}")
+
+
 def _cmd_status() -> None:
-    from _db import get_db
+    from _db import get_db, resolve_db_path
+
+    # Print DB header line.
+    resolved = resolve_db_path()
+    exists = resolved.exists()
+    size = resolved.stat().st_size if exists else 0
+    print(f"DB: {resolved} (exists={exists}, size={size})")
 
     db = get_db()
 
@@ -512,5 +552,7 @@ def _run(ns: argparse.Namespace) -> None:
         _cmd_propose(ns.profile)
     elif cmd == "daemon":
         _cmd_daemon(ns.interval)
+    elif cmd == "init":
+        _cmd_init(getattr(ns, "db_path", None))
     else:
-        print("Usage: hermes karpathy {collect,status,propose,daemon}")
+        print("Usage: hermes karpathy {collect,status,propose,daemon,init}")

@@ -1,9 +1,10 @@
 """
 _db.py — SQLite persistence layer for karpathy-self-improve.
 
-DB path: get_default_hermes_root() / "karpathy-self-improve.db"
-  (central controller DB — shared across all profiles)
-Override via KARPATHY_DB_PATH env var.
+DB path resolution (highest to lowest priority):
+  1. KARPATHY_DB_PATH env var
+  2. config.yaml key plugins.karpathy_self_improve.db_path
+  3. get_default_hermes_root() / "karpathy-self-improve.db"
 
 WAL mode, row_factory=sqlite3.Row, threading lock singleton.
 """
@@ -169,16 +170,55 @@ CREATE TABLE IF NOT EXISTS controls (
 # Connection factory
 # ---------------------------------------------------------------------------
 
-def _get_db_path() -> Path:
+def resolve_db_path() -> Path:
+    """Return the resolved DB path using 3-level precedence.
+
+    1. KARPATHY_DB_PATH env var (highest — tests rely on it).
+    2. config.yaml key plugins.karpathy_self_improve.db_path.
+       Expands ~ and env vars; relative paths resolved under hermes root.
+    3. Default: get_default_hermes_root() / "karpathy-self-improve.db".
+
+    Never raises — falls back to default on any config read error.
+    """
+    # Level 1: env var.
     env = os.environ.get("KARPATHY_DB_PATH")
     if env:
         return Path(env)
+
+    # Level 2: config.yaml.
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        config = load_config()
+        cfg_val = cfg_get(config, "plugins", "karpathy_self_improve", "db_path", default=None)
+        if cfg_val is not None:
+            expanded = os.path.expandvars(os.path.expanduser(str(cfg_val)))
+            p = Path(expanded)
+            if not p.is_absolute():
+                p = get_default_hermes_root() / p
+            return p
+    except Exception:
+        pass  # Config unavailable (bare tests, etc.) — fall through to default.
+
+    # Level 3: default.
     return get_default_hermes_root() / "karpathy-self-improve.db"
 
 
+# Keep _get_db_path as a thin alias so any external callers are not broken.
+def _get_db_path() -> Path:
+    return resolve_db_path()
+
+
 def _open_conn(path: Path) -> sqlite3.Connection:
-    if str(path) != ":memory:":
+    is_memory = str(path) == ":memory:"
+    if not is_memory:
+        exists_before = path.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
+        if not exists_before:
+            logger.info(
+                "karpathy-self-improve: initializing metrics DB at %s", path
+            )
+        else:
+            logger.debug("karpathy-self-improve: opening DB at %s", path)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -198,10 +238,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 def get_db() -> "KarpathyDB":
     """Return the process-wide KarpathyDB singleton, opening on first call."""
     global _conn
-    db_path = _get_db_path()
+    db_path = resolve_db_path()
     with _lock:
         if _conn is None:
-            logger.debug("karpathy-self-improve: opening DB at %s", db_path)
             _conn = _open_conn(db_path)
     return KarpathyDB(_conn)
 
