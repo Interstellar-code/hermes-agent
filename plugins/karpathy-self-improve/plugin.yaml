@@ -5,10 +5,7 @@ author: Interstellar-code
 kind: standalone
 
 # Doc-only: register() is authoritative.
-hooks:
-  - post_llm_call
-  - pre_llm_call
-
+# No hooks declared — register() does not install pre/post_llm_call hooks.
 provides_tools: []
 
 pip_dependencies:

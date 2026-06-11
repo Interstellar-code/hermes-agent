@@ -1,17 +1,17 @@
 """
 _metrics.py — Per-profile metrics collection for karpathy-self-improve.
 
-P0: derives metrics from log files under get_hermes_home()/"logs/":
-  - agent.log   : INFO lines, session boundaries
-  - errors.log  : ERROR / WARNING lines
+P0: derives metrics from agent.log ONLY (errors.log is a strict subset of
+agent.log — both files receive the same WARNING+ records via the shared
+RotatingFileHandler chain in hermes_logging.py — so counting both would
+double-count errors/warnings).
 
-Open Question #133-Q1: log lines are NOT profile-tagged in P0.
-All metrics are written with profile="(unknown)" until the agent runtime
-begins tagging log lines with a profile identifier.
-# TODO(#133-Q1): replace "(unknown)" profile once log lines carry profile tags.
+Metrics are collected over a window anchored by byte offsets so that
+successive collections can attribute delta counts to a specific window.
 
-Structure is intentionally thin so a richer source (gateway sessions store,
-token usage DB) can replace the log-parsing path without changing callers.
+Open Question P0: log lines are not profile-tagged yet. All metrics are
+written under profile="(unknown)" until the agent runtime begins tagging
+log lines with a profile identifier.
 """
 from __future__ import annotations
 
@@ -26,11 +26,15 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Regex patterns
 # ---------------------------------------------------------------------------
 
+# Canonical session-start signature anchored on the real log tag emitted by
+# hermes_logging.py:set_session_context() / run_agent.py:on_session_start.
+# The format is: "... [<session_id>] ..." injected via the session record
+# factory; we match the on_session_start call that always accompanies it.
 _SESSION_START_RE = re.compile(
-    r"on_session_start|session[_\s]start|run_agent:.*agent_init",
+    r"on_session_start",
     re.IGNORECASE,
 )
 _ERROR_RE = re.compile(r"\bERROR\b")
@@ -43,33 +47,44 @@ _COST_RE = re.compile(r"cost[=:\s]+\$?([\d.]+)", re.IGNORECASE)
 _RETRY_RE = re.compile(r"\bretry\b|\bretrying\b", re.IGNORECASE)
 
 
-def _read_log(path: Path) -> List[str]:
-    """Read a log file, returning lines. Returns [] if file absent or unreadable."""
-    try:
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return []
+def _read_log(path: Path, from_offset: int = 0) -> tuple[List[str], int]:
+    """Read a log file from *from_offset* bytes, returning (lines, end_offset).
 
-
-def _parse_log_metrics(log_dir: Path) -> Dict[str, int | float]:
+    Returns ([], 0) if the file is absent or unreadable.
+    The end_offset is the byte position after the last byte read — pass it
+    back as from_offset on the next call to get only new lines.
     """
-    Parse agent.log + errors.log and return raw counts.
+    try:
+        with path.open("rb") as fh:
+            fh.seek(from_offset)
+            data = fh.read()
+            end_offset = from_offset + len(data)
+        return data.decode(encoding="utf-8", errors="replace").splitlines(), end_offset
+    except OSError:
+        return [], from_offset
+
+
+def _parse_log_metrics(
+    log_dir: Path,
+    from_offset: int = 0,
+) -> Dict[str, int | float]:
+    """Parse agent.log ONLY (errors.log is a subset) and return raw counts.
 
     Returns a dict with keys:
-      sessions_count, error_count, warn_count, tokens, cost, retries
+      sessions_count, error_count, warn_count, tokens, cost, retries,
+      to_offset  (byte position after last read — for window tracking)
     """
-    agent_lines = _read_log(log_dir / "agent.log")
-    error_lines = _read_log(log_dir / "errors.log")
-    all_lines = agent_lines + error_lines
+    agent_path = log_dir / "agent.log"
+    lines, to_offset = _read_log(agent_path, from_offset=from_offset)
 
-    sessions_count = sum(1 for ln in agent_lines if _SESSION_START_RE.search(ln))
-    error_count = sum(1 for ln in all_lines if _ERROR_RE.search(ln))
-    warn_count = sum(1 for ln in all_lines if _WARN_RE.search(ln))
-    retries = sum(1 for ln in all_lines if _RETRY_RE.search(ln))
+    sessions_count = sum(1 for ln in lines if _SESSION_START_RE.search(ln))
+    error_count = sum(1 for ln in lines if _ERROR_RE.search(ln))
+    warn_count = sum(1 for ln in lines if _WARN_RE.search(ln))
+    retries = sum(1 for ln in lines if _RETRY_RE.search(ln))
 
     tokens = 0
     cost = 0.0
-    for ln in all_lines:
+    for ln in lines:
         m = _TOKEN_RE.search(ln)
         if m:
             tokens += int(m.group(1))
@@ -84,6 +99,7 @@ def _parse_log_metrics(log_dir: Path) -> Dict[str, int | float]:
         "tokens": tokens,
         "cost": cost,
         "retries": retries,
+        "to_offset": to_offset,
     }
 
 
@@ -93,15 +109,21 @@ def _parse_log_metrics(log_dir: Path) -> Dict[str, int | float]:
 
 def collect_profile_metrics(
     log_dir: Optional[Path] = None,
+    from_offset: int = 0,
 ) -> List[Dict]:
     """
-    Collect metrics from log files and write one metrics_snapshots row.
+    Collect metrics from agent.log and write one metrics_snapshots row.
 
     Returns the list of inserted snapshot dicts (one per profile — P0 always
     returns a single entry with profile="(unknown)").
 
     The *log_dir* parameter allows tests to inject a custom log directory;
     defaults to get_hermes_home() / "logs".
+
+    *from_offset* is the byte offset to start reading agent.log from.  Pass
+    the ``to_offset`` from the previous snapshot to get only the delta window.
+    The returned dict includes ``from_offset`` and ``to_offset`` fields so
+    callers can persist and re-pass them.
 
     NOTE(#133-Q1): Log lines are not profile-tagged in P0. All metrics are
     recorded under profile="(unknown)". Set needs_profile_tagging=True in
@@ -114,31 +136,43 @@ def collect_profile_metrics(
     if log_dir is None:
         log_dir = get_hermes_home() / "logs"
 
-    captured_at = datetime.now(timezone.utc).isoformat()
-    counts = _parse_log_metrics(log_dir)
+    window_started_at = datetime.now(timezone.utc).isoformat()
+    counts = _parse_log_metrics(log_dir, from_offset=from_offset)
+    to_offset = counts.pop("to_offset")
+    window_ended_at = datetime.now(timezone.utc).isoformat()
 
     profile = "(unknown)"
     db = get_db()
     row_id = db.insert_metrics_snapshot(
         profile=profile,
-        captured_at=captured_at,
+        captured_at=window_started_at,
         sessions_count=counts["sessions_count"],
         error_count=counts["error_count"],
         warn_count=counts["warn_count"],
         tokens=counts["tokens"],
         cost=counts["cost"],
         retries=counts["retries"],
-        payload={"source": "log_files", "log_dir": str(log_dir)},
+        window_started_at=window_started_at,
+        window_ended_at=window_ended_at,
+        from_offset=from_offset,
+        to_offset=to_offset,
+        payload={"source": "agent.log", "log_dir": str(log_dir)},
     )
     logger.debug(
-        "karpathy-self-improve: metrics snapshot id=%s profile=%s", row_id, profile
+        "karpathy-self-improve: metrics snapshot id=%s profile=%s offsets=%d..%d",
+        row_id,
+        profile,
+        from_offset,
+        to_offset,
     )
 
     snapshot = {
         "id": row_id,
         "profile": profile,
-        "captured_at": captured_at,
+        "captured_at": window_started_at,
         **counts,
+        "from_offset": from_offset,
+        "to_offset": to_offset,
         "needs_profile_tagging": True,  # TODO(#133-Q1)
     }
     return [snapshot]
