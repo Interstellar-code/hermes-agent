@@ -3,7 +3,7 @@ version: "0.1.0"
 description: "Backend awareness of SwitchUI frontend + bidirectional config sync. Injects per-turn nudge, exposes switchui_info/switchui_status tools, config-sync API at /api/plugins/hermes-switch-ui/."
 author: Interstellar-code
 
-kind: bundled
+kind: standalone
 
 provides_tools:
   - switchui_info
