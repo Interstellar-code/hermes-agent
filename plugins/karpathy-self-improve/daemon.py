@@ -22,9 +22,19 @@ import argparse
 import asyncio
 import logging
 import signal
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# When invoked via the `hermes karpathy` CLI entry point, this plugin directory
+# is NOT on sys.path (unlike the test harness or the web_server router loader),
+# so the bare `from _db import ...` / `from _metrics import ...` imports used by
+# the command handlers below would fail with ModuleNotFoundError. Add the plugin
+# root to sys.path so sibling modules resolve regardless of invocation context.
+_PLUGIN_DIR = Path(__file__).resolve().parent
+if str(_PLUGIN_DIR) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_DIR))
 
 logger = logging.getLogger(__name__)
 
