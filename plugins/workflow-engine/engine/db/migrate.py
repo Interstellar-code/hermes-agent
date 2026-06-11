@@ -61,7 +61,7 @@ def ensure_schema(
     if sys.platform != "win32":
         import fcntl  # noqa: PLC0415
         _lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = open(_lock_path, "w")  # noqa: WPS515
+        lock_fd = open(_lock_path, "w", encoding="utf-8")  # noqa: WPS515
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             _apply_migrations(conn)

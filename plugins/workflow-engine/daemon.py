@@ -46,7 +46,7 @@ async def _main(args: Any) -> int:
     # Signal handlers — guarded for Windows where add_signal_handler is absent
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _handle_stop)
+            loop.add_signal_handler(sig, _handle_stop)  # windows-footgun: ok — wrapped in try/except below
         except (NotImplementedError, OSError):
             # Windows / some embedded loops — fall back to signal.signal
             signal.signal(sig, lambda *_: _handle_stop())
@@ -118,7 +118,7 @@ def _setup(sub: argparse.ArgumentParser) -> None:
         # Write pidfile before entering loop
         if ns.pidfile:
             import os  # noqa: PLC0415
-            with open(ns.pidfile, "w") as f:
+            with open(ns.pidfile, "w", encoding="utf-8") as f:
                 f.write(str(os.getpid()))
         sys.exit(asyncio.run(_main(ns)))
 
