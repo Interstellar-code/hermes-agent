@@ -192,6 +192,7 @@ def _cmd_status() -> None:
 def _cmd_propose(profile: str) -> None:
     from _db import get_db
     from _proposer import propose_for_profile
+    from _wiring import resolve_propose_kwargs
 
     db = get_db()
 
@@ -205,11 +206,18 @@ def _cmd_propose(profile: str) -> None:
         target_relpath = exp.get("target_relpath") or target_relpath
         profile_root = exp.get("target_profile_root") or profile_root
 
+    try:
+        propose_kwargs = resolve_propose_kwargs(profile)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
+
     result = propose_for_profile(
         db=db,
         profile=profile,
         target_relpath=target_relpath,
         profile_root=profile_root,
+        **propose_kwargs,
     )
 
     if result.skipped:
@@ -436,6 +444,7 @@ def _tick_live_experiments(db: Any) -> None:
 def _tick_proposals(db: Any) -> None:
     """For each enabled+non-paused profile with no active experiment, attempt propose."""
     from _proposer import propose_for_profile
+    from _wiring import resolve_propose_kwargs
 
     profiles = _get_enabled_profiles(db)
     for profile in profiles:
@@ -459,11 +468,21 @@ def _tick_proposals(db: Any) -> None:
             target_relpath = exp.get("target_relpath") or target_relpath
             profile_root = exp.get("target_profile_root") or profile_root
 
+        try:
+            propose_kwargs = resolve_propose_kwargs(profile)
+        except ValueError as exc:
+            logger.error(
+                "karpathy-self-improve: skipping propose for %r — model config error: %s",
+                profile, exc,
+            )
+            continue
+
         result = propose_for_profile(
             db=db,
             profile=profile,
             target_relpath=target_relpath,
             profile_root=profile_root,
+            **propose_kwargs,
         )
 
         if result.ok and not result.skipped:
