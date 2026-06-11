@@ -209,10 +209,10 @@ def run_eval(
             experiment_id,
             profile,
         )
-        # Update with score=1.0 (trivially pass if no scenarios).
+        # Update with score=0.0 (no scenarios to evaluate).
         db.update_experiment_fields(experiment_id, updated_at=now)
-        _update_eval_run_score(db, eval_run_id, 1.0)
-        return 1.0
+        _update_eval_run_score(db, eval_run_id, 0.0)
+        return 0.0
 
     pass_count = 0
     total_count = 0
