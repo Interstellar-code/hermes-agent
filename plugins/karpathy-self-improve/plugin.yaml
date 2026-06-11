@@ -1,0 +1,20 @@
+name: karpathy-self-improve
+version: "0.1.0"
+description: "Karpathy-style self-improvement engine. Collects per-profile metrics, persists improvement experiments, and exposes a dashboard API for analysis."
+author: Interstellar-code
+kind: standalone
+
+# Doc-only: register() is authoritative.
+# No hooks declared — register() does not install pre/post_llm_call hooks.
+provides_tools: []
+
+pip_dependencies:
+  - fastapi
+
+requires_env: []
+
+optional_env:
+  - KARPATHY_DB_PATH
+
+# dashboard_manifest is informational only; mounting is driven by dashboard/manifest.json
+dashboard_manifest: dashboard/manifest.json
