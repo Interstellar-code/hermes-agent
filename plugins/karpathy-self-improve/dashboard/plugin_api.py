@@ -551,11 +551,18 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
             target_relpath = body["target_relpath"]
         if isinstance(body.get("profile_root"), str) and body["profile_root"]:
             profile_root = body["profile_root"]
+        # Resolve real gateway-backed model kwargs from config.
+        try:
+            from _wiring import resolve_propose_kwargs
+            propose_kwargs = resolve_propose_kwargs(profile)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         result = propose_for_profile(
             db=db,
             profile=profile,
             target_relpath=target_relpath,
             profile_root=profile_root,
+            **propose_kwargs,
         )
         if result.skipped:
             return JSONResponse({"skipped": True, "reason": result.skip_reason}, status_code=200)
