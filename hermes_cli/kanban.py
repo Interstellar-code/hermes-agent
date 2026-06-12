@@ -942,7 +942,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_tmpl_sb.add_argument(
         "--keep-status",
         action="store_true",
-        help="Preserve task statuses instead of resetting to 'todo'",
+        help=(
+            "Preserve 'ready' task status in the saved template. "
+            "All other statuses (running, blocked, done, etc.) are always "
+            "reset to 'todo'; only 'ready' is preserved when this flag is set."
+        ),
     )
 
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)

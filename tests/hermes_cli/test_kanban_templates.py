@@ -517,3 +517,264 @@ class TestSaveBoardAsTemplate:
     def test_invalid_board_slug_raises(self, template_home):
         with pytest.raises(kt.TemplateValidationError):
             kt.save_board_as_template("INVALID_SLUG!", "tmpl-slug")
+
+
+# ---------------------------------------------------------------------------
+# ΔC — Dependency topology tests (Tests 1-4 + 5-7)
+# ---------------------------------------------------------------------------
+
+class TestDependencyTopology:
+    """Multi-edge instantiation: chain, diamond, multi-parent."""
+
+    def _task_links(self, board: str) -> list[tuple[str, str]]:
+        conn = kb.connect(board=board)
+        rows = conn.execute(
+            "SELECT parent_id, child_id FROM task_links"
+        ).fetchall()
+        conn.close()
+        return [(r[0], r[1]) for r in rows]
+
+    def _task_status(self, board: str, task_id: str) -> str:
+        conn = kb.connect(board=board)
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        conn.close()
+        return row[0]
+
+    # Test 1 — Multi-level chain A→B→C
+    def test_chain_abc_edges_and_blocking(self, template_home):
+        yaml_chain = """\
+schema: 1
+name: Chain Template
+tasks:
+  - key: a
+    title: "Task A"
+  - key: b
+    title: "Task B"
+  - key: c
+    title: "Task C"
+links:
+  - [a, b]
+  - [b, c]
+"""
+        kt.save_template("chain-tmpl", yaml_chain)
+        result = kt.instantiate("chain-tmpl", board_slug="chain-board")
+        task_ids = result["task_ids"]
+
+        links = self._task_links("chain-board")
+        assert (task_ids["a"], task_ids["b"]) in links
+        assert (task_ids["b"], task_ids["c"]) in links
+        assert len(links) == 2
+
+        # C is blocked (todo) because A and B are not done
+        assert self._task_status("chain-board", task_ids["c"]) == "todo"
+
+    # Test 2 — Diamond A→B, A→C, B→D, C→D
+    def test_diamond_all_edges_and_parents(self, template_home):
+        yaml_diamond = """\
+schema: 1
+name: Diamond Template
+tasks:
+  - key: a
+    title: "Task A"
+  - key: b
+    title: "Task B"
+  - key: c
+    title: "Task C"
+  - key: d
+    title: "Task D"
+links:
+  - [a, b]
+  - [a, c]
+  - [b, d]
+  - [c, d]
+"""
+        kt.save_template("diamond-tmpl", yaml_diamond)
+        result = kt.instantiate("diamond-tmpl", board_slug="diamond-board")
+        task_ids = result["task_ids"]
+
+        links = self._task_links("diamond-board")
+        assert len(links) == 4
+        assert (task_ids["a"], task_ids["b"]) in links
+        assert (task_ids["a"], task_ids["c"]) in links
+        assert (task_ids["b"], task_ids["d"]) in links
+        assert (task_ids["c"], task_ids["d"]) in links
+
+        # D must have exactly parents B and C
+        conn = kb.connect(board="diamond-board")
+        d_parents = {
+            r[0]
+            for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (task_ids["d"],),
+            ).fetchall()
+        }
+        conn.close()
+        assert d_parents == {task_ids["b"], task_ids["c"]}
+
+    # Test 3 — Multi-parent (A,B)→C
+    def test_multi_parent_c_has_both_parents(self, template_home):
+        yaml_mp = """\
+schema: 1
+name: MultiParent Template
+tasks:
+  - key: a
+    title: "Task A"
+  - key: b
+    title: "Task B"
+  - key: c
+    title: "Task C"
+links:
+  - [a, c]
+  - [b, c]
+"""
+        kt.save_template("mp-tmpl", yaml_mp)
+        result = kt.instantiate("mp-tmpl", board_slug="mp-board")
+        task_ids = result["task_ids"]
+
+        conn = kb.connect(board="mp-board")
+        c_parents = {
+            r[0]
+            for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ?",
+                (task_ids["c"],),
+            ).fetchall()
+        }
+        conn.close()
+        assert c_parents == {task_ids["a"], task_ids["b"]}
+
+    # Test 4 — Full save→instantiate round-trip with links
+    def test_save_instantiate_roundtrip_links(self, template_home):
+        # Build a 3-task chain on a source board via kanban_db
+        kb.init_db(board="src-chain")
+        conn = kb.connect(board="src-chain")
+        t1 = kb.create_task(conn, title="Alpha", board="src-chain")
+        t2 = kb.create_task(conn, title="Beta", board="src-chain")
+        t3 = kb.create_task(conn, title="Gamma", board="src-chain")
+        kb.link_tasks(conn, t1, t2)
+        kb.link_tasks(conn, t2, t3)
+        conn.close()
+
+        # save_board_as_template must capture both links
+        tmpl = kt.save_board_as_template("src-chain", "chain-snap")
+        assert "links" in tmpl
+        assert len(tmpl["links"]) == 2
+
+        # Instantiate the saved template onto a fresh board
+        result = kt.instantiate("chain-snap", board_slug="chain-dest")
+        new_links = self._task_links("chain-dest")
+        assert len(new_links) == 2
+
+        # The two edges must be present (any key ordering is fine; count is the invariant)
+        assert result["created"] == 3
+
+
+class TestResetStatusClamp:
+    """Test 5 — reset_status=False preserves 'ready'; reset_status=True forces 'todo'."""
+
+    def _create_board_with_ready_task(self, board: str = "clamp-board") -> str:
+        """Create a board with one ready task; return its id."""
+        kb.init_db(board=board)
+        conn = kb.connect(board=board)
+        task_id = kb.create_task(conn, title="Ready Task", board=board)
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        return task_id
+
+    def test_reset_false_preserves_ready(self, template_home):
+        self._create_board_with_ready_task("clamp-board-a")
+        result = kt.save_board_as_template(
+            "clamp-board-a", "clamp-snap-a", reset_status=False
+        )
+        statuses = {t["key"]: t.get("status", "todo") for t in result["tasks"]}
+        # At least one task must be 'ready' (the one we set)
+        assert "ready" in statuses.values(), (
+            "reset_status=False should preserve 'ready' but all statuses are 'todo'"
+        )
+
+    def test_reset_true_forces_todo(self, template_home):
+        self._create_board_with_ready_task("clamp-board-b")
+        result = kt.save_board_as_template(
+            "clamp-board-b", "clamp-snap-b", reset_status=True
+        )
+        for task in result["tasks"]:
+            assert task.get("status", "todo") == "todo", (
+                f"reset_status=True should force 'todo' but got {task.get('status')!r}"
+            )
+
+
+class TestFieldRoundTrip:
+    """Test 6 — max_runtime_seconds + goal_max_turns survive save→instantiate."""
+
+    def test_fields_survive_roundtrip(self, template_home):
+        kb.init_db(board="fields-src")
+        conn = kb.connect(board="fields-src")
+        task_id = kb.create_task(
+            conn,
+            title="Timed Task",
+            board="fields-src",
+            max_runtime_seconds=300,
+            goal_max_turns=10,
+        )
+        conn.close()
+
+        # save_board_as_template must carry both fields
+        tmpl = kt.save_board_as_template("fields-src", "fields-snap")
+        task_entry = tmpl["tasks"][0]
+        assert task_entry.get("max_runtime_seconds") == 300
+        assert task_entry.get("goal_max_turns") == 10
+
+        # instantiate must write both columns into the new board
+        result = kt.instantiate("fields-snap", board_slug="fields-dest")
+        new_task_id = list(result["task_ids"].values())[0]
+
+        conn2 = kb.connect(board="fields-dest")
+        row = conn2.execute(
+            "SELECT max_runtime_seconds, goal_max_turns FROM tasks WHERE id = ?",
+            (new_task_id,),
+        ).fetchone()
+        conn2.close()
+        assert row[0] == 300
+        assert row[1] == 10
+
+
+class TestLinkFailureFatal:
+    """Test 7 — (Codex P1) link-wiring failure is fatal and leaves no partial board."""
+
+    def test_link_failure_raises_and_rolls_back(self, template_home, monkeypatch):
+        yaml_linked = """\
+schema: 1
+name: Linked Tmpl
+tasks:
+  - key: x
+    title: "Task X"
+  - key: y
+    title: "Task Y"
+links:
+  - [x, y]
+"""
+        kt.save_template("fatal-tmpl", yaml_linked)
+
+        # Monkeypatch _kdb.link_tasks to raise on every call
+        def _boom(conn, parent_id, child_id):
+            raise RuntimeError("simulated link failure")
+
+        monkeypatch.setattr(kb, "link_tasks", _boom)
+        # Also patch via the kanban_templates module's reference to _kdb
+        import hermes_cli.kanban_templates as _kt_mod
+        monkeypatch.setattr(_kt_mod._kdb, "link_tasks", _boom)
+
+        with pytest.raises(kt.TemplateError):
+            kt.instantiate("fatal-tmpl", board_slug="fatal-board")
+
+        # Board must have 0 non-archived tasks (rolled back)
+        conn = kb.connect(board="fatal-board")
+        live_count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status != 'archived'"
+        ).fetchone()[0]
+        conn.close()
+        assert live_count == 0, (
+            f"Expected 0 non-archived tasks after fatal link failure, got {live_count}"
+        )
