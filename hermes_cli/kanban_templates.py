@@ -200,6 +200,37 @@ def load_template(slug: str) -> dict:
     return validate_template(data)
 
 
+def _validate_recurrence_cron(slug: str, recurrence: Any) -> None:
+    """Validate ``recurrence.cron`` with croniter when the recurrence is enabled.
+
+    Only validates when ``enabled`` is truthy — disabled recurrence does not
+    need a parseable expression (it may be a placeholder).
+
+    Raises :class:`TemplateValidationError` for an invalid/unparseable expression.
+    """
+    if not isinstance(recurrence, dict):
+        return
+    if not recurrence.get("enabled"):
+        return
+    cron_expr = recurrence.get("cron")
+    if not cron_expr:
+        raise TemplateValidationError(
+            f"template {slug!r}: recurrence.enabled is true but recurrence.cron is absent"
+        )
+    try:
+        from croniter import croniter as _croniter
+        _croniter(str(cron_expr))
+    except ImportError:
+        raise TemplateValidationError(
+            "recurrence.cron validation requires the 'croniter' package; "
+            "install it with: pip install croniter"
+        )
+    except Exception as exc:
+        raise TemplateValidationError(
+            f"template {slug!r}: invalid recurrence.cron {cron_expr!r}: {exc}"
+        ) from exc
+
+
 def save_template(slug: str, yaml_text: str) -> dict:
     """Validate *slug* and *yaml_text*, then atomically write to disk.
 
@@ -208,6 +239,7 @@ def save_template(slug: str, yaml_text: str) -> dict:
     * :data:`MAX_TEMPLATE_BYTES` size cap (before parsing).
     * ``yaml.safe_load`` only.
     * Full schema validation via :func:`validate_template`.
+    * ``recurrence.cron`` validated with croniter when ``enabled`` is true.
 
     Writes to ``templates/<slug>/template.yaml`` atomically (write-then-rename).
 
@@ -231,6 +263,10 @@ def save_template(slug: str, yaml_text: str) -> dict:
         raise TemplateValidationError("template YAML is empty")
     normalised = validate_template(data)
 
+    # Validate recurrence.cron before writing — bad cron expressions are
+    # rejected at save time, not at scheduler dispatch time.
+    _validate_recurrence_cron(slug, normalised.get("recurrence"))
+
     target_dir = _template_dir(slug)
     target_dir.mkdir(parents=True, exist_ok=True)
     target_file = target_dir / "template.yaml"
@@ -242,6 +278,7 @@ def save_template(slug: str, yaml_text: str) -> dict:
         tmp_file.unlink(missing_ok=True)
         raise TemplateValidationError(f"could not write template {slug!r}: {exc}") from exc
     log.info("saved template %r to %s", slug, target_file)
+    sync_recurrence(slug, normalised)
     return normalised
 
 
@@ -263,6 +300,7 @@ def delete_template(slug: str) -> None:
         # Directory not empty (e.g. extra files); leave it, only remove yaml.
         log.debug("template directory %s not empty after yaml removal; left in place", td)
     log.info("deleted template %r", slug)
+    _remove_recurrence_job(slug)
 
 
 # ---------------------------------------------------------------------------
@@ -893,3 +931,99 @@ def save_board_as_template(
 
     yaml_text = yaml.dump(tmpl_dict, default_flow_style=False, allow_unicode=True, sort_keys=False)
     return save_template(template_slug, yaml_text)
+
+
+# ---------------------------------------------------------------------------
+# Recurrence sync helpers (appended — other agents do not touch this section)
+# ---------------------------------------------------------------------------
+
+
+def _recurrence_job_id(slug: str) -> str:
+    """Return the deterministic cron job ID for a template's recurrence job."""
+    return f"kanban-template-{slug}"
+
+
+def _remove_recurrence_job(slug: str) -> None:
+    """Remove the recurrence cron job for *slug* if it exists.
+
+    No-ops silently when the cron subsystem is unavailable or the job does
+    not exist.  Called by :func:`delete_template`.
+    """
+    try:
+        from cron.jobs import remove_job as _remove_job
+    except ImportError:
+        log.debug("cron subsystem unavailable; skipping recurrence job removal for %r", slug)
+        return
+    try:
+        job_id = _recurrence_job_id(slug)
+        _remove_job(job_id)
+        log.debug("removed recurrence cron job %r for template %r", job_id, slug)
+    except Exception as exc:
+        log.debug("could not remove recurrence job for template %r: %s", slug, exc)
+
+
+def sync_recurrence(slug: str, template: dict) -> None:
+    """Upsert or remove the cron job that drives recurrence for *template*.
+
+    Behaviour:
+    * ``recurrence.cron`` present and ``recurrence.enabled`` truthy
+      → upsert job id ``kanban-template-{slug}`` with the given cron schedule,
+        type ``kanban_board_from_template``, and payload derived from *template*.
+    * ``recurrence`` absent, disabled, or ``recurrence.cron`` missing
+      → remove the job id if it exists (no-op when absent).
+
+    Guards:
+    * Imports :mod:`cron.jobs` lazily — if the module is unavailable (e.g.
+      the module is used in a standalone context), logs a debug message and
+      returns without raising.
+    * Any exception from the cron subsystem is caught, logged at WARNING
+      level, and swallowed so a cron-side failure never breaks template saves.
+
+    Called automatically by :func:`save_template` (one-line addition at its
+    end) and :func:`delete_template` (via :func:`_remove_recurrence_job`).
+    """
+    recurrence = template.get("recurrence") if isinstance(template, dict) else None
+
+    # Determine whether recurrence should be active.
+    if not isinstance(recurrence, dict) or not recurrence.get("enabled"):
+        _remove_recurrence_job(slug)
+        return
+
+    cron_expr = recurrence.get("cron")
+    if not cron_expr:
+        _remove_recurrence_job(slug)
+        return
+
+    try:
+        from cron.jobs import upsert_kanban_template_job as _upsert
+    except ImportError:
+        log.debug("cron subsystem unavailable; skipping recurrence sync for template %r", slug)
+        return
+
+    job_id = _recurrence_job_id(slug)
+
+    # Payload: pull variables + auto_dispatch from template if present.
+    on_inst = template.get("on_instantiate") or {}
+    variables: dict = {}
+    if isinstance(on_inst, dict) and on_inst.get("variables"):
+        variables = dict(on_inst["variables"])
+    auto_dispatch: bool = bool(
+        (isinstance(on_inst, dict) and on_inst.get("auto_dispatch"))
+    )
+
+    try:
+        _upsert(
+            job_id=job_id,
+            schedule_expr=str(cron_expr),
+            template_slug=slug,
+            variables=variables if variables else None,
+            auto_dispatch=auto_dispatch,
+        )
+        log.info(
+            "synced recurrence cron job %r for template %r (schedule: %s)",
+            job_id, slug, cron_expr,
+        )
+    except Exception as exc:
+        log.warning(
+            "could not sync recurrence cron job for template %r: %s", slug, exc
+        )
