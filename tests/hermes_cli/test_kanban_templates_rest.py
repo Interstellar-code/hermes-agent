@@ -312,3 +312,58 @@ class TestInstantiateTemplate:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# ΔC Test 8 — REST POST /boards/{slug}/save-as-template
+# ---------------------------------------------------------------------------
+
+class TestRestSaveBoardAsTemplate:
+    """Test 8 — REST save-as-template path with reset_status variants."""
+
+    def _create_board_with_ready_task(self, board: str) -> str:
+        """Create board with one ready task; return its task id."""
+        kb.init_db(board=board)
+        conn = kb.connect(board=board)
+        task_id = kb.create_task(conn, title="Ready Step", board=board)
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        conn.close()
+        return task_id
+
+    def test_save_as_template_reset_false_preserves_ready(self, client, template_home):
+        self._create_board_with_ready_task("rest-src-a")
+
+        r = client.post(
+            "/boards/rest-src-a/save-as-template",
+            json={"template_slug": "rest-snap-a", "reset_status": False},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["ok"] is True
+        tmpl = body["template"]
+
+        # Template must be fetchable and carry a 'ready' task
+        r2 = client.get("/templates/rest-snap-a")
+        assert r2.status_code == 200
+        statuses = {t["key"]: t.get("status", "todo") for t in r2.json()["tasks"]}
+        assert "ready" in statuses.values(), (
+            f"reset_status=False should preserve 'ready'; got statuses={statuses}"
+        )
+
+    def test_save_as_template_reset_true_forces_todo(self, client, template_home):
+        self._create_board_with_ready_task("rest-src-b")
+
+        r = client.post(
+            "/boards/rest-src-b/save-as-template",
+            json={"template_slug": "rest-snap-b", "reset_status": True},
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        r2 = client.get("/templates/rest-snap-b")
+        assert r2.status_code == 200
+        for task in r2.json()["tasks"]:
+            assert task.get("status", "todo") == "todo", (
+                f"reset_status=True should force 'todo'; got {task.get('status')!r}"
+            )
