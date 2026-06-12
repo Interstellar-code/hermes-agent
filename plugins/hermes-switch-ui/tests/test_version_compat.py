@@ -1,8 +1,8 @@
 """test_version_compat.py — tests for hermes-switch-ui _version_compat.py.
 
 Covers:
- - in-range versions (1.0.0, 1.5.2) -> compatible=True, warn=None
- - out-of-range versions (0.9.0, 2.0.0, 3.0.0) -> compatible=False, warn non-null
+ - in-range versions (1.0.0, 1.5.2, 2.3.43) -> compatible=True, warn=None
+ - out-of-range versions (0.9.0, 3.0.0) -> compatible=False, warn non-null
  - None / garbage -> compatible=False, warn non-null, no raise
  - fallback comparator (_check_fallback) is exercised directly so both code paths tested
 """
@@ -58,17 +58,16 @@ def test_out_of_range_below_0_9_0():
     )
 
 
-def test_out_of_range_at_upper_bound_2_0_0():
-    """2.0.0 is excluded by <2.0.0."""
+def test_in_range_2_3_43():
+    """Current SwitchUI 2.x line is in range since the bump to <3.0.0."""
     vc = _load_compat()
-    result = vc.check("2.0.0")
-    assert result["compatible"] is False, f"2.0.0 should not be compatible: {result}"
-    assert result["warn"] is not None and result["warn"].strip(), (
-        f"2.0.0 should have a non-empty warn string: {result['warn']}"
-    )
+    result = vc.check("2.3.43")
+    assert result["compatible"] is True, f"2.3.43 should be compatible: {result}"
+    assert result["warn"] is None, f"2.3.43 should have no warning: {result['warn']}"
 
 
-def test_out_of_range_3_0_0():
+def test_out_of_range_at_upper_bound_3_0_0():
+    """3.0.0 is excluded by <3.0.0."""
     vc = _load_compat()
     result = vc.check("3.0.0")
     assert result["compatible"] is False, f"3.0.0 should not be compatible: {result}"
@@ -135,9 +134,9 @@ def test_fallback_out_of_range_0_9_0():
     assert result["warn"] is not None and result["warn"].strip()
 
 
-def test_fallback_out_of_range_2_0_0():
+def test_fallback_out_of_range_3_0_0():
     vc = _load_compat()
-    result = vc._check_fallback("2.0.0")
+    result = vc._check_fallback("3.0.0")
     assert result["compatible"] is False
     assert result["warn"] is not None and result["warn"].strip()
 

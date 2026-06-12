@@ -19,4 +19,4 @@ optional_env:
   - SWITCHUI_STATE_PATH   # override ~/.hermes/switchui/state.json
   - SWITCHUI_DOCS_URL     # override URL for optional remote capability refresh
 
-compatible_switchui: ">=1.0.0,<2.0.0"
+compatible_switchui: ">=1.0.0,<3.0.0"

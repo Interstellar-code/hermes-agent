@@ -119,7 +119,7 @@ def test_register_compat_in_range(client):
 
 
 def test_register_version_warn_non_null(tmp_path):
-    """Version 3.0.0 is outside >=1.0.0,<2.0.0 — compat.warn must be non-null."""
+    """Version 3.0.0 is outside >=1.0.0,<3.0.0 — compat.warn must be non-null."""
     state_file = tmp_path / "s.json"
     c = _make_client(state_file)
     payload = {**_VALID_MANIFEST, "version": "3.0.0"}

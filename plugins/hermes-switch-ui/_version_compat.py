@@ -15,7 +15,7 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # Mirrored from plugin.yaml: compatible_switchui
-PLUGIN_RANGE: str = ">=1.0.0,<2.0.0"
+PLUGIN_RANGE: str = ">=1.0.0,<3.0.0"
 
 
 # ---------------------------------------------------------------------------
