@@ -383,6 +383,33 @@ def validate_template(data: dict) -> dict:
                 f"task {key!r} priority must be a string label or integer, got {prio!r}"
             )
 
+        # Validate optional positive-integer fields
+        for _field in ("max_runtime_seconds", "goal_max_turns"):
+            v = task.get(_field)
+            if v is None:
+                continue
+            if isinstance(v, bool):
+                raise TemplateValidationError(
+                    f"task {key!r} {_field} must be a positive integer, got {v!r}"
+                )
+            if isinstance(v, int):
+                if v <= 0:
+                    raise TemplateValidationError(
+                        f"task {key!r} {_field} must be a positive integer, got {v!r}"
+                    )
+                task[_field] = v
+            elif isinstance(v, str) and v.isdigit():
+                coerced = int(v)
+                if coerced <= 0:
+                    raise TemplateValidationError(
+                        f"task {key!r} {_field} must be a positive integer, got {v!r}"
+                    )
+                task[_field] = coerced
+            else:
+                raise TemplateValidationError(
+                    f"task {key!r} {_field} must be a positive integer, got {v!r}"
+                )
+
     # Validate links
     links_raw = data.get("links") or []
     if not isinstance(links_raw, list):
@@ -666,6 +693,8 @@ def instantiate(
             max_retries = task_spec.get("max_retries") or None
             goal_mode: bool = bool(task_spec.get("goal_mode", False))
             model_override: Optional[str] = task_spec.get("model_override") or None
+            max_runtime_seconds = task_spec.get("max_runtime_seconds")
+            goal_max_turns = task_spec.get("goal_max_turns")
 
             idempotency_key = f"{slug}:{instance_id}:{key}"
 
@@ -681,6 +710,8 @@ def instantiate(
                 priority=priority,
                 max_retries=int(max_retries) if max_retries is not None else None,
                 goal_mode=goal_mode,
+                max_runtime_seconds=int(max_runtime_seconds) if max_runtime_seconds is not None else None,
+                goal_max_turns=int(goal_max_turns) if goal_max_turns is not None else None,
                 idempotency_key=idempotency_key,
                 tenant=tenant,
                 board=board_slug,
@@ -749,6 +780,9 @@ def instantiate(
                         )
 
         # 6. Wire links (parent → child)
+        # NOTE: create_task commits each task individually (write_txn).
+        # On link failure we must clean up the already-committed tasks so
+        # no partial/edge-missing board is left behind.
         for lnk in links_spec:
             parent_key, child_key = str(lnk[0]), str(lnk[1])
             parent_id = task_ids.get(parent_key)
@@ -757,10 +791,20 @@ def instantiate(
                 try:
                     _kdb.link_tasks(conn, parent_id, child_id)
                 except Exception as exc:
-                    log.warning(
-                        "could not link %s->%s (%s->%s): %s",
-                        parent_key, child_key, parent_id, child_id, exc,
-                    )
+                    # Roll back by archiving every task we just created so
+                    # the board is left in a consistent (empty) state.
+                    created_ids = list(task_ids.values())
+                    if created_ids:
+                        with _kdb.write_txn(conn):
+                            placeholders = ",".join("?" * len(created_ids))
+                            conn.execute(
+                                f"UPDATE tasks SET status = 'archived' "
+                                f"WHERE id IN ({placeholders})",
+                                created_ids,
+                            )
+                    raise TemplateError(
+                        f"failed to wire link {parent_key}->{child_key}: {exc}"
+                    ) from exc
 
         # 7. Emit template_instantiated event on the first task
         if task_ids:
@@ -820,9 +864,17 @@ def save_board_as_template(
 
     Reads all non-archived tasks and their links from the board DB.
     Strips runtime fields (pids, runs, heartbeats, results, claim_lock,
-    workspace_path, created_at, etc.).  Statuses are reset to ``todo``
-    when *reset_status* is True.  Generates template-local ``key`` values
-    from slugified task titles (uniquified with -2/-3 suffixes).
+    workspace_path, created_at, etc.).  Generates template-local ``key``
+    values from slugified task titles (uniquified with -2/-3 suffixes).
+
+    Status handling (``reset_status``):
+
+    * ``True`` (default): every task status → ``todo``.
+    * ``False``: preserves only the authoring distinction — live status
+      ``ready`` → ``ready``; every other live status (``running``,
+      ``blocked``, ``done``, etc.) → ``todo``.  This keeps the template
+      valid (only ``todo``/``ready`` are legal template statuses) while
+      capturing which root tasks were dispatch-ready.
 
     Writes ``template.yaml`` atomically and returns the parsed template dict.
 
@@ -835,7 +887,8 @@ def save_board_as_template(
     try:
         rows = conn.execute(
             "SELECT id, title, body, assignee, priority, skills, "
-            "max_retries, goal_mode, model_override "
+            "max_retries, goal_mode, goal_max_turns, max_runtime_seconds, "
+            "model_override, status "
             "FROM tasks WHERE status != 'archived' "
             "ORDER BY created_at ASC"
         ).fetchall()
@@ -886,7 +939,11 @@ def save_board_as_template(
                 task_entry["goal_mode"] = True
             if row["model_override"]:
                 task_entry["model_override"] = row["model_override"]
-            task_entry["status"] = "todo" if reset_status else "todo"
+            if row["max_runtime_seconds"] is not None:
+                task_entry["max_runtime_seconds"] = row["max_runtime_seconds"]
+            if row["goal_max_turns"] is not None:
+                task_entry["goal_max_turns"] = row["goal_max_turns"]
+            task_entry["status"] = "todo" if reset_status else ("ready" if row["status"] == "ready" else "todo")
             tasks_out.append(task_entry)
 
         # Fetch links
@@ -894,7 +951,8 @@ def save_board_as_template(
             all_ids = [r["id"] for r in rows]
             link_rows = conn.execute(
                 "SELECT parent_id, child_id FROM task_links "
-                "WHERE parent_id IN ({ph}) AND child_id IN ({ph})".format(
+                "WHERE parent_id IN ({ph}) AND child_id IN ({ph}) "
+                "ORDER BY parent_id, child_id".format(
                     ph=",".join("?" * len(all_ids))
                 ),
                 all_ids + all_ids,
