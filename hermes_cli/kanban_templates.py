@@ -410,6 +410,10 @@ def validate_template(data: dict) -> dict:
                     f"task {key!r} {_field} must be a positive integer, got {v!r}"
                 )
 
+        # Validate optional scheduled_at (epoch int, relative offset, or
+        # {{placeholder}}). Resolution happens at instantiation.
+        _validate_scheduled_at_format(key, task.get("scheduled_at"))
+
     # Validate links
     links_raw = data.get("links") or []
     if not isinstance(links_raw, list):
@@ -510,6 +514,106 @@ def substitute(text: str, variables: dict[str, Any]) -> str:
         return m.group(0)  # leave unknown placeholders intact
 
     return _PLACEHOLDER_RE.sub(_replace, text)
+
+
+# ---------------------------------------------------------------------------
+# scheduled_at — deferred-dispatch start time (template-side)
+# ---------------------------------------------------------------------------
+#
+# A task may carry an optional ``scheduled_at`` that defers its dispatch
+# (see kanban_db: the claim/dispatch path skips tasks until the time is due).
+# In a template it accepts three forms:
+#
+#   * a relative offset string ``+<n><unit>`` (``s``/``m``/``h``/``d``/``w``),
+#     e.g. ``+2h``, ``+30m``, ``+1d`` — resolved to ``now + delta`` at
+#     instantiation, so a saved template stays portable across runs;
+#   * an absolute unix-epoch integer (or all-digit string) — passed through;
+#   * a ``{{var}}`` placeholder — substituted first, then resolved as above.
+#
+# Absolute live timestamps are deliberately NOT captured by
+# save_board_as_template (a fixed wall-clock time is stale on the next
+# instantiation — the same non-portable treatment as workspace fields).
+
+_REL_SCHED_RE = re.compile(r"^\+(\d+)([smhdw])$")
+_SCHED_UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _validate_scheduled_at_format(key: str, value: Any) -> None:
+    """Validate a template task's ``scheduled_at`` *format* only.
+
+    Does not resolve relative offsets (that happens at instantiation, when
+    "now" is known). Strings containing ``{{placeholders}}`` are accepted
+    verbatim and re-validated after substitution.
+
+    Raises :class:`TemplateValidationError` for malformed values.
+    """
+    if value is None:
+        return
+    if isinstance(value, bool):
+        raise TemplateValidationError(
+            f"task {key!r} scheduled_at must be a positive epoch int or "
+            f"relative offset like '+2h', got {value!r}"
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise TemplateValidationError(
+                f"task {key!r} scheduled_at must be a positive integer, got {value!r}"
+            )
+        return
+    if isinstance(value, str):
+        v = value.strip()
+        if _PLACEHOLDER_RE.search(v):
+            return  # deferred to instantiation, re-validated after substitute()
+        if _REL_SCHED_RE.match(v):
+            return
+        if v.isdigit() and int(v) > 0:
+            return
+        raise TemplateValidationError(
+            f"task {key!r} scheduled_at {value!r} is invalid; use a positive "
+            f"epoch integer or a relative offset like '+2h' / '+30m' / '+1d'"
+        )
+    raise TemplateValidationError(
+        f"task {key!r} scheduled_at must be a positive epoch int or relative "
+        f"offset like '+2h', got {value!r}"
+    )
+
+
+def _resolve_scheduled_at(value: Any, now_epoch: int) -> Optional[int]:
+    """Resolve a (post-substitution) ``scheduled_at`` value to a unix epoch.
+
+    * ``None`` -> ``None`` (no scheduling constraint).
+    * relative ``+<n><unit>`` -> ``now_epoch + delta``.
+    * absolute int or all-digit string -> that integer.
+
+    Raises :class:`TemplateValidationError` for malformed values (mirrors
+    :func:`_validate_scheduled_at_format`, but after placeholders are gone).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise TemplateValidationError(
+            f"scheduled_at must be a positive epoch int or relative offset, got {value!r}"
+        )
+    if isinstance(value, int):
+        if value <= 0:
+            raise TemplateValidationError(
+                f"scheduled_at must be a positive integer, got {value!r}"
+            )
+        return value
+    if isinstance(value, str):
+        v = value.strip()
+        m = _REL_SCHED_RE.match(v)
+        if m:
+            return now_epoch + int(m.group(1)) * _SCHED_UNIT_SECONDS[m.group(2)]
+        if v.isdigit() and int(v) > 0:
+            return int(v)
+        raise TemplateValidationError(
+            f"scheduled_at {value!r} is invalid after substitution; use a "
+            f"positive epoch integer or a relative offset like '+2h'"
+        )
+    raise TemplateValidationError(
+        f"scheduled_at must be a positive epoch int or relative offset, got {value!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -696,6 +800,13 @@ def instantiate(
             max_runtime_seconds = task_spec.get("max_runtime_seconds")
             goal_max_turns = task_spec.get("goal_max_turns")
 
+            # scheduled_at: substitute {{vars}} first, then resolve a
+            # relative offset (+2h) against "now" or pass an absolute epoch.
+            raw_scheduled = task_spec.get("scheduled_at")
+            if isinstance(raw_scheduled, str):
+                raw_scheduled = substitute(raw_scheduled, merged)
+            scheduled_at = _resolve_scheduled_at(raw_scheduled, int(time.time()))
+
             idempotency_key = f"{slug}:{instance_id}:{key}"
 
             # create_task determines status from parents; we override to todo
@@ -712,6 +823,7 @@ def instantiate(
                 goal_mode=goal_mode,
                 max_runtime_seconds=int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                 goal_max_turns=int(goal_max_turns) if goal_max_turns is not None else None,
+                scheduled_at=scheduled_at,
                 idempotency_key=idempotency_key,
                 tenant=tenant,
                 board=board_slug,
@@ -943,6 +1055,10 @@ def save_board_as_template(
                 task_entry["max_runtime_seconds"] = row["max_runtime_seconds"]
             if row["goal_max_turns"] is not None:
                 task_entry["goal_max_turns"] = row["goal_max_turns"]
+            # scheduled_at is intentionally NOT captured: a live task's value
+            # is an absolute epoch that would be stale (in the past) on the
+            # next instantiation. Authors express deferral portably by adding
+            # a relative offset (e.g. scheduled_at: "+2h") to the template YAML.
             task_entry["status"] = "todo" if reset_status else ("ready" if row["status"] == "ready" else "todo")
             tasks_out.append(task_entry)
 

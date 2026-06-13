@@ -7,6 +7,7 @@ substitute() basics; instantiate() happy-path + guardrails; save_board_as_templa
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -778,3 +779,110 @@ links:
         assert live_count == 0, (
             f"Expected 0 non-archived tasks after fatal link failure, got {live_count}"
         )
+
+
+# ---------------------------------------------------------------------------
+# scheduled_at — deferred dispatch (template-side: steps 3 + 4)
+# ---------------------------------------------------------------------------
+
+
+class TestScheduledAt:
+    def _sched_of(self, board_slug: str) -> list:
+        conn = kb.connect(board=board_slug)
+        try:
+            return [
+                r[0]
+                for r in conn.execute(
+                    "SELECT scheduled_at FROM tasks ORDER BY created_at"
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+    def test_validate_accepts_relative_epoch_and_placeholder(self, template_home):
+        for val in ("+2h", "+30m", "+1d", "+1w", "+45s", 1893456000, "1893456000", "{{when}}"):
+            data = {
+                "schema": 1,
+                "name": "t",
+                "tasks": [{"key": "a", "title": "A", "scheduled_at": val}],
+            }
+            kt.validate_template(data)  # must not raise
+
+    def test_validate_rejects_malformed_scheduled_at(self, template_home):
+        for val in ("2h", "+2x", "-5m", "soon", "+h", 0, -10, True, 3.5):
+            data = {
+                "schema": 1,
+                "name": "t",
+                "tasks": [{"key": "a", "title": "A", "scheduled_at": val}],
+            }
+            with pytest.raises(kt.TemplateValidationError):
+                kt.validate_template(data)
+
+    def test_instantiate_resolves_relative_offset(self, template_home):
+        yaml = (
+            "schema: 1\nname: Sched\nboard:\n  slug: sched-board\n"
+            'tasks:\n  - key: later\n    title: "Deferred"\n    scheduled_at: "+2h"\n'
+        )
+        kt.save_template("sched", yaml)
+        before = int(time.time())
+        kt.instantiate("sched", board_slug="sched-board")
+        after = int(time.time())
+        (val,) = self._sched_of("sched-board")
+        assert before + 7200 <= val <= after + 7200
+
+    def test_instantiate_absolute_epoch_passthrough(self, template_home):
+        yaml = (
+            "schema: 1\nname: Abs\nboard:\n  slug: abs-board\n"
+            'tasks:\n  - key: t\n    title: "T"\n    scheduled_at: 1893456000\n'
+        )
+        kt.save_template("abs", yaml)
+        kt.instantiate("abs", board_slug="abs-board")
+        assert self._sched_of("abs-board") == [1893456000]
+
+    def test_instantiate_scheduled_at_via_variable(self, template_home):
+        yaml = (
+            "schema: 1\nname: Var\nboard:\n  slug: var-board\n"
+            "variables:\n  - key: when\n    default: \"+1h\"\n"
+            'tasks:\n  - key: t\n    title: "T"\n    scheduled_at: "{{when}}"\n'
+        )
+        kt.save_template("varsched", yaml)
+        before = int(time.time())
+        kt.instantiate("varsched", board_slug="var-board")
+        after = int(time.time())
+        (val,) = self._sched_of("var-board")
+        assert before + 3600 <= val <= after + 3600
+
+    def test_instantiate_variable_override_resolves(self, template_home):
+        yaml = (
+            "schema: 1\nname: Var\nboard:\n  slug: ov-board\n"
+            "variables:\n  - key: when\n    default: \"+1h\"\n"
+            'tasks:\n  - key: t\n    title: "T"\n    scheduled_at: "{{when}}"\n'
+        )
+        kt.save_template("ovsched", yaml)
+        before = int(time.time())
+        kt.instantiate("ovsched", board_slug="ov-board", variables={"when": "+1d"})
+        after = int(time.time())
+        (val,) = self._sched_of("ov-board")
+        assert before + 86400 <= val <= after + 86400
+
+    def test_instantiate_without_scheduled_at_is_null(self, template_home):
+        yaml = (
+            "schema: 1\nname: Plain\nboard:\n  slug: plain-board\n"
+            'tasks:\n  - key: t\n    title: "T"\n'
+        )
+        kt.save_template("plain", yaml)
+        kt.instantiate("plain", board_slug="plain-board")
+        assert self._sched_of("plain-board") == [None]
+
+    def test_save_board_as_template_omits_scheduled_at(self, template_home):
+        conn = kb.connect(board="src-board")
+        kb.create_task(
+            conn,
+            title="deferred",
+            assignee="alice",
+            scheduled_at=int(time.time()) + 3600,
+        )
+        conn.close()
+        result = kt.save_board_as_template("src-board", "snap")
+        specs = result["tasks"]
+        assert specs and all("scheduled_at" not in s for s in specs)
