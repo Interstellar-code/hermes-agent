@@ -115,6 +115,9 @@ def _load(library_dir: Path = _LIBRARY_DIR) -> Dict[str, Dict[str, Any]]:
     files are skipped with a warning, not fatal.
     """
     personas: Dict[str, Dict[str, Any]] = {}
+    if yaml is None:
+        log.error("[personas] PyYAML unavailable — persona library will be empty")
+        return personas
     if not library_dir.is_dir():
         log.warning("[personas] library dir missing: %s", library_dir)
         return personas
@@ -125,10 +128,15 @@ def _load(library_dir: Path = _LIBRARY_DIR) -> Dict[str, Dict[str, Any]]:
             continue
         pid = persona["id"]
         if pid in personas:
-            raise ValueError(
-                f"[personas] Duplicate persona id '{pid}' in "
-                f"{personas[pid]['path']} and {persona['path']}"
+            # Operational resilience: a duplicate id must not brick plugin
+            # startup (this runs inside register()). First file wins; the
+            # later duplicate is skipped with a loud error, mirroring the
+            # non-fatal handling of malformed files.
+            log.error(
+                "[personas] Duplicate persona id '%s' — keeping %s, skipping %s",
+                pid, personas[pid]["path"], persona["path"],
             )
+            continue
         personas[pid] = persona
     return personas
 

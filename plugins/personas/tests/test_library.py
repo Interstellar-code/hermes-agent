@@ -105,7 +105,8 @@ def test_skip_malformed_no_crash(tmp_path):
     assert set(loaded.keys()) == {"x"}, "malformed file should be skipped, good kept"
 
 
-def test_duplicate_id_raises(tmp_path):
+def test_duplicate_id_skipped_first_wins(tmp_path):
+    """Duplicate id must NOT crash startup — first file wins, second skipped."""
     lib = _load_library()
     (tmp_path / "a.md").write_text(
         "---\nid: dup\ncategory: c\nglyph: G1\nname: A\n---\na", encoding="utf-8"
@@ -113,9 +114,6 @@ def test_duplicate_id_raises(tmp_path):
     (tmp_path / "b.md").write_text(
         "---\nid: dup\ncategory: c\nglyph: G2\nname: B\n---\nb", encoding="utf-8"
     )
-    try:
-        lib._load(tmp_path)
-    except ValueError as exc:
-        assert "dup" in str(exc)
-    else:
-        raise AssertionError("duplicate id must raise ValueError")
+    loaded = lib._load(tmp_path)
+    assert set(loaded.keys()) == {"dup"}, "duplicate id must not raise; keep one entry"
+    assert loaded["dup"]["name"] == "A", "first file (sorted) must win"

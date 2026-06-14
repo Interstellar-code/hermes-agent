@@ -86,7 +86,7 @@ Flat markdown files under `library/*.md`. **20 personas, 8 categories**
   `default_model, default_memory_provider, suggested_mcps, suggested_toolsets`
 - **Markdown body**: the `system_prompt` overlay text
 
-Malformed files are skipped with a logged warning (never fatal); a duplicate `id` is fatal.
+Malformed files are skipped with a logged warning (never fatal). A duplicate `id` is non-fatal too: the first file (sorted) wins and the later duplicate is skipped with a logged error, so a stray copy can never brick plugin startup.
 
 ---
 

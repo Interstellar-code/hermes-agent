@@ -37,10 +37,13 @@ def _require_auth(request: Request) -> None:
     """
     try:
         from hermes_cli.web_server import _is_authenticated  # type: ignore[import]
-        if not _is_authenticated(request):
-            raise HTTPException(status_code=401, detail="Unauthorized")
     except (ImportError, AttributeError):
-        pass  # test/standalone — auth no-ops
+        return  # web_server not importable (test/standalone) — auth no-ops
+    # Import guard is separate from the auth call: an AttributeError (or any
+    # error) raised *inside* _is_authenticated must NOT be swallowed into an
+    # open-auth bypass — let it surface as a 500.
+    if not _is_authenticated(request):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 router = APIRouter()

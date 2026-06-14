@@ -35,4 +35,4 @@ never the user message. With no `persona_ref` set, the hook is a no-op (cache st
 Flat markdown files under `library/*.md`. YAML frontmatter
 (`id, category, glyph, name, description, tags, default_model,
 default_memory_provider, suggested_mcps, suggested_toolsets`) + markdown body =
-`system_prompt`. Malformed files are skipped with a warning; duplicate ids are fatal.
+`system_prompt`. Malformed files are skipped with a warning; duplicate ids are non-fatal (first wins, later skipped with an error).
