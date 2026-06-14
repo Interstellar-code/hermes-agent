@@ -1,0 +1,11 @@
+{
+  "name": "personas",
+  "label": "Personas",
+  "description": "Canonical persona store — list, read, and (future) promote curated persona templates. Single source of truth consumed by the SwitchUI profile wizard.",
+  "icon": "Drama",
+  "version": "0.1.0",
+  "api": "plugin_api.py",
+  "tab": {
+    "hidden": true
+  }
+}
