@@ -1,10 +1,10 @@
 """Tests for the observable injection signal (feat/mc-injection-signal).
 
 Verifies:
-1. Composed persona contains the ``[matrix-coder active: ...]`` marker line.
-2. Composed persona contains the "Begin your reply..." instruction.
-3. INFO log emitted on explicit injection.
-4. INFO log emitted on implicit injection.
+1. Composed persona is returned as a dict with target="developer"; no marker line.
+2. Composed persona does NOT contain the "Begin your reply..." coercion line.
+3. INFO log emitted on explicit injection (role/lens in log, not in persona text).
+4. INFO log emitted on implicit injection (strong-signal message).
 5. DEBUG log emitted when IntentGate declines (no coding intent).
 6. DEBUG log emitted when DIRECT verdict fires (no persona activated).
 """
@@ -25,32 +25,40 @@ from matrix_coder.core.hermes_bridge import bridge  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# 1. Marker present in composed persona
+# 1. Persona is a dict with target="developer"; marker removed from persona text
 # ---------------------------------------------------------------------------
 
 
 def test_composed_persona_contains_marker_explicit():
+    """hook returns dict(target="developer"); marker is NOT in the persona text."""
     bridge.clear_active_persona()
-    composed = harness.handle_trigger("matrix review security: check auth")
+    result = plugin._inject_persona(user_message="matrix review security: check auth")
 
-    assert composed is not None
-    assert "[matrix-coder active: role=review, lens=security]" in composed
+    assert result is not None
+    assert isinstance(result, dict)
+    assert result.get("target") == "developer"
+    # Marker is emitted via logger.info, NOT embedded in the persona text.
+    assert "[matrix-coder active" not in result.get("context", "")
 
 
 def test_composed_persona_contains_marker_no_lens():
+    """Same contract for a trigger without a lens."""
     bridge.clear_active_persona()
-    composed = harness.handle_trigger("matrix executor: add export")
+    result = plugin._inject_persona(user_message="matrix executor: add export")
 
-    assert composed is not None
-    assert "[matrix-coder active: role=executor, lens=none]" in composed
+    assert result is not None
+    assert isinstance(result, dict)
+    assert result.get("target") == "developer"
+    assert "[matrix-coder active" not in result.get("context", "")
 
 
-def test_composed_persona_contains_begin_reply_instruction():
+def test_composed_persona_has_no_begin_reply_coercion():
+    """The coercion instruction was removed in issue #140; assert it is absent."""
     bridge.clear_active_persona()
     composed = harness.handle_trigger("matrix explore: map the repo")
 
     assert composed is not None
-    assert "Begin your reply with the line above exactly as written." in composed
+    assert "Begin your reply with the line above exactly as written." not in composed
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +91,15 @@ def test_info_log_includes_lens_on_explicit_lensed_injection(caplog):
 
 
 # ---------------------------------------------------------------------------
-# 3. INFO log on implicit injection
+# 3. INFO log on implicit injection — use a STRONG signal message
 # ---------------------------------------------------------------------------
 
 
 def test_info_log_emitted_on_implicit_injection(caplog):
+    """Strong-signal implicit request ("refactor the auth module") must still activate."""
     bridge.clear_active_persona()
     with caplog.at_level(logging.INFO, logger="matrix_coder"):
-        plugin._inject_persona(user_message="is this auth safe?")
+        plugin._inject_persona(user_message="refactor the auth module")
 
     info_records = [r for r in caplog.records if r.levelno == logging.INFO]
     assert any(
@@ -126,10 +135,11 @@ def test_debug_log_on_direct_verdict(caplog):
     with caplog.at_level(logging.DEBUG, logger="matrix_coder"):
         result = plugin._inject_persona(user_message="fix README typo")
 
-    # DIRECT verdict: result is not None (recommendation text) but bridge inactive.
+    # DIRECT verdict: result is not None (trusted-tier dict) but bridge inactive.
     assert result is not None
     assert bridge.is_active() is False
     debug_messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
-    assert any("no injection" in m for m in debug_messages), (
+    # Message changed in issue #140: direct verdict is now delivered in trusted tier.
+    assert any("direct verdict" in m for m in debug_messages), (
         f"Expected DEBUG direct-verdict log, got: {debug_messages}"
     )

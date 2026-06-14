@@ -64,10 +64,21 @@ Tracks epic issue #76.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Optional
 
 from .core import harness, kanban_audit
+from .core.config import load_config as _load_config
 from .core.hermes_bridge import bridge
+from .core.intake import parse_trigger as _parse_trigger
+
+
+def _implicit_routing_enabled() -> bool:
+    """Return whether implicit routing is enabled, defensive — never raises."""
+    try:
+        return bool(_load_config().get("implicit_routing_enabled", True))
+    except Exception:
+        return True
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +87,12 @@ logger = logging.getLogger(__name__)
 # Hooks (sync, defensive — never raise on the hot path)
 # ---------------------------------------------------------------------------
 
-def _log_injection(composed: str, mode: str) -> None:
-    """Emit an INFO log line describing the injected persona."""
-    # Extract role and lens from the marker line prepended by _compose_and_activate.
-    # Marker format: [matrix-coder active: role=<role>, lens=<lens>]
-    import re as _re
-    m = _re.search(r"\[matrix-coder active: role=([^,\]]+), lens=([^\]]+)\]", composed)
-    if m:
-        role, lens = m.group(1), m.group(2)
-    else:
-        role, lens = "unknown", "none"
+def _log_injection(composed: str, mode: str, role: str = "unknown", lens: str = "none") -> None:
+    """Emit an INFO log line describing the injected persona.
+
+    ``role`` and ``lens`` must be passed explicitly by the caller — the marker
+    line that used to be prepended to ``composed`` was removed in issue #140.
+    """
     logger.info(
         "matrix_coder: persona injected role=%s lens=%s mode=%s", role, lens, mode
     )
@@ -102,16 +109,17 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
 
     Phase 2 audit-mirror: on the non-trigger path, any still-open audit card is
     an orphan (a prior dispatch never produced a completion signal). We close it
-    ``done`` and clear the bookkeeping — self-correcting cleanup mirroring the
+    ``blocked`` and clear the bookkeeping — self-correcting cleanup mirroring the
     persona leak guard. Kanban failures are swallowed.
     """
     try:
         user_message = kwargs.get("user_message", "") or ""
-        session_id = str(kwargs.get("session_id") or "")
+        session_id: Optional[str] = kwargs.get("session_id")
         # Bypass: cron sessions (session_id built as "cron_{job_id}_{ts}")
-        if session_id.startswith("cron_"):
+        _sid_str = session_id or ""
+        if _sid_str.startswith("cron_"):
             logger.debug(
-                "matrix_coder: skipping injection — cron session (%s)", session_id
+                "matrix_coder: skipping injection — cron session (%s)", _sid_str
             )
             return None
         # Belt-and-suspenders: system/scheduled preamble marker
@@ -119,35 +127,64 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
             logger.debug("matrix_coder: skipping injection — system preamble")
             return None
         composed = harness.handle_trigger(
-            user_message=user_message, session_id=kwargs.get("session_id")
+            user_message=user_message, session_id=session_id
         )
         if composed:
-            _log_injection(composed, mode="explicit")
-            return composed
+            # Extract role/lens for logging by re-parsing the trigger (cheap).
+            try:
+                _parsed = _parse_trigger(user_message)
+                _role = _parsed.role if _parsed else "unknown"
+                _lens = (_parsed.lens or "none") if _parsed else "none"
+            except Exception:
+                _role, _lens = "unknown", "none"
+            _log_injection(composed, mode="explicit", role=_role, lens=_lens)
+            # Deliver persona in trusted (system) tier, not user-role.
+            # This prevents prompt injection / host-identity override (#140).
+            return {"context": composed, "target": "developer"}
         # No explicit trigger this turn -> close any orphan card and clear stale
         # persona state before implicit routing, so neither leaks forward.
-        orphan_id = bridge.active_card_id()
+        # HIGH-2: use take_active_card() which reads AND clears under a single
+        # lock, so two concurrent turns on the same session cannot both read
+        # the same card_id and double-close it.
+        orphan_id = bridge.take_active_card(session_id)
         if orphan_id:
             kanban_audit.close_card(
                 orphan_id,
                 summary="(closed: no completion signal)",
-                status="done",
+                status="blocked",
             )
-            bridge.clear_active_card()
-        bridge.clear_active_persona()
+        bridge.clear_active_persona(session_id)
+        # Kill-switch: if implicit routing is disabled, skip entirely.
+        # Explicit "matrix ..." triggers (handled above) are unaffected.
+        if not _implicit_routing_enabled():
+            logger.debug("matrix_coder: implicit routing disabled (kill-switch)")
+            return None
         result = harness.handle_implicit(
-            user_message=user_message, session_id=kwargs.get("session_id")
+            user_message=user_message, session_id=session_id
         )
         if result is None:
             logger.debug("matrix_coder: no injection (no coding intent)")
-        elif not bridge.is_active():
+            return None
+        elif not bridge.is_active(session_id):
             # DIRECT verdict: recommendation injected, no persona activated.
-            logger.debug("matrix_coder: no injection (direct verdict)")
+            # Also trusted-tier: it's an instruction to the host agent.
+            logger.debug("matrix_coder: direct verdict injected (trusted tier)")
+            return {"context": result, "target": "developer"}
         else:
-            _log_injection(result, mode="implicit")
-        return result
+            # LOW-3: re-infer role/lens from the user message so the log
+            # carries meaningful role/lens instead of unknown/none.
+            try:
+                from .core.intent_gate import infer_implicit_invocation as _infer
+                _inf = _infer(user_message)
+                _impl_role = _inf.role if _inf else "unknown"
+                _impl_lens = (_inf.lens or "none") if _inf else "none"
+            except Exception:
+                _impl_role, _impl_lens = "unknown", "none"
+            _log_injection(result, mode="implicit", role=_impl_role, lens=_impl_lens)
+            # MATRIX verdict: deliver persona in trusted (system) tier (#140).
+            return {"context": result, "target": "developer"}
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: _inject_persona suppressed error: %s", exc)
+        logger.warning("matrix_coder: _inject_persona suppressed error: %s", exc, exc_info=True)
         return None
 
 
@@ -163,20 +200,24 @@ def _clear_persona(**kwargs: Any) -> Optional[str]:
     Phase 2 audit-mirror: this is the normal close path for a card opened on the
     trigger turn — close it ``done`` with the assistant's response as the
     summary, then clear the card bookkeeping. Defensive — never raises.
+
+    PL-2: read card_id first, clear bookkeeping BEFORE the kanban close call
+    so a concurrent caller sees None and skips the double-close.
     """
+    session_id: Optional[str] = kwargs.get("session_id")
     try:
-        card_id = bridge.active_card_id()
+        # HIGH-2: use take_active_card() — atomic read+clear under single lock.
+        card_id = bridge.take_active_card(session_id)
         if card_id:
             kanban_audit.close_card(
                 card_id,
                 summary=kwargs.get("assistant_response"),
                 status="done",
             )
-            bridge.clear_active_card()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: _clear_persona card-close suppressed error: %s", exc)
     try:
-        bridge.clear_active_persona()
+        bridge.clear_active_persona(session_id)
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("matrix_coder: _clear_persona suppressed error: %s", exc)
     return None
@@ -191,7 +232,8 @@ def _normalize_output(**kwargs: Any) -> Optional[str]:
     phases can shape output without re-plumbing the hook.
     """
     try:
-        if not bridge.is_active():
+        session_id: Optional[str] = kwargs.get("session_id")
+        if not bridge.is_active(session_id):
             return None
         # Phase 1: no transformation yet.
         return None

@@ -52,18 +52,27 @@ def test_pre_llm_call_hook_injects_on_trigger():
     bridge.clear_active_persona()
     injected = plugin._inject_persona(user_message="matrix executor add export")
 
+    # Hook now returns {"context": <str>, "target": "developer"} — trusted tier.
     assert injected is not None
-    assert "Executor Specialist" in injected
+    assert isinstance(injected, dict)
+    assert "Executor Specialist" in injected["context"]
+    assert injected["target"] == "developer"
     assert bridge.is_active() is True
 
 
 def test_pre_llm_call_hook_implicitly_routes_security_review():
     bridge.clear_active_persona()
-    injected = plugin._inject_persona(user_message="is this auth safe?")
+    # Strong-signal implicit security review (advisory "is this auth safe?" now
+    # quiets under the #140 policy; an explicit-role lead still routes).
+    injected = plugin._inject_persona(
+        user_message="review the auth login flow for security"
+    )
 
     assert injected is not None
-    assert "Review Specialist" in injected
-    assert "Review Lens: Security" in injected
+    assert isinstance(injected, dict)
+    assert "Review Specialist" in injected["context"]
+    assert "Review Lens: Security" in injected["context"]
+    assert injected["target"] == "developer"
     assert bridge.is_active() is True
 
 
@@ -74,8 +83,10 @@ def test_pre_llm_call_hook_explicit_trigger_overrides_inference():
     )
 
     assert injected is not None
-    assert "Executor Specialist" in injected
-    assert "Review Specialist" not in injected
+    assert isinstance(injected, dict)
+    assert "Executor Specialist" in injected["context"]
+    assert "Review Specialist" not in injected["context"]
+    assert injected["target"] == "developer"
     assert bridge.is_active() is True
 
 
@@ -84,7 +95,9 @@ def test_pre_llm_call_hook_direct_recommendation_does_not_activate_persona():
     injected = plugin._inject_persona(user_message="fix README typo")
 
     assert injected is not None
-    assert "<verdict>direct</verdict>" in injected
+    assert isinstance(injected, dict)
+    assert "<verdict>direct</verdict>" in injected["context"]
+    assert injected["target"] == "developer"
     assert bridge.is_active() is False
 
 

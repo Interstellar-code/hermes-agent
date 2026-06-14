@@ -25,6 +25,7 @@ Import-light by design: only depends on sibling ``core`` modules.
 from __future__ import annotations
 
 import logging
+import re as _re
 from typing import Optional
 
 from . import kanban_audit, registry
@@ -42,9 +43,32 @@ logger = logging.getLogger(__name__)
 
 _PASSTHROUGH = "_passthrough"
 
+# Module-level constant: compiled once at import time (NIT fix).
+_MARKER_SPOOF_RE = _re.compile(r"\[matrix-coder active:[^\]]*\]", _re.IGNORECASE)
+
+
+def _safe_goal(goal: Optional[str]) -> str:
+    """Sanitize goal text before storing in the audit card.
+
+    Strips CR/LF, removes any embedded [matrix-coder active:...] marker-spoof
+    substrings, and length-caps at 500 characters so no injected text can
+    pollute the audit trail.
+    """
+    if not goal:
+        return ""
+    sanitized = goal.replace("\r", " ").replace("\n", " ")
+    sanitized = _MARKER_SPOOF_RE.sub("", sanitized)
+    return sanitized[:500].strip()
+
 
 def _compose_and_activate(parsed: ParsedInvocation, session_id: Optional[str]) -> str:
-    """Compose *parsed* into an active persona and open its audit card."""
+    """Compose *parsed* into an active persona and open its audit card.
+
+    Returns the composed persona string (no coercion marker prepended). The
+    caller in __init__.py wraps this in {"context": ..., "target": "developer"}
+    so the gateway delivers it in the system/trusted tier rather than the
+    user-role message.
+    """
     base = registry.load_base_contracts()
     persona = registry.load_persona(parsed.role)
     lens_text = (
@@ -56,19 +80,20 @@ def _compose_and_activate(parsed: ParsedInvocation, session_id: Optional[str]) -
 
     composed = compose_persona(base, persona, lens=lens_text, domain_pack=domain_text)
 
-    # Prepend a visible activation marker and instruct the agent to echo it.
+    # Audit log at INFO: record role/lens without pushing a marker through the
+    # model. The coercion "Begin your reply with the line above..." was removed
+    # in issue #140 — persona is now delivered in the trusted (system) tier.
     lens_part = parsed.lens if parsed.lens else "none"
-    marker = f"[matrix-coder active: role={parsed.role}, lens={lens_part}]"
-    composed = (
-        f"{marker}\n"
-        "Begin your reply with the line above exactly as written.\n\n"
-        + composed
+    logger.info(
+        "matrix_coder: activating persona role=%s lens=%s", parsed.role, lens_part
     )
 
-    bridge.set_active_persona(composed)
+    # bridge stores the raw composed text (not the dict wrapper)
+    bridge.set_active_persona(composed, session_id)
 
-    cid = kanban_audit.open_card(parsed.role, parsed.lens, parsed.goal, session_id)
-    bridge.set_active_card(cid)
+    safe_goal = _safe_goal(parsed.goal)
+    cid = kanban_audit.open_card(parsed.role, parsed.lens, safe_goal, session_id)
+    bridge.set_active_card(cid, session_id)
     return composed
 
 
@@ -94,23 +119,32 @@ def handle_trigger(
         if parsed is None:
             return None
 
-        # A stale card from an interrupted prior turn -> close it as superseded
-        # before opening the new one, so cards don't accumulate open forever.
-        stale_id = bridge.active_card_id()
-        if stale_id:
-            kanban_audit.close_card(
-                stale_id,
-                summary="(superseded by a new matrix invocation)",
-                status="done",
-            )
-            bridge.clear_active_card()
-
         # Explicit trigger -> intake gate always routes through the matrix.
         intake_gate(parsed)
 
-        return _compose_and_activate(parsed, session_id)
+        # KB-2: capture any stale card BEFORE compose so we know what to close.
+        # Then compose + activate (opens a NEW card). Only after the new card is
+        # open do we close the stale one, so if _compose_and_activate raises the
+        # stale card is NOT prematurely closed (no audit gap on failure).
+        stale_id = bridge.active_card_id(session_id)
+
+        result = _compose_and_activate(parsed, session_id)
+
+        # Close the pre-existing stale card now that the new one is open.
+        # Kanban failures are swallowed — must never block composition/return.
+        if stale_id:
+            try:
+                kanban_audit.close_card(
+                    stale_id,
+                    summary="(superseded by a new matrix invocation)",
+                    status="done",
+                )
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        return result
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: handle_trigger suppressed error: %s", exc)
+        logger.warning("matrix_coder: handle_trigger suppressed error: %s", exc, exc_info=True)
         return None
 
 
@@ -133,11 +167,11 @@ def handle_implicit(
             return direct_recommendation_context(decision)
         return _compose_and_activate(parsed, session_id)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: handle_implicit suppressed error: %s", exc)
+        logger.warning("matrix_coder: handle_implicit suppressed error: %s", exc, exc_info=True)
         return None
 
 
-def run_passthrough(goal: str) -> SpecialistResult:
+def run_passthrough(goal: str, session_id: Optional[str] = None) -> SpecialistResult:
     """Run the Phase 0 passthrough specialist and return its shaped result.
 
     Composes the ``_passthrough`` persona, marks the dispatch active for its
@@ -148,12 +182,15 @@ def run_passthrough(goal: str) -> SpecialistResult:
     The active persona is scoped to this call via ``try/finally``: it is always
     cleared before returning, so the ``pre_llm_call`` hook correctly no-ops once
     the dispatch is over and never leaks into ordinary conversation turns.
+
+    PL-3: ``_active_card_id`` is also cleared in the finally block so no stale
+    card id lingers after passthrough returns.
     """
     base = registry.load_base_contracts()
     persona = registry.load_persona(_PASSTHROUGH)
     composed = compose_persona(base, persona)
 
-    bridge.set_active_persona(composed)
+    bridge.set_active_persona(composed, session_id)
     try:
         return SpecialistResult(
             role=_PASSTHROUGH,
@@ -165,4 +202,6 @@ def run_passthrough(goal: str) -> SpecialistResult:
         )
     finally:
         # Dispatch is over — clear active state so injection no-ops afterwards.
-        bridge.clear_active_persona()
+        bridge.clear_active_persona(session_id)
+        # PL-3: also clear any stale card id so no orphan reference lingers.
+        bridge.clear_active_card(session_id)

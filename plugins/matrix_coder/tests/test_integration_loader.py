@@ -39,7 +39,15 @@ def _load():
 
 def _injected(pm, message: str) -> str:
     res = pm.invoke_hook("pre_llm_call", user_message=message, session_id="itest")
-    return "\n".join(r for r in res if isinstance(r, str))
+    # Hook now returns {"context": str, "target": "developer"} dicts (issue #140).
+    # Extract the context text from both dict and plain-string returns.
+    parts = []
+    for r in res:
+        if isinstance(r, dict) and r.get("context"):
+            parts.append(str(r["context"]))
+        elif isinstance(r, str) and r:
+            parts.append(r)
+    return "\n".join(parts)
 
 
 def test_real_loader_trigger_injects_persona_and_lens():
@@ -66,7 +74,9 @@ def test_real_loader_implicit_request_injects_inferred_persona():
     if loaded is None:
         return
     pm, _ = loaded
-    out = _injected(pm, "is this auth safe?")
+    # Strong-signal implicit security review ("is this auth safe?" now quiets
+    # under the #140 policy; an explicit-role lead still routes).
+    out = _injected(pm, "review the auth login flow for security")
     assert out and "Review Specialist" in out
     assert "Review Lens: Security" in out
 

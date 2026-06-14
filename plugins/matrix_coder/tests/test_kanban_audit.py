@@ -210,19 +210,24 @@ def test_lifecycle_trigger_opens_card_then_noncontrigger_closes():
             "matrix review security: x", session_id="s1"
         )
         assert composed is not None
-        assert bridge.active_card_id() == "life-1"
+        assert bridge.active_card_id("s1") == "life-1"
         assert len(fake.create_calls) == 1
 
         # A non-trigger pre_llm_call closes the orphan card + clears bookkeeping.
-        result = plugin._inject_persona(user_message="ordinary follow-up")
+        # KB-1: an abandoned dispatch (no completion signal) closes as BLOCKED,
+        # not done. Same session_id ("s1") so the orphan is found in its slot.
+        result = plugin._inject_persona(
+            user_message="ordinary follow-up", session_id="s1"
+        )
         assert result is None
-        assert bridge.active_card_id() is None
-        assert len(fake.complete_calls) == 1
-        assert fake.complete_calls[0][0] == "life-1"
+        assert bridge.active_card_id("s1") is None
+        assert len(fake.block_calls) == 1
+        assert fake.block_calls[0][0] == "life-1"
+        assert not fake.complete_calls
     finally:
         kanban_audit._kb = prev
-        bridge.clear_active_persona()
-        bridge.clear_active_card()
+        bridge.clear_active_persona("s1")
+        bridge.clear_active_card("s1")
 
 
 def test_lifecycle_post_llm_call_closes_with_response():
@@ -232,18 +237,18 @@ def test_lifecycle_post_llm_call_closes_with_response():
     bridge.clear_active_card()
     try:
         harness.handle_trigger("matrix executor: add export", session_id="s2")
-        assert bridge.active_card_id() == "life-2"
+        assert bridge.active_card_id("s2") == "life-2"
 
-        plugin._clear_persona(assistant_response="done implementing")
-        assert bridge.active_card_id() is None
+        plugin._clear_persona(assistant_response="done implementing", session_id="s2")
+        assert bridge.active_card_id("s2") is None
         assert len(fake.complete_calls) == 1
         task_id, kw = fake.complete_calls[0]
         assert task_id == "life-2"
         assert kw["summary"] == "done implementing"
     finally:
         kanban_audit._kb = prev
-        bridge.clear_active_persona()
-        bridge.clear_active_card()
+        bridge.clear_active_persona("s2")
+        bridge.clear_active_card("s2")
 
 
 def test_lifecycle_stale_card_superseded_on_new_trigger():
@@ -252,16 +257,17 @@ def test_lifecycle_stale_card_superseded_on_new_trigger():
     bridge.clear_active_persona()
     bridge.clear_active_card()
     try:
-        # Simulate a stale card left from an interrupted prior turn.
-        bridge.set_active_card("stale-card")
+        # Simulate a stale card left from an interrupted prior turn, in the same
+        # session ("s3") the new trigger arrives on.
+        bridge.set_active_card("stale-card", "s3")
         harness.handle_trigger("matrix review: y", session_id="s3")
         # Stale card was completed (superseded) and a fresh one opened.
         assert any(c[0] == "stale-card" for c in fake.complete_calls)
-        assert bridge.active_card_id() == "new-card"
+        assert bridge.active_card_id("s3") == "new-card"
     finally:
         kanban_audit._kb = prev
-        bridge.clear_active_persona()
-        bridge.clear_active_card()
+        bridge.clear_active_persona("s3")
+        bridge.clear_active_card("s3")
 
 
 # ---------------------------------------------------------------------------
@@ -411,13 +417,15 @@ def test_single_dispatch_no_child_card():
         assert composed is not None
         # Only one card created — the parent invocation card
         assert len(fake.create_calls) == 1
-        assert bridge.active_card_id() == "only-card"
-        # No child cards registered
-        assert bridge.pop_child_card_ids() == []
+        assert bridge.active_card_id("s1") == "only-card"
+        # LOW-1 fix: pass the same session_id used by the dispatch ("s1"),
+        # not no-arg (which uses the sentinel "") — the old bare call was
+        # vacuously passing because it looked in the wrong session slot.
+        assert bridge.pop_child_card_ids("s1") == []
     finally:
         kanban_audit._kb = prev
-        bridge.clear_active_persona()
-        bridge.clear_active_card()
+        bridge.clear_active_persona("s1")
+        bridge.clear_active_card("s1")
 
 
 # ---------------------------------------------------------------------------

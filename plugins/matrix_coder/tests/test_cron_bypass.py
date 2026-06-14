@@ -61,13 +61,14 @@ def test_cron_session_id_varied_job_names():
 
 def test_interactive_session_still_injects():
     """An explicit trigger on a normal uuid session must not be suppressed."""
-    bridge.clear_active_persona()
+    sid = "550e8400-e29b-41d4-a716-446655440000"
+    bridge.clear_active_persona(sid)
     result = plugin._inject_persona(
-        user_message=_CODING_MSG,
-        session_id="550e8400-e29b-41d4-a716-446655440000",
+        user_message="matrix executor: add a new migration",
+        session_id=sid,
     )
     assert result is not None
-    assert bridge.is_active() is True
+    assert bridge.is_active(sid) is True
 
 
 # ---------------------------------------------------------------------------
@@ -104,5 +105,6 @@ def test_none_session_id_does_not_crash():
         user_message="fix README typo",
         session_id=None,
     )
-    # Must not raise; return value is either None or a non-empty string.
-    assert result is None or isinstance(result, str)
+    # Must not raise; return value is either None or a trusted-tier dict
+    # {"context": str, "target": "developer"} (shape changed in issue #140).
+    assert result is None or (isinstance(result, dict) and result.get("context"))

@@ -1,6 +1,6 @@
 name: matrix_coder
-version: "0.6.0"
-description: "Matrix Coder — a specialist-coder layer for Hermes. Turns the active Hermes agent into a focused specialist by composing a PERSONA as ephemeral pre_llm_call context. Phase 5 adds a cheap deterministic IntentGate for plain coding requests: it infers one of eight roles, an optional review lens, and an optional domain pack; explicit messages beginning with 'matrix' always override inference. Clear mechanical low-risk requests receive a visible direct-handling recommendation, while sensitive or nontrivial coding work silently receives the inferred specialist persona. Workflow personas (ralph, autopilot, ultrawork, ultraqa), domain packs, and optional Kanban audit cards remain available. Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. The /matrix command is STATUS/HELP only. Tracks epic #76."
+version: "0.6.1"
+description: "Matrix Coder — a specialist-coder layer for Hermes. Turns the active Hermes agent into a focused specialist by composing a PERSONA as TRUSTED developer-tier pre_llm_call context (delivered alongside the host system prompt, never in the user message, so it cannot override the host identity — hardened in #140). A cheap deterministic IntentGate infers one of eight roles, an optional review lens, and an optional domain pack for plain coding requests; explicit messages beginning with 'matrix' always override inference and always activate. Implicit routing silently activates ONLY on a strong signal (explicit role word or a clear code imperative); weaker/ambiguous requests get a visible recommendation, and advisory/meta questions addressed to Hermes receive no injection. Set MATRIX_CODER_IMPLICIT_ROUTING=0 to require the explicit trigger. Workflow personas (ralph, autopilot, ultrawork, ultraqa), domain packs, and optional Kanban audit cards remain available. Single-writer-per-file is the orchestration-time guardrail; per-role read/write nature is advisory persona guidance. The /matrix command is STATUS/HELP only. Tracks epic #76."
 author: Interstellar-code
 kind: standalone
 
@@ -13,5 +13,6 @@ hooks:
 # Tools registered with the Hermes agent (none in Phase 0).
 provides_tools: []
 
-# Environment variables read at runtime (none in Phase 0).
-requires_env: []
+# Environment variables read at runtime.
+requires_env:
+  - MATRIX_CODER_IMPLICIT_ROUTING  # "0" disables implicit IntentGate routing (explicit `matrix` trigger only)

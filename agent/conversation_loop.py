@@ -700,6 +700,7 @@ def run_conversation(
     #
     # All injected context is ephemeral (not persisted to session DB).
     _plugin_user_context = ""
+    _plugin_trusted_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -715,13 +716,27 @@ def run_conversation(
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
+        _trusted_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
+                _target = r.get("target", "user_message")
+                if _target in ("system", "developer"):
+                    _trusted_parts.append(str(r["context"]))
+                else:
+                    # Default: target absent or "user_message" -> user context
+                    _ctx_parts.append(str(r["context"]))
             elif isinstance(r, str) and r.strip():
                 _ctx_parts.append(r)
         if _ctx_parts:
             _plugin_user_context = "\n\n".join(_ctx_parts)
+        # Trusted plugin context (target="system"/"developer"): appended to the
+        # locally-rebuilt effective_system string at API-call time (NOT stored on
+        # agent.ephemeral_system_prompt). The cached active_system_prompt is never
+        # mutated; only this turn's effective_system string differs when a plugin
+        # returns a trusted target. This avoids prompt injection and keeps the
+        # cached system prefix byte-stable on turns where no plugin returns a
+        # trusted target (the common case).
+        _plugin_trusted_context = "\n\n".join(_trusted_parts) if _trusted_parts else ""
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -992,10 +1007,14 @@ def run_conversation(
         # External recall context is injected into the user message, not the system
         # prompt, so the stable cache prefix remains unchanged.
         #
-        # NOTE: Plugin context from pre_llm_call hooks is injected into the
-        # user message (see injection block above), NOT the system prompt.
-        # This is intentional — system prompt modifications break the prompt
-        # cache prefix.  The system prompt is reserved for Hermes internals.
+        # NOTE: Plugin context from pre_llm_call hooks with target absent or
+        # "user_message" is injected into the user message (see injection block
+        # above).  Plugin context with target="system" or "developer" is
+        # appended to the locally-rebuilt effective_system string at API-call
+        # time (NOT stored on agent.ephemeral_system_prompt), so the cached
+        # active_system_prompt is unmutated and only this turn's system string
+        # differs.  Cache only busts on turns where a plugin returns a trusted
+        # target (rare; controlled by the plugin).
         #
         # Hermes invariant: the system prompt is built ONCE per session
         # (cached on ``_cached_system_prompt``) and replayed verbatim on
@@ -1005,6 +1024,8 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        if _plugin_trusted_context:
+            effective_system = (effective_system + "\n\n" + _plugin_trusted_context).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

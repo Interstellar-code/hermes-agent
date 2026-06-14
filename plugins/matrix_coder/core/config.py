@@ -7,6 +7,7 @@ free of Hermes-runtime imports so it stays unit-testable in isolation.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, Optional
 
 
@@ -38,4 +39,10 @@ def load_config() -> Dict[str, Any]:
         # card for live observability on the Switch UI. Purely an audit layer,
         # never control flow. Set False to disable mirroring entirely.
         "KANBAN_AUDIT_ENABLED": True,
+        # Phase 5 implicit routing kill-switch.  Set to False (or set the env
+        # var MATRIX_CODER_IMPLICIT_ROUTING=0) to disable all implicit intent
+        # routing; explicit "matrix ..." triggers are unaffected.
+        "implicit_routing_enabled": os.environ.get(
+            "MATRIX_CODER_IMPLICIT_ROUTING", "1"
+        ) != "0",
     }

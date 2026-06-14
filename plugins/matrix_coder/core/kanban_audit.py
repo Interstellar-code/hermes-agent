@@ -48,7 +48,7 @@ def is_enabled() -> bool:
     try:
         return bool(load_config().get("KANBAN_AUDIT_ENABLED", False))
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: kanban_audit.is_enabled error: %s", exc)
+        logger.warning("matrix_coder: kanban_audit.is_enabled config error: %s", exc, exc_info=True)
         return False
 
 

@@ -179,7 +179,7 @@ def parse_trigger(message: str) -> Optional[ParsedInvocation]:
 
         return ParsedInvocation(role=role, lens=lens, goal=goal, domain=domain)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: parse_trigger suppressed error: %s", exc)
+        logger.warning("matrix_coder: parse_trigger suppressed error: %s", exc, exc_info=True)
         return None
 
 
@@ -195,7 +195,7 @@ def looks_sensitive(goal: str) -> bool:
         low = goal.lower()
         return any(pat in low for pat in SENSITIVE_PATH_PATTERNS)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: looks_sensitive suppressed error: %s", exc)
+        logger.warning("matrix_coder: looks_sensitive suppressed error: %s", exc, exc_info=True)
         return False
 
 

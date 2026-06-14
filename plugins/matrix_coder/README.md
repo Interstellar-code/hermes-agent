@@ -2,7 +2,9 @@
 
 A specialist-coder layer for Hermes. Matrix Coder turns the active Hermes agent
 into a focused **specialist** for a coding task by injecting a composed persona
-as ephemeral turn context.
+as **trusted (developer-tier) ephemeral turn context** — delivered alongside the
+host system prompt, never appended to the user message, so it cannot be mistaken
+for a user instruction or override the host agent's identity (hardened in #140).
 
 Phases 0–5 are implemented: explicit and implicit invocation, eight roles,
 review lenses, Kanban audit mirroring, workflow personas, and domain packs.
@@ -54,26 +56,37 @@ future enforcement builds on.
 
 Matrix Coder supports two conversational paths:
 
-- **Implicit (default):** a cheap deterministic IntentGate recognizes plain
-  coding requests and infers a role, optional review lens, and optional domain
-  pack. Matrix-worthy work silently receives the specialist persona.
-- **Explicit override:** start with `matrix`; explicit role/lens/domain parsing
-  always wins over inference.
+- **Explicit:** start a message with `matrix`; explicit role/lens/domain parsing
+  always wins and always activates the specialist.
+- **Implicit (inferred):** a cheap deterministic IntentGate inspects plain
+  coding requests. It **silently activates** a specialist ONLY on a **strong
+  signal** — an explicit role word (`review ...`, `debug ...`) or a clear
+  imperative on code (`refactor the auth module`, `add tests for the parser`).
+  Weaker or ambiguous coding requests get a **visible recommendation** asking
+  whether to invoke Matrix Coder or let Hermes handle it. Advisory or meta
+  questions addressed to Hermes — `what should we refactor?`, `should I ...?`,
+  `is X up to date?`, `where is X?` — receive **no injection**; Hermes answers
+  them directly as the orchestrator. (Hardened in #140: the old gate silently
+  hijacked any coding-adjacent question that ended in `?`.)
 
 Examples:
 
 ```
-is this auth safe?                              # review + security lens
-why does the API endpoint crash?               # debug + backend-api domain
-matrix review this for security
-matrix explore how auth flows through the gateway
-matrix executor @backend-api: add CSV export   # explicit always wins
+refactor the auth module                       # strong signal -> silent simplify
+review API endpoint performance                # strong signal -> review:performance@backend-api
+fix README typo                                # trivial -> visible "let Hermes handle?" recommendation
+what parts of the frontend need refactoring?   # advisory to Hermes -> no injection
+matrix review this for security                # explicit always activates
+matrix executor @backend-api: add CSV export   # explicit role/lens/domain
+matrix is this safe?                           # explicit, defaults to review
 ```
 
-The implicit intake gate is conservative. Clear, mechanical, low-risk work
-(for example, `fix README typo`) injects a visible recommendation asking
-whether Hermes should handle it directly; sensitive or nontrivial coding work
-silently routes through Matrix Coder. Unrelated chat receives no injection.
+Persona text is delivered as **trusted developer-tier context** (alongside the
+host system prompt), not appended to your message, and carries no user-visible
+activation marker.
+
+**Kill-switch:** set `MATRIX_CODER_IMPLICIT_ROUTING=0` to require the explicit
+`matrix` trigger for every dispatch; the explicit path is unaffected.
 
 The `/matrix` slash command displays status/help; conversational messages are
 the dispatch path.

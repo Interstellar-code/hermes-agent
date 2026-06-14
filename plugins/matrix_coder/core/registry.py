@@ -38,7 +38,7 @@ def _read(path: Path) -> str:
         logger.debug("matrix_coder: persona file not found: %s", path)
         return ""
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("matrix_coder: failed reading %s: %s", path, exc)
+        logger.warning("matrix_coder: failed reading %s: %s", path, exc, exc_info=True)
         return ""
 
 
