@@ -206,7 +206,7 @@ def register(ctx) -> None:  # noqa: ANN001
 
     # Optional operator skill — guarded (register_skill arrived in a later ctx version).
     if hasattr(ctx, "register_skill"):
-        skill_path = _PLUGIN_DIR / "SKILL.md"
+        skill_path = _PLUGIN_DIR / "skills" / "personas" / "SKILL.md"
         if skill_path.exists():
             try:
                 ctx.register_skill(
