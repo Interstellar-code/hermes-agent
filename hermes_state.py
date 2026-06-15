@@ -446,7 +446,10 @@ class SessionDB:
             # Performance PRAGMAs — keep WAL checkpoints frequent (default 1000
             # pages = ~4MB lets WAL bloat under burst writes), avoid FULL
             # synchronous mode's per-commit fsync, and extend lock wait to 5s
-            # for read concurrency under load. Mirrors kanban_db.py settings.
+            # for read concurrency under load. Checkpoint cadence
+            # (wal_autocheckpoint=100) matches kanban_db.py; synchronous=NORMAL
+            # is safe under WAL (kanban_db.py uses FULL — stricter, not needed
+            # for this read-heavy session store).
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA wal_autocheckpoint=100")
             self._conn.execute("PRAGMA busy_timeout=5000")
