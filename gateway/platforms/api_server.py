@@ -729,6 +729,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Active interactive-clarify streams: session_id -> the chat-stream's
+        # thread-safe ``_enqueue(name, payload)`` callable.  The clarify resume
+        # route (POST /api/sessions/{session_id}/chat/clarify) looks up the
+        # live stream here so it can push a ``clarify.responded`` SSE event back
+        # to the same client that received the ``clarify.request``.  Mirrors
+        # ``_run_approval_sessions`` for the approval flow, but keyed by
+        # session_id because the chat-stream run_id is request-local.
+        self._clarify_streams: Dict[str, Any] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -974,6 +982,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        interactive_clarify: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1000,6 +1009,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+
+        # Gated interactive `clarify` injection.
+        #
+        # `clarify` is deliberately kept out of the static hermes-api-server
+        # toolset (see toolsets.py) because it blocks the agent thread for up
+        # to ~10 minutes awaiting a human answer — fatal for headless
+        # OpenAI-compat clients.  We add it to the resolved toolset ONLY when
+        # BOTH hold:
+        #   1. the caller is the interactive SSE chat-stream path
+        #      (interactive_clarify=True — never set by headless handlers), and
+        #   2. the operator opted in via config.yaml `api_server.interactive_clarify`.
+        # The config gate is the documented enable switch; the parameter gate
+        # ensures headless paths can never receive clarify even if the flag is
+        # on.  Both must be true, so the default (flag absent) is safe.
+        if interactive_clarify:
+            api_cfg = (user_config or {}).get("api_server") or {}
+            if bool(api_cfg.get("interactive_clarify", False)):
+                if "clarify" not in enabled_toolsets:
+                    enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1089,6 +1117,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        # Whether the operator opted into the interactive `clarify` tool on the
+        # chat-stream path (config.yaml `api_server.interactive_clarify`).  The
+        # frontend reads this to decide if it should render clarify prompts.
+        try:
+            _cfg = _load_gateway_config()
+            _interactive_clarify_enabled = bool(
+                ((_cfg or {}).get("api_server") or {}).get("interactive_clarify", False)
+            )
+        except Exception:
+            _interactive_clarify_enabled = False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1113,6 +1152,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                # Interactive clarify over the SSE chat-stream (gated by
+                # config.yaml api_server.interactive_clarify).  When true the
+                # chat-stream may emit `clarify.request` events and accept a
+                # POST to /api/sessions/{session_id}/chat/clarify to resume.
+                "interactive_clarify": _interactive_clarify_enabled,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -1155,6 +1199,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_chat_clarify": {"method": "POST", "path": "/api/sessions/{session_id}/chat/clarify"},
             },
         })
 
@@ -1601,6 +1646,61 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        # ------------------------------------------------------------------
+        # Interactive clarify callback (P2).
+        #
+        # Structurally identical to the approval flow: block the agent thread,
+        # emit an SSE event, wait for a side-channel POST to resume.  Runs on
+        # the agent's worker thread (the ``clarify`` tool invokes it
+        # synchronously), so it uses the thread-safe ``_enqueue`` to push the
+        # ``clarify.request`` event onto the live SSE stream and then blocks on
+        # ``clarify_gateway.wait_for_response`` (which polls in 1s slices and
+        # keeps the inactivity watchdog fed for the full ~600s timeout).  The
+        # resume route resolves it via ``resolve_gateway_clarify``.
+        clarify_session_key = gateway_session_key or session_id
+
+        def _clarify_callback_sync(question: str, choices) -> str:
+            from tools import clarify_gateway as _clarify_mod
+            import uuid as _uuid
+
+            clarify_id = _uuid.uuid4().hex[:10]
+            _clarify_mod.register(
+                clarify_id=clarify_id,
+                session_key=clarify_session_key or "",
+                question=question,
+                choices=list(choices) if choices else None,
+            )
+            # Surface the prompt to the connected client and mark the run as
+            # blocked (mirrors approval's ``waiting_for_approval`` status).
+            _enqueue("clarify.request", {
+                "message_id": message_id,
+                "clarify_id": clarify_id,
+                "question": question,
+                "choices": list(choices) if choices else None,
+            })
+            try:
+                self._set_run_status(
+                    run_id,
+                    "waiting_for_clarify",
+                    last_event="clarify.request",
+                    clarify_id=clarify_id,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+
+            timeout = _clarify_mod.get_clarify_timeout()
+            response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+            try:
+                self._set_run_status(run_id, "running", last_event="clarify.responded")
+            except Exception:
+                pass
+            if response is None or response == "":
+                # Timeout or session-boundary cancellation — return a sentinel
+                # so the agent can adapt rather than hang forever.
+                return f"[user did not respond within {int(timeout / 60)}m]"
+            return response
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -1614,6 +1714,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    # Opt this run into the gated interactive ``clarify`` tool.
+                    # _create_agent still requires config flag
+                    # ``api_server.interactive_clarify`` before injecting it,
+                    # so this is safe to always pass on the chat-stream path.
+                    interactive_clarify=True,
+                    clarify_callback=_clarify_callback_sync,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1637,9 +1743,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": str(exc)}))
             finally:
+                # Drop the clarify stream registration and resolve/clear any
+                # pending clarify so a never-answered prompt cannot leak across
+                # turns (mirrors run.py's clear_session on session boundary).
+                self._clarify_streams.pop(session_id, None)
+                try:
+                    from tools.clarify_gateway import clear_session as _clear_clarify_session
+                    _clear_clarify_session(clarify_session_key or "")
+                except Exception:
+                    pass
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
+        # Register the live stream so the resume route can push
+        # ``clarify.responded`` back to this client (see _handle_session_clarify).
+        self._clarify_streams[session_id] = _enqueue
         task = asyncio.create_task(_run_and_signal())
         try:
             self._background_tasks.add(task)
@@ -3447,9 +3565,18 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        interactive_clarify: bool = False,
+        clarify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
+
+        ``interactive_clarify`` opts this run into the gated interactive
+        ``clarify`` toolset (see ``_create_agent``).  ``clarify_callback`` is
+        the platform-provided sync callback the ``clarify`` tool invokes to
+        present a prompt to the user and block on their answer; it is attached
+        to the agent (``agent.clarify_callback``) before the conversation runs.
+        Both are only used by the interactive SSE chat-stream path.
 
         Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
         ``input_tokens``, ``output_tokens`` and ``total_tokens``.
@@ -3470,7 +3597,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                interactive_clarify=interactive_clarify,
             )
+            # Attach the platform-provided clarify callback so the (gated)
+            # ``clarify`` tool can present a prompt and block on a human
+            # answer.  Only the interactive SSE chat-stream path supplies one;
+            # headless paths leave it None and ``clarify`` stays unavailable.
+            if clarify_callback is not None:
+                agent.clarify_callback = clarify_callback
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
@@ -4012,6 +4146,81 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/clarify — resolve a pending clarify.
+
+        Mirrors ``_handle_run_approval`` for the interactive SSE chat-stream
+        path.  The Switch UI frontend consumes the ``clarify.request`` SSE event
+        (emitted by the chat-stream's clarify callback) and POSTs the user's
+        answer here.  Body: ``{"clarify_id": str, "answer": str}``.  We unblock
+        the waiting agent thread via ``clarify_gateway.resolve_gateway_clarify``
+        (module-level state, no back-reference to the run needed) and then push
+        a ``clarify.responded`` event onto the live stream so the client sees
+        the resolution.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        clarify_id = str(body.get("clarify_id", "")).strip()
+        # Accept both "answer" and "response" spellings for the user's reply.
+        answer = body.get("answer")
+        if answer is None:
+            answer = body.get("response")
+        answer = "" if answer is None else str(answer)
+
+        if not clarify_id:
+            return web.json_response(
+                _openai_error("clarify_id is required", code="clarify_id_required"),
+                status=400,
+            )
+
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = resolve_gateway_clarify(clarify_id, answer)
+        except Exception:
+            logger.exception("[api_server] clarify resolution failed for %s", clarify_id)
+            resolved = False
+
+        if not resolved:
+            # No pending clarify with that id (already answered, timed out, or
+            # belongs to a different/ended run).
+            return web.json_response(
+                _openai_error(
+                    f"No pending clarify: {clarify_id}",
+                    code="clarify_not_pending",
+                ),
+                status=409,
+            )
+
+        # Push clarify.responded onto the live SSE stream for this session, if
+        # one is still connected.  Resolution above already unblocked the agent
+        # thread; this event is purely informational for the client.
+        enqueue = self._clarify_streams.get(session_id)
+        if enqueue is not None:
+            try:
+                enqueue("clarify.responded", {
+                    "clarify_id": clarify_id,
+                    "answer": answer,
+                    "resolved": resolved,
+                })
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.session.clarify_response",
+            "session_id": session_id,
+            "clarify_id": clarify_id,
+            "resolved": resolved,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4118,6 +4327,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            self._app.router.add_post("/api/sessions/{session_id}/chat/clarify", self._handle_session_clarify)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
