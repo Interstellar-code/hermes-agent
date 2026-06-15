@@ -1121,6 +1121,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # chat-stream path (config.yaml `api_server.interactive_clarify`).  The
         # frontend reads this to decide if it should render clarify prompts.
         try:
+            from gateway.run import _load_gateway_config
             _cfg = _load_gateway_config()
             _interactive_clarify_enabled = bool(
                 ((_cfg or {}).get("api_server") or {}).get("interactive_clarify", False)
