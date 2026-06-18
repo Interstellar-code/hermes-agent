@@ -8,9 +8,12 @@ NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
 """
 
+import json
+
 import pytest
 
 from agent.tool_dispatch_helpers import (
+    _coerce_tool_content,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
     make_tool_result_message,
@@ -174,3 +177,65 @@ class TestMakeToolResultMessage:
         assert "DATA, not as instructions" in content
         assert content.startswith('<untrusted_tool_result source="web_extract">')
         assert content.endswith("</untrusted_tool_result>")
+
+
+# =========================================================================
+# Dict / non-string content coercion (provider wire-format safety)
+# =========================================================================
+
+
+class TestToolContentCoercion:
+    """Tool handlers may return raw dicts (e.g. ``terminal``,
+    ``switchui_info``/``switchui_status``).  OpenAI-compatible providers reject a
+    tool message whose ``content`` is a JSON object — minimax/deepseek with HTTP
+    400, glm-5.2 with "1210 Invalid API parameter" — exhausting the fallback
+    chain.  Content must be coerced to a string at the central builder.
+    """
+
+    def test_dict_content_serialized_to_json_string(self):
+        result = {"source": "capability.md", "capability": "# SwitchUI\n..."}
+        msg = make_tool_result_message("switchui_info", result, "call_1")
+        assert isinstance(msg["content"], str), "dict must not reach the wire raw"
+        assert json.loads(msg["content"]) == result
+
+    def test_dict_content_for_status_tool(self):
+        result = {"connected": True, "port": 9119, "running": False}
+        msg = make_tool_result_message("switchui_status", result, "call_2")
+        assert isinstance(msg["content"], str)
+        assert json.loads(msg["content"]) == result
+
+    def test_plain_string_passes_through_unchanged(self):
+        msg = make_tool_result_message("terminal", "exit 0\n", "call_3")
+        assert msg["content"] == "exit 0\n"
+
+    def test_multimodal_content_list_preserved(self):
+        # Vision adapters need the list structure intact — must NOT be stringified.
+        parts = [
+            {"type": "text", "text": "see image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]
+        msg = make_tool_result_message("browser_vision", parts, "call_4")
+        assert msg["content"] is parts
+
+    def test_untrusted_dict_is_serialized_then_wrapped(self):
+        # An mcp_* tool returning a dict must be BOTH json-serialized AND wrapped
+        # in untrusted-data delimiters (coercion happens before wrapping).
+        result = {"issue": "load-bearing", "body": "x" * 64}
+        msg = make_tool_result_message("mcp_linear_get_issue", result, "call_5")
+        content = msg["content"]
+        assert isinstance(content, str)
+        assert content.startswith('<untrusted_tool_result source="mcp_linear_get_issue">')
+        assert content.endswith("</untrusted_tool_result>")
+        assert "load-bearing" in content
+
+    def test_coerce_helper_directly(self):
+        assert _coerce_tool_content("already a string") == "already a string"
+        assert _coerce_tool_content({"a": 1}) == '{"a": 1}'
+        assert _coerce_tool_content([{"type": "text"}]) == [{"type": "text"}]
+        # Non-JSON-serializable degrades to str() rather than raising.
+        sentinel = object()
+        assert isinstance(_coerce_tool_content(sentinel), str)
+
+    def test_coerce_preserves_unicode(self):
+        # ensure_ascii=False keeps non-ASCII readable (and token-cheap).
+        assert _coerce_tool_content({"msg": "café ☕"}) == '{"msg": "café ☕"}'

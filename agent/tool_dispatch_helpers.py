@@ -317,6 +317,30 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def _coerce_tool_content(content: Any) -> Any:
+    """Coerce a tool result to a provider-safe wire shape.
+
+    OpenAI-compatible chat APIs require a tool message's ``content`` to be a
+    string (or, for vision adapters, a list of content parts).  Tool handlers
+    are free to return a raw dict/scalar (e.g. ``terminal`` returns a dict, and
+    plugin tools like ``switchui_info``/``switchui_status`` return dicts).  When
+    such a dict reached the wire unchanged, OpenAI-compatible providers rejected
+    the request — minimax/deepseek with HTTP 400, glm-5.2 with "1210 Invalid API
+    parameter" — exhausting the fallback chain.
+
+    A ``str`` passes through unchanged; a ``list`` (multimodal content parts:
+    ``[{type:text}, {type:image_url}]``) passes through so vision adapters keep a
+    valid structure; everything else is JSON-serialized (``default=str`` so
+    non-serializable values degrade gracefully rather than raising).
+    """
+    if isinstance(content, (str, list)):
+        return content
+    try:
+        return json.dumps(content, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
 def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -329,11 +353,14 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     and MCP responses — it changes how the model interprets the content rather
     than relying on regex pattern matching catching every payload.
 
-    Wrapping only happens for plain string content.  Multimodal results
-    (content lists with image_url parts) pass through unwrapped so the
+    Non-string, non-multimodal content is JSON-serialized first (see
+    ``_coerce_tool_content``) so a dict-returning tool can't ship a raw object
+    that providers reject.  Coercion happens BEFORE wrapping so an untrusted
+    tool returning a dict still gets both serialized and wrapped.  Multimodal
+    results (content lists with image_url parts) pass through unwrapped so the
     list structure stays valid for vision-capable adapters.
     """
-    wrapped = _maybe_wrap_untrusted(name, content)
+    wrapped = _maybe_wrap_untrusted(name, _coerce_tool_content(content))
     return {
         "role": "tool",
         "name": name,
