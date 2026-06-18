@@ -1,5 +1,7 @@
 """Tests for the ChatCompletionsTransport."""
 
+import json
+
 import pytest
 from types import SimpleNamespace
 
@@ -103,6 +105,41 @@ class TestChatCompletionsBasic:
         assert result[2]["tool_call_id"] == "call_1"
         # Original list untouched (deepcopy-on-demand)
         assert msgs[2]["tool_name"] == "execute_code"
+
+    def test_convert_messages_coerces_dict_tool_content(self, transport):
+        """A role=tool message whose content is a dict (e.g. reloaded from
+        session history persisted before serialization) is invalid wire format —
+        OpenAI-compatible providers 400, glm-5.2 reports '1210 Invalid API
+        parameter'. convert_messages must JSON-serialize it so poisoned sessions
+        self-heal on the next turn.
+        """
+        result_dict = {"source": "capability.md", "capability": "# SwitchUI"}
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "switchui_info", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": result_dict},
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.2")
+        assert isinstance(result[2]["content"], str), "dict must be serialized"
+        assert json.loads(result[2]["content"]) == result_dict
+        # Original list untouched (deepcopy-on-demand)
+        assert isinstance(msgs[2]["content"], dict)
+
+    def test_convert_messages_preserves_string_and_multimodal_tool_content(self, transport):
+        """The coercion must not touch already-valid content: plain strings and
+        multimodal content-part lists (vision results) pass through unchanged.
+        """
+        parts = [{"type": "text", "text": "see"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
+        msgs = [
+            {"role": "tool", "tool_call_id": "c1", "content": "plain string"},
+            {"role": "tool", "tool_call_id": "c2", "content": parts},
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.2")
+        assert result[0]["content"] == "plain string"
+        assert result[1]["content"] == parts
 
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.

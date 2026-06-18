@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -178,6 +179,16 @@ class ChatCompletionsTransport(ProviderTransport):
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
                 needs_sanitize = True
                 break
+            # A role=tool message whose content is not a string is invalid wire
+            # format for OpenAI-compatible providers (they 400; glm-5.2 reports
+            # "1210 Invalid API parameter"). This can be reached from reloaded
+            # session history persisted before the dict was coerced, so detect
+            # it here too — not just at message-build time.
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                needs_sanitize = True
+                break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
@@ -206,6 +217,19 @@ class ChatCompletionsTransport(ProviderTransport):
             # is safe and future-proofs against new markers being added.
             for key in [k for k in msg if isinstance(k, str) and k.startswith("_")]:
                 msg.pop(key, None)
+            # Coerce non-string tool content (e.g. a dict persisted in session
+            # history before it was serialized) to a JSON string so the provider
+            # accepts the wire format. Lists (multimodal content parts) and the
+            # already-correct string case pass through untouched.
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                try:
+                    msg["content"] = json.dumps(
+                        msg.get("content"), default=str, ensure_ascii=False
+                    )
+                except (TypeError, ValueError):
+                    msg["content"] = str(msg.get("content"))
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
