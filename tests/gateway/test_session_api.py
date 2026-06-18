@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -48,6 +49,11 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_post("/api/sessions/{session_id}/chat/clarify", adapter._handle_session_clarify)
+    app.router.add_post(
+        "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
+        adapter._handle_session_interaction_respond,
+    )
     return app
 
 
@@ -72,6 +78,14 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert data["endpoints"]["session_chat_stream"] == {
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
+    }
+    assert data["endpoints"]["session_chat_clarify"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/chat/clarify",
+    }
+    assert data["endpoints"]["session_chat_interaction_respond"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
     }
 
 
@@ -141,6 +155,137 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["title"] == "Alternative"
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
+
+
+@pytest.mark.asyncio
+async def test_session_clarify_endpoint_statuses_events_and_persists_receipt(adapter, session_db):
+    from tools.clarify_gateway import clear_session, register
+
+    session_id = session_db.create_session("clarify-session", "api_server")
+    app = _create_session_app(adapter)
+    events = []
+    adapter._clarify_streams[session_id] = lambda name, payload: events.append((name, payload))
+    clarify_id = "clarify_1"
+    register(clarify_id, session_id, "Pick a backend path?", ["Core", "Plugin"])
+    adapter._session_interactions[clarify_id] = {
+        "interaction_id": clarify_id,
+        "clarify_id": clarify_id,
+        "kind": "choice",
+        "tool_name": "clarify",
+        "session_id": session_id,
+        "run_id": "run_1",
+        "message_id": "msg_1",
+        "question": "Pick a backend path?",
+        "choices": ["Core", "Plugin"],
+    }
+
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            missing = await cli.post(f"/api/sessions/{session_id}/chat/clarify", json={"answer": "Core"})
+            assert missing.status == 400
+            assert (await missing.json())["error"]["code"] == "clarify_id_required"
+
+            ok = await cli.post(
+                f"/api/sessions/{session_id}/chat/clarify",
+                json={"clarify_id": clarify_id, "answer": "Core"},
+            )
+            assert ok.status == 200, await ok.text()
+            payload = await ok.json()
+            assert payload["object"] == "hermes.session.clarify_response"
+            assert payload["clarify_id"] == clarify_id
+            assert payload["resolved"] is True
+
+            stale = await cli.post(
+                f"/api/sessions/{session_id}/chat/clarify",
+                json={"clarify_id": clarify_id, "answer": "Plugin"},
+            )
+            assert stale.status == 409
+            assert (await stale.json())["error"]["code"] == "clarify_not_pending"
+    finally:
+        clear_session(session_id)
+
+    event_names = [name for name, _ in events]
+    assert event_names == ["clarify.responded", "interaction.responded"]
+    responded = events[0][1]
+    assert responded["clarify_id"] == clarify_id
+    assert responded["interaction_id"] == clarify_id
+    assert responded["run_id"] == "run_1"
+    assert responded["message_id"] == "msg_1"
+    assert responded["question"] == "Pick a backend path?"
+    assert responded["choices"] == ["Core", "Plugin"]
+    assert responded["answer"] == "Core"
+    assert responded["selected_answer"] == "Core"
+    assert responded["resolved"] is True
+
+    messages = session_db.get_messages(session_id)
+    receipt_msg = messages[-1]
+    assert receipt_msg["role"] == "tool"
+    assert receipt_msg["tool_name"] == "clarify"
+    receipt = json.loads(receipt_msg["content"])
+    assert receipt == {
+        "type": "interaction_receipt",
+        "kind": "choice",
+        "tool_name": "clarify",
+        "interaction_id": clarify_id,
+        "clarify_id": clarify_id,
+        "session_id": session_id,
+        "run_id": "run_1",
+        "message_id": "msg_1",
+        "question": "Pick a backend path?",
+        "choices": ["Core", "Plugin"],
+        "selected_answer": "Core",
+        "resolved": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_session_interaction_respond_endpoint_resolves_clarify(adapter, session_db):
+    from tools.clarify_gateway import clear_session, register
+
+    session_id = session_db.create_session("interaction-session", "api_server")
+    interaction_id = "interaction_1"
+    register(interaction_id, session_id, "Type a value", None)
+    adapter._session_interactions[interaction_id] = {
+        "interaction_id": interaction_id,
+        "clarify_id": interaction_id,
+        "kind": "text",
+        "tool_name": "clarify",
+        "session_id": session_id,
+        "run_id": "run_2",
+        "message_id": "msg_2",
+        "question": "Type a value",
+        "choices": None,
+    }
+
+    app = _create_session_app(adapter)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            ok = await cli.post(
+                f"/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
+                json={"answer": "free text"},
+            )
+            assert ok.status == 200, await ok.text()
+            payload = await ok.json()
+            assert payload["object"] == "hermes.session.interaction_response"
+            assert payload["interaction_id"] == interaction_id
+            assert payload["clarify_id"] == interaction_id
+            assert payload["resolved"] is True
+
+            stale = await cli.post(
+                f"/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
+                json={"answer": "again"},
+            )
+            assert stale.status == 409
+            assert (await stale.json())["error"]["code"] == "interaction_not_pending"
+    finally:
+        clear_session(session_id)
+
+    receipt = json.loads(session_db.get_messages(session_id)[-1]["content"])
+    assert receipt["kind"] == "text"
+    assert receipt["question"] == "Type a value"
+    assert receipt["choices"] is None
+    assert receipt["selected_answer"] == "free text"
+    assert receipt["resolved"] is True
 
 
 @pytest.mark.asyncio
@@ -335,6 +480,71 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
     # The tool call is preserved alongside the intermediate text.
     assert any(m.get("tool_calls") for m in messages)
 
+
+
+@pytest.mark.asyncio
+async def test_run_approval_response_emits_event_and_persists_receipt(adapter, session_db):
+    session_id = session_db.create_session("approval-session", "api_server")
+    run_id = "run_approval_test"
+    approval_id = "approval_1"
+    approval_session_key = "approval-session-key"
+    adapter._run_statuses[run_id] = {"status": "waiting_for_approval", "session_id": session_id}
+    adapter._run_approval_sessions[run_id] = approval_session_key
+    queue = __import__("asyncio").Queue()
+    adapter._run_streams[run_id] = queue
+    adapter._run_approval_requests[run_id] = [{
+        "event": "approval.request",
+        "approval_id": approval_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "message_id": "msg_approval",
+        "timestamp": 123.0,
+        "command": "rm -rf /tmp/example",
+        "description": "Dangerous command",
+        "pattern_key": "dangerous_rm",
+        "pattern_keys": ["dangerous_rm"],
+        "choices": ["once", "session", "always", "deny"],
+    }]
+
+    app = _create_session_app(adapter)
+    app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    with patch("tools.approval.resolve_gateway_approval", return_value=1):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/v1/runs/{run_id}/approval", json={"choice": "approve"})
+            assert resp.status == 200, await resp.text()
+            payload = await resp.json()
+
+    assert payload["object"] == "hermes.run.approval_response"
+    assert payload["approval_id"] == approval_id
+    assert payload["choice"] == "once"
+    assert payload["approved"] is True
+    assert payload["resolved"] == 1
+
+    event = queue.get_nowait()
+    assert event["event"] == "approval.responded"
+    assert event["approval_id"] == approval_id
+    assert event["session_id"] == session_id
+    assert event["run_id"] == run_id
+    assert event["message_id"] == "msg_approval"
+    assert event["choice"] == "once"
+    assert event["approved"] is True
+    assert event["resolved"] == 1
+    assert event["action"] == "rm -rf /tmp/example"
+    assert event["context"] == "Dangerous command"
+    assert event["choices"] == ["once", "session", "always", "deny"]
+
+    receipt_msg = session_db.get_messages(session_id)[-1]
+    assert receipt_msg["role"] == "tool"
+    assert receipt_msg["tool_name"] == "approval"
+    receipt = json.loads(receipt_msg["content"])
+    assert receipt["kind"] == "approval"
+    assert receipt["tool_name"] == "approval"
+    assert receipt["approval_id"] == approval_id
+    assert receipt["action"] == "rm -rf /tmp/example"
+    assert receipt["context"] == "Dangerous command"
+    assert receipt["selected_answer"] == "once"
+    assert receipt["approved"] is True
+    assert receipt["resolved"] == 1
 
 
 @pytest.mark.asyncio

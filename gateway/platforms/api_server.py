@@ -729,6 +729,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # LOCAL_DELTA(interactive-clarify): approval request metadata for durable receipts.
+        self._run_approval_requests: Dict[str, List[Dict[str, Any]]] = {}
         # Active interactive-clarify streams: session_id -> the chat-stream's
         # thread-safe ``_enqueue(name, payload)`` callable.  The clarify resume
         # route (POST /api/sessions/{session_id}/chat/clarify) looks up the
@@ -737,6 +739,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # ``_run_approval_sessions`` for the approval flow, but keyed by
         # session_id because the chat-stream run_id is request-local.
         self._clarify_streams: Dict[str, Any] = {}
+        # LOCAL_DELTA(interactive-clarify): durable Switch UI interaction receipts.
+        # Active session-chat interactions keyed by public interaction id.
+        self._session_interactions: Dict[str, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
 
     @staticmethod
@@ -1010,24 +1015,20 @@ class APIServerAdapter(BasePlatformAdapter):
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
-        # Gated interactive `clarify` injection.
-        #
-        # `clarify` is deliberately kept out of the static hermes-api-server
-        # toolset (see toolsets.py) because it blocks the agent thread for up
-        # to ~10 minutes awaiting a human answer — fatal for headless
-        # OpenAI-compat clients.  We add it to the resolved toolset ONLY when
-        # BOTH hold:
+        # LOCAL_DELTA(interactive-clarify): keep `clarify` in the static
+        # hermes-api-server toolset for capability/config reporting, but expose
+        # it to an agent ONLY when BOTH hold:
         #   1. the caller is the interactive SSE chat-stream path
         #      (interactive_clarify=True — never set by headless handlers), and
         #   2. the operator opted in via config.yaml `api_server.interactive_clarify`.
-        # The config gate is the documented enable switch; the parameter gate
-        # ensures headless paths can never receive clarify even if the flag is
-        # on.  Both must be true, so the default (flag absent) is safe.
-        if interactive_clarify:
-            api_cfg = (user_config or {}).get("api_server") or {}
-            if bool(api_cfg.get("interactive_clarify", False)):
-                if "clarify" not in enabled_toolsets:
-                    enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
+        # This preserves the OpenAI-compatible stateless paths as non-blocking
+        # even though the platform composite contains the clarify tool name.
+        api_cfg = (user_config or {}).get("api_server") or {}
+        clarify_allowed = interactive_clarify and bool(api_cfg.get("interactive_clarify", False))
+        if not clarify_allowed and "clarify" in enabled_toolsets:
+            enabled_toolsets = sorted(set(enabled_toolsets) - {"clarify"})
+        elif clarify_allowed and "clarify" not in enabled_toolsets:
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -1201,7 +1202,168 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_chat_clarify": {"method": "POST", "path": "/api/sessions/{session_id}/chat/clarify"},
+                "session_chat_interaction_respond": {
+                    "method": "POST",
+                    "path": "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
+                },
             },
+        })
+
+    def _persist_interaction_receipt(self, session_id: str, meta: Dict[str, Any], answer: str, resolved: bool) -> None:
+        """Persist a transcript-visible receipt for an interactive tool response."""
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        receipt = {
+            "type": "interaction_receipt",
+            "kind": meta.get("kind") or "choice",
+            "tool_name": meta.get("tool_name") or "clarify",
+            "interaction_id": meta.get("interaction_id"),
+            "clarify_id": meta.get("clarify_id"),
+            "session_id": session_id,
+            "run_id": meta.get("run_id"),
+            "message_id": meta.get("message_id"),
+            "question": meta.get("question"),
+            "choices": meta.get("choices"),
+            "selected_answer": answer,
+            "resolved": bool(resolved),
+        }
+        try:
+            db.append_message(
+                session_id=session_id,
+                role="tool",
+                content=json.dumps(receipt, ensure_ascii=False),
+                tool_name=receipt["tool_name"],
+                tool_call_id=receipt["interaction_id"],
+                observed=True,
+            )
+        except Exception:
+            logger.warning("[api_server] failed to persist interaction receipt", exc_info=True)
+
+    def _persist_approval_receipt(self, session_id: str, meta: Dict[str, Any], choice: str, resolved: int) -> None:
+        """Persist a transcript-visible receipt for terminal/Tirith approvals."""
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        receipt = {
+            "type": "interaction_receipt",
+            "kind": "approval",
+            "tool_name": "approval",
+            "approval_id": meta.get("approval_id"),
+            "session_id": session_id,
+            "run_id": meta.get("run_id"),
+            "message_id": meta.get("message_id"),
+            "action": meta.get("command"),
+            "context": meta.get("description"),
+            "pattern_key": meta.get("pattern_key"),
+            "pattern_keys": meta.get("pattern_keys"),
+            "choices": meta.get("choices") or ["once", "session", "always", "deny"],
+            "selected_answer": choice,
+            "approved": choice != "deny",
+            "resolved": int(resolved),
+        }
+        try:
+            db.append_message(
+                session_id=session_id,
+                role="tool",
+                content=json.dumps(receipt, ensure_ascii=False),
+                tool_name="approval",
+                tool_call_id=receipt["approval_id"],
+                observed=True,
+            )
+        except Exception:
+            logger.warning("[api_server] failed to persist approval receipt", exc_info=True)
+
+    def _interaction_event_payload(self, meta: Dict[str, Any], answer: Optional[str] = None, resolved: Optional[bool] = None) -> Dict[str, Any]:
+        payload = {
+            "interaction_id": meta.get("interaction_id"),
+            "clarify_id": meta.get("clarify_id"),
+            "kind": meta.get("kind") or "choice",
+            "tool_name": meta.get("tool_name") or "clarify",
+            "session_id": meta.get("session_id"),
+            "run_id": meta.get("run_id"),
+            "message_id": meta.get("message_id"),
+            "question": meta.get("question"),
+            "choices": meta.get("choices"),
+        }
+        if answer is not None:
+            payload["answer"] = answer
+            payload["selected_answer"] = answer
+        if resolved is not None:
+            payload["resolved"] = bool(resolved)
+        return payload
+
+    async def _resolve_session_interaction(
+        self,
+        session_id: str,
+        interaction_id: str,
+        answer: str,
+        *,
+        missing_code: str = "interaction_id_required",
+        object_name: str = "hermes.session.interaction_response",
+    ) -> "web.Response":
+        interaction_id = str(interaction_id or "").strip()
+        if not interaction_id:
+            return web.json_response(
+                _openai_error("interaction_id is required", code=missing_code),
+                status=400,
+            )
+
+        meta = self._session_interactions.get(interaction_id)
+        if not meta or meta.get("session_id") != session_id:
+            return web.json_response(
+                _openai_error(
+                    f"No pending interaction: {interaction_id}",
+                    code="clarify_not_pending" if missing_code == "clarify_id_required" else "interaction_not_pending",
+                ),
+                status=409,
+            )
+
+        kind = meta.get("kind") or "choice"
+        if meta.get("tool_name") != "clarify" or kind not in {"choice", "text"}:
+            return web.json_response(
+                _openai_error(
+                    f"Unsupported interaction kind: {kind}",
+                    code="unsupported_interaction_kind",
+                ),
+                status=400,
+            )
+
+        clarify_id = str(meta.get("clarify_id") or interaction_id)
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = resolve_gateway_clarify(clarify_id, answer)
+        except Exception:
+            logger.exception("[api_server] clarify resolution failed for %s", clarify_id)
+            resolved = False
+
+        if not resolved:
+            return web.json_response(
+                _openai_error(
+                    f"No pending clarify: {clarify_id}",
+                    code="clarify_not_pending",
+                ),
+                status=409,
+            )
+
+        self._session_interactions.pop(interaction_id, None)
+        event_payload = self._interaction_event_payload(meta, answer=answer, resolved=True)
+        self._persist_interaction_receipt(session_id, meta, answer, True)
+
+        enqueue = self._clarify_streams.get(session_id)
+        if enqueue is not None:
+            try:
+                enqueue("clarify.responded", dict(event_payload))
+                enqueue("interaction.responded", dict(event_payload))
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": object_name,
+            "session_id": session_id,
+            "interaction_id": interaction_id,
+            "clarify_id": clarify_id,
+            "resolved": True,
         })
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
@@ -1665,20 +1827,30 @@ class APIServerAdapter(BasePlatformAdapter):
             import uuid as _uuid
 
             clarify_id = _uuid.uuid4().hex[:10]
+            normalized_choices = list(choices) if choices else None
             _clarify_mod.register(
                 clarify_id=clarify_id,
                 session_key=clarify_session_key or "",
                 question=question,
-                choices=list(choices) if choices else None,
+                choices=normalized_choices,
             )
+            interaction_meta = {
+                "interaction_id": clarify_id,
+                "clarify_id": clarify_id,
+                "kind": "choice" if normalized_choices else "text",
+                "tool_name": "clarify",
+                "session_id": session_id,
+                "run_id": run_id,
+                "message_id": message_id,
+                "question": question,
+                "choices": normalized_choices,
+            }
+            self._session_interactions[clarify_id] = interaction_meta
+            request_payload = self._interaction_event_payload(interaction_meta)
             # Surface the prompt to the connected client and mark the run as
             # blocked (mirrors approval's ``waiting_for_approval`` status).
-            _enqueue("clarify.request", {
-                "message_id": message_id,
-                "clarify_id": clarify_id,
-                "question": question,
-                "choices": list(choices) if choices else None,
-            })
+            _enqueue("clarify.request", dict(request_payload))
+            _enqueue("interaction.request", dict(request_payload))
             try:
                 self._set_run_status(
                     run_id,
@@ -1748,6 +1920,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # pending clarify so a never-answered prompt cannot leak across
                 # turns (mirrors run.py's clear_session on session boundary).
                 self._clarify_streams.pop(session_id, None)
+                for _iid, _meta in list(self._session_interactions.items()):
+                    if _meta.get("session_id") == session_id:
+                        self._session_interactions.pop(_iid, None)
                 try:
                     from tools.clarify_gateway import clear_session as _clear_clarify_session
                     _clear_clarify_session(clarify_session_key or "")
@@ -3824,17 +3999,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                    approval_id = f"approval_{uuid.uuid4().hex[:10]}"
                     event = dict(approval_data or {})
                     event.update({
                         "event": "approval.request",
+                        "approval_id": approval_id,
+                        "session_id": session_id,
                         "run_id": run_id,
+                        "message_id": approval_id,
                         "timestamp": time.time(),
                         "choices": ["once", "session", "always", "deny"],
                     })
+                    self._run_approval_requests.setdefault(run_id, []).append(dict(event))
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval_id=approval_id,
+                        session_id=session_id,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -3975,6 +4157,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_requests.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -4126,101 +4309,101 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        pending_requests = self._run_approval_requests.get(run_id) or []
+        if resolve_all:
+            approval_metas = list(pending_requests)
+            self._run_approval_requests.pop(run_id, None)
+        else:
+            approval_metas = [pending_requests.pop(0)] if pending_requests else []
+            if not pending_requests:
+                self._run_approval_requests.pop(run_id, None)
+        status_session_id = (status or {}).get("session_id") or run_id
+        if not approval_metas:
+            approval_metas = [{
+                "approval_id": f"approval_{run_id}",
+                "session_id": status_session_id,
+                "run_id": run_id,
+                "message_id": None,
+                "choices": ["once", "session", "always", "deny"],
+            }]
+        approval_meta = dict(approval_metas[0])
+        approval_id = approval_meta.get("approval_id")
+        self._persist_approval_receipt(status_session_id, approval_meta, choice, resolved)
+
+        self._set_run_status(run_id, "running", last_event="approval.responded", approval_id=approval_id)
+        event = {
+            "event": "approval.responded",
+            "approval_id": approval_id,
+            "session_id": status_session_id,
+            "run_id": run_id,
+            "message_id": approval_meta.get("message_id"),
+            "timestamp": time.time(),
+            "choice": choice,
+            "approved": choice != "deny",
+            "resolved": resolved,
+            "action": approval_meta.get("command"),
+            "context": approval_meta.get("description"),
+            "choices": approval_meta.get("choices") or ["once", "session", "always", "deny"],
+        }
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
+                q.put_nowait(event)
             except Exception:
                 pass
 
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "approval_id": approval_id,
             "choice": choice,
+            "approved": choice != "deny",
             "resolved": resolved,
         })
 
     async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/chat/clarify — resolve a pending clarify.
-
-        Mirrors ``_handle_run_approval`` for the interactive SSE chat-stream
-        path.  The Switch UI frontend consumes the ``clarify.request`` SSE event
-        (emitted by the chat-stream's clarify callback) and POSTs the user's
-        answer here.  Body: ``{"clarify_id": str, "answer": str}``.  We unblock
-        the waiting agent thread via ``clarify_gateway.resolve_gateway_clarify``
-        (module-level state, no back-reference to the run needed) and then push
-        a ``clarify.responded`` event onto the live stream so the client sees
-        the resolution.
-        """
+        """POST /api/sessions/{session_id}/chat/clarify — resolve a pending clarify."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         session_id = request.match_info["session_id"]
-
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         clarify_id = str(body.get("clarify_id", "")).strip()
-        # Accept both "answer" and "response" spellings for the user's reply.
         answer = body.get("answer")
         if answer is None:
             answer = body.get("response")
         answer = "" if answer is None else str(answer)
 
-        if not clarify_id:
-            return web.json_response(
-                _openai_error("clarify_id is required", code="clarify_id_required"),
-                status=400,
-            )
+        return await self._resolve_session_interaction(
+            session_id,
+            clarify_id,
+            answer,
+            missing_code="clarify_id_required",
+            object_name="hermes.session.clarify_response",
+        )
 
+    async def _handle_session_interaction_respond(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/interactions/{interaction_id}/respond."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        interaction_id = request.match_info["interaction_id"]
         try:
-            from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = resolve_gateway_clarify(clarify_id, answer)
+            body = await request.json()
         except Exception:
-            logger.exception("[api_server] clarify resolution failed for %s", clarify_id)
-            resolved = False
-
-        if not resolved:
-            # No pending clarify with that id (already answered, timed out, or
-            # belongs to a different/ended run).
-            return web.json_response(
-                _openai_error(
-                    f"No pending clarify: {clarify_id}",
-                    code="clarify_not_pending",
-                ),
-                status=409,
-            )
-
-        # Push clarify.responded onto the live SSE stream for this session, if
-        # one is still connected.  Resolution above already unblocked the agent
-        # thread; this event is purely informational for the client.
-        enqueue = self._clarify_streams.get(session_id)
-        if enqueue is not None:
-            try:
-                enqueue("clarify.responded", {
-                    "clarify_id": clarify_id,
-                    "answer": answer,
-                    "resolved": resolved,
-                })
-            except Exception:
-                pass
-
-        return web.json_response({
-            "object": "hermes.session.clarify_response",
-            "session_id": session_id,
-            "clarify_id": clarify_id,
-            "resolved": resolved,
-        })
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        answer = body.get("answer")
+        if answer is None:
+            answer = body.get("response")
+        answer = "" if answer is None else str(answer)
+        return await self._resolve_session_interaction(session_id, interaction_id, answer)
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
@@ -4287,6 +4470,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_requests.pop(run_id, None)
 
             stale_statuses = [
                 run_id
@@ -4329,6 +4513,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
             self._app.router.add_post("/api/sessions/{session_id}/chat/clarify", self._handle_session_clarify)
+            self._app.router.add_post(
+                "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
+                self._handle_session_interaction_respond,
+            )
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)

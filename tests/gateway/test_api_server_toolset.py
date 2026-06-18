@@ -44,9 +44,9 @@ class TestHermesApiServerToolset:
         for tool in ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"]:
             assert tool in tools, f"Missing HA tool: {tool}"
 
-    def test_toolset_excludes_clarify(self):
+    def test_toolset_includes_clarify_for_capability_reporting(self):
         tools = resolve_toolset("hermes-api-server")
-        assert "clarify" not in tools
+        assert "clarify" in tools
 
     def test_toolset_excludes_send_message(self):
         tools = resolve_toolset("hermes-api-server")
@@ -93,7 +93,36 @@ class TestApiServerAdapterToolset:
             toolsets = call_kwargs.kwargs.get("enabled_toolsets")
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
+            assert "clarify" not in toolsets
             assert call_kwargs.kwargs.get("platform") == "api_server"
+
+
+    @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
+    def test_create_agent_includes_clarify_only_when_both_interactive_gates_are_active(self):
+        """Static toolset has clarify, but agent exposure still requires both gates."""
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = APIServerAdapter(PlatformConfig())
+
+        with (
+            patch("gateway.run._resolve_runtime_agent_kwargs") as mock_kwargs,
+            patch("gateway.run._resolve_gateway_model") as mock_model,
+            patch("gateway.run._load_gateway_config") as mock_config,
+            patch("run_agent.AIAgent") as mock_agent_cls,
+        ):
+
+            mock_kwargs.return_value = {"api_key": "test-key", "base_url": None,
+                                        "provider": None, "api_mode": None,
+                                        "command": None, "args": []}
+            mock_model.return_value = "test/model"
+            mock_config.return_value = {"api_server": {"interactive_clarify": True}}
+            mock_agent_cls.return_value = MagicMock()
+
+            adapter._create_agent(interactive_clarify=True)
+
+            toolsets = mock_agent_cls.call_args.kwargs.get("enabled_toolsets")
+            assert "clarify" in toolsets
 
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_respects_config_override(self):

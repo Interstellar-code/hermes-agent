@@ -805,6 +805,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # LOCAL_DELTA(interactive-clarify): Switch UI can opt into interactive
+    # session-chat clarify while stateless OpenAI-compatible paths stay safe.
+    "api_server": {
+        "interactive_clarify": False,
+    },
     "agent": {
         "max_turns": 90,
         # Inactivity timeout for gateway agent execution (seconds).
