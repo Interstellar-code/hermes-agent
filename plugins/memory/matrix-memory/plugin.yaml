@@ -1,0 +1,3 @@
+name: matrix-memory
+version: 0.1.0
+description: "Matrix Memory — local-first three-tier memory provider with wiki + SQLite FTS recall."
