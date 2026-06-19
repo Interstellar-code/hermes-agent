@@ -18,7 +18,7 @@ _GOLDEN_EVENTS = _FIXTURES / "golden-events.json"
 
 
 def _load_golden_events():
-    with open(_GOLDEN_EVENTS) as f:
+    with open(_GOLDEN_EVENTS, encoding="utf-8") as f:
         return json.load(f)
 
 
