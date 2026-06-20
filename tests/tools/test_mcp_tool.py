@@ -3782,6 +3782,7 @@ class TestRegisterMcpServers:
         _servers.pop("srv", None)
 
 
+
 # ---------------------------------------------------------------------------
 # Tests for parallel tool call support (port from openai/codex#17667)
 # ---------------------------------------------------------------------------
