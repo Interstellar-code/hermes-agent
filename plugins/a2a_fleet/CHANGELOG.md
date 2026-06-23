@@ -1,5 +1,38 @@
 # a2a_fleet — Changelog
 
+## v0.8.15 — oc receiver ergonomics: workdir prompt injection, wait-for-reply client helper, duplicate-dispatch guard
+
+Addresses three issues surfaced by a Phase-1 oc-receiver field test (reviewer was
+on ~0.8.9; two earlier-reported P0s — opencode `cwd` and `receiver_token`
+persistence — were already fixed in 0.8.10–0.8.12 and are not repeated here).
+
+- **Workdir injected into the role prompt (P1-7):** the static `A2A_ROLE_TEXT`
+  said "cwd is pinned" but never stated the actual path, so OpenCode guessed its
+  working directory and relative-path tool calls could silently hit the wrong
+  dir. `oc_deploy.py` now builds the role text via `role_text_for(repo_path)`,
+  appending the concrete `repo_path` plus a "use absolute paths" directive at
+  both the receiver-config and `.hermes/A2A.md` write sites.
+
+- **`send_message_and_wait()` client helper (P0-4):** async receivers (opencode)
+  return a `[queued]` ack and deliver the real reply later, forcing callers to
+  sleep-and-tail by hand. The new `client.send_message_and_wait(...)` returns
+  immediately for synchronous receivers, and for async ones polls the receiver's
+  transcript jsonl (located via the peer's `repo_path` or an explicit
+  `transcript_path=`) by `context_id` for the final reply, with a `max_wait`
+  deadline. Same-machine + oc-specific; cross-machine peers still use the
+  push-back-to-Hermes channel.
+
+- **Duplicate-dispatch guard with distinct error code (P1-5):** a second dispatch
+  on a context already running a turn used to be silently accepted as a second
+  indistinguishable `[queued]` ack. The oc receiver now tracks in-flight
+  contexts (`claim_inflight`/`release_inflight`, released in a `finally` around
+  the turn) and rejects a duplicate with JSON-RPC **`-32001`**
+  ("duplicate dispatch… retry"). `server.py`'s Route B `A2ABusyError` now uses
+  the same `-32001` code (was the generic `-32000`) so clients can branch on it.
+  - **Behavior change:** a concurrent same-context dispatch is now rejected
+    (client retries) instead of queued-and-serialized. Sequential follow-ups
+    after a turn completes are unaffected.
+
 ## v0.8.14 — A2A listener starts on adapter.connect() (bind-race + bridge-colocation fix) + Hermes↔Hermes peering docs (#120)
 
 - **Bind-race / bridge-colocation fix (blocker, proven broken at runtime):**

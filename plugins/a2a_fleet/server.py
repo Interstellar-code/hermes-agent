@@ -39,6 +39,10 @@ from .response_handler import HandlerResult, echo_handler
 # Immutable handler registry — looked up per request by response_handler config key.
 HANDLERS = {"echo": echo_handler, "llm": llm_handler}
 
+# Distinct JSON-RPC error code for "busy / duplicate dispatch, retry" so clients
+# can branch on it instead of the generic -32000 server error (P1-5).
+A2A_BUSY_CODE = -32001
+
 log = logging.getLogger("a2a_fleet.server")
 
 
@@ -230,7 +234,7 @@ def build_app() -> FastAPI:
                         timeout,
                     )
                 except A2ABusyError as exc:
-                    return _rpc_error(rpc_id, -32000, f"peer busy on this context, retry: {exc}")
+                    return _rpc_error(rpc_id, A2A_BUSY_CODE, f"peer busy on this context, retry: {exc}")
                 except A2ABridgeNotReady as exc:
                     return _rpc_error(rpc_id, -32000, f"agent bridge not ready: {exc}")
                 except TimeoutError as exc:

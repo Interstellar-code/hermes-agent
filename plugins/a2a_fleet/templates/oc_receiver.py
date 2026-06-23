@@ -58,6 +58,9 @@ CONFIG_PATH = SCRIPT_DIR / "oc_receiver.json"
 INBOX_PATH = SCRIPT_DIR / "a2a-oc-inbox.jsonl"
 INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-oc-inbox.offset"
 TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-oc-transcript.jsonl"
+# Distinct JSON-RPC error code for "busy / duplicate dispatch, retry" so clients
+# can branch on it instead of the generic -32000 server error (P1-5).
+A2A_BUSY_CODE = -32001
 PID_PATH = SCRIPT_DIR / "oc_receiver.pid"
 
 # Cap on a single inbound JSON-RPC body (DoS guard) and the prompt we hand to
@@ -778,6 +781,28 @@ class Receiver:
         # Idle-timeout self-teardown bookkeeping.
         self._last_msg_ts = time.monotonic()
         self._on_idle_shutdown = on_idle_shutdown
+        # In-flight context guard (P1-5): a context_id is "in flight" from the
+        # moment do_POST queues a turn until process_message finishes it. A
+        # second dispatch for the same context while one is in flight is a
+        # duplicate -> rejected with a distinct error so clients can dedup,
+        # instead of silently accepting a second [queued] ack.
+        self._inflight: set = set()
+        self._inflight_lock = threading.Lock()
+
+    # -- in-flight context guard -------------------------------------------
+
+    def claim_inflight(self, context_id: str) -> bool:
+        """Atomically mark ``context_id`` in flight. Return False if already in
+        flight (caller should reject the dispatch as a duplicate)."""
+        with self._inflight_lock:
+            if context_id in self._inflight:
+                return False
+            self._inflight.add(context_id)
+            return True
+
+    def release_inflight(self, context_id: str) -> None:
+        with self._inflight_lock:
+            self._inflight.discard(context_id)
 
     # -- inbox offset -------------------------------------------------------
 
@@ -795,6 +820,14 @@ class Receiver:
     # -- turn processing ----------------------------------------------------
 
     def process_message(self, context_id: str, text: str) -> Optional[str]:
+        """Run the turn, then always clear the in-flight claim (P1-5) so the next
+        dispatch on this context is accepted."""
+        try:
+            return self._run_turn(context_id, text)
+        finally:
+            self.release_inflight(context_id)
+
+    def _run_turn(self, context_id: str, text: str) -> Optional[str]:
         """Bounded-concurrency + per-context serialization, run turn, POST reply."""
         # Global concurrency cap: bounded wait, then reply [busy] (never block
         # the poll-spawned thread forever).
@@ -1075,6 +1108,15 @@ def make_handler(
             message = params.get("message") or {}
             # Missing contextId -> fresh uuid4 (no shared anon sentinel).
             context_id = message.get("contextId") or f"anon-{uuid.uuid4()}"
+            # P1-5: reject a duplicate dispatch while this context already has a
+            # turn in flight, so the client can dedup instead of getting a second
+            # indistinguishable [queued] ack. Cleared when the turn completes.
+            if receiver is not None and not receiver.claim_inflight(context_id):
+                self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
+                                 "error": {"code": A2A_BUSY_CODE,
+                                           "message": "duplicate dispatch: context already has a "
+                                                      "turn in flight; retry after it completes"}})
+                return
             # Queue to inbox; the poll loop processes asynchronously. The append
             # is serialized via _INBOX_LOCK so concurrent POSTs can't tear lines.
             try:
@@ -1085,6 +1127,8 @@ def make_handler(
                     "text": text,
                 }, _INBOX_LOCK)
             except OSError as exc:
+                if receiver is not None:
+                    receiver.release_inflight(context_id)
                 self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
                                  "error": {"code": -32000, "message": f"inbox write failed: {exc}"}})
                 return

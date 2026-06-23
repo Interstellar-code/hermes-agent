@@ -6,8 +6,10 @@ requests using ``httpx`` directly. No ``a2a-sdk`` dependency in v0.1.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
@@ -114,6 +116,142 @@ async def send_message(
     except ValueError as exc:
         raise FleetClientError(f"peer {agent_name!r} returned non-JSON body") from exc
     return _extract_reply(body)
+
+
+# ---------------------------------------------------------------------------
+# Wait-for-reply helper (P0-4)
+#
+# Some receivers (notably the opencode receiver) cannot finish inside the HTTP
+# request: they return an immediate "[queued]" ack and write the real reply to
+# a local transcript jsonl later, also POSTing it back to Hermes. For the
+# CLI/testing path there is no inbound listener, so callers had to sleep + tail
+# the transcript by hand. ``send_message_and_wait`` automates exactly that poll.
+# ---------------------------------------------------------------------------
+
+QUEUED_MARKER = "[queued]"
+OC_TRANSCRIPT_REL = ".hermes/a2a-oc-transcript.jsonl"
+
+
+def _resolve_transcript_path(
+    agent_entry: Dict[str, Any], transcript_path: Optional[str]
+) -> Optional[Path]:
+    if transcript_path:
+        return Path(transcript_path)
+    repo = agent_entry.get("repo_path")
+    if repo:
+        return Path(repo) / OC_TRANSCRIPT_REL
+    return None
+
+
+def _scan_transcript_reply(
+    path: Path, context_id: str, start_offset: int
+) -> tuple[Optional[str], int]:
+    """Scan transcript bytes appended after ``start_offset`` for the peer's final
+    reply on ``context_id``. Returns ``(reply_text_or_None, new_offset)``.
+
+    A "final" reply is a record addressed ``to == "hermes"`` from the peer that
+    is not the ``[queued]`` ack and not a ``(busy)`` notice.
+    """
+    try:
+        if path.stat().st_size <= start_offset:
+            return None, start_offset
+    except OSError:
+        return None, start_offset
+    with path.open("r") as f:
+        f.seek(start_offset)
+        data = f.read()
+        new_offset = f.tell()
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if rec.get("contextId") != context_id:
+            continue
+        if rec.get("to") != "hermes" or rec.get("from") == "hermes":
+            continue
+        direction = rec.get("dir", "")
+        if "(ack)" in direction or "(busy)" in direction:
+            continue
+        text = rec.get("text", "")
+        if QUEUED_MARKER in text:
+            continue
+        return text, new_offset
+    return None, new_offset
+
+
+async def send_message_and_wait(
+    agent_name: str,
+    text: str,
+    *,
+    context_id: Optional[str] = None,
+    transcript_path: Optional[str] = None,
+    max_wait: float = 280.0,
+    poll_interval: float = 2.0,
+    send_timeout: float = 30.0,
+    client: Optional[httpx.AsyncClient] = None,
+) -> Dict[str, Any]:
+    """Send ``text`` and block until the peer's real reply arrives (or timeout).
+
+    Synchronous receivers return the real reply in the HTTP response; for those
+    this returns immediately with ``{"reply", "context_id", "waited": False}``.
+
+    Async receivers (e.g. opencode) return a ``[queued]`` ack; this then polls
+    the receiver's transcript jsonl for the final reply on the same
+    ``context_id``, returning ``{"reply", "context_id", "waited": True}`` when it
+    lands. On timeout it returns the original ack plus ``"waited": False`` and a
+    ``"reason"``. Requires local filesystem access to the receiver's transcript
+    (resolved from the peer's ``repo_path`` or the ``transcript_path`` arg);
+    without one it cannot poll and returns the ack with a ``"reason"``.
+    """
+    try:
+        entry = get_agent(agent_name)
+    except KeyError as exc:
+        raise FleetClientError(exc.args[0] if exc.args else "unknown agent") from exc
+
+    # Capture the transcript offset BEFORE sending so a fast reply written
+    # between the HTTP response and our first poll is not skipped.
+    tpath = _resolve_transcript_path(entry, transcript_path)
+    start_offset = 0
+    if tpath is not None:
+        try:
+            start_offset = tpath.stat().st_size
+        except OSError:
+            start_offset = 0
+
+    first = await send_message(
+        agent_name, text, context_id=context_id, timeout=send_timeout, client=client
+    )
+    reply = first.get("reply", "")
+    ctx = first.get("context_id") or context_id or ""
+
+    if QUEUED_MARKER not in reply:
+        return {**first, "waited": False}
+    if tpath is None:
+        return {
+            **first,
+            "waited": False,
+            "reason": "queued ack but no transcript_path resolvable "
+            "(peer entry has no repo_path; pass transcript_path=)",
+        }
+    if not ctx:
+        return {**first, "waited": False, "reason": "queued ack had no context_id to correlate"}
+
+    deadline = asyncio.get_event_loop().time() + max_wait
+    offset = start_offset
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(poll_interval)
+        found, offset = _scan_transcript_reply(tpath, ctx, offset)
+        if found is not None:
+            return {"reply": found, "context_id": ctx, "waited": True}
+    return {
+        **first,
+        "waited": False,
+        "reason": f"no final reply in transcript within {max_wait}s",
+    }
 
 
 def _print_usage(exit_code: int = 0) -> None:

@@ -68,6 +68,22 @@ A2A_ROLE_TEXT = (
     "blocked) so Hermes can summarize them to the user and decide the next step.\n"
 )
 
+
+def role_text_for(repo_path: "Path | str") -> str:
+    """A2A_ROLE_TEXT with the concrete workdir + absolute-path rule injected.
+
+    P1-7: the static role text says "cwd is pinned" but never states the actual
+    path, so OpenCode guesses its working directory and relative-path tool calls
+    can silently hit the wrong dir. Inject the real repo_path and require
+    absolute paths.
+    """
+    return A2A_ROLE_TEXT.rstrip() + (
+        f"\n- Workdir: your effective working directory is `{repo_path}`. Use "
+        "absolute paths rooted there for every file and shell operation; do not "
+        "assume the process cwd matches it.\n"
+    )
+
+
 DEFAULT_BIND_PORT = 9310
 DEFAULT_HERMES_URL = "http://127.0.0.1:9219/jsonrpc"
 PID_FILENAME = "oc_receiver.pid"
@@ -198,7 +214,7 @@ def build_receiver_config(
         "bind_host": "127.0.0.1",
         "bind_port": int(bind_port),
         "hermes_url": DEFAULT_HERMES_URL,
-        "role_prompt": A2A_ROLE_TEXT.strip(),
+        "role_prompt": role_text_for(repo_path).strip(),
         "role_file": f".hermes/{ROLE_FILENAME}",
         "poll_interval_s": 2.0,
         "opencode_timeout_s": 300,
@@ -497,7 +513,7 @@ async def deploy_oc_receiver_handler(
             return {"error": f"cannot copy receiver template into {hermes_dir}: {exc}"}
 
         try:
-            _atomic_write_text(role_dest, A2A_ROLE_TEXT)
+            _atomic_write_text(role_dest, role_text_for(repo))
         except OSError as exc:
             return {"error": f"cannot write {role_dest}: {exc}"}
 
