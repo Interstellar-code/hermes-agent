@@ -800,6 +800,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Active interactive-clarify streams: session_id -> thread-safe
+        # _enqueue(name, payload) callable for the live chat stream.
+        self._clarify_streams: Dict[str, Any] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -1078,6 +1081,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        interactive_clarify: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1122,6 +1126,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+
+        # Gated interactive `clarify` injection.
+        if interactive_clarify:
+            api_cfg = (user_config or {}).get("api_server") or {}
+            if bool(api_cfg.get("interactive_clarify", False)):
+                if "clarify" not in enabled_toolsets:
+                    enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
 
         max_iterations = _current_max_iterations()
 
@@ -1237,6 +1248,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            from gateway.run import _load_gateway_config
+            _cfg = _load_gateway_config()
+            _interactive_clarify_enabled = bool(((_cfg or {}).get("api_server") or {}).get("interactive_clarify", False))
+        except Exception:
+            _interactive_clarify_enabled = False
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1261,6 +1279,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "interactive_clarify": _interactive_clarify_enabled,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -1303,6 +1322,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_chat_clarify": {"method": "POST", "path": "/api/sessions/{session_id}/chat/clarify"},
             },
         })
 
@@ -1768,6 +1788,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        clarify_session_key = gateway_session_key or session_id
+
+        def _clarify_callback_sync(question: str, choices) -> str:
+            from tools import clarify_gateway as _clarify_mod
+            import uuid as _uuid
+
+            clarify_id = _uuid.uuid4().hex[:10]
+            _clarify_mod.register(
+                clarify_id=clarify_id,
+                session_key=clarify_session_key or "",
+                question=question,
+                choices=list(choices) if choices else None,
+            )
+            _enqueue("clarify.request", {
+                "message_id": message_id,
+                "clarify_id": clarify_id,
+                "question": question,
+                "choices": list(choices) if choices else None,
+            })
+            try:
+                self._set_run_status(
+                    run_id,
+                    "waiting_for_clarify",
+                    last_event="clarify.request",
+                    clarify_id=clarify_id,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+
+            timeout = _clarify_mod.get_clarify_timeout()
+            response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+            try:
+                self._set_run_status(run_id, "running", last_event="clarify.responded")
+            except Exception:
+                pass
+            if response is None or response == "":
+                return f"[user did not respond within {int(timeout / 60)}m]"
+            return response
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -1781,6 +1841,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
                     gateway_session_key=gateway_session_key,
+                    interactive_clarify=True,
+                    clarify_callback=_clarify_callback_sync,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -1804,9 +1866,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                self._clarify_streams.pop(session_id, None)
+                try:
+                    from tools.clarify_gateway import clear_session as _clear_clarify_session
+                    _clear_clarify_session(clarify_session_key or "")
+                except Exception:
+                    pass
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
+        self._clarify_streams[session_id] = _enqueue
         task = asyncio.create_task(_run_and_signal())
         try:
             self._background_tasks.add(task)
@@ -3807,6 +3876,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        interactive_clarify: bool = False,
+        clarify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3838,7 +3909,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    interactive_clarify=interactive_clarify,
                 )
+                if clarify_callback is not None:
+                    agent.clarify_callback = clarify_callback
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
@@ -4396,6 +4470,62 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/chat/clarify — resolve a pending clarify."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        clarify_id = str(body.get("clarify_id", "")).strip()
+        answer = body.get("answer")
+        if answer is None:
+            answer = body.get("response")
+        answer = "" if answer is None else str(answer)
+
+        if not clarify_id:
+            return web.json_response(
+                _openai_error("clarify_id is required", code="clarify_id_required"),
+                status=400,
+            )
+
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = resolve_gateway_clarify(clarify_id, answer)
+        except Exception:
+            logger.exception("[api_server] clarify resolution failed for %s", clarify_id)
+            resolved = False
+
+        if not resolved:
+            return web.json_response(
+                _openai_error(f"No pending clarify: {clarify_id}", code="clarify_not_pending"),
+                status=409,
+            )
+
+        enqueue = self._clarify_streams.get(session_id)
+        if enqueue is not None:
+            try:
+                enqueue("clarify.responded", {
+                    "clarify_id": clarify_id,
+                    "answer": answer,
+                    "resolved": resolved,
+                })
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.session.clarify_response",
+            "session_id": session_id,
+            "clarify_id": clarify_id,
+            "resolved": resolved,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4550,6 +4680,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
+            self._app.router.add_post("/api/sessions/{session_id}/chat/clarify", self._handle_session_clarify)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
