@@ -95,7 +95,7 @@ from utils import env_var_enabled
 
 try:
     from fastapi import (
-        FastAPI, File, Form, HTTPException, Request, UploadFile,
+        FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
         WebSocket, WebSocketDisconnect,
     )
     from fastapi.middleware.cors import CORSMiddleware
@@ -111,7 +111,7 @@ except ImportError:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
         from fastapi import (
-            FastAPI, File, Form, HTTPException, Request, UploadFile,
+            FastAPI, File, Form, HTTPException, Query, Request, UploadFile,
             WebSocket, WebSocketDisconnect,
         )
         from fastapi.middleware.cors import CORSMiddleware
@@ -10966,8 +10966,8 @@ async def get_session_latest_descendant(
 async def get_session_messages(
     session_id: str,
     profile: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
+    limit: Optional[int] = Query(default=None, ge=0),
+    offset: int = Query(default=0, ge=0),
 ):
     def _read():
         db = _open_session_db_for_profile(profile)

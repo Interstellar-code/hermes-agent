@@ -4516,6 +4516,7 @@ class SessionDB:
         self,
         session_id: str,
         include_inactive: bool = False,
+        *,
         limit: Optional[int] = None,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -4529,25 +4530,45 @@ class SessionDB:
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
 
-        When ``limit`` is provided, returns at most ``limit`` messages
-        starting from ``offset`` (0-based, in insertion order). Enables
-        pagination for the API endpoint to avoid loading entire transcripts.
-        ``offset`` alone (without ``limit``) also pages — SQLite requires a
-        LIMIT clause for OFFSET, so it's emitted as ``LIMIT -1`` (unbounded).
+        Paging: the returned list is ALWAYS oldest→newest. When ``limit``
+        is given it bounds a *tail* — ``offset`` counts backward from the
+        most recent message, so ``limit=50, offset=0`` is the newest 50
+        messages and ``offset=50`` the 50 before those. This is the cheap,
+        chat-tail shape: paging is done at the SQL layer (``ORDER BY id
+        DESC LIMIT/OFFSET``) so the full transcript is never materialized.
+        ``limit=None`` (the default) returns the whole session unchanged.
+
+        Tail rather than forward paging is deliberate and is the fork's
+        contract (kept across the 0.19 adoption). Upstream 0.19 pages
+        forward from the oldest message but its endpoint returns no total
+        count, so a chat client cannot address the newest N without walking
+        the entire transcript first — which is the one query a chat UI
+        actually makes. See the 0.19 migration ledger, row 8188ce6db7.
         """
         active_clause = "" if include_inactive else " AND active = 1"
-        sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause} ORDER BY id"
-        )
-        params: list = [session_id]
-        if limit is not None or offset:
-            # SQLite's OFFSET requires LIMIT; -1 means "no limit".
-            sql += " LIMIT ? OFFSET ?"
-            params.extend([-1 if limit is None else limit, offset])
         with self._lock:
-            cursor = self._conn.execute(sql, params)
-            rows = cursor.fetchall()
+            if limit is None and not offset:
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ?"
+                    f"{active_clause} ORDER BY id",
+                    (session_id,),
+                )
+                rows = cursor.fetchall()
+            else:
+                # Walk backward from the newest row so ``offset`` always counts
+                # from the tail, then flip to oldest→newest for the caller.
+                # ``offset`` alone is honoured too (skip the newest N and return
+                # the rest) — SQLite needs a LIMIT for OFFSET, so -1 = unbounded.
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ?"
+                    f"{active_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (
+                        session_id,
+                        -1 if limit is None else max(0, int(limit)),
+                        max(0, int(offset)),
+                    ),
+                )
+                rows = list(reversed(cursor.fetchall()))
         result = []
         for row in rows:
             msg = dict(row)

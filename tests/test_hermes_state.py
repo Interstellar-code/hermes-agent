@@ -6221,8 +6221,14 @@ class TestCompactRows:
 # =========================================================================
 
 class TestGetMessagesPagination:
-    """get_messages(limit=, offset=) pages in insertion order; the default
-    (limit=None) returns the full transcript unchanged."""
+    """get_messages(limit=, offset=) pages a TAIL; the default (limit=None,
+    offset=0) returns the full transcript unchanged.
+
+    ``offset`` counts backward from the newest message, and every page is
+    returned oldest→newest. This is the fork's contract, kept across the 0.19
+    adoption: a chat client's one query is "the newest N", and the endpoint
+    exposes no total count, so forward paging cannot express it without first
+    walking the whole transcript. See the 0.19 migration ledger, row 8188ce6db7."""
 
     def _seed(self, db, n=10):
         db.create_session(session_id="s1", source="cli")
@@ -6234,14 +6240,15 @@ class TestGetMessagesPagination:
         messages = db.get_messages("s1")
         assert [m["content"] for m in messages] == [f"msg-{i}" for i in range(10)]
 
-    def test_limit_pages_in_insertion_order(self, db):
+    def test_limit_pages_a_tail_oldest_first_within_each_page(self, db):
         self._seed(db)
         page1 = db.get_messages("s1", limit=4, offset=0)
         page2 = db.get_messages("s1", limit=4, offset=4)
         page3 = db.get_messages("s1", limit=4, offset=8)
-        assert [m["content"] for m in page1] == ["msg-0", "msg-1", "msg-2", "msg-3"]
-        assert [m["content"] for m in page2] == ["msg-4", "msg-5", "msg-6", "msg-7"]
-        assert [m["content"] for m in page3] == ["msg-8", "msg-9"]
+        # offset 0 is the NEWEST four; each page itself reads oldest→newest.
+        assert [m["content"] for m in page1] == ["msg-6", "msg-7", "msg-8", "msg-9"]
+        assert [m["content"] for m in page2] == ["msg-2", "msg-3", "msg-4", "msg-5"]
+        assert [m["content"] for m in page3] == ["msg-0", "msg-1"]
 
     def test_offset_past_end_returns_empty(self, db):
         self._seed(db, n=3)
@@ -6257,14 +6264,16 @@ class TestGetMessagesPagination:
         )
         db._conn.commit()
         page = db.get_messages("s1", limit=3, offset=0)
-        assert [m["content"] for m in page] == ["msg-2", "msg-3", "msg-4"]
+        # msg-0/msg-1 are inactive; the newest three of what remains.
+        assert [m["content"] for m in page] == ["msg-3", "msg-4", "msg-5"]
 
     def test_offset_without_limit_pages(self, db):
-        """offset alone must not be silently ignored (review finding):
-        SQLite needs LIMIT for OFFSET, emitted as LIMIT -1."""
+        """offset alone must not be silently ignored (upstream review finding,
+        kept: the fork's original tail implementation dropped it). Counting from
+        the tail, offset=3 skips the newest three."""
         self._seed(db, n=5)
         rows = db.get_messages("s1", offset=3)
-        assert [m["content"] for m in rows] == ["msg-3", "msg-4"]
+        assert [m["content"] for m in rows] == ["msg-0", "msg-1"]
 
 
 # =========================================================================
