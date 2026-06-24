@@ -73,6 +73,17 @@ async def test_session_clarify_endpoint_resolves_pending_clarify(adapter):
     events = []
     adapter._clarify_streams[session_id] = lambda name, payload: events.append((name, payload))
     register(clarify_id, session_id, "Pick one", ["A", "B"])
+    adapter._session_interactions[clarify_id] = {
+        "interaction_id": clarify_id,
+        "clarify_id": clarify_id,
+        "kind": "choice",
+        "tool_name": "clarify",
+        "session_id": session_id,
+        "run_id": "run_1",
+        "message_id": "msg_1",
+        "question": "Pick one",
+        "choices": ["A", "B"],
+    }
     try:
         async with TestClient(TestServer(_app(adapter))) as cli:
             missing = await cli.post(f"/api/sessions/{session_id}/chat/clarify", json={"answer": "A"}, headers={"Authorization": "Bearer test-key"})
@@ -88,7 +99,13 @@ async def test_session_clarify_endpoint_resolves_pending_clarify(adapter):
     finally:
         clear_session(session_id)
 
-    assert events == [(
-        "clarify.responded",
-        {"clarify_id": clarify_id, "answer": "A", "resolved": True},
-    )]
+    event_names = [name for name, _ in events]
+    assert event_names == ["clarify.responded", "interaction.responded"]
+    responded = events[0][1]
+    assert responded["clarify_id"] == clarify_id
+    assert responded["interaction_id"] == clarify_id
+    assert responded["question"] == "Pick one"
+    assert responded["choices"] == ["A", "B"]
+    assert responded["answer"] == "A"
+    assert responded["selected_answer"] == "A"
+    assert responded["resolved"] is True
