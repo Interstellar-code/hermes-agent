@@ -705,6 +705,9 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
+                # Read-only connections also benefit from larger busy_timeout
+                # when the writer process is checkpointing.
+                self._conn.execute("PRAGMA busy_timeout=5000")
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -725,6 +728,13 @@ class SessionDB:
                 self._conn.row_factory = sqlite3.Row
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
+                # Performance PRAGMAs — keep WAL checkpoints frequent (default 1000
+                # pages = ~4MB lets WAL bloat under burst writes), avoid FULL
+                # synchronous mode's per-commit fsync, and extend lock wait to 5s
+                # for read concurrency under load. Mirrors kanban_db.py settings.
+                self._conn.execute("PRAGMA synchronous=NORMAL")
+                self._conn.execute("PRAGMA wal_autocheckpoint=100")
+                self._conn.execute("PRAGMA busy_timeout=5000")
                 self._init_schema()
 
             try:

@@ -1817,17 +1817,21 @@ async def get_status(profile: Optional[str] = None):
         active_sessions = 0
         try:
             from hermes_state import SessionDB
-            db = SessionDB()
-            try:
-                sessions = db.list_sessions_rich(limit=50)
-                now = time.time()
-                active_sessions = sum(
-                    1 for s in sessions
-                    if s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
-                )
-            finally:
-                db.close()
+
+            def _count_active():
+                db = SessionDB()
+                try:
+                    sessions = db.list_sessions_rich(limit=50)
+                    now = time.time()
+                    return sum(
+                        1 for s in sessions
+                        if s.get("ended_at") is None
+                        and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                    )
+                finally:
+                    db.close()
+
+            active_sessions = await asyncio.to_thread(_count_active)
         except Exception:
             pass
 
@@ -2876,48 +2880,51 @@ async def get_sessions(
     if profile:
         profile_name, _ = _cron_profile_home(profile)
     try:
-        db = _open_session_db_for_profile(profile)
-        try:
-            min_message_count = max(0, min_messages)
-            archived_only = archived == "only"
-            include_archived = archived == "include"
-            # Optional source scoping: ``source`` includes a single class,
-            # ``exclude_sources`` (comma-separated) drops classes. The desktop
-            # uses these to split recents (exclude=cron) from the cron-jobs
-            # section (source=cron) into two independent lists.
-            exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
-            sessions = db.list_sessions_rich(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                limit=limit,
-                offset=offset,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                order_by_last_active=order == "recent",
-            )
-            total = db.session_count(
-                source=source or None,
-                exclude_sources=exclude_list or None,
-                min_message_count=min_message_count,
-                include_archived=include_archived,
-                archived_only=archived_only,
-                exclude_children=True,
-            )
-            now = time.time()
-            for s in sessions:
-                s["is_active"] = (
-                    s.get("ended_at") is None
-                    and (now - s.get("last_active", s.get("started_at", 0))) < 300
+        def _load_sessions():
+            db = _open_session_db_for_profile(profile)
+            try:
+                min_message_count = max(0, min_messages)
+                archived_only = archived == "only"
+                include_archived = archived == "include"
+                # Optional source scoping: ``source`` includes a single class,
+                # ``exclude_sources`` (comma-separated) drops classes. The desktop
+                # uses these to split recents (exclude=cron) from the cron-jobs
+                # section (source=cron) into two independent lists.
+                exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+                sessions = db.list_sessions_rich(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    limit=limit,
+                    offset=offset,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    order_by_last_active=order == "recent",
                 )
-                if profile_name:
-                    s["profile"] = profile_name
-                    s["is_default_profile"] = profile_name == "default"
-                # SQLite stores the flag as 0/1; expose a real JSON boolean.
-                s["archived"] = bool(s.get("archived"))
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
-        finally:
-            db.close()
+                total = db.session_count(
+                    source=source or None,
+                    exclude_sources=exclude_list or None,
+                    min_message_count=min_message_count,
+                    include_archived=include_archived,
+                    archived_only=archived_only,
+                    exclude_children=True,
+                )
+                now = time.time()
+                for s in sessions:
+                    s["is_active"] = (
+                        s.get("ended_at") is None
+                        and (now - s.get("last_active", s.get("started_at", 0))) < 300
+                    )
+                    if profile_name:
+                        s["profile"] = profile_name
+                        s["is_default_profile"] = profile_name == "default"
+                    # SQLite stores the flag as 0/1; expose a real JSON boolean.
+                    s["archived"] = bool(s.get("archived"))
+                return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            finally:
+                db.close()
+
+        return await asyncio.to_thread(_load_sessions)
     except HTTPException:
         raise
     except Exception:
@@ -7227,11 +7234,14 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        return {"count": db.count_empty_sessions()}
-    finally:
-        db.close()
+    def _count_empty():
+        db = _open_session_db_for_profile(profile)
+        try:
+            return {"count": db.count_empty_sessions()}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_count_empty)
 
 
 @app.delete("/api/sessions/empty")
@@ -7254,12 +7264,15 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        deleted = db.delete_empty_sessions()
-        return {"ok": True, "deleted": deleted}
-    finally:
-        db.close()
+    def _delete_empty():
+        db = _open_session_db_for_profile(profile)
+        try:
+            deleted = db.delete_empty_sessions()
+            return {"ok": True, "deleted": deleted}
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_delete_empty)
 
 
 @app.get("/api/sessions/stats")
@@ -7269,28 +7282,31 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
-    db = _open_session_db_for_profile(profile)
-    try:
-        total = db.session_count(include_archived=True)
-        active_store = db.session_count(include_archived=False)
-        archived = db.session_count(archived_only=True)
-        messages = db.message_count()
-        by_source: Dict[str, int] = {}
+    def _compute_stats():
+        db = _open_session_db_for_profile(profile)
         try:
-            for s in db.list_sessions_rich(limit=10000, include_archived=True):
-                src = str(s.get("source") or "cli")
-                by_source[src] = by_source.get(src, 0) + 1
-        except Exception:
-            pass
-        return {
-            "total": total,
-            "active_store": active_store,
-            "archived": archived,
-            "messages": messages,
-            "by_source": by_source,
-        }
-    finally:
-        db.close()
+            total = db.session_count(include_archived=True)
+            active_store = db.session_count(include_archived=False)
+            archived = db.session_count(archived_only=True)
+            messages = db.message_count()
+            by_source: Dict[str, int] = {}
+            try:
+                for s in db.list_sessions_rich(limit=10000, include_archived=True):
+                    src = str(s.get("source") or "cli")
+                    by_source[src] = by_source.get(src, 0) + 1
+            except Exception:
+                pass
+            return {
+                "total": total,
+                "active_store": active_store,
+                "archived": archived,
+                "messages": messages,
+                "by_source": by_source,
+            }
+        finally:
+            db.close()
+
+    return await asyncio.to_thread(_compute_stats)
 
 
 def _open_session_db_for_profile(profile: Optional[str]):
