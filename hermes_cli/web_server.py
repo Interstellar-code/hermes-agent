@@ -5266,18 +5266,26 @@ async def get_session_latest_descendant(session_id: str):
 async def get_session_messages(
     session_id: str,
     profile: Optional[str] = None,
-    limit: Optional[int] = None,
-    offset: int = 0,
+    limit: Optional[str] = None,
+    offset: str = "0",
 ):
     # ``limit``/``offset`` page a tail at the storage layer (oldest→newest
     # result; offset counts back from newest). Omit both for the full
     # transcript. See SessionDB.get_messages for the paging contract.
+    try:
+        parsed_limit = int(limit) if limit is not None else None
+        parsed_offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="limit and offset must be integers")
+    if parsed_limit is not None and parsed_limit < 0:
+        raise HTTPException(status_code=400, detail="limit must be >= 0")
+
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
-        messages = db.get_messages(sid, limit=limit, offset=max(0, offset))
+        messages = db.get_messages(sid, limit=parsed_limit, offset=parsed_offset)
         return {"session_id": sid, "messages": messages}
     finally:
         db.close()
