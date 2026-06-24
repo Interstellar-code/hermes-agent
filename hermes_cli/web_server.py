@@ -5263,13 +5263,21 @@ async def get_session_latest_descendant(session_id: str):
     }
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_session_messages(session_id: str, profile: Optional[str] = None):
+async def get_session_messages(
+    session_id: str,
+    profile: Optional[str] = None,
+    limit: Optional[int] = None,
+    offset: int = 0,
+):
+    # ``limit``/``offset`` page a tail at the storage layer (oldest→newest
+    # result; offset counts back from newest). Omit both for the full
+    # transcript. See SessionDB.get_messages for the paging contract.
     db = _open_session_db_for_profile(profile)
     try:
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
-        messages = db.get_messages(sid)
+        messages = db.get_messages(sid, limit=limit, offset=max(0, offset))
         return {"session_id": sid, "messages": messages}
     finally:
         db.close()
