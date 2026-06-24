@@ -5907,13 +5907,25 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    Exception: verify-mode tasks inherently reference a PR URL in their
+    #    verdict comments (the PR under review, not one they created). For
+    #    those tasks this guard would permanently trap them after every run.
+    task_body_row = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    is_verify_task = (
+        task_body_row is not None
+        and task_body_row["body"]
+        and re.search(r"##\s*Mode\s*\n\s*verify", task_body_row["body"], re.IGNORECASE)
+    )
+    if not is_verify_task:
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
