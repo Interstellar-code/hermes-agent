@@ -388,7 +388,15 @@ TOOLSETS = {
     },
 
     "hermes-api-server": {
-        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
+        # NOTE on `clarify`: the interactive `clarify` tool is intentionally
+        # NOT listed statically here. `clarify` blocks the agent thread for
+        # up to ~10 minutes waiting for a human answer, which would hang
+        # headless OpenAI-compat clients (/v1/chat/completions, /v1/responses).
+        # Instead it is injected dynamically into the resolved toolset by
+        # gateway/platforms/api_server.py::_create_agent ONLY on the
+        # interactive SSE chat-stream path AND only when the config flag
+        # `api_server.interactive_clarify` is enabled.
+        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (clarify injected dynamically only on the interactive SSE chat-stream path when api_server.interactive_clarify is enabled)",
         "tools": [
             # Web
             "web_search", "web_extract",

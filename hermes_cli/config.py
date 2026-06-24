@@ -886,6 +886,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+ # Switch UI can opt into interactive session-chat clarify while
+ # stateless OpenAI-compatible paths stay safe.
+ "api_server": {
+  "interactive_clarify": False,
+ },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
