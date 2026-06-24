@@ -9,6 +9,7 @@ which has provider-specific conditionals for max_tokens defaults,
 reasoning configuration, temperature handling, and extra_body assembly.
 """
 
+import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -194,6 +195,11 @@ class ChatCompletionsTransport(ProviderTransport):
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
                 needs_sanitize = True
                 break
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                needs_sanitize = True
+                break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
@@ -249,6 +255,20 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 for key in internal_keys:
                     out_msg.pop(key, None)
+
+            # A dict-typed tool result poisons the session: the provider 400s
+            # on every subsequent turn, so the history can never drain itself
+            # (#dict-tool-content). Coerce on the way out so already-poisoned
+            # sessions heal. Copy-on-write — never mutate the caller's message.
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                raw_content = msg.get("content")
+                try:
+                    coerced = json.dumps(raw_content, default=str, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    coerced = str(raw_content)
+                mutable_msg()["content"] = coerced
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):

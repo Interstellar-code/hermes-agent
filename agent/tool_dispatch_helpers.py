@@ -454,6 +454,16 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def _coerce_tool_content(content: Any) -> Any:
+    """Coerce a tool result to a provider-safe wire shape."""
+    if isinstance(content, (str, list)):
+        return content
+    try:
+        return json.dumps(content, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
 def make_tool_result_message(
     name: str,
     content: Any,
@@ -472,6 +482,9 @@ def make_tool_result_message(
     and MCP responses — it changes how the model interprets the content rather
     than relying on regex pattern matching catching every payload.
 
+    Non-string, non-multimodal content is JSON-serialized first so a
+    dict-returning tool can't ship a raw object that providers reject.
+
     Wrapping applies to plain string content and to multimodal content
     lists (``[{"type": "text", "text": "..."}, {"type": "image_url", ...}]``):
     each text-type part is wrapped individually using the same rules as plain
@@ -480,7 +493,7 @@ def make_tool_result_message(
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
     """
-    wrapped = _maybe_wrap_untrusted(name, content)
+    wrapped = _maybe_wrap_untrusted(name, _coerce_tool_content(content))
     message = {
         "role": "tool",
         "name": name,
