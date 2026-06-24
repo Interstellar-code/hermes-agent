@@ -800,6 +800,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Approval request metadata for durable receipts.
+        self._run_approval_requests: Dict[str, List[Dict[str, Any]]] = {}
         # Active interactive-clarify streams: session_id -> thread-safe
         # _enqueue(name, payload) callable for the live chat stream.
         self._clarify_streams: Dict[str, Any] = {}
@@ -1362,6 +1364,40 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             logger.warning("[api_server] failed to persist interaction receipt", exc_info=True)
+
+    def _persist_approval_receipt(self, session_id: str, meta: Dict[str, Any], choice: str, resolved: int) -> None:
+        """Persist a transcript-visible receipt for approvals."""
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        receipt = {
+            "type": "interaction_receipt",
+            "kind": "approval",
+            "tool_name": "approval",
+            "approval_id": meta.get("approval_id"),
+            "session_id": session_id,
+            "run_id": meta.get("run_id"),
+            "message_id": meta.get("message_id"),
+            "action": meta.get("command"),
+            "context": meta.get("description"),
+            "pattern_key": meta.get("pattern_key"),
+            "pattern_keys": meta.get("pattern_keys"),
+            "choices": meta.get("choices") or ["once", "session", "always", "deny"],
+            "selected_answer": choice,
+            "approved": choice != "deny",
+            "resolved": int(resolved),
+        }
+        try:
+            db.append_message(
+                session_id=session_id,
+                role="tool",
+                content=json.dumps(receipt, ensure_ascii=False),
+                tool_name="approval",
+                tool_call_id=receipt["approval_id"],
+                observed=True,
+            )
+        except Exception:
+            logger.warning("[api_server] failed to persist approval receipt", exc_info=True)
 
     def _interaction_event_payload(self, meta: Dict[str, Any], answer: Optional[str] = None, resolved: Optional[bool] = None) -> Dict[str, Any]:
         payload = {
@@ -4282,6 +4318,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                    approval_id = f"approval_{uuid.uuid4().hex[:10]}"
                     event = dict(approval_data or {})
                     # Redact credentials from the command before it enters the
                     # SSE/API event stream — same egress bug as #48456, second
@@ -4293,14 +4330,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         event["command"] = _redact_approval_command(event.get("command"))
                     event.update({
                         "event": "approval.request",
+                        "approval_id": approval_id,
+                        "session_id": session_id,
                         "run_id": run_id,
+                        "message_id": approval_id,
                         "timestamp": time.time(),
                         "choices": ["once", "session", "always", "deny"],
                     })
+                    self._run_approval_requests.setdefault(run_id, []).append(dict(event))
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
+                        approval_id=approval_id,
+                        session_id=session_id,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -4440,6 +4483,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_requests.pop(run_id, None)
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
@@ -4591,24 +4635,56 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._set_run_status(run_id, "running", last_event="approval.responded")
+        pending_requests = self._run_approval_requests.get(run_id) or []
+        if resolve_all:
+            approval_metas = list(pending_requests)
+            self._run_approval_requests.pop(run_id, None)
+        else:
+            approval_metas = [pending_requests.pop(0)] if pending_requests else []
+            if not pending_requests:
+                self._run_approval_requests.pop(run_id, None)
+        status = self._run_statuses.get(run_id) or {}
+        status_session_id = status.get("session_id") or run_id
+        if not approval_metas:
+            approval_metas = [{
+                "approval_id": f"approval_{run_id}",
+                "session_id": status_session_id,
+                "run_id": run_id,
+                "message_id": None,
+                "choices": ["once", "session", "always", "deny"],
+            }]
+        approval_meta = dict(approval_metas[0])
+        approval_id = approval_meta.get("approval_id")
+        self._persist_approval_receipt(status_session_id, approval_meta, choice, resolved)
+
+        self._set_run_status(run_id, "running", last_event="approval.responded", approval_id=approval_id)
+        event = {
+            "event": "approval.responded",
+            "approval_id": approval_id,
+            "session_id": status_session_id,
+            "run_id": run_id,
+            "message_id": approval_meta.get("message_id"),
+            "timestamp": time.time(),
+            "choice": choice,
+            "approved": choice != "deny",
+            "resolved": resolved,
+            "action": approval_meta.get("command"),
+            "context": approval_meta.get("description"),
+            "choices": approval_meta.get("choices") or ["once", "session", "always", "deny"],
+        }
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
-                    "event": "approval.responded",
-                    "run_id": run_id,
-                    "timestamp": time.time(),
-                    "choice": choice,
-                    "resolved": resolved,
-                })
+                q.put_nowait(event)
             except Exception:
                 pass
 
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "approval_id": approval_id,
             "choice": choice,
+            "approved": choice != "deny",
             "resolved": resolved,
         })
 
@@ -4731,6 +4807,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_requests.pop(run_id, None)
 
             stale_statuses = [
                 run_id
