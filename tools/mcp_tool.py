@@ -2792,6 +2792,9 @@ _parallel_safe_servers: set = set()
 # captured at registration time so parallel safety never relies on prefix
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
+_connecting_servers: Dict[str, threading.Event] = {}
+_server_lock_identities: Dict[str, str] = {}
+_MCP_SERVER_LOCK_SCOPE = "mcp-server"
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -3081,6 +3084,56 @@ def _load_mcp_config() -> Dict[str, dict]:
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
+
+
+def _mcp_server_lock_identity(_name: str, config: dict) -> str:
+    """Return a machine-local lock identity for one MCP server config."""
+    if "url" in config:
+        return f"http:{config.get('url')}"
+    payload = {
+        "command": config.get("command"),
+        "args": config.get("args") or [],
+    }
+    return f"stdio:{json.dumps(payload, sort_keys=True, separators=(',', ":"))}"
+
+
+def _wait_for_connecting_servers(
+    wait_events: List[tuple[str, threading.Event, float]],
+) -> None:
+    """Block for in-flight same-process MCP connects to finish."""
+    for server_name, event, timeout in wait_events:
+        timeout = max(float(timeout or 0.0), 0.0)
+        if event.wait(timeout=timeout):
+            continue
+        logger.warning(
+            "MCP server '%s': timed out waiting %.0fs for in-flight registration",
+            server_name,
+            timeout,
+        )
+
+
+def _finish_connecting_server(name: str, *, release_lock: bool) -> None:
+    """Clear in-flight connect bookkeeping and optionally release ownership."""
+    with _lock:
+        event = _connecting_servers.pop(name, None)
+        lock_identity = _server_lock_identities.get(name)
+        if release_lock and lock_identity is not None:
+            _server_lock_identities.pop(name, None)
+
+    if release_lock and lock_identity is not None:
+        try:
+            from gateway.status import release_scoped_lock
+
+            release_scoped_lock(_MCP_SERVER_LOCK_SCOPE, lock_identity)
+        except Exception:
+            logger.debug(
+                "MCP server '%s': failed to release scoped lock",
+                name,
+                exc_info=True,
+            )
+
+    if event is not None:
+        event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -3991,25 +4044,34 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
-    server = await asyncio.wait_for(
-        _connect_server(name, config),
-        timeout=connect_timeout,
-    )
-    with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
-        _servers[name] = server
+    try:
+        server = await asyncio.wait_for(
+            _connect_server(name, config),
+            timeout=connect_timeout,
+        )
+        with _lock:
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            _servers[name] = server
 
-    registered_names = _register_server_tools(name, server, config)
-    server._registered_tool_names = list(registered_names)
+        registered_names = _register_server_tools(name, server, config)
+        server._registered_tool_names = list(registered_names)
 
-    transport_type = "HTTP" if "url" in config else "stdio"
-    logger.info(
-        "MCP server '%s' (%s): registered %d tool(s): %s",
-        name, transport_type, len(registered_names),
-        ", ".join(registered_names),
-    )
-    return registered_names
+        transport_type = "HTTP" if "url" in config else "stdio"
+        logger.info(
+            "MCP server '%s' (%s): registered %d tool(s): %s",
+            name, transport_type, len(registered_names),
+            ", ".join(registered_names),
+        )
+        _finish_connecting_server(name, release_lock=False)
+        return registered_names
+    except Exception:
+        with _lock:
+            _server_connecting.discard(name)
+            _server_connect_errors.pop(name, None)
+            _servers.pop(name, None)
+        _finish_connecting_server(name, release_lock=True)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -4037,23 +4099,64 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
 
-    # Only attempt servers that aren't already connected and are enabled
-    # (enabled: false skips the server entirely without removing its config)
+    # Only attempt servers that aren't already connected and are enabled.
+    # Servers already connecting in this process are waited on rather than
+    # re-spawned, and machine-local scoped locks prevent duplicate ownership
+    # across multiple Hermes processes.
+    wait_events: List[tuple[str, threading.Event, float]] = []
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
-        }
-        _server_connecting.update(new_servers)
-        for srv_name in new_servers:
-            _server_connect_errors.pop(srv_name, None)
+        new_servers: Dict[str, dict] = {}
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
                 _parallel_safe_servers.add(sanitize_mcp_name_component(srv_name))
             else:
                 _parallel_safe_servers.discard(sanitize_mcp_name_component(srv_name))
+            if not _parse_boolish(srv_cfg.get("enabled", True), default=True):
+                continue
+            if srv_name in _servers:
+                continue
+            pending_event = _connecting_servers.get(srv_name)
+            if pending_event is not None:
+                wait_events.append((
+                    srv_name,
+                    pending_event,
+                    float(srv_cfg.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)),
+                ))
+                continue
+            try:
+                from gateway.status import acquire_scoped_lock
+
+                lock_identity = _mcp_server_lock_identity(srv_name, srv_cfg)
+                acquired, owner = acquire_scoped_lock(
+                    _MCP_SERVER_LOCK_SCOPE,
+                    lock_identity,
+                    metadata={"server": srv_name},
+                )
+            except Exception:
+                logger.warning(
+                    "MCP server '%s': failed to acquire scoped lock",
+                    srv_name,
+                    exc_info=True,
+                )
+                continue
+            if not acquired:
+                owner_pid = owner.get("pid") if isinstance(owner, dict) else None
+                logger.info(
+                    "MCP server '%s': skipping connect because another local Hermes process already owns this server%s",
+                    srv_name,
+                    f" (pid {owner_pid})" if owner_pid else "",
+                )
+                continue
+            _server_lock_identities[srv_name] = lock_identity
+            _connecting_servers[srv_name] = threading.Event()
+            new_servers[srv_name] = srv_cfg
+        _server_connecting.update(new_servers)
+        for srv_name in new_servers:
+            _server_connect_errors.pop(srv_name, None)
+
+    if wait_events:
+        _wait_for_connecting_servers(wait_events)
 
     if not new_servers:
         return _existing_tool_names()
@@ -4554,9 +4657,23 @@ def shutdown_mcp_servers():
     """
     with _lock:
         servers_snapshot = list(_servers.values())
+        pending_lock_identities = dict(_server_lock_identities) if not servers_snapshot else {}
+        if not servers_snapshot:
+            _server_lock_identities.clear()
+            _connecting_servers.clear()
 
     # Fast path: nothing to shut down.
     if not servers_snapshot:
+        if pending_lock_identities:
+            try:
+                from gateway.status import release_scoped_lock
+
+                for lock_identity in pending_lock_identities.values():
+                    if not lock_identity:
+                        continue
+                    release_scoped_lock(_MCP_SERVER_LOCK_SCOPE, lock_identity)
+            except Exception:
+                logger.debug("Error releasing pending MCP scoped locks", exc_info=True)
         _stop_mcp_loop()
         return
 
@@ -4571,7 +4688,22 @@ def shutdown_mcp_servers():
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
         with _lock:
+            lock_identities = {
+                server.name: _server_lock_identities.pop(server.name, None)
+                for server in servers_snapshot
+            }
             _servers.clear()
+            for server in servers_snapshot:
+                _connecting_servers.pop(server.name, None)
+        try:
+            from gateway.status import release_scoped_lock
+
+            for server_name, lock_identity in lock_identities.items():
+                if not lock_identity:
+                    continue
+                release_scoped_lock(_MCP_SERVER_LOCK_SCOPE, lock_identity)
+        except Exception:
+            logger.debug("Error releasing MCP scoped locks", exc_info=True)
 
     with _lock:
         loop = _mcp_loop
