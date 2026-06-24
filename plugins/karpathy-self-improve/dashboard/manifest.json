@@ -6,5 +6,6 @@
   "tab": {
     "path": "/self-improve",
     "position": "end"
-  }
+  },
+  "api": "plugin_api.py"
 }
