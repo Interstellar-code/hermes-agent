@@ -581,6 +581,31 @@ class TestWebServerEndpoints:
         resp = self.client.patch("/api/sessions/does-not-exist", json={"title": "x"})
         assert resp.status_code == 404
 
+    def test_get_session_messages_honors_pagination_and_rejects_bad_limit(self):
+        """Dashboard session-message reads must match gateway pagination semantics."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="paged-chat", source="cli")
+            for i in range(6):
+                db.append_message(session_id="paged-chat", role="user", content=f"m{i}")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/paged-chat/messages?limit=2&offset=2")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert [m["content"] for m in body["messages"]] == ["m2", "m3"]
+
+        bad_text = self.client.get("/api/sessions/paged-chat/messages?limit=abc")
+        assert bad_text.status_code == 400
+        assert bad_text.json()["detail"] == "limit and offset must be integers"
+
+        bad_negative = self.client.get("/api/sessions/paged-chat/messages?limit=-5")
+        assert bad_negative.status_code == 400
+        assert bad_negative.json()["detail"] == "limit must be >= 0"
+
     def test_archive_session_via_patch(self):
         """PATCH archived=true soft-hides a session; archived=false restores it."""
         from hermes_state import SessionDB

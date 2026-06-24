@@ -2682,7 +2682,12 @@ class SessionDB:
         self._execute_write(_do)
 
     def get_messages(
-        self, session_id: str, include_inactive: bool = False
+        self,
+        session_id: str,
+        include_inactive: bool = False,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -2693,15 +2698,31 @@ class SessionDB:
 
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
+
+        Paging: the returned list is ALWAYS oldest→newest. When ``limit``
+        is given it bounds a *tail* — ``offset`` counts backward from the
+        most recent message, so ``limit=50, offset=0`` is the newest 50
+        messages and ``offset=50`` the 50 before those. This is the cheap,
+        chat-tail shape: paging is done at the SQL layer (``ORDER BY id
+        DESC LIMIT/OFFSET``) so the full transcript is never materialized.
+        ``limit=None`` (the default) returns the whole session unchanged.
         """
         active_clause = "" if include_inactive else " AND active = 1"
         with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ?"
-                f"{active_clause} ORDER BY id",
-                (session_id,),
-            )
-            rows = cursor.fetchall()
+            if limit is None:
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ?"
+                    f"{active_clause} ORDER BY id",
+                    (session_id,),
+                )
+                rows = cursor.fetchall()
+            else:
+                cursor = self._conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ?"
+                    f"{active_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (session_id, max(0, int(limit)), max(0, int(offset))),
+                )
+                rows = list(reversed(cursor.fetchall()))
         result = []
         for row in rows:
             msg = dict(row)

@@ -1501,9 +1501,26 @@ class APIServerAdapter(BasePlatformAdapter):
         _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
+        # ``limit``/``offset`` page a tail at the storage layer (data is
+        # oldest→newest; offset counts back from the newest message). Omit
+        # both for the full transcript. See SessionDB.get_messages.
+        try:
+            limit = request.query.get("limit")
+            limit = int(limit) if limit is not None else None
+            offset = max(0, int(request.query.get("offset", 0)))
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error("limit and offset must be integers", code="invalid_pagination"),
+                status=400,
+            )
+        if limit is not None and limit < 0:
+            return web.json_response(
+                _openai_error("limit must be >= 0", code="invalid_pagination"),
+                status=400,
+            )
         db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
-        messages = db.get_messages(resolved_id)
+        messages = db.get_messages(resolved_id, limit=limit, offset=offset)
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
