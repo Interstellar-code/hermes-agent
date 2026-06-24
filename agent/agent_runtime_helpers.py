@@ -2305,6 +2305,30 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
 
+    # --- Coerce role=tool content into a shape every provider accepts ---
+    def _coerce_tool_message_content(content: Any) -> Any:
+        import json as _json
+        from agent.tool_dispatch_helpers import _is_multimodal_tool_result
+
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if _is_multimodal_tool_result(content):
+            return content.get("content") or []
+        if isinstance(content, list) and all(
+            isinstance(part, dict) and "type" in part for part in content
+        ):
+            return content
+        try:
+            return _json.dumps(content, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(content)
+
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            msg["content"] = _coerce_tool_message_content(msg.get("content"))
+
     surviving_call_ids: set = set()
     for msg in messages:
         if msg.get("role") == "assistant":
