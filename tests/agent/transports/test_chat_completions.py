@@ -1,5 +1,6 @@
 """Tests for the ChatCompletionsTransport."""
 
+import json
 import pytest
 from types import SimpleNamespace
 
@@ -128,6 +129,31 @@ class TestChatCompletionsBasic:
         returned by identity (preserves the deepcopy-on-demand contract)."""
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
+
+    def test_convert_messages_coerces_dict_tool_content(self, transport):
+        result_dict = {"source": "capability.md", "capability": "# SwitchUI"}
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "switchui_info", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": result_dict},
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.2")
+        assert isinstance(result[2]["content"], str)
+        assert json.loads(result[2]["content"]) == result_dict
+        assert isinstance(msgs[2]["content"], dict)
+
+    def test_convert_messages_preserves_string_and_multimodal_tool_content(self, transport):
+        parts = [{"type": "text", "text": "see"},
+                 {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
+        msgs = [
+            {"role": "tool", "tool_call_id": "c1", "content": "plain string"},
+            {"role": "tool", "tool_call_id": "c2", "content": parts},
+        ]
+        result = transport.convert_messages(msgs, model="glm-5.2")
+        assert result[0]["content"] == "plain string"
+        assert result[1]["content"] == parts
 
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.

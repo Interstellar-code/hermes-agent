@@ -8,9 +8,12 @@ NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
 """
 
+import json
+
 import pytest
 
 from agent.tool_dispatch_helpers import (
+    _coerce_tool_content,
     _extract_file_mutation_targets,
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
@@ -294,3 +297,50 @@ class TestFileMutationTargets:
             },
         )
         assert targets == ["old/name.py", "new/name.py"]
+
+
+class TestToolContentCoercion:
+    def test_dict_content_serialized_to_json_string(self):
+        result = {"source": "capability.md", "capability": "# SwitchUI\n..."}
+        msg = make_tool_result_message("switchui_info", result, "call_1")
+        assert isinstance(msg["content"], str)
+        assert json.loads(msg["content"]) == result
+
+    def test_dict_content_for_status_tool(self):
+        result = {"connected": True, "port": 9119, "running": False}
+        msg = make_tool_result_message("switchui_status", result, "call_2")
+        assert isinstance(msg["content"], str)
+        assert json.loads(msg["content"]) == result
+
+    def test_plain_string_passes_through_unchanged(self):
+        msg = make_tool_result_message("terminal", "exit 0\n", "call_3")
+        assert msg["content"] == "exit 0\n"
+
+    def test_multimodal_content_list_preserved(self):
+        parts = [
+            {"type": "text", "text": "see image"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]
+        msg = make_tool_result_message("browser_vision", parts, "call_4")
+        # List is rebuilt (not returned by identity) since untrusted-tool
+        # multimodal content now gets its text parts wrapped per-part.
+        assert msg["content"] == parts
+
+    def test_untrusted_dict_is_serialized_then_wrapped(self):
+        result = {"issue": "load-bearing", "body": "x" * 64}
+        msg = make_tool_result_message("mcp_linear_get_issue", result, "call_5")
+        content = msg["content"]
+        assert isinstance(content, str)
+        assert content.startswith('<untrusted_tool_result source="mcp_linear_get_issue">')
+        assert content.endswith('</untrusted_tool_result>')
+        assert "load-bearing" in content
+
+    def test_coerce_helper_directly(self):
+        assert _coerce_tool_content("already a string") == "already a string"
+        assert _coerce_tool_content({"a": 1}) == '{"a": 1}'
+        assert _coerce_tool_content([{"type": "text"}]) == [{"type": "text"}]
+        sentinel = object()
+        assert isinstance(_coerce_tool_content(sentinel), str)
+
+    def test_coerce_preserves_unicode(self):
+        assert _coerce_tool_content({"msg": "café ☕"}) == '{"msg": "café ☕"}'
