@@ -300,7 +300,11 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
             if collector.provider:
                 return collector.provider
         except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+            # Surface at WARNING with traceback: a swallowed register() error
+            # here is the exact failure behind "loaded but no provider instance
+            # found", and a DEBUG-only log makes that class of bug undiagnosable
+            # in production (gateway loggers run at INFO/WARNING).
+            logger.warning("register() failed for %s: %s", name, e, exc_info=True)
 
     # Fallback: find a MemoryProvider subclass and instantiate it
     from agent.memory_provider import MemoryProvider
