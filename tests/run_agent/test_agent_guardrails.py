@@ -6,6 +6,7 @@ Covers three static methods on AIAgent (inspired by PR #1321 — @alireza78a):
   - _deduplicate_tool_calls()   — Phase 2b: identical call deduplication
 """
 
+import json
 import types
 
 from run_agent import AIAgent
@@ -107,6 +108,45 @@ class TestSanitizeApiMessages:
         out = AIAgent._sanitize_api_messages(msgs)
         assert len(out) == 2
         assert out[1]["tool_call_id"] == "c6"
+
+    def test_tool_dict_content_is_json_stringified(self):
+        msgs = [
+            {"role": "assistant", "tool_calls": [assistant_dict_call("c7")]},
+            tool_result("c7", {"ok": True, "count": 1}),
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert isinstance(out[1]["content"], str)
+        assert json.loads(out[1]["content"]) == {"ok": True, "count": 1}
+
+    def test_tool_none_content_becomes_empty_string(self):
+        msgs = [
+            {"role": "assistant", "tool_calls": [assistant_dict_call("c8")]},
+            tool_result("c8", None),
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert out[1]["content"] == ""
+
+    def test_tool_content_part_list_is_preserved(self):
+        parts = [{"type": "text", "text": "hello"}]
+        msgs = [
+            {"role": "assistant", "tool_calls": [assistant_dict_call("c9")]},
+            tool_result("c9", parts),
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert out[1]["content"] is parts
+
+    def test_tool_multimodal_envelope_unwraps_to_content_list(self):
+        envelope = {
+            "_multimodal": True,
+            "content": [{"type": "text", "text": "captured"}],
+            "text_summary": "captured",
+        }
+        msgs = [
+            {"role": "assistant", "tool_calls": [assistant_dict_call("c10")]},
+            tool_result("c10", envelope),
+        ]
+        out = AIAgent._sanitize_api_messages(msgs)
+        assert out[1]["content"] == [{"type": "text", "text": "captured"}]
 
 
 # ---------------------------------------------------------------------------
