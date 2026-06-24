@@ -107,6 +107,16 @@ config/mcporter.json
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# Agent / orchestration runtime state created in-repo — never codebase artifacts.
+.omc/
+.codegraph/
+.omo/
+*.log
+CLAUDE.md
+hindsight.py
+.claude/
+cache/
+/*.log
 # Working directory for the Hermes Agent's session state (~/.hermes/ at runtime;
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.
