@@ -317,6 +317,16 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def _coerce_tool_content(content: Any) -> Any:
+    """Coerce a tool result to a provider-safe wire shape."""
+    if isinstance(content, (str, list)):
+        return content
+    try:
+        return json.dumps(content, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
 def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -329,11 +339,12 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     and MCP responses — it changes how the model interprets the content rather
     than relying on regex pattern matching catching every payload.
 
-    Wrapping only happens for plain string content.  Multimodal results
-    (content lists with image_url parts) pass through unwrapped so the
-    list structure stays valid for vision-capable adapters.
+    Non-string, non-multimodal content is JSON-serialized first so a
+    dict-returning tool can't ship a raw object that providers reject.
+    Multimodal results (content lists with image_url parts) pass through
+    unwrapped so the list structure stays valid for vision-capable adapters.
     """
-    wrapped = _maybe_wrap_untrusted(name, content)
+    wrapped = _maybe_wrap_untrusted(name, _coerce_tool_content(content))
     return {
         "role": "tool",
         "name": name,

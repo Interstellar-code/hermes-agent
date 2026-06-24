@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+import json
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -178,6 +179,11 @@ class ChatCompletionsTransport(ProviderTransport):
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
                 needs_sanitize = True
                 break
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                needs_sanitize = True
+                break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
@@ -206,6 +212,15 @@ class ChatCompletionsTransport(ProviderTransport):
             # is safe and future-proofs against new markers being added.
             for key in [k for k in msg if isinstance(k, str) and k.startswith("_")]:
                 msg.pop(key, None)
+            if msg.get("role") == "tool" and not isinstance(
+                msg.get("content"), (str, list)
+            ):
+                try:
+                    msg["content"] = json.dumps(
+                        msg.get("content"), default=str, ensure_ascii=False
+                    )
+                except (TypeError, ValueError):
+                    msg["content"] = str(msg.get("content"))
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
