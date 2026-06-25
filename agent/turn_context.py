@@ -110,8 +110,13 @@ class TurnContext:
     current_turn_user_idx: int
     # Whether the post-turn memory review should fire.
     should_review_memory: bool = False
-    # Context contributed by ``pre_llm_call`` plugins (appended to user message).
+    # Context contributed by ``pre_llm_call`` plugins and appended to the
+    # current turn's user message.
     plugin_user_context: str = ""
+    # Trusted plugin context contributed by ``pre_llm_call`` plugins with
+    # ``target in ("system", "developer")``. Appended to the effective
+    # system prompt at API-call time only.
+    plugin_trusted_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
 
@@ -428,8 +433,14 @@ def build_turn_context(
                 if not _compressor.should_compress(_preflight_tokens):
                     break
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    # Plugin hook: pre_llm_call.
+    #
+    # Plain strings and dicts without a target are injected into the current
+    # turn's user message. Trusted dicts with target="system"/"developer" are
+    # appended to the effective system prompt at API-call time only; they are
+    # never persisted to the session DB.
     plugin_user_context = ""
+    plugin_trusted_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -445,13 +456,20 @@ def build_turn_context(
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
+        _trusted_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
+                _target = r.get("target", "user_message")
+                if _target in ("system", "developer"):
+                    _trusted_parts.append(str(r["context"]))
+                else:
+                    _ctx_parts.append(str(r["context"]))
             elif isinstance(r, str) and r.strip():
                 _ctx_parts.append(r)
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
+        if _trusted_parts:
+            plugin_trusted_context = "\n\n".join(_trusted_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
@@ -502,5 +520,6 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        plugin_trusted_context=plugin_trusted_context,
         ext_prefetch_cache=ext_prefetch_cache,
     )

@@ -1582,11 +1582,11 @@ class TestPreLlmCallTargetRouting:
         assert "memory context" in contexts
         assert "guardrail text" in contexts
 
-    def test_routing_logic_all_to_user_message(self, tmp_path, monkeypatch):
+    def test_routing_logic_splits_user_and_trusted_context(self, tmp_path, monkeypatch):
         """Simulate the routing logic from run_agent.py.
 
-        All plugin context — dicts and plain strings — ends up in a single
-        user message context string. There is no system_prompt target.
+        Plain strings and target-less dicts go to the user message. Trusted
+        dicts with ``target="developer"`` route to system-tier context.
         """
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         self._make_pre_llm_plugin(
@@ -1601,6 +1601,10 @@ class TestPreLlmCallTargetRouting:
             plugins_dir, "ccc_plain",
             '"plain text C"',
         )
+        self._make_pre_llm_plugin(
+            plugins_dir, "ddd_trusted",
+            '{"context": "persona D", "target": "developer"}',
+        )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
@@ -1611,11 +1615,17 @@ class TestPreLlmCallTargetRouting:
             conversation_history=[], is_first_turn=True, model="test",
         )
 
-        # Replicate run_agent.py routing logic — everything goes to user msg
+        # Replicate current routing logic: plain strings / target-less dicts go
+        # to user context; trusted targets feed the effective system string.
         _ctx_parts = []
+        _trusted_parts = []
         for r in results:
             if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
+                _target = r.get("target", "user_message")
+                if _target in ("system", "developer"):
+                    _trusted_parts.append(str(r["context"]))
+                else:
+                    _ctx_parts.append(str(r["context"]))
             elif isinstance(r, str) and r.strip():
                 _ctx_parts.append(r)
 
@@ -1624,6 +1634,7 @@ class TestPreLlmCallTargetRouting:
         assert "memory A" in _plugin_user_context
         assert "rule B" in _plugin_user_context
         assert "plain text C" in _plugin_user_context
+        assert _trusted_parts == ["persona D"]
 
 
 # ── TestPluginCommands ────────────────────────────────────────────────────

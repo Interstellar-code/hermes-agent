@@ -595,6 +595,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _plugin_trusted_context = _ctx.plugin_trusted_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Main conversation loop counters (pure locals consumed by the loop below).
@@ -785,7 +786,7 @@ def run_conversation(
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
-            # with target="user_message" (the default).  Both are
+            # with target absent or target="user_message" (the default). Both are
             # API-call-time only — the original message in `messages` is
             # never mutated, so nothing leaks into session persistence.
             if idx == current_turn_user_idx and msg.get("role") == "user":
@@ -829,10 +830,13 @@ def run_conversation(
         # External recall context is injected into the user message, not the system
         # prompt, so the stable cache prefix remains unchanged.
         #
-        # NOTE: Plugin context from pre_llm_call hooks is injected into the
-        # user message (see injection block above), NOT the system prompt.
-        # This is intentional — system prompt modifications break the prompt
-        # cache prefix.  The system prompt is reserved for Hermes internals.
+        # NOTE: Plugin context from pre_llm_call hooks with target absent or
+        # "user_message" is injected into the user message (see injection block
+        # above). Plugin context with target="system" or "developer" is
+        # appended to the locally-rebuilt effective_system string at API-call
+        # time only (NOT stored on agent.ephemeral_system_prompt), so the
+        # cached active_system_prompt stays unchanged unless a trusted plugin
+        # explicitly contributes system-tier context for this turn.
         #
         # Hermes invariant: the system prompt is built ONCE per session
         # (cached on ``_cached_system_prompt``) and replayed verbatim on
@@ -842,6 +846,8 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        if _plugin_trusted_context:
+            effective_system = (effective_system + "\n\n" + _plugin_trusted_context).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

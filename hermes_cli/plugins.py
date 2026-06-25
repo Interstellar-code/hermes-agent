@@ -1853,16 +1853,16 @@ class PluginManager:
         Returns a list of non-``None`` return values from callbacks.
 
         For ``pre_llm_call``, callbacks may return a dict describing
-        context to inject into the current turn's user message::
+        context to inject into the current turn::
 
             {"context": "recalled text..."}
             "recalled text..."          # plain string, equivalent
+            {"context": "trusted overlay", "target": "developer"}
 
-        Context is ALWAYS injected into the user message, never the
-        system prompt.  This preserves the prompt cache prefix — the
-        system prompt stays identical across turns so cached tokens
-        are reused.  All injected context is ephemeral — never
-        persisted to session DB.
+        Plain strings and target-less dicts are injected into the user
+        message. Dicts with ``target in ("system", "developer")`` are
+        appended to the effective system prompt at API-call time only.
+        All injected context is ephemeral — never persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
