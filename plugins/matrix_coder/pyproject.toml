@@ -1,0 +1,19 @@
+# Optional packaging metadata for matrix_coder.
+#
+# This file is OPTIONAL. Matrix Coder loads as a *directory plugin* regardless
+# of this file's presence — the Hermes plugin loader discovers it via
+# `plugin.yaml` + `__init__.py:register(ctx)`, not via pip/entry-points.
+# This metadata exists only so the plugin can optionally be packaged or linted
+# as a standalone distribution in the future.
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matrix-coder"
+version = "0.0.1"
+description = "Matrix Coder — a specialist-coder layer for Hermes (Phase 0 scaffold)."
+authors = [{ name = "Interstellar-code" }]
+requires-python = ">=3.9"
+dependencies = []  # stdlib-only in Phase 0
