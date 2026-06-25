@@ -516,6 +516,10 @@ def test_deploy_provisions_inbound_token(tmp_path: Path, stub_template, monkeypa
 
     res = _run(cc_deploy.deploy_cc_receiver_handler(str(repo)))
     assert res["deployed"] is True
+    # #98: the detached receiver's env always pins HERMES_HOME so it resolves the
+    # deployer's profile, not the silent ~/.hermes default-profile fallback.
+    assert captured["env"] is not None
+    assert "HERMES_HOME" in captured["env"]
     # Returned to Hermes for fleet_send wiring.
     token = res["receiver_token"]
     token_env = res["receiver_token_env"]
@@ -601,8 +605,11 @@ def test_deploy_no_auth_opt_out(tmp_path: Path, stub_template, monkeypatch: pyte
     assert "receiver_token" not in res
     cfg = json.loads((repo / ".hermes" / "a2a_receiver.json").read_text())
     assert "auth_token_env" not in cfg
-    # No injected env override (full os.environ not copied).
-    assert captured["env"] is None
+    # no_auth opt-out is enforced by the absence of receiver_token (result) and
+    # auth_token_env (config), asserted above. #98: the child env is still built
+    # to pin HERMES_HOME even on the no_auth path.
+    assert captured["env"] is not None
+    assert "HERMES_HOME" in captured["env"]
     assert any("no_auth" in w for w in res["warnings"])
 
 
@@ -684,17 +691,33 @@ def _stub_fleet(monkeypatch: pytest.MonkeyPatch, agents: dict):
     monkeypatch.setattr(fleet_config, "load_fleet", lambda profile=None: {"agents": agents})
 
 
-def test_managed_cc_peers_selection():
+def test_iter_supported_managed_peers_selection():
+    """iter_supported_managed_peers covers all supported modes (claude_code + opencode)."""
+    from a2a_fleet.managed_peers import iter_supported_managed_peers
+
     agents = {
+        # plain url peer — not managed
         "plain": {"url": "http://x", "managed": False, "mode": None, "repo_path": None},
-        "route-b": {"url": "http://y", "managed": True, "mode": None, "repo_path": "/r"},
-        "wrong-mode": {"url": "http://z", "managed": True, "mode": "llm", "repo_path": "/r"},
+        # managed but mode=None (legacy / Route B — no mode field) — excluded
+        "legacy-no-mode": {"url": "http://y", "managed": True, "mode": None, "repo_path": "/r"},
+        # managed but unknown mode — excluded
+        "unknown-mode": {"url": "http://z", "managed": True, "mode": "llm", "repo_path": "/r"},
+        # managed claude_code but no repo_path — excluded
         "no-repo": {"url": "http://w", "managed": True, "mode": "claude_code", "repo_path": None},
-        "good": {"url": "http://c", "managed": True, "mode": "claude_code", "repo_path": "/r"},
+        # valid claude_code managed peer — included
+        "good-cc": {"url": "http://c", "managed": True, "mode": "claude_code", "repo_path": "/r"},
+        # valid opencode managed peer — included
+        "good-oc": {"url": "http://d", "managed": True, "mode": "opencode", "repo_path": "/r2"},
     }
-    selected = cc_deploy._managed_cc_peers({"agents": agents})
+    selected = list(iter_supported_managed_peers(agents))
     names = [n for n, _ in selected]
-    assert names == ["good"]
+    assert "good-cc" in names
+    assert "good-oc" in names
+    assert "plain" not in names
+    assert "legacy-no-mode" not in names
+    assert "unknown-mode" not in names
+    assert "no-repo" not in names
+    assert len(names) == 2
 
 
 def test_reconcile_noop_when_no_managed_peers(monkeypatch: pytest.MonkeyPatch):
@@ -1059,3 +1082,90 @@ def test_canonicalize_unwraps_nested_repo_path_dict(tmp_path):
     p, err = cc_deploy.canonicalize_repo_path({"repo_path": str(repo)})
     assert err is None
     assert p == Path(os.path.realpath(str(repo)))
+
+
+# ---------------------------------------------------------------------------
+# Boot-reconcile: opencode managed peer + legacy no-mode peer
+# ---------------------------------------------------------------------------
+
+def test_reconcile_down_opencode_peer_triggers_oc_redeploy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed opencode peer that is down must trigger oc_deploy (not cc_deploy)."""
+    from a2a_fleet import oc_deploy
+
+    repo = _make_repo(tmp_path)
+    canonical = Path(os.path.realpath(str(repo)))
+    _stub_fleet(monkeypatch, {
+        "opencode": {
+            "url": "http://127.0.0.1:9310", "managed": True,
+            "mode": "opencode", "repo_path": str(canonical),
+        },
+    })
+    # Down (pid file absent, not healthy).
+    monkeypatch.setattr(cc_deploy, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(cc_deploy, "_check_health_once",
+                        lambda port, expected_repo_path=None: False)
+    called = {}
+
+    async def fake_oc_deploy(repo_path, bind_port=oc_deploy.DEFAULT_BIND_PORT, **k):
+        called["repo_path"] = repo_path
+        called["bind_port"] = bind_port
+        called["mode"] = "opencode"
+        return {"deployed": True, "pid": 9999}
+
+    monkeypatch.setattr(oc_deploy, "deploy_oc_receiver_handler", fake_oc_deploy)
+    rows = cc_deploy.reconcile_managed_receivers()
+    assert len(rows) == 1
+    assert rows[0]["action"] == "redeployed"
+    assert rows[0]["pid"] == 9999
+    assert called.get("mode") == "opencode", "oc_deploy was not called for mode=opencode peer"
+    assert called["repo_path"] == str(canonical)
+    assert called["bind_port"] == 9310
+
+
+def test_reconcile_legacy_no_mode_peer_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed peer with mode=None (legacy / Route B) must be ignored gracefully, not crash."""
+    _stub_fleet(monkeypatch, {
+        "legacy": {
+            "url": "http://127.0.0.1:9300", "managed": True,
+            "mode": None, "repo_path": str(tmp_path),
+        },
+    })
+    # If the legacy peer were processed it might call _managed_receiver_module which raises.
+    rows = cc_deploy.reconcile_managed_receivers()
+    # No crash, empty result (unsupported mode is filtered by iter_supported_managed_peers).
+    assert rows == []
+
+
+def test_reconcile_managed_receiver_module_selected_for_opencode() -> None:
+    """_managed_receiver_module('opencode') returns the oc_deploy module."""
+    from a2a_fleet import oc_deploy as oc_mod
+
+    module = cc_deploy._managed_receiver_module("opencode")
+    assert module is oc_mod
+
+
+def test_deploy_cc_handler_dict_dispatch_extracts_all_params(
+    tmp_path: Path, stub_template: Path, stub_runtime
+) -> None:
+    """Registry calls handler(args_dict, task_id=...) — all params must be unwrapped for cc too.
+
+    This test FAILS before the cc_deploy dict-unwrap fix (bind_port silently defaults)
+    and PASSES after.
+    """
+    repo = _make_repo(tmp_path)
+    res = _run(cc_deploy.deploy_cc_receiver_handler(
+        {"repo_path": str(repo), "bind_port": 9312, "model": "claude-test", "no_auth": True},
+        task_id="t-cc",
+    ))
+    assert res.get("deployed") is True, f"deploy failed: {res}"
+    cfg_path = repo / ".hermes" / "a2a_receiver.json"
+    cfg = json.loads(cfg_path.read_text())
+    assert cfg["bind_port"] == 9312, (
+        f"Expected bind_port=9312 (from dict args), got {cfg['bind_port']} — "
+        "dict-unwrap for non-repo_path params is missing in cc_deploy"
+    )
+    assert cfg.get("claude_model") == "claude-test"

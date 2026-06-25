@@ -1,32 +1,52 @@
 #!/usr/bin/env python3
-"""Standalone A2A receiver — OpenCode as a repo-scoped executor peer.
+"""Standalone A2A receiver — OpenAI Codex CLI as a repo-scoped executor peer.
 
-This file is a TEMPLATE. Hermes' ``deploy_oc_receiver`` tool copies it verbatim
-into a target repo's ``<repo>/.hermes/oc_receiver.py`` and writes a sibling
-``oc_receiver.json`` config. The receiver then runs as a detached daemon that:
+This file is a TEMPLATE. Hermes' ``deploy_codex_receiver`` tool copies it
+verbatim into a target repo's ``<repo>/.hermes/codex_receiver.py`` and writes a
+sibling ``codex_receiver.json`` config. The receiver then runs as a detached
+daemon that:
 
   1. Serves an A2A surface on ``bind_host:bind_port``
      (GET /health, GET /.well-known/agent-card.json, POST /jsonrpc).
   2. Queues inbound messages to an inbox JSONL and ACKs immediately.
-  3. A background poll loop drains the inbox, spawning ``opencode run`` with the
-     FULL repo harness inherited via ``cwd=repo_path`` and the receiver role prompt.
-  4. Maintains a persistent OpenCode session per A2A ``contextId`` via
-     a durable ``a2a-oc-sessions.json`` map + ``--session <sessionID>``.
+  3. A background poll loop drains the inbox, spawning ``codex exec`` with the
+     repo as cwd (pinned from config, NEVER from inbound message).
+  4. Maintains a persistent Codex thread per A2A ``contextId`` via
+     a durable ``a2a-codex-sessions.json`` map + ``codex exec resume <thread_id>``.
   5. POSTs the result back to ``hermes_url`` as a JSON-RPC SendMessage.
 
 Design constraints (deliberate):
-  * STDLIB ONLY (+ the ``opencode`` CLI). No import of the a2a_fleet package, no
+  * STDLIB ONLY (+ the ``codex`` CLI). No import of the a2a_fleet package, no
     Hermes gateway dependency — it must run on its own inside any repo.
-  * ``cwd`` for opencode is ALWAYS ``repo_path`` from config, NEVER taken from an
+  * ``cwd`` for codex is ALWAYS ``repo_path`` from config, NEVER taken from an
     inbound message (a remote peer must not be able to redirect execution).
   * Per-contextId serialization: two concurrent turns on the same contextId must
-    NOT both mint / reuse the same OpenCode session concurrently. A per-contextId
-    lock serializes same-context turns;
-    different contextIds run concurrently.
+    NOT both mint / reuse the same Codex thread concurrently. A per-contextId
+    lock serializes same-context turns; different contextIds run concurrently.
+
+Subprocess CLI contract (codex-cli 0.135.0):
+  First turn (no stored thread_id):
+    codex exec "<prompt>" --json --skip-git-repo-check -s <sandbox> [-m <model>]
+  Resume turn (stored thread_id exists):
+    codex exec resume <thread_id> "<prompt>" --json --skip-git-repo-check [-m <model>]
+  * Do NOT pass --color (asymmetry: accepted on exec but REJECTED on exec resume).
+  * Do NOT pass --ephemeral (disables resume).
+  * Sandbox default: workspace-write  (read-only | workspace-write | danger-full-access)
+  * -s/--sandbox only on first turn; resume inherits the sandbox from thread creation.
+
+JSONL output parsing:
+  Events are line-delimited JSON on STDOUT. Key event types:
+    {"type":"thread.started","thread_id":"<uuid>"}
+    {"type":"turn.started"}
+    {"type":"item.completed","item":{"id":"...","type":"agent_message","text":"<reply>"}}
+    {"type":"turn.completed","usage":{...}}
+  * RESUMABLE SESSION ID: thread_id from "thread.started" event.
+  * FINAL REPLY: the LAST item.completed event where item["type"]=="agent_message" -> item["text"].
+  * SESSION-NOT-FOUND: "no rollout found for thread id" in reply text or stderr.
 
 Reply contract (receiver -> Hermes), POSTed to ``hermes_url``::
 
-    {"jsonrpc": "2.0", "id": "oc-<ts>", "method": "SendMessage",
+    {"jsonrpc": "2.0", "id": "codex-<ts>", "method": "SendMessage",
      "params": {"message": {"role": "agent",
                             "parts": [{"text": "<result>"}],
                             "contextId": "<same contextId>"}}}
@@ -54,68 +74,59 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "oc_receiver.json"
-INBOX_PATH = SCRIPT_DIR / "a2a-oc-inbox.jsonl"
-INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-oc-inbox.offset"
-TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-oc-transcript.jsonl"
-# Distinct JSON-RPC error code for "busy / duplicate dispatch, retry" so clients
-# can branch on it instead of the generic -32000 server error (P1-5).
-A2A_BUSY_CODE = -32001
-PID_PATH = SCRIPT_DIR / "oc_receiver.pid"
+CONFIG_PATH = SCRIPT_DIR / "codex_receiver.json"
+INBOX_PATH = SCRIPT_DIR / "a2a-codex-inbox.jsonl"
+INBOX_OFFSET_PATH = SCRIPT_DIR / "a2a-codex-inbox.offset"
+TRANSCRIPT_PATH = SCRIPT_DIR / "a2a-codex-transcript.jsonl"
+PID_PATH = SCRIPT_DIR / "codex_receiver.pid"
 
 # Cap on a single inbound JSON-RPC body (DoS guard) and the prompt we hand to
-# opencode. 1 MiB body is generous for text tasks; oversized bodies are rejected
+# codex. 1 MiB body is generous for text tasks; oversized bodies are rejected
 # with HTTP 413 before allocation.
 MAX_BODY_BYTES = 1 * 1024 * 1024
 MAX_PROMPT_CHARS = 256 * 1024
-# Cap opencode stdout we buffer in memory (defensive — runaway tool output).
+# Cap codex stdout we buffer in memory (defensive — runaway tool output).
 MAX_STDOUT_BYTES = 8 * 1024 * 1024
-TOKEN_PATH = SCRIPT_DIR / ".oc-token"
-SESSION_MAP_PATH = SCRIPT_DIR / "a2a-oc-sessions.json"
+TOKEN_PATH = SCRIPT_DIR / ".codex-token"
+SESSION_MAP_PATH = SCRIPT_DIR / "a2a-codex-sessions.json"
 
-# A signal in a result frame / stderr that a session genuinely does not exist
-# (the ONLY condition under which we retry the other session mode — see
-# ``run_opencode_turn``). Kept narrow on purpose: this receiver runs autonomously
-# with ``--permission-mode bypassPermissions``, so a spurious retry can
-# double-execute a side-effecting turn.
+# A signal in a result frame / stderr that a Codex thread genuinely does not
+# exist (the ONLY condition under which we retry with a fresh first turn — see
+# ``run_codex_turn``). Kept narrow on purpose: this receiver runs autonomously
+# with ``--skip-git-repo-check``, so a spurious retry can double-execute a
+# side-effecting turn.
 SESSION_NOT_FOUND_SIGNALS = (
-    "error: session not found",
+    "no rollout found for thread id",
 )
 
+DEFAULT_SANDBOX = "workspace-write"
 
 DEFAULTS: Dict[str, Any] = {
     "repo_path": str(SCRIPT_DIR.parent),  # .hermes/ is inside the repo
     "bind_host": "127.0.0.1",
-    "bind_port": 9310,
+    "bind_port": 9311,
     "hermes_url": "http://127.0.0.1:9219/jsonrpc",
     "role_prompt": (
-        "You are an OpenCode executor peer in an A2A fleet. The orchestrator "
+        "You are a Codex CLI executor peer in an A2A fleet. The orchestrator "
         "is Hermes. You receive tasks over A2A and execute them in THIS repo "
-        "using your full tools/skills/MCP. Reply concisely with results/status. "
+        "using your full tools/skills. Reply concisely with results/status. "
         "Same contextId = same ongoing session/thread."
     ),
     "role_file": None,            # if set, read role prompt from this path (overrides role_prompt)
-    "opencode_model": None,
-    # Agent profile opencode runs under. None = opencode's OWN default primary
-    # agent, which already has the full tool set (read/edit/bash). Do NOT force
-    # "build": in some installs (e.g. 1.15.13) "build" is registered as a
-    # SUBAGENT, and `--agent build` then warns + falls back to default anyway.
-    # The real #99 fix is PATH augmentation (gh/git reach the daemon), not the
-    # agent. Set this only to pin a specific tool-enabled primary agent; never a
-    # restricted/plan agent (the model would reply "I don't have access").
-    "opencode_agent": None,
-    "opencode_extra_flags": [],     # list[str] appended verbatim to the command
+    "codex_model": None,
+    "codex_sandbox": DEFAULT_SANDBOX,
+    "codex_extra_flags": [],      # list[str] appended verbatim to the command
     "auth_token_env": None,       # env var name holding the INBOUND bearer token (POST /jsonrpc)
     "hermes_auth_token_env": None,  # env var name holding the bearer token for OUTBOUND replies to Hermes
     "poll_interval_s": 2.0,
-    "opencode_timeout_s": 300,
+    "codex_timeout_s": 300,
     "context_lock_wait_s": 600.0,  # how long a queued same-context turn waits for the lock
-    "max_concurrent_turns": 3,     # global cap on simultaneous OpenCode subprocesses
+    "max_concurrent_turns": 3,     # global cap on simultaneous Codex subprocesses
     "max_tracked_contexts": 1024,  # bound on the per-context lock registry
     "idle_timeout_s": 1800,        # self-teardown after this many idle seconds (0 = disabled)
 }
 
-log = logging.getLogger("oc_receiver")
+log = logging.getLogger("codex_receiver")
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +134,13 @@ log = logging.getLogger("oc_receiver")
 # ---------------------------------------------------------------------------
 
 def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
-    """Read ``oc_receiver.json`` (sibling of this script), merge over DEFAULTS.
+    """Read ``codex_receiver.json`` (sibling of this script), merge over DEFAULTS.
 
     Missing / malformed config is non-fatal: defaults are used and a warning is
     logged. ``role_file`` (if set + readable) supplies the role prompt.
     """
     cfg = dict(DEFAULTS)
-    cfg["opencode_extra_flags"] = list(DEFAULTS["opencode_extra_flags"])
+    cfg["codex_extra_flags"] = list(DEFAULTS["codex_extra_flags"])
     try:
         raw = json.loads(config_path.read_text())
         if isinstance(raw, dict):
@@ -151,9 +162,9 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
         except OSError as exc:
             log.warning("role_file %s unreadable (%s); using role_prompt", role_file, exc)
 
-    if not isinstance(cfg.get("opencode_extra_flags"), list):
-        log.warning("opencode_extra_flags is not a list; ignoring")
-        cfg["opencode_extra_flags"] = []
+    if not isinstance(cfg.get("codex_extra_flags"), list):
+        log.warning("codex_extra_flags is not a list; ignoring")
+        cfg["codex_extra_flags"] = []
 
     return cfg
 
@@ -171,7 +182,7 @@ def resolve_hermes_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
     """Return the OUTBOUND bearer token (for replies to Hermes) or None.
 
     Read from the env var named in ``hermes_auth_token_env``. Unset name or
-    unset/empty value -> None (no Authorization header sent; current behavior).
+    unset/empty value -> None (no Authorization header sent).
     """
     env_name = cfg.get("hermes_auth_token_env")
     if not env_name:
@@ -181,14 +192,14 @@ def resolve_hermes_auth_token(cfg: Dict[str, Any]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Durable OpenCode session map
+# Durable Codex thread map (contextId -> thread_id)
 # ---------------------------------------------------------------------------
 
 _SESSION_MAP_LOCK = threading.Lock()
 
 
 def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]:
-    """Load the durable OpenCode session map. Malformed content -> empty map."""
+    """Load the durable Codex thread map. Malformed content -> empty map."""
     try:
         raw = json.loads(path.read_text())
     except FileNotFoundError:
@@ -203,31 +214,31 @@ def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]
     for context_id, entry in raw.items():
         if not isinstance(context_id, str) or not isinstance(entry, dict):
             continue
-        session_id = entry.get("session_id")
+        thread_id = entry.get("thread_id")
         updated_at = entry.get("updated_at")
-        if isinstance(session_id, str) and session_id.strip():
+        if isinstance(thread_id, str) and thread_id.strip():
             clean[context_id] = {
-                "session_id": session_id.strip(),
+                "thread_id": thread_id.strip(),
                 "updated_at": int(updated_at) if isinstance(updated_at, (int, float)) else int(time.time()),
             }
     return clean
 
 
-def get_session_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> Optional[str]:
+def get_thread_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> Optional[str]:
     entry = load_session_map(path).get(context_id) or {}
-    session_id = entry.get("session_id")
-    if isinstance(session_id, str) and session_id.strip():
-        return session_id.strip()
+    thread_id = entry.get("thread_id")
+    if isinstance(thread_id, str) and thread_id.strip():
+        return thread_id.strip()
     return None
 
 
-def store_session_id_for_context(context_id: str, session_id: str, path: Path = SESSION_MAP_PATH) -> None:
-    if not session_id.strip():
+def store_thread_id_for_context(context_id: str, thread_id: str, path: Path = SESSION_MAP_PATH) -> None:
+    if not thread_id.strip():
         return
     with _SESSION_MAP_LOCK:
         data = load_session_map(path)
         data[context_id] = {
-            "session_id": session_id.strip(),
+            "thread_id": thread_id.strip(),
             "updated_at": int(time.time()),
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -242,12 +253,14 @@ def store_session_id_for_context(context_id: str, session_id: str, path: Path = 
                 pass
 
 
-def clear_session_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> None:
-    """Remove a stale/dead session_id entry for ``context_id`` from the session map.
+def clear_thread_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) -> None:
+    """Remove a stale/dead thread_id entry for ``context_id`` from the session map.
 
-    Atomic tmp+os.replace write, same as ``store_session_id_for_context``.
-    Called under the per-contextId lock BEFORE a remint retry so that a failed
+    Atomic tmp+os.replace write, same as ``store_thread_id_for_context``.
+    Called under the per-contextId lock before a remint retry so that a failed
     remint leaves the map clean (no stale id re-persisted on the next turn).
+    Must be called while already holding _SESSION_MAP_LOCK or before acquiring it
+    — this function acquires the lock itself.
     """
     with _SESSION_MAP_LOCK:
         data = load_session_map(path)
@@ -260,47 +273,15 @@ def clear_session_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH)
             os.replace(tmp, path)
         except OSError as exc:
             log.warning("session map clear failed for ctx=%s (%s)", context_id, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
 # Command builder
 # ---------------------------------------------------------------------------
-
-# Flags that oc_receiver manages itself — must never be injected via opencode_extra_flags.
-_FORBIDDEN_OC: frozenset[str] = frozenset({
-    "--session", "-s",
-    "--continue", "-c",
-    "run",          # subcommand — positional, but guard against it in flags list
-    "--print",
-    "--format",
-    "--agent",      # managed via cfg["opencode_agent"]
-})
-
-
-def _sanitize_extra_flags(extra: List[str]) -> List[str]:
-    """Return a copy of ``extra`` with flags managed by oc_receiver removed.
-
-    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one token).
-    Logs a warning per dropped token so operators notice stale configs.
-    """
-    result: List[str] = []
-    tokens = [str(x) for x in extra]
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        base = tok.split("=", 1)[0] if "=" in tok else tok
-        if base in _FORBIDDEN_OC:
-            log.warning("dropping forbidden opencode_extra_flags token %r", tok)
-            i += 1
-            # --flag value form: also consume the following value token if it
-            # does not look like a flag itself.
-            if "=" not in tok and i < len(tokens) and not tokens[i].startswith("-"):
-                log.warning("dropping forbidden opencode_extra_flags value token %r", tokens[i])
-                i += 1
-            continue
-        result.append(tok)
-        i += 1
-    return result
 
 
 def _prompt_with_role(prompt: str, cfg: Dict[str, Any]) -> str:
@@ -313,35 +294,91 @@ def _prompt_with_role(prompt: str, cfg: Dict[str, Any]) -> str:
     return role + "\n\n" + prompt
 
 
-def build_opencode_command(
+def build_codex_command(
     prompt: str,
     cfg: Dict[str, Any],
     *,
-    session_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> List[str]:
-    """Build the ``opencode run`` argv for one turn."""
-    cmd: List[str] = ["opencode", "run"]
-    if session_id:
-        cmd += ["--session", session_id]
-    cmd += [
-        _prompt_with_role(prompt, cfg),
-        "--format",
-        "json",
-        "--dangerously-skip-permissions",
-    ]
-    # Optional explicit agent. Default (None) uses opencode's own default primary
-    # agent, which already has the full tool set. Only pinned when an operator
-    # sets a specific tool-enabled primary agent (see DEFAULTS note, issue #99).
-    agent = cfg.get("opencode_agent") or DEFAULTS["opencode_agent"]
-    if agent:
-        cmd += ["--agent", str(agent)]
-    model = cfg.get("opencode_model")
+    """Build the ``codex exec`` argv for one turn.
+
+    First turn (no thread_id):
+        codex exec "<prompt>" --json --skip-git-repo-check -s <sandbox> [-m <model>]
+    Resume turn (thread_id stored):
+        codex exec resume <thread_id> "<prompt>" --json --skip-git-repo-check [-m <model>]
+
+    IMPORTANT:
+      * No --color: asymmetry between exec (accepts) and exec resume (rejects).
+      * No --ephemeral: disables resume capability.
+      * -s/--sandbox only on first turn; resume inherits sandbox from thread creation.
+    """
+    full_prompt = _prompt_with_role(prompt, cfg)
+    if thread_id:
+        # Resume turn: codex exec resume <thread_id> "<prompt>" --json --skip-git-repo-check
+        cmd: List[str] = ["codex", "exec", "resume", thread_id, full_prompt]
+    else:
+        # First turn: codex exec "<prompt>" --json --skip-git-repo-check -s <sandbox>
+        sandbox = str(cfg.get("codex_sandbox") or DEFAULT_SANDBOX)
+        cmd = ["codex", "exec", full_prompt, "-s", sandbox]
+    cmd += ["--json", "--skip-git-repo-check"]
+    model = cfg.get("codex_model")
     if model:
-        cmd += ["--model", str(model)]
-    extra = cfg.get("opencode_extra_flags") or []
+        cmd += ["-m", str(model)]
+    extra = cfg.get("codex_extra_flags") or []
     if isinstance(extra, list):
-        cmd += _sanitize_extra_flags(extra)
+        cmd += _sanitize_extra_flags(extra, is_resume=bool(thread_id))
     return cmd
+
+
+# Flags that are ALWAYS forbidden (they break the resume model wholesale).
+_FORBIDDEN_ANY: frozenset[str] = frozenset({"--ephemeral"})
+# Flags that are forbidden only on resume (rejected by codex exec resume).
+_FORBIDDEN_RESUME: frozenset[str] = frozenset({"--color", "-s", "--sandbox"})
+
+
+def _sanitize_extra_flags(extra: List[str], *, is_resume: bool) -> List[str]:
+    """Return a copy of ``extra`` with forbidden flags (and their values) removed.
+
+    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one token).
+    Forbidden on ANY command: ``--ephemeral``.
+    Forbidden on RESUME only: ``--color``, ``-s``/``--sandbox``.
+    Logs a warning for each dropped flag so operators notice stale configs.
+    """
+    forbidden = set(_FORBIDDEN_ANY)
+    if is_resume:
+        forbidden |= _FORBIDDEN_RESUME
+
+    result: List[str] = []
+    tokens = [str(x) for x in extra]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+
+        # --flag=value form: extract the flag portion before '='
+        base = tok.split("=", 1)[0] if "=" in tok else tok
+
+        if base in forbidden:
+            log.warning(
+                "dropping forbidden codex_extra_flags token %r%s",
+                tok,
+                " (resume command)" if is_resume else "",
+            )
+            i += 1
+            # --flag value form (no '='): also consume the following value token
+            # if it does not look like a flag itself.
+            if "=" not in tok and i < len(tokens) and not tokens[i].startswith("-"):
+                log.warning(
+                    "dropping forbidden codex_extra_flags value token %r%s",
+                    tokens[i],
+                    " (resume command)" if is_resume else "",
+                )
+                i += 1
+            continue
+
+        result.append(tok)
+        i += 1
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +386,22 @@ def build_opencode_command(
 # ---------------------------------------------------------------------------
 
 
-def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str]]:
-    """Parse OpenCode NDJSON stdout into session id and reply text."""
-    session_id: Optional[str] = None
-    parts: List[str] = []
+def parse_codex_output(stdout: str) -> Tuple[Optional[str], Optional[str]]:
+    """Parse Codex JSONL stdout into thread_id and reply text.
+
+    Event format (codex-cli 0.135.0):
+      {"type":"thread.started","thread_id":"<uuid>"}
+      {"type":"turn.started"}
+      {"type":"item.completed","item":{"id":"...","type":"agent_message","text":"<reply>"}}
+      {"type":"turn.completed","usage":{...}}
+
+    Returns (thread_id, reply_text):
+      * thread_id: from the first "thread.started" event -> event["thread_id"]
+      * reply_text: the LAST item.completed where item["type"]=="agent_message" -> item["text"]
+        (there may be multiple item.completed events for tool calls/file changes)
+    """
+    thread_id: Optional[str] = None
+    last_agent_reply: Optional[str] = None
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -364,31 +413,24 @@ def parse_opencode_output(stdout: str) -> Tuple[Optional[str], Optional[str]]:
             continue
         if not isinstance(obj, dict):
             continue
-        if session_id is None:
-            top = obj.get("sessionID")
-            if isinstance(top, str) and top.strip():
-                session_id = top.strip()
-            else:
-                part = obj.get("part")
-                if isinstance(part, dict):
-                    nested = part.get("sessionID")
-                    if isinstance(nested, str) and nested.strip():
-                        session_id = nested.strip()
-        text_part = _text_from_frame(obj)
-        if text_part:
-            parts.append(text_part)
-    reply_text = "".join(parts).strip() or None
-    return session_id, reply_text
 
+        event_type = obj.get("type")
 
-def _text_from_frame(obj: Dict[str, Any]) -> str:
-    if obj.get("type") != "text":
-        return ""
-    part = obj.get("part")
-    if not isinstance(part, dict):
-        return ""
-    text = part.get("text")
-    return text if isinstance(text, str) else ""
+        # Capture thread_id from thread.started event
+        if event_type == "thread.started" and thread_id is None:
+            tid = obj.get("thread_id")
+            if isinstance(tid, str) and tid.strip():
+                thread_id = tid.strip()
+
+        # Capture the LAST agent_message from item.completed events
+        if event_type == "item.completed":
+            item = obj.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text")
+                if isinstance(text, str):
+                    last_agent_reply = text
+
+    return thread_id, last_agent_reply or None
 
 
 # ---------------------------------------------------------------------------
@@ -448,66 +490,74 @@ class ContextLocks:
 # ---------------------------------------------------------------------------
 
 # The runner contract is ``(cmd, cwd, timeout) -> (stdout, rc, stderr)``.
-# (stderr is appended in v0.3 so the poll loop can surface a snippet on failure;
+# (stderr is appended so the poll loop can surface a snippet on failure;
 # legacy 2-tuple runners are still accepted for backward compatibility.)
 
 
-class OpenCodeCLINotFound(Exception):
-    """Raised by the runner when the ``opencode`` binary is not on PATH."""
+class CodexCLINotFound(Exception):
+    """Raised by the runner when the ``codex`` binary is not on PATH."""
 
 
-def run_opencode_turn(
+def run_codex_turn(
     prompt: str,
     context_id: str,
     cfg: Dict[str, Any],
     *,
     runner: Any = None,
 ) -> Optional[str]:
-    """Run one OpenCode turn for ``context_id`` with narrow session remint."""
+    """Run one Codex turn for ``context_id`` with narrow thread remint."""
     if runner is None:
         runner = _subprocess_runner
 
-    repo_path = Path(cfg["repo_path"])
-    timeout = float(cfg.get("opencode_timeout_s") or DEFAULTS["opencode_timeout_s"])
-    stored_session_id = get_session_id_for_context(context_id)
+    # Look up SESSION_MAP_PATH dynamically (module-level variable may be
+    # monkeypatched in tests; default-argument form captures the original value).
+    session_map_path: Path = SESSION_MAP_PATH
 
-    def _invoke(session_id: Optional[str]) -> Tuple[Optional[str], Optional[str], int, str]:
-        cmd = build_opencode_command(prompt, cfg, session_id=session_id)
+    repo_path = Path(cfg["repo_path"])
+    timeout = float(cfg.get("codex_timeout_s") or DEFAULTS["codex_timeout_s"])
+    stored_thread_id = get_thread_id_for_context(context_id, session_map_path)
+
+    def _invoke(thread_id: Optional[str]) -> Tuple[Optional[str], Optional[str], int, str]:
+        cmd = build_codex_command(prompt, cfg, thread_id=thread_id)
         stdout, rc, stderr = _call_runner(runner, cmd, str(repo_path), timeout)
-        parsed_session_id, reply = parse_opencode_output(stdout)
-        if parsed_session_id:
-            store_session_id_for_context(context_id, parsed_session_id)
-        return parsed_session_id, reply, rc, stderr
+        parsed_thread_id, reply = parse_codex_output(stdout)
+        if parsed_thread_id:
+            store_thread_id_for_context(context_id, parsed_thread_id, session_map_path)
+        return parsed_thread_id, reply, rc, stderr
 
     try:
-        parsed_session_id, reply, rc, stderr = _invoke(stored_session_id)
+        parsed_thread_id, reply, rc, stderr = _invoke(stored_thread_id)
     except subprocess.TimeoutExpired:
-        return f"[error] opencode turn timed out after {timeout}s"
-    except (FileNotFoundError, OpenCodeCLINotFound):
-        return "[error] opencode CLI not found on PATH"
+        return f"[error] codex turn timed out after {timeout}s"
+    except (FileNotFoundError, CodexCLINotFound):
+        return "[error] codex CLI not found on PATH"
     except Exception as exc:  # noqa: BLE001
-        log.warning("opencode invocation failed (%s)", exc)
-        return f"[error] opencode invocation failed: {exc}"
+        log.warning("codex invocation failed (%s)", exc)
+        return f"[error] codex invocation failed: {exc}"
 
-    if stored_session_id and _is_session_not_found(reply, stderr):
-        log.info("stored session %s missing for ctx=%s; reminting new OpenCode session", stored_session_id, context_id)
-        clear_session_id_for_context(context_id)
+    # Remint: only on genuine session-not-found signal in BOTH reply and stderr
+    if stored_thread_id and _is_session_not_found(reply, stderr):
+        log.info("stored thread %s missing for ctx=%s; reminting new Codex thread", stored_thread_id, context_id)
+        # Clear the stale thread_id BEFORE the retry so that if the retry also
+        # fails (emits no thread.started), the bad id is not left on disk and
+        # the next turn does not blindly attempt resume <dead-id> again.
+        clear_thread_id_for_context(context_id, session_map_path)
         try:
-            parsed_session_id, reply, rc, stderr = _invoke(None)
+            parsed_thread_id, reply, rc, stderr = _invoke(None)
         except subprocess.TimeoutExpired:
-            return f"[error] opencode turn timed out after {timeout}s"
-        except (FileNotFoundError, OpenCodeCLINotFound):
-            return "[error] opencode CLI not found on PATH"
+            return f"[error] codex turn timed out after {timeout}s"
+        except (FileNotFoundError, CodexCLINotFound):
+            return "[error] codex CLI not found on PATH"
         except Exception as exc:  # noqa: BLE001
-            log.warning("opencode remint failed (%s)", exc)
-            return f"[error] opencode invocation failed: {exc}"
-        if parsed_session_id:
-            log.info("stored reminted OpenCode session %s for ctx=%s", parsed_session_id, context_id)
+            log.warning("codex remint failed (%s)", exc)
+            return f"[error] codex invocation failed: {exc}"
+        if parsed_thread_id:
+            log.info("reminted Codex thread %s for ctx=%s", parsed_thread_id, context_id)
 
     if reply is None and rc != 0:
         snippet = (stderr or "").strip().replace("\n", " ")[:300]
         reply = (
-            f"[error] opencode exited rc={rc} with no parseable output"
+            f"[error] codex exited rc={rc} with no parseable output"
             + (f": {snippet}" if snippet else "")
         )
     return reply
@@ -524,10 +574,11 @@ def _call_runner(runner: Any, cmd: List[str], cwd: str, timeout: float) -> Tuple
 
 
 def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
-    """True only on a genuine OpenCode session-not-found signal (reply text or stderr).
+    """True only on a genuine Codex thread-not-found signal (reply text or stderr).
 
     Deliberately narrow: we do NOT treat a bare non-zero rc or a None reply as a
     session error, because retrying would re-run the turn.
+    Checks BOTH reply text AND stderr (JSON-RPC error -32600 may surface in either).
     """
     haystacks: List[str] = []
     if reply:
@@ -541,11 +592,11 @@ def _is_session_not_found(reply: Optional[str], stderr: str) -> bool:
     return False
 
 
-# Common tool dirs appended to PATH for spawned CLIs. A receiver launched by
-# launchd (or any non-login daemon) inherits a minimal PATH, so the agent's
-# bash/tool calls can't find `gh`/`git`/node — which surfaces as "I don't have
-# access to the gh CLI" (issue #99). We APPEND (never shadow) so an explicit
-# PATH from the parent still wins; only missing dirs are added as fallbacks.
+# Common tool dirs appended to PATH for the spawned codex process. A receiver
+# launched by launchd (or any non-login daemon) inherits a minimal PATH, so
+# codex's tool/command_execution calls can't find `gh`/`git`/node. We APPEND
+# (never shadow) so an explicit parent PATH still wins; only missing dirs are
+# added as fallbacks.
 _EXTRA_PATH_DIRS: Tuple[str, ...] = (
     "/opt/homebrew/bin", "/opt/homebrew/sbin",
     "/usr/local/bin", "/usr/local/sbin",
@@ -565,12 +616,18 @@ def _tool_env() -> Dict[str, str]:
 
 
 def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, int, str]:
-    """Real subprocess invocation of ``opencode run``.
+    """Real subprocess invocation of ``codex exec``.
 
     Uses ``Popen`` + ``start_new_session=True`` so the whole process tree lands in
     its own process group; on timeout we ``killpg`` the group to reap orphans.
-    Returns (stdout, rc, stderr). Buffers are capped defensively. ``env`` carries
-    an augmented PATH so opencode's bash/tool calls can find gh/git (issue #99).
+    Returns (stdout, rc, stderr). Buffers are capped defensively.
+
+    stdin=DEVNULL is REQUIRED (codex-cli >= 0.136). codex exec inspects whether
+    stdin is a pipe; if it is (which a detached daemon's inherited stdin is) and
+    the positional prompt isn't consumed, codex blocks "Reading additional input
+    from stdin..." and exits rc=1 with no parseable output (issue #97). Closing
+    stdin forces codex to use the positional prompt argument. The prompt is ALWAYS
+    passed as a positional arg (see build_codex_command), never via stdin.
     """
     try:
         proc = subprocess.Popen(
@@ -584,7 +641,7 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
             env=_tool_env(),
         )
     except FileNotFoundError:
-        raise OpenCodeCLINotFound("opencode") from None
+        raise CodexCLINotFound("codex") from None
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -598,7 +655,7 @@ def _subprocess_runner(cmd: List[str], cwd: str, timeout: float) -> Tuple[str, i
     if stdout and len(stdout) > MAX_STDOUT_BYTES:
         stdout = stdout[:MAX_STDOUT_BYTES]
     if rc != 0 and stderr:
-        log.warning("opencode stderr: %s", stderr.strip()[:500])
+        log.warning("codex stderr: %s", stderr.strip()[:500])
     return stdout or "", rc, stderr or ""
 
 
@@ -670,17 +727,11 @@ def post_reply(
     """POST the reply back to Hermes as JSON-RPC SendMessage. Returns success.
 
     When ``auth_token`` is supplied, an ``Authorization: Bearer <token>`` header
-    is sent (an auth-enabled Hermes node would 401 otherwise). When None, no
-    Authorization header is sent (open loopback dev node — current behavior).
-
-    A transient Hermes outage would drop a completed result, so we retry up to
-    ``POST_REPLY_MAX_ATTEMPTS`` with short backoff before giving up (in-process
-    only — NOT a durable queue). Final failure is logged loudly and swallowed
-    (never crashes the poll loop).
+    is sent. Retries up to ``POST_REPLY_MAX_ATTEMPTS`` with short backoff.
     """
     payload = {
         "jsonrpc": "2.0",
-        "id": f"oc-{int(time.time() * 1000)}",
+        "id": f"codex-{int(time.time() * 1000)}",
         "method": "SendMessage",
         "params": {
             "message": {
@@ -774,35 +825,13 @@ class Receiver:
         self._processed = _read_offset(offset_path)
         self._offset_lock = threading.Lock()
         self._stop = threading.Event()
-        # Global cap on concurrent OpenCode subprocesses (per-context lock still
+        # Global cap on concurrent Codex subprocesses (per-context lock still
         # serializes same-context turns; this bounds the cross-context fan-out).
         max_turns = int(cfg.get("max_concurrent_turns") or DEFAULTS["max_concurrent_turns"])
         self._turn_slots = threading.BoundedSemaphore(max(1, max_turns))
         # Idle-timeout self-teardown bookkeeping.
         self._last_msg_ts = time.monotonic()
         self._on_idle_shutdown = on_idle_shutdown
-        # In-flight context guard (P1-5): a context_id is "in flight" from the
-        # moment do_POST queues a turn until process_message finishes it. A
-        # second dispatch for the same context while one is in flight is a
-        # duplicate -> rejected with a distinct error so clients can dedup,
-        # instead of silently accepting a second [queued] ack.
-        self._inflight: set = set()
-        self._inflight_lock = threading.Lock()
-
-    # -- in-flight context guard -------------------------------------------
-
-    def claim_inflight(self, context_id: str) -> bool:
-        """Atomically mark ``context_id`` in flight. Return False if already in
-        flight (caller should reject the dispatch as a duplicate)."""
-        with self._inflight_lock:
-            if context_id in self._inflight:
-                return False
-            self._inflight.add(context_id)
-            return True
-
-    def release_inflight(self, context_id: str) -> None:
-        with self._inflight_lock:
-            self._inflight.discard(context_id)
 
     # -- inbox offset -------------------------------------------------------
 
@@ -820,22 +849,12 @@ class Receiver:
     # -- turn processing ----------------------------------------------------
 
     def process_message(self, context_id: str, text: str) -> Optional[str]:
-        """Run the turn, then always clear the in-flight claim (P1-5) so the next
-        dispatch on this context is accepted."""
-        try:
-            return self._run_turn(context_id, text)
-        finally:
-            self.release_inflight(context_id)
-
-    def _run_turn(self, context_id: str, text: str) -> Optional[str]:
         """Bounded-concurrency + per-context serialization, run turn, POST reply."""
-        # Global concurrency cap: bounded wait, then reply [busy] (never block
-        # the poll-spawned thread forever).
         wait = float(self.cfg.get("context_lock_wait_s") or DEFAULTS["context_lock_wait_s"])
         if not self._turn_slots.acquire(timeout=wait):
             busy = "[busy] max concurrent turns reached, retry"
             log.warning("ctx=%s busy; concurrency cap reached", context_id)
-            _transcript("opencode->hermes (busy)", "opencode", "hermes", context_id, busy)
+            _transcript("codex->hermes (busy)", "codex", "hermes", context_id, busy)
             post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
             return busy
         try:
@@ -844,15 +863,15 @@ class Receiver:
             if not acquired:
                 busy = "[busy] this context is processing another turn; retry shortly"
                 log.warning("ctx=%s busy; lock wait %.0fs exceeded", context_id, wait)
-                _transcript("opencode->hermes (busy)", "opencode", "hermes", context_id, busy)
+                _transcript("codex->hermes (busy)", "codex", "hermes", context_id, busy)
                 post_reply(self.cfg["hermes_url"], context_id, busy, self._hermes_auth_token)
                 return busy
             try:
-                reply = run_opencode_turn(
+                reply = run_codex_turn(
                     text, context_id, self.cfg, runner=self.runner
                 )
-                out = reply if reply is not None else "[no reply produced by opencode]"
-                _transcript("opencode->hermes", "opencode", "hermes", context_id, out)
+                out = reply if reply is not None else "[no reply produced by codex]"
+                _transcript("codex->hermes", "codex", "hermes", context_id, out)
                 post_reply(self.cfg["hermes_url"], context_id, out, self._hermes_auth_token)
                 return reply
             finally:
@@ -865,11 +884,6 @@ class Receiver:
         locking inside ``process_message`` serializes same-context turns)."""
         if not self.inbox_path.exists():
             return
-        # TODO(perf, a2a_fleet v0.4): this rereads the ENTIRE inbox every poll and
-        # re-splits O(history) lines just to skip already-processed ones. For a
-        # long-lived receiver this is O(n) per poll. Switch to seeking a persisted
-        # BYTE offset (read from there to EOF) and/or periodic inbox compaction.
-        # Left as a clear TODO deliberately — not half-built here.
         try:
             lines = self.inbox_path.read_text().splitlines()
         except OSError as exc:
@@ -877,8 +891,6 @@ class Receiver:
             return
         for idx in range(self._processed, len(lines)):
             line = lines[idx].strip()
-            # Blank/malformed/non-hermes lines are consumed with no handoff, so
-            # persist their offset immediately (at-most-once; nothing to lose).
             if not line:
                 self._advance_offset(idx + 1)
                 continue
@@ -890,8 +902,7 @@ class Receiver:
             if entry.get("from") != "hermes":
                 self._advance_offset(idx + 1)
                 continue
-            # Missing contextId -> mint a fresh uuid4 (no shared anon sentinel,
-            # so unrelated anonymous tasks don't cross-talk on one session/lock).
+            # Missing contextId -> mint a fresh uuid4
             context_id = entry.get("contextId") or f"anon-{uuid.uuid4()}"
             text = entry.get("text", "")
             self.note_inbound()
@@ -904,15 +915,9 @@ class Receiver:
             try:
                 thread.start()
             except RuntimeError as exc:
-                # Thread creation failed (e.g. resource exhaustion): do NOT advance
-                # the offset, so the next poll retries this message rather than
-                # losing an already-ACKed task. Stop draining this pass.
                 log.warning("failed to start turn thread for ctx=%s (%s); "
                             "leaving message unconsumed for retry", context_id, exc)
                 return
-            # At-most-once: advance ONLY after a successful handoff. A crash in the
-            # window between .start() and here is near-zero; we accept it rather
-            # than risk at-least-once re-execution under bypassPermissions.
             self._advance_offset(idx + 1)
 
     def poll_loop(self) -> None:
@@ -948,7 +953,6 @@ class Receiver:
         idle_to = float(self.cfg.get("idle_timeout_s") or 0)
         if idle_to <= 0:
             return
-        # Check on a fraction of the timeout so teardown is reasonably prompt.
         tick = max(1.0, min(idle_to / 4.0, 60.0))
         log.info("idle monitor started (idle_timeout_s=%.0f, tick=%.0fs)", idle_to, tick)
         while not self._stop.is_set():
@@ -967,10 +971,10 @@ class Receiver:
 def _agent_card(cfg: Dict[str, Any]) -> Dict[str, Any]:
     base = f"http://{cfg['bind_host']}:{cfg['bind_port']}"
     return {
-        "name": "opencode",
-        "description": "OpenCode repo-scoped A2A executor peer (oc_receiver).",
+        "name": "codex",
+        "description": "Codex CLI repo-scoped A2A executor peer (codex_receiver).",
         "url": f"{base}/jsonrpc",
-        "version": "0.3.0",
+        "version": "0.1.0",
         "protocolVersion": "1.0",
         "capabilities": {
             "streaming": False,
@@ -987,8 +991,8 @@ def _agent_card(cfg: Dict[str, Any]) -> Dict[str, Any]:
             {
                 "id": "execute",
                 "name": "Repo executor",
-                "description": "Executes A2A tasks in the bound repo via opencode run with full harness.",
-                "tags": ["v0.3", "opencode", "executor"],
+                "description": "Executes A2A tasks in the bound repo via codex exec with full harness.",
+                "tags": ["v0.1", "codex", "executor"],
             }
         ],
     }
@@ -999,11 +1003,7 @@ def make_handler(
     expected_token: Optional[str],
     receiver: Optional["Receiver"] = None,
 ) -> type:
-    """Build a BaseHTTPRequestHandler subclass closed over config + token.
-
-    ``receiver`` (when supplied) is notified of inbound messages so the idle
-    monitor's clock resets on real traffic.
-    """
+    """Build a BaseHTTPRequestHandler subclass closed over config + token."""
 
     def extract_text(params: Dict[str, Any]) -> str:
         message = params.get("message") or {}
@@ -1034,8 +1034,6 @@ def make_handler(
             if not header.lower().startswith("bearer "):
                 self._json(401, {"error": "missing bearer token"})
                 return False
-            # "bearer " prefix matched, but the token may be missing/whitespace:
-            # split can yield a single element -> guard against IndexError (500).
             parts = header.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
                 self._json(401, {"error": "missing bearer token"})
@@ -1046,11 +1044,11 @@ def make_handler(
                 return False
             return True
 
-        def do_GET(self) -> None:  # noqa: N802 - http.server API
+        def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
                 self._json(200, {
                     "ok": True,
-                    "name": "opencode",
+                    "name": "codex",
                     "repo_path": cfg["repo_path"],
                 })
             elif self.path.startswith("/.well-known/agent-card.json"):
@@ -1058,14 +1056,12 @@ def make_handler(
             else:
                 self._json(404, {"error": "not found"})
 
-        def do_POST(self) -> None:  # noqa: N802 - http.server API
+        def do_POST(self) -> None:  # noqa: N802
             if self.path != "/jsonrpc":
                 self._json(404, {"error": "not found"})
                 return
             if not self._check_auth():
                 return
-            # Parse Content-Length defensively: malformed -> -32600, oversized ->
-            # HTTP 413 BEFORE allocating the read buffer (DoS guard).
             try:
                 length = int(self.headers.get("Content-Length", 0) or 0)
             except (TypeError, ValueError):
@@ -1102,23 +1098,10 @@ def make_handler(
                                  "error": {"code": -32601, "message": f"method not found: {method!r}"}})
                 return
             text = extract_text(params)
-            # Clamp prompt size before it can reach OpenCode.
             if len(text) > MAX_PROMPT_CHARS:
                 text = text[:MAX_PROMPT_CHARS]
             message = params.get("message") or {}
-            # Missing contextId -> fresh uuid4 (no shared anon sentinel).
             context_id = message.get("contextId") or f"anon-{uuid.uuid4()}"
-            # P1-5: reject a duplicate dispatch while this context already has a
-            # turn in flight, so the client can dedup instead of getting a second
-            # indistinguishable [queued] ack. Cleared when the turn completes.
-            if receiver is not None and not receiver.claim_inflight(context_id):
-                self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
-                                 "error": {"code": A2A_BUSY_CODE,
-                                           "message": "duplicate dispatch: context already has a "
-                                                      "turn in flight; retry after it completes"}})
-                return
-            # Queue to inbox; the poll loop processes asynchronously. The append
-            # is serialized via _INBOX_LOCK so concurrent POSTs can't tear lines.
             try:
                 _append_jsonl(INBOX_PATH, {
                     "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1127,16 +1110,14 @@ def make_handler(
                     "text": text,
                 }, _INBOX_LOCK)
             except OSError as exc:
-                if receiver is not None:
-                    receiver.release_inflight(context_id)
                 self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
                                  "error": {"code": -32000, "message": f"inbox write failed: {exc}"}})
                 return
             if receiver is not None:
                 receiver.note_inbound()
-            _transcript("hermes->opencode", "hermes", "opencode", context_id, text)
-            ack = "Message received; executing in repo via OpenCode. Reply will follow. [queued]"
-            _transcript("opencode->hermes (ack)", "opencode", "hermes", context_id, ack)
+            _transcript("hermes->codex", "hermes", "codex", context_id, text)
+            ack = "Message received; executing in repo via Codex. Reply will follow. [queued]"
+            _transcript("codex->hermes (ack)", "codex", "hermes", context_id, ack)
             self._json(200, {
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -1158,11 +1139,11 @@ def log_harness_inventory(repo_path: Path) -> Dict[str, bool]:
     inventory = {
         "AGENTS.md": (repo_path / "AGENTS.md").exists(),
         ".mcp.json": (repo_path / ".mcp.json").exists(),
-        ".opencode": (repo_path / ".opencode").exists(),
+        ".codex": (repo_path / ".codex").exists(),
     }
     log.info(
-        "harness inventory for %s: AGENTS.md=%s .mcp.json=%s .opencode=%s",
-        repo_path, inventory["AGENTS.md"], inventory[".mcp.json"], inventory[".opencode"],
+        "harness inventory for %s: AGENTS.md=%s .mcp.json=%s .codex=%s",
+        repo_path, inventory["AGENTS.md"], inventory[".mcp.json"], inventory[".codex"],
     )
     return inventory
 
@@ -1176,31 +1157,29 @@ def is_loopback_bind(host: str) -> bool:
     return str(host).strip().lower() in {"127.0.0.1", "::1", "localhost", ""}
 
 
-def probe_opencode_cli() -> bool:
-    """Best-effort ``opencode --version`` probe; loud warning if missing. Non-fatal."""
+def probe_codex_cli() -> bool:
+    """Best-effort ``codex --version`` probe; loud warning if missing. Non-fatal."""
     try:
         proc = subprocess.run(
-            ["opencode", "--version"],
+            ["codex", "--version"],
             capture_output=True, text=True, timeout=10,
         )
         if proc.returncode == 0:
-            log.info("opencode CLI present: %s", (proc.stdout or "").strip()[:120])
+            log.info("codex CLI present: %s", (proc.stdout or "").strip()[:120])
             return True
-        log.warning("opencode --version exited rc=%s: %s", proc.returncode,
+        log.warning("codex --version exited rc=%s: %s", proc.returncode,
                     (proc.stderr or "").strip()[:200])
         return False
     except FileNotFoundError:
-        log.warning("opencode CLI NOT FOUND on PATH — turns will fail fatally "
-                    "with '[error] opencode CLI not found on PATH'")
+        log.warning("codex CLI NOT FOUND on PATH — turns will fail fatally "
+                    "with '[error] codex CLI not found on PATH'")
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("opencode --version probe failed (%s)", exc)
+        log.warning("codex --version probe failed (%s)", exc)
         return False
 
 
 def write_pid_file(path: Optional[Path] = None) -> None:
-    # Resolve PID_PATH at CALL time (not as a default-arg binding) so the
-    # module-level constant is authoritative — and so tests can monkeypatch it.
     if path is None:
         path = PID_PATH
     try:
@@ -1225,7 +1204,7 @@ def remove_pid_file(path: Optional[Path] = None) -> None:
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [oc_receiver] %(levelname)s %(message)s",
+        format="%(asctime)s [codex_receiver] %(levelname)s %(message)s",
     )
     cfg = load_config()
     repo_path = Path(cfg["repo_path"])
@@ -1233,8 +1212,7 @@ def main() -> int:
     expected_token = resolve_auth_token(cfg)
     bind_host = cfg.get("bind_host", "")
 
-    # Fail-closed: a non-loopback bind with no auth token is an open RCE surface
-    # (bypassPermissions). Refuse to start rather than merely warn.
+    # Fail-closed: a non-loopback bind with no auth token is an open RCE surface.
     if not expected_token and not is_loopback_bind(bind_host):
         log.error(
             "refusing to start: bind_host=%r is not loopback and no auth token is "
@@ -1253,9 +1231,9 @@ def main() -> int:
             cfg.get("auth_token_env"),
         )
 
-    probe_opencode_cli()
+    probe_codex_cli()
     log_harness_inventory(repo_path)
-    log.info("repo_path (cwd for opencode) pinned to %s", repo_path)
+    log.info("repo_path (cwd for codex) pinned to %s", repo_path)
 
     httpd_box: Dict[str, Any] = {}
 
@@ -1268,16 +1246,13 @@ def main() -> int:
 
     receiver = Receiver(cfg, on_idle_shutdown=_idle_teardown)
 
-    # Bind the server FIRST. A failed bind (port in use) must NOT leave a stale
-    # PID file behind to poison status/stop — so the pidfile is written only
-    # AFTER a successful bind, and removed if bind raises.
     handler = make_handler(cfg, expected_token, receiver)
     try:
         httpd = ThreadingHTTPServer((cfg["bind_host"], int(cfg["bind_port"])), handler)
     except OSError as exc:
         log.error("failed to bind %s:%s (%s); not writing PID file",
                   cfg["bind_host"], cfg["bind_port"], exc)
-        remove_pid_file()  # defensive: ensure no stale pidfile survives a bind failure
+        remove_pid_file()
         return 2
     httpd_box["httpd"] = httpd
     write_pid_file()
@@ -1299,13 +1274,13 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    log.info("oc_receiver listening on http://%s:%s", cfg["bind_host"], cfg["bind_port"])
+    log.info("codex_receiver listening on http://%s:%s", cfg["bind_host"], cfg["bind_port"])
     try:
         httpd.serve_forever()
     finally:
         receiver.stop()
         remove_pid_file()
-        log.info("oc_receiver stopped")
+        log.info("codex_receiver stopped")
     return 0
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Deploy + manage an OpenCode A2A executor receiver in a target repo.
+"""Deploy + manage a Google Antigravity CLI (``agy``) A2A executor receiver.
 
-This module intentionally mirrors ``cc_deploy.py`` behavior, but with OpenCode-
+This module intentionally mirrors ``codex_deploy.py`` behavior, but with agy-
 specific runtime filenames, defaults, token naming, and fleet auto-wiring.
 
 Design constraints:
@@ -9,6 +9,11 @@ Design constraints:
   * Handlers NEVER raise; they return ``{"error": "..."}`` on failure.
   * Receiver cwd is ALWAYS the canonical repo_path written into config.
   * Detached launch uses ``start_new_session=True``.
+
+agy specifics:
+  * NO model param exists (agy has no --model flag).
+  * ``sandbox`` is a BOOLEAN toggle (cfg ``agy_sandbox``), not a level string.
+  * Requires an interactive ``agy`` sign-in once (macOS Keychain auth).
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import psutil
 
-log = logging.getLogger("a2a_fleet.oc_deploy")
+log = logging.getLogger("a2a_fleet.agy_deploy")
 
 CLAUDE_MD_START = "<!-- a2a-fleet:start -->"
 CLAUDE_MD_END = "<!-- a2a-fleet:end -->"
@@ -38,9 +43,9 @@ CLAUDE_MD_IMPORT_LINE = "@.hermes/A2A.md"
 A2A_ROLE_TEXT = (
     "# A2A Executor Role (managed by Hermes a2a_fleet)\n"
     "\n"
-    "You are an OpenCode executor peer in an A2A fleet. Orchestrator: Hermes at "
-    "http://127.0.0.1:9219. You receive tasks over A2A and execute them in THIS "
-    "repo using your full tools/skills/MCP. Reply concisely with results/status. "
+    "You are a Google Antigravity CLI executor peer in an A2A fleet. Orchestrator: "
+    "Hermes at http://127.0.0.1:9219. You receive tasks over A2A and execute them in "
+    "THIS repo using your full tools/skills. Reply concisely with results/status. "
     "The same A2A contextId = the same ongoing session — context accumulates, so "
     "treat a repeated contextId as a continuation of the prior turn, not a fresh "
     "start.\n"
@@ -52,10 +57,9 @@ A2A_ROLE_TEXT = (
     "as orchestrator, the bound repo path, the comm contract, and the collaboration "
     "purpose). When you recognize a handshake message, do NOT start work — reply "
     "with a concise confirmation containing:\n"
-    "- role = executor (you confirm you are the OpenCode executor for this repo);\n"
+    "- role = executor (you confirm you are the Antigravity CLI executor for this repo);\n"
     "- the repo you are operating in — echo your actual cwd / working directory;\n"
-    "- a brief harness inventory — which of repo skills, MCP servers, and A2A.md "
-    "are active for you;\n"
+    "- a brief harness inventory — which of repo skills and A2A.md are active for you;\n"
     "- ready / not-ready (and why, if not ready).\n"
     "\n"
     "## Operating guardrails\n"
@@ -68,40 +72,26 @@ A2A_ROLE_TEXT = (
     "blocked) so Hermes can summarize them to the user and decide the next step.\n"
 )
 
-
-def role_text_for(repo_path: "Path | str") -> str:
-    """A2A_ROLE_TEXT with the concrete workdir + absolute-path rule injected.
-
-    P1-7: the static role text says "cwd is pinned" but never states the actual
-    path, so OpenCode guesses its working directory and relative-path tool calls
-    can silently hit the wrong dir. Inject the real repo_path and require
-    absolute paths.
-    """
-    return A2A_ROLE_TEXT.rstrip() + (
-        f"\n- Workdir: your effective working directory is `{repo_path}`. Use "
-        "absolute paths rooted there for every file and shell operation; do not "
-        "assume the process cwd matches it.\n"
-    )
-
-
-DEFAULT_BIND_PORT = 9310
+# Start of the agy port band (9330-9339); see managed_peers._MODE_PORT_BANDS.
+# A parity test asserts this equals managed_peers.default_port_for("agy").
+DEFAULT_BIND_PORT = 9330
 DEFAULT_HERMES_URL = "http://127.0.0.1:9219/jsonrpc"
-PID_FILENAME = "oc_receiver.pid"
-RECEIVER_FILENAME = "oc_receiver.py"
-CONFIG_FILENAME = "oc_receiver.json"
+PID_FILENAME = "agy_receiver.pid"
+RECEIVER_FILENAME = "agy_receiver.py"
+CONFIG_FILENAME = "agy_receiver.json"
 ROLE_FILENAME = "A2A.md"
-LOG_FILENAME = "oc_receiver.log"
-TOKEN_FILENAME = ".oc-token"
+LOG_FILENAME = "agy_receiver.log"
+TOKEN_FILENAME = ".agy-token"
 GITIGNORE_FILENAME = ".gitignore"
 
 HERMES_GITIGNORE_ENTRIES = (
-    ".oc-token",
+    ".agy-token",
     "*.pid",
     "*.log",
-    "a2a-oc-inbox*",
-    "a2a-oc-transcript*",
-    "a2a-oc-inbox.offset",
-    "a2a-oc-sessions.json",
+    "a2a-agy-inbox*",
+    "a2a-agy-transcript*",
+    "a2a-agy-inbox.offset",
+    "a2a-agy-sessions.json",
 )
 
 HEALTH_POLL_BUDGET_S = 8.0
@@ -111,7 +101,9 @@ HEALTH_REQUEST_TIMEOUT_S = 1.5
 STOP_TERM_WAIT_S = 3.0
 STOP_POLL_INTERVAL_S = 0.1
 
-RECEIVER_TOKEN_ENV_PREFIX = "A2A_OC_TOKEN_"
+RECEIVER_TOKEN_ENV_PREFIX = "A2A_AGY_TOKEN_"
+
+DEFAULT_SANDBOX = False
 
 
 def canonicalize_repo_path(repo_path: str) -> Tuple[Optional[Path], Optional[str]]:
@@ -205,27 +197,30 @@ def upsert_claude_md_import(claude_md_path: Path) -> str:
 def build_receiver_config(
     repo_path: Path,
     bind_port: int,
-    model: Optional[str],
+    sandbox: bool = DEFAULT_SANDBOX,
     auth_token_env: str = "",
     hermes_auth_token_env: str = "",
 ) -> Dict[str, Any]:
+    """Build the ``agy_receiver.json`` payload matching agy_receiver's load_config.
+
+    No model key (agy has no --model). ``agy_sandbox`` is a boolean toggle.
+    """
     cfg: Dict[str, Any] = {
         "repo_path": str(repo_path),
         "bind_host": "127.0.0.1",
         "bind_port": int(bind_port),
         "hermes_url": DEFAULT_HERMES_URL,
-        "role_prompt": role_text_for(repo_path).strip(),
+        "role_prompt": A2A_ROLE_TEXT.strip(),
         "role_file": f".hermes/{ROLE_FILENAME}",
         "poll_interval_s": 2.0,
-        "opencode_timeout_s": 300,
+        "agy_timeout_s": 300,
+        "agy_sandbox": bool(sandbox),
         "context_lock_wait_s": 600.0,
         "max_concurrent_turns": 3,
         "max_tracked_contexts": 1024,
         "idle_timeout_s": 1800,
-        "opencode_extra_flags": [],
+        "agy_extra_flags": [],
     }
-    if model:
-        cfg["opencode_model"] = str(model)
     if auth_token_env:
         cfg["auth_token_env"] = str(auth_token_env)
     if hermes_auth_token_env:
@@ -344,19 +339,23 @@ def _stop_old_receiver(pid_path: Path) -> Tuple[Optional[int], Optional[str]]:
     return pid, None
 
 
-def _probe_opencode_cli() -> bool:
+def _probe_agy_cli() -> bool:
+    """Best-effort ``agy --help`` probe (agy has no --version). False if absent."""
     try:
+        env = dict(os.environ)
+        env["AGY_CLI_DISABLE_LATEX"] = "1"
         proc = subprocess.run(
-            ["opencode", "--version"],
+            ["agy", "--help"],
             capture_output=True,
             text=True,
             timeout=10,
+            env=env,
         )
         return proc.returncode == 0
     except FileNotFoundError:
         return False
     except Exception as exc:  # noqa: BLE001
-        log.warning("opencode --version probe failed (%s)", exc)
+        log.warning("agy --help probe failed (%s)", exc)
         return False
 
 
@@ -429,22 +428,13 @@ def _autowire_managed_peer(repo: Path, bind_port: int, token_env: str) -> Tuple[
 
     peer_url = f"http://127.0.0.1:{int(bind_port)}"
     try:
-        if hasattr(fleet_yaml_io, "upsert_oc_peer"):
-            result = fleet_yaml_io.upsert_oc_peer(
-                repo_path=str(repo),
-                url=peer_url,
-                token_env=token_env,
-            )
-        elif hasattr(fleet_yaml_io, "upsert_managed_peer"):
-            result = fleet_yaml_io.upsert_managed_peer(
-                repo_path=str(repo),
-                url=peer_url,
-                token_env=token_env,
-                name="opencode",
-                mode="opencode",
-            )
-        else:
-            return None, "fleet_yaml_io has no OpenCode managed-peer upsert helper yet"
+        result = fleet_yaml_io.upsert_managed_peer(
+            repo_path=str(repo),
+            url=peer_url,
+            token_env=token_env,
+            name="agy",
+            mode="agy",
+        )
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
 
@@ -453,10 +443,10 @@ def _autowire_managed_peer(repo: Path, bind_port: int, token_env: str) -> Tuple[
     return result if isinstance(result, dict) else None, None
 
 
-async def deploy_oc_receiver_handler(
+async def deploy_agy_receiver_handler(
     repo_path: str,
     bind_port: Optional[int] = None,
-    model: Optional[str] = None,
+    sandbox: bool = DEFAULT_SANDBOX,
     no_auth: bool = False,
     hermes_auth_token_env: str = "",
     **_injected: Any,
@@ -464,13 +454,15 @@ async def deploy_oc_receiver_handler(
     # Dispatch shape: registry.dispatch() calls handler(args, **kwargs) — the
     # WHOLE args dict lands in the first positional (repo_path). Unwrap it so
     # all params are extracted, while still tolerating direct kwarg-style calls.
+    # NOTE: agy has NO model param (no --model flag exists).
     if isinstance(repo_path, dict):
         _p = repo_path
         repo_path = _p.get("repo_path") or _p.get("path") or ""
         _bp = _p.get("bind_port")
         if _bp is not None:
             bind_port = int(_bp)
-        model = _p.get("model") or model
+        if "sandbox" in _p:
+            sandbox = bool(_p.get("sandbox"))
         no_auth = bool(_p.get("no_auth", no_auth))
         hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
     warnings: List[str] = []
@@ -480,10 +472,10 @@ async def deploy_oc_receiver_handler(
             return {"error": err or "invalid repo_path"}
 
         # bind_port=None -> reuse this repo's existing port or auto-pick a free
-        # one in the opencode band (9310-9319); explicit value honored verbatim.
+        # one in the agy band (9330-9339); explicit value honored verbatim.
         from .cc_deploy import resolve_managed_bind_port  # noqa: PLC0415,WPS433
 
-        bind_port, port_err = resolve_managed_bind_port(repo, "opencode", bind_port)
+        bind_port, port_err = resolve_managed_bind_port(repo, "agy", bind_port)
         if port_err is not None:
             return {"error": port_err}
 
@@ -513,7 +505,7 @@ async def deploy_oc_receiver_handler(
             return {"error": f"cannot copy receiver template into {hermes_dir}: {exc}"}
 
         try:
-            _atomic_write_text(role_dest, role_text_for(repo))
+            _atomic_write_text(role_dest, A2A_ROLE_TEXT)
         except OSError as exc:
             return {"error": f"cannot write {role_dest}: {exc}"}
 
@@ -537,7 +529,7 @@ async def deploy_oc_receiver_handler(
             cfg = build_receiver_config(
                 repo,
                 int(bind_port),
-                model,
+                sandbox=bool(sandbox),
                 auth_token_env=receiver_token_env,
                 hermes_auth_token_env=hermes_auth_token_env,
             )
@@ -545,8 +537,8 @@ async def deploy_oc_receiver_handler(
         except OSError as exc:
             return {"error": f"cannot write {config_dest}: {exc}"}
 
-        if not _probe_opencode_cli():
-            warnings.append("opencode CLI not found on PATH (opencode --version failed); turns will fail")
+        if not _probe_agy_cli():
+            warnings.append("agy CLI not found on PATH (agy --help failed); turns will fail")
 
         stopped, stop_err = _stop_old_receiver(pid_path)
         if stop_err is not None:
@@ -604,6 +596,10 @@ async def deploy_oc_receiver_handler(
             "status": "healthy",
             "claude_md": claude_md_status,
             "warnings": warnings,
+            "note": (
+                "agy requires an interactive `agy` sign-in once on this host "
+                "(macOS Keychain; no headless login). No model selection."
+            ),
         }
         if isinstance(peer_wiring, dict) and not peer_wiring.get("error"):
             result["fleet_peer"] = peer_wiring
@@ -612,11 +608,11 @@ async def deploy_oc_receiver_handler(
             result["receiver_token_env"] = receiver_token_env
         return result
     except Exception as exc:  # noqa: BLE001
-        log.exception("deploy_oc_receiver_handler failed")
-        return {"error": f"deploy_oc_receiver failed: {exc}"}
+        log.exception("deploy_agy_receiver_handler failed")
+        return {"error": f"deploy_agy_receiver failed: {exc}"}
 
 
-async def oc_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
+async def agy_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
     try:
         repo, err = canonicalize_repo_path(repo_path)
         if err is not None or repo is None:
@@ -646,11 +642,11 @@ async def oc_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[s
             "repo_path": str(repo),
         }
     except Exception as exc:  # noqa: BLE001
-        log.exception("oc_receiver_status_handler failed")
-        return {"error": f"oc_receiver_status failed: {exc}"}
+        log.exception("agy_receiver_status_handler failed")
+        return {"error": f"agy_receiver_status failed: {exc}"}
 
 
-async def oc_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
+async def agy_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str, Any]:
     try:
         repo, err = canonicalize_repo_path(repo_path)
         if err is not None or repo is None:
@@ -675,5 +671,5 @@ async def oc_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str
             pass
         return {"stopped": bool(killed), "pid": pid}
     except Exception as exc:  # noqa: BLE001
-        log.exception("oc_receiver_stop_handler failed")
-        return {"error": f"oc_receiver_stop failed: {exc}"}
+        log.exception("agy_receiver_stop_handler failed")
+        return {"error": f"agy_receiver_stop failed: {exc}"}

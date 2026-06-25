@@ -191,6 +191,44 @@ def session_id_for_context(context_id: str) -> str:
 # Command builder
 # ---------------------------------------------------------------------------
 
+# Flags that cc_receiver manages itself — must never be injected via claude_extra_flags.
+_FORBIDDEN_CC: frozenset[str] = frozenset({
+    "--session-id",
+    "--resume",
+    "-p", "--print",
+    "--output-format",
+    "--permission-mode",
+    "--model",
+    "--setting-sources",
+})
+
+
+def _sanitize_extra_flags(extra: List[str]) -> List[str]:
+    """Return a copy of ``extra`` with flags managed by cc_receiver removed.
+
+    Handles both ``--flag value`` (two tokens) and ``--flag=value`` (one token).
+    Logs a warning per dropped token so operators notice stale configs.
+    """
+    result: List[str] = []
+    tokens = [str(x) for x in extra]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        base = tok.split("=", 1)[0] if "=" in tok else tok
+        if base in _FORBIDDEN_CC:
+            log.warning("dropping forbidden claude_extra_flags token %r", tok)
+            i += 1
+            # --flag value form: also consume the following value token if it
+            # does not look like a flag itself.
+            if "=" not in tok and i < len(tokens) and not tokens[i].startswith("-"):
+                log.warning("dropping forbidden claude_extra_flags value token %r", tokens[i])
+                i += 1
+            continue
+        result.append(tok)
+        i += 1
+    return result
+
+
 def build_claude_command(
     prompt: str,
     session_uuid: str,
@@ -232,7 +270,7 @@ def build_claude_command(
 
     extra = cfg.get("claude_extra_flags") or []
     if isinstance(extra, list):
-        cmd += [str(x) for x in extra]
+        cmd += _sanitize_extra_flags(extra)
     return cmd
 
 

@@ -585,7 +585,7 @@ def stable_token_env_name(repo: Path) -> str:
 
 async def deploy_cc_receiver_handler(
     repo_path: str,
-    bind_port: int = DEFAULT_BIND_PORT,
+    bind_port: Optional[int] = None,
     model: Optional[str] = None,
     no_auth: bool = False,
     hermes_auth_token_env: str = "",
@@ -607,12 +607,30 @@ async def deploy_cc_receiver_handler(
     ``hermes_auth_token_env`` (optional) is written into the config so the receiver
     sends ``Authorization: Bearer <token>`` on replies to an auth-enabled Hermes.
     """
+    # Dispatch shape: registry.dispatch() calls handler(args, **kwargs) — the
+    # WHOLE args dict lands in the first positional (repo_path). Unwrap it so
+    # all params are extracted, while still tolerating direct kwarg-style calls.
+    if isinstance(repo_path, dict):
+        _p = repo_path
+        repo_path = _p.get("repo_path") or _p.get("path") or ""
+        _bp = _p.get("bind_port")
+        if _bp is not None:
+            bind_port = int(_bp)
+        model = _p.get("model") or model
+        no_auth = bool(_p.get("no_auth", no_auth))
+        hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
     warnings: List[str] = []
 
     # 1. Validate + canonicalize.
     repo, err = canonicalize_repo_path(repo_path)
     if err is not None or repo is None:
         return {"error": err or "invalid repo_path"}
+
+    # bind_port=None -> reuse this repo's existing port or auto-pick a free one
+    # in the claude_code band (9300-9309); an explicit value is honored verbatim.
+    bind_port, port_err = resolve_managed_bind_port(repo, "claude_code", bind_port)
+    if port_err is not None:
+        return {"error": port_err}
 
     if not _is_git_repo(repo):
         warnings.append(f"{repo} does not look like a git repo (.git missing)")
@@ -698,9 +716,13 @@ async def deploy_cc_receiver_handler(
     # launch fails or the child never becomes healthy, we must leave no token
     # leak behind (#7). The doomed child still got the token at launch, but it is
     # torn down below, so that copy is harmless.
-    child_env: Optional[Dict[str, str]] = None
+    # Always pin HERMES_HOME so the detached receiver resolves the SAME profile
+    # the deployer did, never the silent ~/.hermes default-profile fallback (#98).
+    from hermes_constants import get_hermes_home  # noqa: PLC0415,WPS433
+
+    child_env: Dict[str, str] = dict(os.environ)
+    child_env["HERMES_HOME"] = str(get_hermes_home())
     if receiver_token is not None:
-        child_env = dict(os.environ)
         child_env[receiver_token_env] = receiver_token
     try:
         pid = _launch_receiver(repo, receiver_dest, log_path, env=child_env)
@@ -851,28 +873,6 @@ async def cc_receiver_stop_handler(repo_path: str, **_injected: Any) -> Dict[str
 # Boot-reconcile (Phase 3)
 # ---------------------------------------------------------------------------
 
-def _managed_cc_peers(fleet_cfg: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
-    """Select fleet peers Hermes owns as Claude Code receivers.
-
-    A peer qualifies iff ``managed is True`` AND ``mode == "claude_code"`` AND it
-    names a ``repo_path``. Anything else (plain url/token peers, Route B, peers
-    missing the v0.3 fields) is ignored, so a fresh install with no managed peers
-    yields an empty list -> reconcile is a clean no-op.
-    """
-    out: List[Tuple[str, Dict[str, Any]]] = []
-    agents = fleet_cfg.get("agents") or {}
-    if not isinstance(agents, dict):
-        return out
-    for name, entry in agents.items():
-        if not isinstance(entry, dict):
-            continue
-        if (
-            entry.get("managed") is True
-            and entry.get("mode") == "claude_code"
-            and entry.get("repo_path")
-        ):
-            out.append((name, entry))
-    return out
 
 
 def _managed_receiver_module(mode: str):
@@ -882,6 +882,14 @@ def _managed_receiver_module(mode: str):
         from . import oc_deploy  # noqa: PLC0415,WPS433
 
         return oc_deploy
+    if mode == "codex":
+        from . import codex_deploy  # noqa: PLC0415,WPS433
+
+        return codex_deploy
+    if mode == "agy":
+        from . import agy_deploy  # noqa: PLC0415,WPS433
+
+        return agy_deploy
     raise ValueError(f"unsupported managed receiver mode: {mode!r}")
 
 
@@ -896,6 +904,101 @@ def _managed_receiver_port(repo: Path, mode: str) -> int:
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         pass
     return default
+
+
+def _configured_bind_port(repo: Path, mode: str) -> Optional[int]:
+    """Bind port recorded in this repo's ``mode`` receiver config, else ``None``.
+
+    Unlike ``_managed_receiver_port`` (which falls back to the mode default),
+    this returns ``None`` when no config exists so the caller can tell a
+    re-deploy (reuse the stored port) apart from a fresh deploy (allocate one).
+    """
+    module = _managed_receiver_module(mode)
+    config_filename = str(getattr(module, "CONFIG_FILENAME"))
+    try:
+        cfg = json.loads((repo / ".hermes" / config_filename).read_text())
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
+        try:
+            return int(cfg["bind_port"])
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _ports_claimed_by_other_repos(mode: str, this_repo: Path) -> set:
+    """Ports already assigned to OTHER managed peers — ACROSS ALL MODES.
+
+    A TCP port is a port regardless of which mode owns it: a new allocation in
+    ``mode``'s band must never land on a port another managed peer holds, even
+    a currently-DOWN peer (its socket would test free) or a peer of a DIFFERENT
+    mode that sits inside this band (e.g. a legacy/out-of-band entry — a
+    claude_code peer historically bound on 9310 would otherwise be handed out
+    again to an opencode deploy). We therefore claim every managed peer's port
+    and exclude only this exact ``(repo, mode)`` slot (its own reuse is handled
+    by ``_configured_bind_port`` upstream).
+
+    Best-effort: a missing/garbled fleet.yaml yields an empty set, and the live
+    socket probe in ``allocate_band_port`` remains the backstop.
+    """
+    claimed: set = set()
+    try:
+        from . import fleet_config  # noqa: PLC0415,WPS433
+        from .managed_peers import iter_supported_managed_peers  # noqa: PLC0415,WPS433
+
+        cfg = fleet_config.load_fleet()
+        for _name, entry in iter_supported_managed_peers(cfg.get("agents") or {}):
+            peer_mode = str(entry.get("mode") or "")
+            peer_repo, err = canonicalize_repo_path(str(entry.get("repo_path")))
+            if err is not None or peer_repo is None:
+                continue
+            if peer_repo == this_repo and peer_mode == mode:
+                continue  # our own (repo, mode) slot — reuse handled upstream
+            port = _port_from_peer_url(entry.get("url"))
+            if port is None:
+                port = _configured_bind_port(peer_repo, peer_mode)
+            if port is not None:
+                claimed.add(int(port))
+    except Exception:  # noqa: BLE001 — claim discovery is advisory only.
+        pass
+    return claimed
+
+
+def resolve_managed_bind_port(
+    repo: Path, mode: str, requested: Optional[int]
+) -> Tuple[Optional[int], Optional[str]]:
+    """Decide the bind port for a managed receiver deploy.
+
+    * ``requested`` not None -> honored verbatim (explicit manual override; may
+      sit outside the band for power users).
+    * Re-deploy of a repo that already has a configured port -> that port is
+      reused (idempotent: the old receiver on it is torn down + relaunched).
+    * Otherwise -> first free port in the mode's band, skipping ports claimed by
+      other repos' peers and any port currently bound.
+
+    Returns ``(port, None)`` on success, or ``(None, error)`` when the band is
+    exhausted.
+    """
+    from .managed_peers import allocate_band_port, port_band_for  # noqa: PLC0415
+
+    if requested is not None:
+        return int(requested), None
+
+    existing = _configured_bind_port(repo, mode)
+    if existing is not None:
+        return existing, None
+
+    claimed = _ports_claimed_by_other_repos(mode, repo)
+    port = allocate_band_port(mode, claimed=claimed)
+    if port is None:
+        low, high = port_band_for(mode)
+        return None, (
+            f"no free port available for mode {mode!r} in band {low}-{high} "
+            f"(all {high - low + 1} ports in use); stop an unused {mode} receiver "
+            f"or pass an explicit bind_port"
+        )
+    return port, None
 
 
 def _read_managed_token_file(repo: Path, mode: str) -> Optional[str]:
@@ -923,6 +1026,14 @@ def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]
         from . import oc_deploy  # noqa: PLC0415,WPS433
 
         return asyncio.run(oc_deploy.deploy_oc_receiver_handler(str(repo), bind_port=port))
+    if mode == "codex":
+        from . import codex_deploy  # noqa: PLC0415,WPS433
+
+        return asyncio.run(codex_deploy.deploy_codex_receiver_handler(str(repo), bind_port=port))
+    if mode == "agy":
+        from . import agy_deploy  # noqa: PLC0415,WPS433
+
+        return asyncio.run(agy_deploy.deploy_agy_receiver_handler(str(repo), bind_port=port))
     raise ValueError(f"unsupported managed receiver mode: {mode!r}")
 
 
