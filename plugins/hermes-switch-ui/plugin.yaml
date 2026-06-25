@@ -1,0 +1,22 @@
+name: hermes-switch-ui
+version: "0.1.0"
+description: "Backend awareness of SwitchUI frontend + bidirectional config sync. Injects per-turn nudge, exposes switchui_info/switchui_status tools, config-sync API at /api/plugins/hermes-switch-ui/."
+author: Interstellar-code
+
+kind: standalone
+
+provides_tools:
+  - switchui_info
+  - switchui_status
+
+provides_hooks:
+  - pre_llm_call
+
+pip_dependencies:
+  - fastapi
+
+optional_env:
+  - SWITCHUI_STATE_PATH   # override ~/.hermes/switchui/state.json
+  - SWITCHUI_DOCS_URL     # override URL for optional remote capability refresh
+
+compatible_switchui: ">=1.0.0,<3.0.0"
