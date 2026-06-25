@@ -217,6 +217,7 @@ AUTHOR_MAP = {
     "draihan@student.ubc.ca": "0xdany",  # PR #26124 salvage (chat argv off event loop)
     "30366221+WorldWriter@users.noreply.github.com": "WorldWriter",
     "dafeng@DafengdeMacBook-Pro.local": "WorldWriter",
+    "interstellar.consulting@gmail.com": "Interstellar-code",
     "schepers.zander1@gmail.com": "Strontvod",
     "ed@bebop.crew": "someaka",
     "anadi.jaggia@gmail.com": "Jaggia",
