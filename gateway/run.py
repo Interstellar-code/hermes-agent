@@ -6735,10 +6735,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # failure and can trip stepped restart backoff.  launchd's
                 # KeepAlive.SuccessfulExit=false needs a non-zero exit to
                 # relaunch, so keep the old code on macOS.
+                invocation_id = os.environ.get("INVOCATION_ID")
                 self._exit_code = (
-                    GATEWAY_SERVICE_RESTART_EXIT_CODE
-                    if sys.platform == "darwin" or not os.environ.get("INVOCATION_ID")
-                    else 0
+                    0
+                    if invocation_id
+                    else (GATEWAY_SERVICE_RESTART_EXIT_CODE if sys.platform == "darwin" else 0)
                 )
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
