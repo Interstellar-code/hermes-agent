@@ -811,6 +811,8 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Earliest dispatch time (unix epoch seconds). NULL = no constraint.
+    scheduled_at: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -885,6 +887,9 @@ class Task:
             ),
             session_id=(
                 row["session_id"] if "session_id" in keys else None
+            ),
+            scheduled_at=(
+                int(row["scheduled_at"]) if "scheduled_at" in keys and row["scheduled_at"] else None
             ),
         )
 
@@ -1047,7 +1052,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Earliest time (unix epoch seconds) at which this task may be dispatched.
+    -- NULL = no scheduling constraint (dispatch immediately when ready).
+    -- The dispatcher skips tasks where scheduled_at > now().
+    scheduled_at         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1676,6 +1685,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # which is the correct default (they keep the global behaviour
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
+    _add_column_if_missing(conn, "tasks", "scheduled_at", "scheduled_at INTEGER")
 
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
@@ -1716,6 +1726,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_at "
+        "ON tasks(scheduled_at) WHERE scheduled_at IS NOT NULL"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2082,6 +2096,7 @@ def create_task(
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    scheduled_at: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2246,8 +2261,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        scheduled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2269,6 +2285,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(scheduled_at) if scheduled_at is not None else None,
                     ),
                 )
                 for pid in parents:
@@ -3050,8 +3067,9 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND (scheduled_at IS NULL OR scheduled_at <= ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
@@ -3126,8 +3144,9 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND (scheduled_at IS NULL OR scheduled_at <= ?)
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, now),
         )
         if cur.rowcount != 1:
             return None
