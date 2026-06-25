@@ -1,0 +1,20 @@
+id: parallel-fanout-test
+name: Parallel Fanout Test
+description: 3 children start in same layer after fan_out
+kind: workflow
+
+nodes:
+  - id: fan_out
+    bash: echo "fan_out"
+  - id: child_a
+    bash: echo "child_a"
+    depends_on: [fan_out]
+  - id: child_b
+    bash: echo "child_b"
+    depends_on: [fan_out]
+  - id: child_c
+    bash: echo "child_c"
+    depends_on: [fan_out]
+  - id: join
+    bash: echo "join"
+    depends_on: [child_a, child_b, child_c]

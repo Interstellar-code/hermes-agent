@@ -1,0 +1,30 @@
+[
+  {
+    "run_id": "run-golden-1",
+    "event_type": "workflow_started",
+    "node_run_id": null,
+    "data": {"workflow_id": "hello-world", "workflow_name": "Hello World"},
+    "created_at": 1700000000000
+  },
+  {
+    "run_id": "run-golden-1",
+    "event_type": "node_started",
+    "node_run_id": "nr-1",
+    "data": {"node_id": "greet", "node_type": "bash"},
+    "created_at": 1700000001000
+  },
+  {
+    "run_id": "run-golden-1",
+    "event_type": "node_completed",
+    "node_run_id": "nr-1",
+    "data": {"node_id": "greet", "duration_ms": 500},
+    "created_at": 1700000001500
+  },
+  {
+    "run_id": "run-golden-1",
+    "event_type": "workflow_completed",
+    "node_run_id": null,
+    "data": {"workflow_id": "hello-world", "duration_ms": 1500},
+    "created_at": 1700000001500
+  }
+]
