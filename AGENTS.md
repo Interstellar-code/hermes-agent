@@ -1367,3 +1367,81 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+
+<claude-mem-context>
+# Memory Context
+
+# [hermes-agent] recent context, 2026-05-27 8:24am GMT+2
+
+Legend: 🎯session 🔴bugfix 🟣feature 🔄refactor ✅change 🔵discovery ⚖️decision 🚨security_alert 🔐security_note
+Format: ID TIME TYPE TITLE
+Fetch details: get_observations([IDs]) | Search: mem-search skill
+
+Stats: 50 obs (27,759t read) | 746,644t work | 96% savings
+
+### May 26, 2026
+S2460 Commit mcp_lazy Phase 2 and update hermes agent config with new discovery settings (May 26 at 12:59 PM)
+13106 1:02p 🟣 Q1 Token Threshold Tests Added — test_eager_threshold.py
+13107 1:03p 🔵 pool.py Does Not Track eager Flag Per-Server — test_eager_threshold.py Will Fail
+13108 " 🔴 promote_server_tools: eager=True Now Promotes All Server Tools to Full Schema via pool.promote()
+13109 1:10p 🔵 mcp_lazy Phase 2 Post-Implementation Correctness Review — Scope and Checklist
+13110 1:12p 🔵 mcp_lazy Phase 2 Correctness Review — All 15 Items Verified With Findings
+13111 1:13p ✅ Gateway Restart + Hermes Agent Config Review
+S2461 Verify mcp_lazy Phase 2 is live after gateway restart by checking agent logs (May 26 at 1:13 PM)
+13112 1:14p 🔵 mcp_lazy Phase 2 Live: Tool Count Drops from 349 to 49 on Cold Turns
+S2462 Measure Phase 2 real-world token savings using live hermes-switch log analysis (May 26 at 1:14 PM)
+13113 1:15p 🔵 cache_report Falls Back to Default Profile Due to Unset HERMES_HOME
+13114 " 🔵 cache_report Reads Fixed JSONL Path; Promotion Strategy Thresholds Documented
+13115 1:16p 🔵 mcp_lazy Phase 2 Real-World Stats: 68% Token Reduction Across 5 Live Turns
+S2463 Push Phase 2 to GitHub, retag v2026.5.26, and publish release notes with full mcp_lazy changelog (May 26 at 1:16 PM)
+13116 1:17p 🔵 mcp_lazy Phase 2 Server Discovery — Post-Implementation Correctness Review Initiated
+13117 1:18p 🔵 mcp_lazy Phase 2 Correctness Review — All 15 Checks Completed
+13118 1:19p ✅ mcp_lazy Phase 2 Pushed to GitHub; v2026.5.26 Tag Force-Updated
+13119 " ✅ GitHub Release v2026.5.26 Published with Full mcp_lazy Phase 0–2 Changelog
+S2466 mcp_lazy TODO task list reviewed for relevance and cleared (May 26 at 1:19 PM)
+13160 1:34p ⚖️ mcp_lazy TODO Tasks Reviewed for Relevance — User Requested Clearing
+13161 " ✅ mcp_lazy TODO Task #1 Deleted from Task Tracker
+13162 " ✅ Remaining mcp_lazy TODO Tasks #2 and #4 Deleted — Cleanup Complete
+S2468 Performance analysis of mcp_lazy Phase 2 plugin — investigating whether it caused session slowness in the interstellar hermes agent repo, plus changelog/commit status check intent (May 26 at 1:34 PM)
+13163 1:42p 🔵 Interstellar Hermes Agent Repo — Changelog Release Intent
+S2469 Investigate the Hermes agent skill-library auto-trigger mechanism (May 26 at 1:42 PM)
+13178 1:58p 🔵 Skill Library Auto-Trigger Located in background_review.py
+13179 " 🔵 Hermes Background Review Architecture: Forked Agent with Tool Whitelist
+13180 " 🔵 Background Review Trigger Points: conversation_loop.py and codex_runtime.py
+13181 1:59p 🔵 Background Review Gate Conditions in conversation_loop.py
+13182 " 🔵 Memory and Skill Review Trigger Logic: Interval-Based Counters
+13183 " 🔵 Default Nudge Intervals: 10 Turns for Memory, 10 Tool-Iterations for Skills
+S2478 Check GitHub issue #31435 on NousResearch/hermes-agent for activity on a bug report (May 26 at 1:59 PM)
+13364 6:49p 🔵 GitHub API Unreachable from Hermes Agent Dev Environment
+S2479 Check GitHub issue #31435 on NousResearch/hermes-agent for bug report activity — blocked by invalid gh auth token (May 26 at 6:49 PM)
+13369 6:50p 🔵 GitHub CLI Token Invalid for Account "Interstellar-code"
+13392 7:12p 🔵 hermes-agent MCP Lazy Loading Phase 2 Merged, Phase 3 Planning Underway
+13595 9:39p 🔵 OMX Model-Role Mappings & Codex/Provider Settings — Weak Wiki Evidence in hermes-agent
+13678 10:48p 🔴 Workflow Engine: Fix fire-and-forget task orphaning in agent tool sync loop
+13686 " 🔵 Workflow Engine Issue #2 Fix: Deep Code Trace Confirms Correctness with Notable Gaps
+13715 10:55p ⚖️ MCP Lazy Loading v2 Plan Sign-Off Review Initiated
+13716 10:56p 🔵 MCP Lazy Loading v2 Source-Level Gap Analysis: 5 Key Checkpoints Verified Against Live Code
+13717 " 🔵 Hermes Plugin Hook Architecture: VALID_HOOKS, Session Lifecycle, and Tool List Pipeline
+13719 10:58p 🔵 MCP Lazy Loading v3 Plan — Final Sign-Off Review Initiated
+13724 10:59p 🔵 MCP Lazy Loading v3 Sign-Off: Source Code Verification Findings
+13756 11:09p 🔵 mcp_lazy Phase 2 (Server Discovery) Post-Implementation Correctness Review Initiated
+13758 11:10p 🔵 mcp_lazy Phase 2 Correctness Review — Complete Code Audit Results
+### May 27, 2026
+S2489 Continue — session state recovery and credential investigation for TheClawbay/OpenAI API mismatch (May 27 at 3:28 AM)
+13906 3:56a 🔵 mcp_lazy Phase 2 Server Discovery — Architecture Correctness Review Initiated
+13909 3:57a 🔵 mcp_lazy Phase 2 Correctness Review — All 15 Checks Completed, One MAJOR Gap Found
+14023 5:05a 🔵 Workspace Chat Session Duplication Bug: Root Cause Traced to api_server.py Hash-Derived Session IDs
+14024 5:08a 🔴 Workflow Engine Race Condition Fixes: Exactly-Once Cancel Event via CAS Gate
+14025 " 🔵 Adversarial Pre-Merge Review of MCP Lazy Loading Phase 1 (PR #7)
+14026 5:09a 🔵 Verified: cancel_workflow_run() CAS Gate Implementation in run_store.py
+14027 " 🔵 Verified: _execute() CancelledError Branch CAS Gate in runner.py
+14028 " 🔵 Verified: cancel() Method CAS Gate and cancel_run() No-Emit Helper in runner.py
+14029 " 🔵 Verified: resume() Prior-Task Drain with asyncio.shield on Both Wait Legs
+14030 " 🔵 MCP Lazy Pool GC Anchor: Agent Attribute Holds Strong Ref
+14031 " 🔵 Lazy Server Filter: Empty Set vs None Semantics in mix_full_and_stubs
+14032 " 🔵 ContextVar Propagation Claim: Synchronous Dispatch Assumed
+14033 " 🔵 Stub Detection Uses Schema Sentinel Field, Not Call Args
+
+Access 747k tokens of past work via get_observations([IDs]) or mem-search skill.
+</claude-mem-context>
