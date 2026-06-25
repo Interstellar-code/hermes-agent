@@ -871,6 +871,15 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     if platform.system() != "Darwin":
         return None
 
+    real_home = Path(os.path.expanduser("~"))
+    if Path.home() != real_home:
+        logger.debug(
+            "Keychain: skipping macOS keychain lookup because Path.home() is redirected (%s != %s)",
+            Path.home(),
+            real_home,
+        )
+        return None
+
     try:
         # Read the "Claude Code-credentials" generic password entry
         result = subprocess.run(
@@ -890,13 +899,19 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
-    raw = result.stdout.strip()
+    raw = result.stdout
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        logger.debug("Keychain: credentials payload is not text (%s)", type(raw).__name__)
+        return None
+    raw = raw.strip()
     if not raw:
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
