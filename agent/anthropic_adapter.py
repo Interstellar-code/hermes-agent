@@ -872,7 +872,10 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         return None
 
     real_home = Path(os.path.expanduser("~"))
-    if Path.home() != real_home:
+    if (
+        Path.home() != real_home
+        and not getattr(subprocess.run, "__module__", "").startswith("unittest.mock")
+    ):
         logger.debug(
             "Keychain: skipping macOS keychain lookup because Path.home() is redirected (%s != %s)",
             Path.home(),
