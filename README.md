@@ -135,6 +135,7 @@ browser frontend. Each ships its own README under `plugins/`.
 | **a2a_fleet**           | Agent-to-Agent peering — makes a profile a fleet member with an embedded A2A server, the `fleet_send` tool, and managed executors (Claude Code, OpenCode, Codex, Antigravity). |
 | **matrix_coder**        | Turns the active agent into a focused coding **specialist** via trusted developer-tier persona injection, with roles, review lenses, and Kanban audit mirroring. |
 | **kanban**              | Board + dispatcher that backs Matrix Coder's task flow.                                               |
+| **workflow-engine**     | DAG workflow engine — runs YAML-defined multi-node flows with conditional branching, parallel execution, approval gates, cron polling, and Kanban task dispatch. |
 | **personas**            | Makes personas first-class — canonical template library, runtime tools on every platform, and a REST API the SwitchUI profile wizard consumes. |
 | **mcp_lazy**            | Lazy MCP tool-schema loading — sends stub schemas and promotes full ones on demand, cutting ~80% of per-turn MCP token overhead. |
 | **hermes-switch-ui**    | Gives the agent awareness of the SwitchUI browser frontend and keeps the two sides in sync.          |
