@@ -123,6 +123,25 @@ For the full command lists, see the [CLI guide](https://hermes-agent.nousresearc
 
 ---
 
+## This fork — custom plugins
+
+This [Interstellar-code](https://github.com/Interstellar-code/hermes-agent) fork tracks
+upstream Hermes and layers on a set of fork-specific plugins for agent-to-agent
+work, autonomous coding, and the [SwitchUI](https://github.com/Interstellar-code/hermes-switchui)
+browser frontend. Each ships its own README under `plugins/`.
+
+| Plugin                  | What it adds                                                                                          |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- |
+| **a2a_fleet**           | Agent-to-Agent peering — makes a profile a fleet member with an embedded A2A server, the `fleet_send` tool, and managed executors (Claude Code, OpenCode, Codex, Antigravity). |
+| **matrix_coder**        | Turns the active agent into a focused coding **specialist** via trusted developer-tier persona injection, with roles, review lenses, and Kanban audit mirroring. |
+| **kanban**              | Board + dispatcher that backs Matrix Coder's task flow.                                               |
+| **personas**            | Makes personas first-class — canonical template library, runtime tools on every platform, and a REST API the SwitchUI profile wizard consumes. |
+| **mcp_lazy**            | Lazy MCP tool-schema loading — sends stub schemas and promotes full ones on demand, cutting ~80% of per-turn MCP token overhead. |
+| **hermes-switch-ui**    | Gives the agent awareness of the SwitchUI browser frontend and keeps the two sides in sync.          |
+| **karpathy-self-improve** | Autonomous self-improvement loop — collects metrics, proposes diffs, evaluates, and promotes or reverts via a git ratchet. |
+
+---
+
 ## Documentation
 
 All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
