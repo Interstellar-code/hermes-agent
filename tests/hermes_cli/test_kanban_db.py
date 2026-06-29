@@ -1902,6 +1902,31 @@ def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     assert reason is None
 
 
+def test_respawn_guard_verify_task_ignores_pr_comment_url(kanban_home):
+    """Verify-mode tasks must not self-trap on verifier PR-link comments."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Verify PR #250",
+            assignee="alice",
+            body=(
+                "## Mode\n"
+                "verify\n\n"
+                "## PR\n"
+                "https://github.com/Interstellar-code/hermes-switchui/pull/250\n"
+            ),
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "Verifier FAIL. comment posted: "
+            "https://github.com/Interstellar-code/hermes-switchui/pull/250#issuecomment-4761067048",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
     kanban_home, all_assignees_spawnable
 ):
