@@ -107,7 +107,6 @@ config/mcporter.json
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
-<<<<<<< HEAD
 # Agent / orchestration runtime state created in-repo — never codebase artifacts.
 .omc/
 .codegraph/
