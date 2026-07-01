@@ -98,6 +98,39 @@ def _log_injection(composed: str, mode: str, role: str = "unknown", lens: str = 
     )
 
 
+_DELEGATE_CHILD_MARKER = "focused subagent working on a specific delegated task"
+
+
+def _is_delegated_subagent(conversation_history: Any) -> bool:
+    """Detect whether the current turn is inside a delegate_task child.
+
+    delegate_task builds the child's system prompt via
+    ``_build_child_system_prompt`` (delegate_tool.py:674), which always
+    starts with ``"You are a focused subagent working on a specific
+    delegated task."``. Top-level interactive agents never carry this
+    marker. Kanban-worker spawns share the same prompt builder, so they
+    are correctly covered too.
+
+    The ``pre_llm_call`` hook does not receive the ``agent`` object, so
+    we sniff the system message in ``conversation_history`` instead.
+    """
+    if not conversation_history:
+        return False
+    try:
+        for msg in conversation_history:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content", "") or ""
+            if _DELEGATE_CHILD_MARKER in content:
+                return True
+            break
+    except Exception:
+        pass
+    return False
+
+
 def _inject_persona(**kwargs: Any) -> Optional[str]:
     """``pre_llm_call`` hook: explicit trigger first, then implicit IntentGate.
 
@@ -158,6 +191,15 @@ def _inject_persona(**kwargs: Any) -> Optional[str]:
         # Explicit "matrix ..." triggers (handled above) are unaffected.
         if not _implicit_routing_enabled():
             logger.debug("matrix_coder: implicit routing disabled (kill-switch)")
+            return None
+        # Guard: skip IMPLICIT persona routing inside delegate_task children.
+        # The parent already gave the child an explicit task; the IntentGate
+        # re-classifying it can override the parent's instructions and route
+        # execution work to read-only specialists like 'verify' (#151).
+        # EXPLICIT "matrix ..." triggers (handled above) are NOT affected —
+        # workflow personas that explicitly invoke a role still work.
+        if _is_delegated_subagent(kwargs.get("conversation_history")):
+            logger.debug("matrix_coder: skipping implicit routing — delegate_task child")
             return None
         result = harness.handle_implicit(
             user_message=user_message, session_id=session_id
