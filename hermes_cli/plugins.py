@@ -126,6 +126,9 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Transform the tool list before it's sent to the API (mcp_lazy lazy-load).
+    # Plugins return a replacement tools list or None to leave unchanged.
+    "transform_tools",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
