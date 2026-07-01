@@ -33,7 +33,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -4075,8 +4075,15 @@ def run_conversation(
                 continue
             
             else:
-                # No tool calls - this is the final response
-                final_response = assistant_message.content or ""
+                # No tool calls - this is the final response.
+                # Scrub any echoed <memory-context> spans / system-note lines /
+                # orphan fence tags from the model's raw output. The streaming
+                # delta path is protected by StreamingContextScrubber
+                # (run_agent.py), but final_response is built from the raw
+                # assistant message and bypasses that scrubber. Without this,
+                # echoed context leaks to every delivery surface (CLI, TUI,
+                # desktop, gateway). See Interstellar-code/hermes-agent#150.
+                final_response = sanitize_context(assistant_message.content or "")
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery

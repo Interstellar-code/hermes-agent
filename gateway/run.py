@@ -362,6 +362,18 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
+
+    # Defense-in-depth: strip any <memory-context> spans the model echoed into
+    # its reply. The agent layer (conversation_loop.py) already scrubs
+    # final_response before returning, but this catches leaks from proxy paths,
+    # recovery branches, or future regressions. Runs for ALL platforms — the
+    # leak isn't Telegram-specific. See Interstellar-code/hermes-agent#150.
+    try:
+        from agent.memory_manager import sanitize_context
+        text = sanitize_context(text)
+    except Exception:
+        pass
+
     if _gateway_platform_value(platform) != "telegram":
         return text
 
