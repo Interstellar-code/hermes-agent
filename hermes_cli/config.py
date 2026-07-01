@@ -4966,6 +4966,64 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             "    base_url: https://...",
         ))
 
+    # ── mcp lazy-loading config ───────────────────────────────────────────
+    mcp_cfg = config.get("mcp")
+    if mcp_cfg is not None:
+        if not isinstance(mcp_cfg, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"mcp should be a dict, got {type(mcp_cfg).__name__}",
+                "Use:\n  mcp:\n    lazy_loading: true\n    discovery_mode: tool",
+            ))
+        else:
+            mode = mcp_cfg.get("discovery_mode")
+            if mode is not None and mode not in {"tool", "server", "both"}:
+                issues.append(ConfigIssue(
+                    "error",
+                    "mcp.discovery_mode must be one of: tool, server, both",
+                    "Set discovery_mode to 'tool', 'server', or 'both'",
+                ))
+            for key in ("lazy_stub_max_desc", "server_stub_max_desc"):
+                value = mcp_cfg.get(key)
+                if value is not None and (not isinstance(value, int) or value < 0):
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"mcp.{key} must be a non-negative integer",
+                        f"Set {key} to 0 or a positive integer",
+                    ))
+            eager = mcp_cfg.get("server_eager_token_threshold")
+            if eager is not None and (not isinstance(eager, int) or eager < 0):
+                issues.append(ConfigIssue(
+                    "error",
+                    "mcp.server_eager_token_threshold must be a non-negative integer",
+                    "Set server_eager_token_threshold to 0 or a positive integer",
+                ))
+
+    mcp_servers_cfg = config.get("mcp_servers")
+    if mcp_servers_cfg is not None:
+        if not isinstance(mcp_servers_cfg, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"mcp_servers should be a dict, got {type(mcp_servers_cfg).__name__}",
+                "Use:\n  mcp_servers:\n    trek:\n      description: Trip planning tools",
+            ))
+        else:
+            for server_name, server_cfg in mcp_servers_cfg.items():
+                if not isinstance(server_cfg, dict):
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"mcp_servers.{server_name} should be a dict",
+                        "Each server entry should be a mapping of options",
+                    ))
+                    continue
+                desc = server_cfg.get("description")
+                if desc is not None and not isinstance(desc, str):
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"mcp_servers.{server_name}.description must be a string",
+                        "Set description to plain text",
+                    ))
+
     # ── Root-level keys that look misplaced ──────────────────────────────
     for key in config:
         if key.startswith("_"):

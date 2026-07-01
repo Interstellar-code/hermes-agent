@@ -590,6 +590,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     tools_for_api = agent.tools
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        hook_results = invoke_hook(
+            "transform_tools",
+            tools=tools_for_api,
+            agent=agent,
+            api_messages=api_messages,
+        )
+        for result in hook_results or []:
+            if isinstance(result, list) and result:
+                tools_for_api = result
+                break
+    except Exception as exc:
+        logger.debug("transform_tools hook error: %s", exc)
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

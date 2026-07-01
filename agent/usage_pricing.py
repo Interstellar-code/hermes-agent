@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
@@ -13,6 +14,33 @@ DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
+
+logger = logging.getLogger(__name__)
+_usage_observers: list[Callable[["CanonicalUsage"], None]] = []
+
+
+def register_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
+    """Register a best-effort observer for normalized usage records."""
+    if callback not in _usage_observers:
+        _usage_observers.append(callback)
+
+
+def unregister_usage_observer(callback: Callable[["CanonicalUsage"], None]) -> None:
+    """Remove a previously registered usage observer if present."""
+    try:
+        _usage_observers.remove(callback)
+    except ValueError:
+        pass
+
+
+def _notify_usage_observers(usage: "CanonicalUsage") -> None:
+    for callback in list(_usage_observers):
+        try:
+            callback(usage)
+        except Exception:
+            logger.debug("usage observer failed", exc_info=True)
+
+
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 
 CostStatus = Literal["actual", "estimated", "included", "unknown"]
@@ -824,13 +852,15 @@ def normalize_usage(
     if output_details:
         reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
     )
+    _notify_usage_observers(usage)
+    return usage
 
 
 def estimate_usage_cost(
