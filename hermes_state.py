@@ -121,6 +121,7 @@ def _delete_delegate_children(conn, parent_ids: List[str]) -> List[str]:
 T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+_IMPORTED_DEFAULT_DB_PATH = DEFAULT_DB_PATH
 
 SCHEMA_VERSION = 17
 
@@ -889,7 +890,16 @@ class SessionDB:
     _OPTIMIZE_EVERY_N_WRITES = 1000
 
     def __init__(self, db_path: Path = None, read_only: bool = False):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        if db_path is not None:
+            self.db_path = db_path
+        elif DEFAULT_DB_PATH != _IMPORTED_DEFAULT_DB_PATH:
+            # Tests sometimes monkeypatch DEFAULT_DB_PATH directly; honor that.
+            self.db_path = DEFAULT_DB_PATH
+        else:
+            # Resolve HERMES_HOME at instantiation time rather than import
+            # time so per-test / per-profile env overrides don't leak writes
+            # into whatever state.db was active when hermes_state.py imported.
+            self.db_path = get_hermes_home() / "state.db"
         self.read_only = read_only
 
         self._lock = threading.Lock()
