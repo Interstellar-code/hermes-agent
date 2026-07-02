@@ -83,6 +83,16 @@ _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+# Cron-session marker. Task-local so the in-gateway-thread cron scheduler
+# (gateway/run.py starts InProcessCronScheduler in a thread of the gateway
+# PROCESS) cannot leak cron-ness into concurrent interactive sessions. The
+# previous ``os.environ["HERMES_CRON_SESSION"]`` write was process-global and
+# never unset, so after the first cron tick every interactive session read as
+# cron and had execute_code denied by the approval guard. Set per-job via
+# ``set_session_vars(is_cron=True)``; interactive contexts leave it "" (default
+# is_cron=False), so only genuine separate-process cron/CLI falls back to the
+# ``os.environ`` value via ``get_session_env``.
+_CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
@@ -128,6 +138,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_SESSION": _CRON_SESSION,
 }
 
 
@@ -160,6 +171,7 @@ def set_session_vars(
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    is_cron: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -175,6 +187,12 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``is_cron`` marks this context as a cron-job execution so the approval
+    guard applies ``approvals.cron_mode`` (task-local, not process-global —
+    the cron scheduler runs in a thread of the gateway process). Interactive
+    callers leave it False, which explicitly clears the marker to "" so a
+    stale ``os.environ["HERMES_CRON_SESSION"]`` cannot misclassify them.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -194,6 +212,7 @@ def set_session_vars(
         _SESSION_MESSAGE_ID.set(message_id),
         _SESSION_PROFILE.set(profile),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _CRON_SESSION.set("1" if is_cron else ""),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -227,6 +246,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _CRON_SESSION,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
