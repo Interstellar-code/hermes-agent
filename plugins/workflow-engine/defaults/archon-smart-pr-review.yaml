@@ -1,0 +1,92 @@
+name: archon-smart-pr-review
+description: |
+  Use when: a PR needs a multi-angle code review with auto-fix for CRITICAL/HIGH issues.
+  Triggers: "smart review", "review this PR", "review PR #123", "efficient review",
+            "review and fix", "code review", "quick review".
+  Does: syncs the PR with its base -> runs the 5-agent PR review subgraph
+        (code, error-handling, test coverage, comment quality, docs impact) ->
+        synthesises findings -> auto-applies CRITICAL/HIGH fixes -> notifies if
+        ntfy MCP is configured.
+  NOT for: status checks on CI ("did it pass?"), one-off questions about a PR.
+
+nodes:
+  - id: extract-pr-number
+    hermes_task:
+      skills:
+        - planning
+      agent_hint: morpheus
+    prompt: |
+      Extract the PR number from $USER_MESSAGE.
+      The user may give it as #123, PR-123, or just 123. Output ONLY the bare
+      number with no quotes, markdown, or explanation. Example: 709
+    phase: Scope
+
+  - id: pr-number
+    bash: |
+      RAW="$extract-pr-number.output"
+      ISSUE_NUM=$(echo "$RAW" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract PR number from: $RAW" >&2
+        exit 1
+      fi
+      echo "$ISSUE_NUM"
+    depends_on:
+      - extract-pr-number
+    phase: Scope
+
+  - id: sync
+    hermes_task:
+      skills:
+        - git
+        - github
+      agent_hint: switch
+    prompt: |
+      Sync PR #$pr-number.output with its base branch:
+      1. `gh pr checkout $pr-number.output`
+      2. Determine base via `gh pr view $pr-number.output --json baseRefName`.
+      3. `git fetch origin <base>` then `git pull --rebase origin <base>`.
+      4. If trivial conflicts surface, resolve them; if not, abort the rebase
+         and report so a human can handle.
+      5. If new commits landed, `git push --force-with-lease`.
+      Output: short status (ahead/behind counts, conflicts handled or not).
+    depends_on:
+      - pr-number
+    phase: Scope
+
+  - id: review
+    subgraph:
+      ref: pr-review-5agents
+      inputs:
+        pr_number: $pr-number.output
+    depends_on:
+      - sync
+    phase: Analyze
+
+  - id: check-ntfy
+    bash: test -f .archon/mcp/ntfy.json && echo 'true' || echo 'false'
+    depends_on:
+      - review
+    phase: Publish
+
+  - id: notify
+    hermes_task:
+      skills:
+        - github
+      agent_hint: switch
+    depends_on:
+      - check-ntfy
+    when: $check-ntfy.output == 'true'
+    mcp: .archon/mcp/ntfy.json
+    prompt: |
+      Send a push notification summarising the PR review.
+      Subgraph synthesis:
+      $review.outputs.synthesis
+      Fix summary:
+      $review.outputs.fix_summary
+
+      Use ntfy. Priority:
+      - 3 if the verdict is APPROVE
+      - 4 if REQUEST_CHANGES
+      - 5 if CRITICAL issues remain
+      Title: "PR Review Complete"
+    phase: Publish

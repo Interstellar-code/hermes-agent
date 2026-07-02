@@ -1,0 +1,108 @@
+name: archon-fix-github-issue
+description: |
+  Use when: a GitHub issue should be investigated, fixed, opened as a PR, and
+  reviewed by the 5-agent subgraph.
+  Triggers: "fix issue #123", "resolve this bug", "implement issue #N",
+            "fix github issue", "fix this issue".
+  Input: issue number (or URL) in $USER_MESSAGE.
+  NOT for: feature requests without a clear issue (use idea-to-pr).
+
+nodes:
+  - id: extract-issue-number
+    hermes_task:
+      skills:
+        - planning
+      agent_hint: morpheus
+    prompt: |
+      Extract the GitHub issue number from $USER_MESSAGE.
+      Accept #123, GH-123, plain 123, or a github.com/.../issues/N URL.
+      Output ONLY the bare number, no quotes/markdown. Example: 709
+    phase: Intake
+
+  - id: issue-number
+    bash: |
+      RAW="$extract-issue-number.output"
+      ISSUE_NUM=$(echo "$RAW" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ISSUE_NUM" ]; then
+        echo "Failed to extract issue number from: $RAW" >&2
+        exit 1
+      fi
+      echo "$ISSUE_NUM"
+    depends_on:
+      - extract-issue-number
+    phase: Intake
+
+  - id: fetch-issue
+    bash: gh issue view "$issue-number.output" --json title,body,labels,comments
+    depends_on:
+      - issue-number
+    phase: Intake
+
+  - id: investigate
+    hermes_task:
+      skills:
+        - research
+        - code
+      agent_hint: morpheus
+    prompt: |
+      Investigate issue #$issue-number.output.
+      Issue body:
+      $fetch-issue.output
+      Steps:
+      1. Identify suspect code paths via grep/glob/repo structure.
+      2. Read the relevant files; cite file:line for each finding.
+      3. Reproduce the bug if possible (write a failing test that captures it).
+      4. Output a root-cause hypothesis + fix sketch (no code edits yet).
+    depends_on:
+      - fetch-issue
+    context: fresh
+    phase: Investigate
+
+  - id: implement-fix
+    hermes_task:
+      skills:
+        - coding
+        - testing
+      agent_hint: neo
+    prompt: |
+      Apply the fix described in $investigate.output.
+      Write a regression test that fails before the fix and passes after.
+      Run lint/typecheck/full tests. Commit locally with a clear message
+      that closes #$issue-number.output. Do NOT push.
+      Output: files changed + commits + verification.
+    depends_on:
+      - investigate
+    context: fresh
+    phase: Implement
+
+  - id: create-pr
+    hermes_task:
+      skills:
+        - git
+        - github
+      agent_hint: switch
+    prompt: |
+      Push the branch and open a PR with body that closes #$issue-number.output.
+      Include reproduction summary from $investigate.output and verification
+      from $implement-fix.output.
+      Refuse if tree dirty. Do NOT --force.
+      Output: PR URL.
+    depends_on:
+      - implement-fix
+    context: fresh
+    phase: Publish
+
+  - id: pr-number
+    bash: gh pr view --json number -q '.number'
+    depends_on:
+      - create-pr
+    phase: Publish
+
+  - id: review
+    subgraph:
+      ref: pr-review-5agents
+      inputs:
+        pr_number: $pr-number.output
+    depends_on:
+      - pr-number
+    phase: Analyze

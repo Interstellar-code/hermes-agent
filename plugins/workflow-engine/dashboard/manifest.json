@@ -1,0 +1,11 @@
+{
+  "name": "workflow-engine",
+  "label": "Workflows",
+  "description": "Define, trigger, and monitor DAG workflows (API only; no dashboard tab).",
+  "icon": "GitBranch",
+  "version": "0.1.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}

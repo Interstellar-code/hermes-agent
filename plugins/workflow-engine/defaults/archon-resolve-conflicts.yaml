@@ -1,0 +1,57 @@
+name: archon-resolve-conflicts
+description: |
+  Use when: a branch has merge conflicts against its base that need fixing.
+  Triggers: "resolve conflicts", "fix merge conflicts", "rebase this PR",
+            "resolve this", "fix conflicts", "merge conflicts", "rebase and fix".
+  Does: fetches base branch -> detects conflicting files -> resolves conflicts
+        via AI judgement -> commits the resolution locally.
+        Does NOT push.
+  NOT for: branches without conflicts, plain rebasing, squashing commits.
+nodes:
+  - id: detect
+    bash: |
+      BASE="${BASE_BRANCH:-main}"
+      git fetch origin "$BASE" 2>&1 | tail -3
+      git merge "origin/$BASE" --no-commit --no-ff 2>&1 || true
+      CONFLICTS="$(git diff --name-only --diff-filter=U 2>/dev/null)"
+      if [ -z "$CONFLICTS" ]; then
+        echo "No conflicts against origin/$BASE. Nothing to do."
+        git merge --abort 2>/dev/null || true
+        exit 0
+      fi
+      echo "=== Conflicting files ==="
+      echo "$CONFLICTS"
+      echo "$CONFLICTS" > "$ARTIFACTS_DIR/conflicting-files.txt"
+    phase: Investigate
+
+  - id: resolve
+    hermes_task:
+      skills:
+        - git
+        - merge
+      agent_hint: switch
+    prompt: |
+      Resolve the merge conflicts left in the working tree by the previous step.
+
+      ## Conflicting files
+      $detect.output
+
+      ## Instructions
+      1. For each conflicting file, read it and inspect <<<<<<<, =======, >>>>>>>
+         markers. Understand each side via `git log -3 <file>` on both branches.
+      2. Apply the safest merge:
+         - Prefer additive changes — keep both behaviors when non-contradictory.
+         - When intent conflicts, choose the side aligned with the branch's task.
+         - Never delete a working block just to make a conflict go away.
+      3. Remove all conflict markers, save the file.
+      4. Run the repo's lint/typecheck/test commands if present. Fix obvious
+         regressions caused by the resolution; flag pre-existing failures.
+      5. If any conflict required a judgement call the user should review, stop
+         and produce a summary listing those files plus your reasoning — do NOT
+         commit. Otherwise: `git add -A && git commit -m "Resolve merge conflicts"`.
+      6. Do NOT push. Leave that to the user.
+
+      Output: short summary of each file resolved plus any judgement calls.
+    depends_on:
+      - detect
+    phase: Resolve

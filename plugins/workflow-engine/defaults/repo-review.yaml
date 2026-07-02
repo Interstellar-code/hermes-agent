@@ -1,0 +1,347 @@
+name: repo-review
+description: |
+  Reviews a Git repository for bugs, code smells, and issues.
+  Runs mechanical checks (TypeScript, ESLint) and LLM-powered diff review,
+  then creates GitHub issues for findings. Configurable per project.
+
+  Inputs:
+    repo_path (required)  — absolute path to the local repo
+    github_repo (required) — owner/repo on GitHub (e.g. Interstellar-code/subsheroload)
+    branch (optional)     — branch to review (default: main)
+    diff_hours (optional)  — how far back to look in commits (default: 168 = 7 days)
+    max_issues (optional)  — cap on new issues created (default: 15)
+    skip_tests (optional)  — set "true" if no test runner available
+
+  Trigger: manual or cron. Delivers a structured summary as the final output.
+
+provider: manifest
+model: glm-4.1-plus
+tags:
+  - code-review
+  - github
+  - automated
+
+inputs:
+  - name: repo_path
+    required: true
+    description: "Absolute path to the local repo checkout"
+  - name: github_repo
+    required: true
+    description: "GitHub owner/repo (e.g. Interstellar-code/subsheroload)"
+  - name: branch
+    required: false
+    default: "main"
+  - name: diff_hours
+    required: false
+    default: "168"
+  - name: max_issues
+    required: false
+    default: "15"
+  - name: skip_tests
+    required: false
+    default: "false"
+
+nodes:
+  # ── Phase 1: DISCOVER ─────────────────────────────────────────────
+  - id: pull-latest
+    phase: Discover
+    bash: |
+      cd "$repo_path"
+      git fetch origin
+      git checkout "$branch" 2>/dev/null || true
+      git pull origin "$branch"
+      echo '{"branch": "'"$branch"'", "head": "'$(git rev-parse --short HEAD)"'"}'
+
+  - id: collect-diff
+    phase: Discover
+    depends_on:
+      - pull-latest
+    bash: |
+      cd "$repo_path"
+      COMMIT_COUNT=$(git log --oneline --since="${diff_hours} hours ago" | wc -l | tr -d ' ')
+      if [ "$COMMIT_COUNT" -eq 0 ]; then
+        echo '{"has_commits": "false", "commit_count": "0"}'
+      else
+        STATS=$(git log --oneline --since="${diff_hours} hours ago" | head -30)
+        DIFF_STAT=$(git diff HEAD~${COMMIT_COUNT}..HEAD --stat | tail -5)
+        # Write full diff to artifacts for the LLM node
+        mkdir -p "${ARTIFACTS_DIR:-/tmp}"
+        git diff HEAD~${COMMIT_COUNT}..HEAD > "${ARTIFACTS_DIR:-/tmp}/review-diff.patch"
+        git log --oneline --since="${diff_hours} hours ago" > "${ARTIFACTS_DIR:-/tmp}/review-commits.txt"
+        echo "{\"has_commits\": \"true\", \"commit_count\": \"$COMMIT_COUNT\"}"
+      fi
+
+  - id: gate-no-commits
+    phase: Discover
+    depends_on:
+      - collect-diff
+    when: $collect-diff.output.has_commits == 'false'
+    cancel: "No new commits in the last ${diff_hours} hours. Skipping review."
+
+  # ── Phase 2: MECHANICAL CHECKS ────────────────────────────────────
+  - id: run-typescript
+    phase: Execute
+    depends_on:
+      - collect-diff
+    when: $collect-diff.output.has_commits == 'true'
+    bash: |
+      cd "$repo_path"
+      if [ -f "tsconfig.json" ]; then
+        npx tsc --noEmit 2>&1 | tail -30 > "${ARTIFACTS_DIR:-/tmp}/tsc-output.txt"
+        TSC_ERRORS=$(grep -c "error TS" "${ARTIFACTS_DIR:-/tmp}/tsc-output.txt" 2>/dev/null || echo "0")
+        echo "{\"typescript_errors\": \"$TSC_ERRORS\"}"
+      else
+        echo '{"typescript_errors": "skipped", "reason": "no tsconfig.json"}'
+      fi
+
+  - id: run-eslint
+    phase: Execute
+    depends_on:
+      - collect-diff
+    when: $collect-diff.output.has_commits == 'true'
+    bash: |
+      cd "$repo_path"
+      if [ -f "eslint.config.js" ] || [ -f ".eslintrc.json" ] || [ -f ".eslintrc.js" ]; then
+        npx eslint . --no-fix 2>&1 | tail -50 > "${ARTIFACTS_DIR:-/tmp}/eslint-output.txt"
+        ESLINT_ERRORS=$(grep -c "error" "${ARTIFACTS_DIR:-/tmp}/eslint-output.txt" 2>/dev/null || echo "0")
+        ESLINT_WARNINGS=$(grep -c "warning" "${ARTIFACTS_DIR:-/tmp}/eslint-output.txt" 2>/dev/null || echo "0")
+        echo "{\"eslint_errors\": \"$ESLINT_ERRORS\", \"eslint_warnings\": \"$ESLINT_WARNINGS\"}"
+      else
+        echo '{"eslint_errors": "skipped", "reason": "no eslint config"}'
+      fi
+
+  # ── Phase 3: LLM REVIEW ──────────────────────────────────────────
+  - id: llm-review
+    phase: Execute
+    depends_on:
+      - run-typescript
+      - run-eslint
+    prompt: |
+      You are a senior code reviewer. Analyze the following diff and mechanical check results for a repository.
+
+      ## Repository: $github_repo (branch: $branch)
+      ## Recent commits:
+      Read the file at ${ARTIFACTS_DIR:-/tmp}/review-commits.txt for the list of recent commits.
+
+      ## Full diff:
+      Read the file at ${ARTIFACTS_DIR:-/tmp}/review-diff.patch for the complete diff.
+
+      ## Mechanical check results:
+      - TypeScript: $run-typescript.output
+      - ESLint: $run-eslint.output
+
+      ## Your task:
+
+      Review the diff for these SPECIFIC issues ONLY:
+      1. **Null safety:** nullable properties accessed without null checks
+      2. **Error handling:** happy-path-only code that silently fails on errors
+      3. **Type safety:** any casts, type mismatches, missing generics
+      4. **Security:** unvalidated input, raw queries, exposed secrets/keys
+      5. **Dead code:** unused imports, unreachable branches
+      6. **Inconsistency:** new code contradicting existing patterns in the codebase
+      7. **Missing tests:** new features/methods without test coverage
+
+      For EACH finding, classify:
+      - **HIGH confidence:** Obvious bug, crash, type error, null dereference, lint error
+      - **MEDIUM confidence:** Likely issue but needs human judgment
+      - **LOW confidence:** Style preference or speculative — SKIP these entirely
+
+      Output a JSON array of findings. Each finding must have:
+      - "severity": "high" | "medium" | "low"
+      - "confidence": "high" | "medium"
+      - "file": path to the file
+      - "line": line number or range (string)
+      - "category": one of [null-safety, error-handling, type-safety, security, dead-code, inconsistency, missing-tests]
+      - "title": one-line summary (max 80 chars, prefix with [code-review])
+      - "description": 2-3 sentence explanation
+      - "suggested_fix": brief description of the fix
+
+      IMPORTANT RULES:
+      - Only report things you are CONFIDENT about. Skip anything speculative.
+      - Do NOT report style preferences, formatting, or naming conventions.
+      - Do NOT suggest architectural changes.
+      - Max 15 findings total.
+      - If the diff is clean, output an empty array [].
+
+  # ── Phase 4: CREATE ISSUES ───────────────────────────────────────
+  - id: create-issues
+    phase: Execute
+    depends_on:
+      - llm-review
+    script: |
+      import json
+      import os
+      import subprocess
+
+      artifacts = os.environ.get("ARTIFACTS_DIR", "/tmp")
+      github_repo = os.environ.get("github_repo", "")
+      max_issues = int(os.environ.get("max_issues", "15"))
+
+      # Read the LLM review output — it's in the previous node's output
+      llm_output = """$llm-review.output"""
+
+      # Try to extract JSON array from the LLM output
+      findings = []
+      try:
+          # Find JSON array in the output
+          start = llm_output.find('[')
+          end = llm_output.rfind(']') + 1
+          if start >= 0 and end > start:
+              findings = json.loads(llm_output[start:end])
+      except (json.JSONDecodeError, ValueError) as e:
+          print(json.dumps({"error": f"Failed to parse LLM output: {str(e)}", "findings": 0}))
+          # Write empty results
+          with open(f"{artifacts}/review-findings.json", "w") as f:
+              json.dump({"findings": [], "issues_created": 0}, f)
+          raise SystemExit(0)
+
+      # Read mechanical check results
+      tsc_errors = 0
+      eslint_errors = 0
+      try:
+          with open(f"{artifacts}/tsc-output.txt") as f:
+              tsc_errors = sum(1 for line in f if "error TS" in line)
+      except FileNotFoundError:
+          pass
+      try:
+          with open(f"{artifacts}/eslint-output.txt") as f:
+              content = f.read()
+              eslint_errors = content.count("  error  ")
+      except FileNotFoundError:
+          pass
+
+      # Create GitHub issues
+      issues_created = []
+      for i, finding in enumerate(findings[:max_issues]):
+          title = finding.get("title", "[code-review] Issue found")
+          if not title.startswith("[code-review]"):
+              title = f"[code-review] {title}"
+
+          severity = finding.get("severity", "low")
+          confidence = finding.get("confidence", "medium")
+          category = finding.get("category", "general")
+          file_path = finding.get("file", "unknown")
+          line = finding.get("line", "?")
+          description = finding.get("description", "")
+          suggested_fix = finding.get("suggested_fix", "")
+
+          # Determine labels
+          labels = ["code-review"]
+          if severity == "high":
+              labels.append("severity:high")
+          elif severity == "medium":
+              labels.append("severity:medium")
+          else:
+              labels.append("severity:low")
+
+          # Determine frontend vs backend label
+          if file_path.endswith(('.tsx', '.ts', '.jsx', '.js', '.css', '.scss')):
+              labels.append("frontend")
+          elif file_path.endswith(('.php', '.blade.php')):
+              labels.append("backend")
+
+          body = f"""**Category:** {category}
+      **File:** `{file_path}` (line {line})
+      **Severity:** {severity}
+      **Confidence:** {confidence}
+
+      {description}
+
+      **Suggested fix:** {suggested_fix}
+
+      ---
+      *Auto-generated by repo-review workflow*"""
+
+          cmd = [
+              "gh", "issue", "create",
+              "--repo", github_repo,
+              "--title", title,
+              "--body", body,
+          ]
+          for label in labels:
+              cmd.extend(["--label", label])
+
+          result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+          issue_url = result.stdout.strip() if result.returncode == 0 else f"FAILED: {result.stderr.strip()[:200]}"
+          issues_created.append({
+              "title": title,
+              "url": issue_url,
+              "severity": severity,
+          })
+
+      # Also create issues for mechanical check failures
+      if tsc_errors > 0:
+          title = f"[code-review] TypeScript: {tsc_errors} type error(s) found"
+          result = subprocess.run([
+              "gh", "issue", "create",
+              "--repo", github_repo,
+              "--title", title,
+              "--body", f"TypeScript type-check found {tsc_errors} error(s).\n\nSee workflow output for details.\n\n---\n*Auto-generated by repo-review workflow*",
+              "--label", "code-review",
+              "--label", "severity:high",
+              "--label", "frontend",
+          ], capture_output=True, text=True, timeout=30)
+          issues_created.append({"title": title, "url": result.stdout.strip(), "severity": "high"})
+
+      if eslint_errors > 0:
+          title = f"[code-review] ESLint: {eslint_errors} error(s) found"
+          result = subprocess.run([
+              "gh", "issue", "create",
+              "--repo", github_repo,
+              "--title", title,
+              "--body": f"ESLint found {eslint_errors} error(s).\n\nSee workflow output for details.\n\n---\n*Auto-generated by repo-review workflow*",
+              "--label", "code-review",
+              "--label", "severity:medium",
+              "--label", "frontend",
+          ], capture_output=True, text=True, timeout=30)
+          issues_created.append({"title": title, "url": result.stdout.strip(), "severity": "medium"})
+
+      # Save results for the summary node
+      with open(f"{artifacts}/review-findings.json", "w") as f:
+          json.dump({
+              "findings": findings,
+              "issues_created": issues_created,
+              "tsc_errors": tsc_errors,
+              "eslint_errors": eslint_errors,
+          }, f, indent=2)
+
+      print(json.dumps({
+          "issues_created": len(issues_created),
+          "findings_count": len(findings),
+          "tsc_errors": tsc_errors,
+          "eslint_errors": eslint_errors,
+      }))
+    runtime: uv
+
+  # ── Phase 5: REPORT ──────────────────────────────────────────────
+  - id: build-summary
+    phase: Report
+    depends_on:
+      - create-issues
+    prompt: |
+      You are producing a morning code review summary for the user.
+
+      ## Review results for $github_repo ($branch):
+      Read the file at ${ARTIFACTS_DIR:-/tmp}/review-findings.json for the complete findings and issues created.
+
+      ## Commit activity:
+      Read the file at ${ARTIFACTS_DIR:-/tmp}/review-commits.txt for the list of commits reviewed.
+
+      Produce a clean, scannable summary in this format:
+
+      📊 **Repo Review — $github_repo — <today's date>**
+
+      **Commits reviewed:** X (last ${diff_hours}h)
+      **TypeScript:** ✅ clean / ❌ N errors
+      **ESLint:** ✅ clean / ❌ N errors
+
+      **Issues created:** N
+      For each issue:
+      - **#URL** — [severity] title
+
+      **High-confidence findings:** N (details)
+      **Medium-confidence findings:** N (details)
+
+      If no issues were created, say: "Codebase looks clean. No actionable findings."
+
+      Keep it under 40 lines. Be direct. No filler.

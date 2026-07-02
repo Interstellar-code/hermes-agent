@@ -1,0 +1,5 @@
+name: Hello World
+description: Minimal single-node workflow for testing
+nodes:
+  - id: greet
+    prompt: Say hello and confirm you are working correctly.

@@ -1,0 +1,94 @@
+name: archon-idea-to-pr
+description: |
+  Use when: starting from a raw idea, want autonomous PRD -> plan -> implement
+  -> PR -> 5-agent review -> auto-fix.
+  Triggers: "idea to pr", "build this idea", "autonomous build",
+            "ship this idea", "idea to merged pr".
+  Input: the idea text via $USER_MESSAGE.
+  NOT for: working from an existing plan (use plan-to-pr).
+
+nodes:
+  - id: prd
+    hermes_task:
+      skills:
+        - planning
+        - writing
+      agent_hint: morpheus
+    prompt: |
+      Draft a PRD for the idea: $USER_MESSAGE
+      Use first-principles thinking: who has the problem, what they do today,
+      why it's worth solving now, how we'll know we succeeded.
+      Write to $ARTIFACTS_DIR/prd.md and output the file path.
+    phase: Discover
+
+  - id: plan
+    hermes_task:
+      skills:
+        - planning
+      agent_hint: morpheus
+    prompt: |
+      Read the PRD at $prd.output and produce an actionable implementation plan
+      (sections: scope, phases, file-level deltas, tests, risks).
+      Write to $ARTIFACTS_DIR/plan.md and output the file path.
+    depends_on:
+      - prd
+    context: fresh
+    phase: Draft
+
+  - id: implement
+    hermes_task:
+      skills:
+        - coding
+        - testing
+      agent_hint: neo
+    prompt: |
+      Implement the plan at $plan.output.
+      Follow the plan section-by-section. Write tests with code.
+      Run repo lint/typecheck/tests after each chunk. Commit locally.
+      Output: files changed + commits + verification run.
+    depends_on:
+      - plan
+    context: fresh
+    phase: Implement
+
+  - id: validate
+    hermes_task:
+      skills:
+        - testing
+      agent_hint: trinity
+    prompt: |
+      Run the full validation suite. Fix obvious regressions from $implement.output.
+      Output: pass/fail summary + diagnostics.
+    depends_on:
+      - implement
+    phase: Verify
+
+  - id: create-pr
+    hermes_task:
+      skills:
+        - git
+        - github
+      agent_hint: switch
+    prompt: |
+      Push the branch and open a PR. Title from the PRD heading, body
+      summarising implementation. Refuse if tree dirty. Do NOT --force.
+      Output: PR URL.
+    depends_on:
+      - validate
+    context: fresh
+    phase: Publish
+
+  - id: pr-number
+    bash: gh pr view --json number -q '.number'
+    depends_on:
+      - create-pr
+    phase: Publish
+
+  - id: review
+    subgraph:
+      ref: pr-review-5agents
+      inputs:
+        pr_number: $pr-number.output
+    depends_on:
+      - pr-number
+    phase: Analyze

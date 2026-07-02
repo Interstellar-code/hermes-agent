@@ -1,0 +1,222 @@
+name: repo-issue-fixer
+description: |
+  Reviews open GitHub issues for a repository, analyzes each one, attempts
+  to fix the ones it can confidently resolve, and creates draft PRs.
+
+  Pipeline per issue:
+    1. Fetch open issues from GitHub
+    2. Classify each issue (bug / enhancement / question / duplicate)
+    3. For bugs with high-confidence fixes: branch → fix → draft PR
+    4. For bugs needing more context: add a comment with analysis
+    5. Update issue labels based on analysis
+    6. Deliver a summary
+
+  Inputs:
+    repo_path (required)    — absolute path to the local repo
+    github_repo (required)  — owner/repo on GitHub
+    branch (optional)       — base branch for PRs (default: main)
+    max_prs (optional)      — max draft PRs to create per run (default: 5)
+    max_issues (optional)   — max issues to analyze per run (default: 20)
+    label_filter (optional) — only process issues with this label (default: empty = all)
+
+  Safety constraints:
+    - All PRs are created as DRAFTS — never auto-merge
+    - Will not touch: migrations, auth, payment, .env files
+    - Skips issues with active PRs already linked
+
+provider: manifest
+model: glm-4.1-plus
+tags:
+  - issue-fix
+  - github
+  - automated
+
+inputs:
+  - name: repo_path
+    required: true
+    description: "Absolute path to the local repo checkout"
+  - name: github_repo
+    required: true
+    description: "GitHub owner/repo (e.g. Interstellar-code/subsheroload)"
+  - name: branch
+    required: false
+    default: "main"
+  - name: max_prs
+    required: false
+    default: "5"
+  - name: max_issues
+    required: false
+    default: "20"
+  - name: label_filter
+    required: false
+    default: ""
+
+nodes:
+  # ── Phase 1: DISCOVER ─────────────────────────────────────────────
+  - id: pull-latest
+    phase: Discover
+    bash: |
+      cd "$repo_path"
+      git fetch origin
+      git checkout "$branch" 2>/dev/null || true
+      git pull origin "$branch"
+      echo '{"status": "ok", "branch": "'"$branch"'"}'
+
+  - id: fetch-issues
+    phase: Discover
+    depends_on:
+      - pull-latest
+    bash: |
+      ARGS=("gh" "issue" "list" "--repo" "$github_repo" "--state" "open" "--limit" "$max_issues" "--json" "number,title,labels,body,createdAt,comments")
+      if [ -n "$label_filter" ]; then
+        ARGS+=("--label" "$label_filter")
+      fi
+      cd "$repo_path"
+      ISSUES=$("${ARGS[@]}" 2>&1)
+      echo "$ISSUES" > "${ARTIFACTS_DIR:-/tmp}/open-issues.json"
+      COUNT=$(echo "$ISSUES" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+      echo "{\"issue_count\": \"$COUNT\"}"
+
+  - id: gate-no-issues
+    phase: Discover
+    depends_on:
+      - fetch-issues
+    when: $fetch-issues.output.issue_count == '0'
+    cancel: "No open issues found. Nothing to fix."
+
+  # ── Phase 2: ANALYZE ─────────────────────────────────────────────
+  - id: analyze-issues
+    phase: Execute
+    depends_on:
+      - fetch-issues
+    when: $fetch-issues.output.issue_count != '0'
+    prompt: |
+      You are a senior developer analyzing open GitHub issues to determine which ones can be auto-fixed.
+
+      ## Repository: $github_repo (branch: $branch)
+      ## Repo path: $repo_path
+
+      ## Open issues:
+      Read the file at ${ARTIFACTS_DIR:-/tmp}/open-issues.json for the full list of open issues with their titles, labels, bodies, and metadata.
+
+      ## Your task:
+
+      For EACH issue, analyze and classify:
+
+      1. **type**: "bug" | "enhancement" | "question" | "duplicate" | "wontfix" | "code-review"
+      2. **fixability**: "high" | "medium" | "low" | "none"
+         - HIGH: The issue describes a clear, specific bug with an obvious fix (e.g. null check, missing import, wrong condition, type error, lint error)
+         - MEDIUM: The issue is a real bug but the fix requires some judgment or understanding of business logic
+         - LOW: The issue is valid but complex, needs architecture decisions, or has multiple possible approaches
+         - NONE: Not a bug (question, feature request, duplicate, or needs human decisions)
+      3. **fix_plan**: For HIGH fixability only — describe the exact fix in 2-3 sentences. Be specific about which file(s) and what to change.
+      4. **comment**: For MEDIUM fixability — write a brief analysis comment explaining what's likely wrong and what to investigate
+      5. **skip_reason**: For LOW/NONE — why this shouldn't be auto-fixed
+
+      ## IMPORTANT RULES:
+      - Do NOT attempt to fix: database migrations, auth logic, payment/billing code, .env files, architectural changes
+      - Do NOT attempt fixes that span more than 3 files
+      - Do NOT attempt fixes that require new dependencies
+      - Only classify as HIGH fixability if you are confident about the fix
+      - If an issue already has linked PRs, set fixability to "none" with skip_reason "has linked PR"
+      - Max $max_prs issues classified as HIGH
+
+      Output a JSON array. Each entry:
+      {
+        "issue_number": 123,
+        "title": "issue title",
+        "type": "bug",
+        "fixability": "high",
+        "fix_plan": "Add null check on line 47 of SubscriptionController.php before accessing ->name",
+        "comment": null,
+        "skip_reason": null
+      }
+
+  # ── Phase 3: EXECUTE FIXES ───────────────────────────────────────
+  - id: execute-fixes
+    phase: Execute
+    depends_on:
+      - analyze-issues
+    prompt: |
+      You are an autonomous coding agent. You will fix GitHub issues and create draft PRs.
+
+      ## Repository: $github_repo (branch: $branch)
+      ## Repo path: $repo_path
+
+      ## Analysis results:
+      $analyze-issues.output
+
+      ## Your task:
+
+      For each issue with **fixability: "high"** (up to $max_prs total):
+
+      1. Read the relevant source file(s) to understand the current code
+      2. Create a new branch: `git checkout -b fix/issue-{number}-{short-description}`
+      3. Apply the fix using the terminal tools available to you. Use `sed`, `patch`, or write the fixed file.
+      4. Run quick validation if possible (e.g. `npx eslint` on the changed file, or `npx tsc --noEmit`)
+      5. Commit with message: `fix: {description} (closes #{number})`
+      6. Push the branch: `git push origin fix/issue-{number}-{short-description}`
+      7. Create a **DRAFT** PR:
+         ```
+         gh pr create --draft --repo $github_repo \
+           --title "fix: {description}" \
+           --body "Auto-generated fix for #{number}\n\n**Issue:** #{number}\n**Confidence:** HIGH\n**Fix:** {what was changed}\n\nPlease review before merging." \
+           --base $branch
+         ```
+      8. Add a comment to the original issue: "I've created a draft PR with a proposed fix. Please review when you have a chance."
+      9. Switch back to main: `git checkout $branch`
+
+      For each issue with **fixability: "medium"**:
+
+      1. Add an analysis comment to the issue with your findings
+      2. Add the label "triaged" if it doesn't already have it
+
+      For each issue with **fixability: "none"**:
+
+      Skip it entirely.
+
+      ## SAFETY RULES:
+      - ALL PRs must be drafts. NEVER merge.
+      - If a fix doesn't feel right, skip it. Better to skip than break.
+      - If git operations fail, skip that issue and continue to the next.
+      - Do not touch: migrations, auth, payment, .env
+      - Run `git checkout $branch` after each fix to clean up
+
+      After processing all issues, output a JSON summary:
+      {
+        "prs_created": [...],
+        "comments_added": [...],
+        "skipped": [...]
+      }
+
+  # ── Phase 4: REPORT ──────────────────────────────────────────────
+  - id: build-summary
+    phase: Report
+    depends_on:
+      - execute-fixes
+    prompt: |
+      You are producing a summary of automated issue fixing for a repository.
+
+      ## Repository: $github_repo ($branch)
+      ## Fix execution results:
+      $execute-fixes.output
+
+      ## Original analysis:
+      $analyze-issues.output
+
+      Produce a clean, scannable summary:
+
+      🔧 **Issue Fixer — $github_repo — <today's date>**
+
+      **Issues analyzed:** X
+      **Draft PRs created:** N
+      For each PR:
+      - **PR #URL** — fix: description (fixes #issue)
+
+      **Analysis comments added:** N
+      For each comment:
+      - **#issue** — brief analysis summary
+
+      **Skipped:** N (reason: not fixable / needs human judgment)
+
+      Keep it under 40 lines. Be direct.
