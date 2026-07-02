@@ -859,6 +859,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- template ---
+    p_tmpl = sub.add_parser(
+        "template",
+        help="Manage board templates (save once, instantiate repeatedly)",
+        description=(
+            "Board templates store a set of tasks, dependencies, variables, and "
+            "optional recurrence rules so you can seed a board in one command. "
+            "Templates live under <HERMES_HOME>/kanban/templates/<slug>/template.yaml."
+        ),
+    )
+    tmpl_sub = p_tmpl.add_subparsers(dest="template_action")
+
+    tmpl_sub.add_parser("list", aliases=["ls"], help="List all saved templates")
+
+    p_tmpl_show = tmpl_sub.add_parser("show", help="Print the raw YAML of a template")
+    p_tmpl_show.add_argument("slug", help="Template slug")
+
+    p_tmpl_create = tmpl_sub.add_parser("create", help="Save a template from a YAML file (slug taken from file content)")
+    p_tmpl_create.add_argument("file", help="Path to the template YAML file")
+    p_tmpl_create.add_argument("--slug", default=None, metavar="SLUG", help="Override the slug (default: use the 'slug' field inside the file)")
+
+    p_tmpl_delete = tmpl_sub.add_parser("delete", aliases=["rm"], help="Delete a saved template")
+    p_tmpl_delete.add_argument("slug", help="Template slug to delete")
+    p_tmpl_delete.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+
+    p_tmpl_inst = tmpl_sub.add_parser("instantiate", aliases=["apply"], help="Create board tasks from a template")
+    p_tmpl_inst.add_argument("slug", help="Template slug to instantiate")
+    p_tmpl_inst.add_argument("--var", dest="vars", action="append", default=[], metavar="KEY=VALUE", help="Set a template variable (repeatable). Split on first '=' only.")
+    p_tmpl_inst.add_argument("--board", dest="template_board", default=None, metavar="SLUG", help="Target board slug (overrides board.slug in template)")
+    p_tmpl_inst.add_argument("--dispatch", action="store_true", help="Set auto_dispatch=True so ready tasks are picked up by the dispatcher")
+
+    p_tmpl_sb = tmpl_sub.add_parser("save-board", help="Snapshot a live board as a reusable template")
+    p_tmpl_sb.add_argument("board_slug", help="Source board slug to snapshot")
+    p_tmpl_sb.add_argument("--as", dest="template_slug", required=True, metavar="TEMPLATE_SLUG", help="Slug for the new template")
+    p_tmpl_sb.add_argument("--name", default=None, help="Human-readable display name for the template")
+    p_tmpl_sb.add_argument("--keep-status", action="store_true", help=("Preserve 'ready' task status in the saved template. All other statuses (running, blocked, done, etc.) are always reset to 'todo'; only 'ready' is preserved when this flag is set."))
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -893,6 +930,9 @@ def kanban_command(args: argparse.Namespace) -> int:
     # alpha.
     if action == "boards":
         return _dispatch_boards(args)
+
+    if action == "template":
+        return _dispatch_templates(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -974,6 +1014,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
+            "template": _dispatch_templates,
         }
         handler = handlers.get(action)
         if not handler:
@@ -2843,3 +2884,180 @@ def run_slash(rest: str) -> str:
     if err and out:
         return f"{out}\n{err}"
     return err if err else (out or "(no output)")
+
+
+
+# ---------------------------------------------------------------------------
+# Template management (hermes kanban template …)
+# ---------------------------------------------------------------------------
+
+
+def _dispatch_templates(args: argparse.Namespace) -> int:
+    """Handle ``hermes kanban template <action>``."""
+    sub = getattr(args, "template_action", None) or "list"
+    if sub in {"list", "ls"}:
+        return _cmd_template_list(args)
+    if sub == "show":
+        return _cmd_template_show(args)
+    if sub == "create":
+        return _cmd_template_create(args)
+    if sub in {"delete", "rm"}:
+        return _cmd_template_delete(args)
+    if sub in {"instantiate", "apply"}:
+        return _cmd_template_instantiate(args)
+    if sub == "save-board":
+        return _cmd_template_save_board(args)
+    print(f"kanban template: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_template_list(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    templates = kt.list_templates()
+    if not templates:
+        print("(no templates saved — create one with `hermes kanban template create <file.yaml>`)")
+        return 0
+    # Table: slug, name, #tasks, required vars, recurrence
+    print(f"{'SLUG':24s}  {'NAME':28s}  {'TASKS':5s}  {'REQ VARS':20s}  RECURRENCE")
+    for t in templates:
+        req_vars = [v["key"] for v in t.get("variables", []) if v.get("required")]
+        req_str = ", ".join(req_vars) if req_vars else "-"
+        recur = "yes" if t.get("has_recurrence") else "-"
+        # task count: load template to get exact count
+        try:
+            data = kt.load_template(t["slug"])
+            task_count = str(len(data.get("tasks") or []))
+        except kt.TemplateError:
+            task_count = "?"
+        print(
+            f"{t['slug']:24s}  {t['name']:28s}  {task_count:5s}  {req_str:20s}  {recur}"
+        )
+    return 0
+
+
+def _cmd_template_show(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    slug = args.slug
+    try:
+        tf = kt._template_file(kt._validate_slug(slug))
+        if not tf.exists():
+            raise kt.TemplateNotFound(f"template {slug!r} not found")
+        print(tf.read_text(encoding="utf-8"), end="")
+        return 0
+    except kt.TemplateError as exc:
+        print(f"kanban template show: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_template_create(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    import yaml as _yaml
+    file_path = Path(args.file)
+    if not file_path.exists():
+        print(f"kanban template create: file not found: {file_path}", file=sys.stderr)
+        return 1
+    try:
+        yaml_text = file_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"kanban template create: cannot read {file_path}: {exc}", file=sys.stderr)
+        return 1
+    # Determine slug: --slug override, else slug field in YAML, else error
+    slug = getattr(args, "slug", None)
+    if not slug:
+        try:
+            data = _yaml.safe_load(yaml_text) or {}
+        except _yaml.YAMLError as exc:
+            print(f"kanban template create: invalid YAML: {exc}", file=sys.stderr)
+            return 1
+        slug = data.get("slug")
+        if not slug:
+            print(
+                "kanban template create: YAML must contain a 'slug' field, "
+                "or use --slug to specify one",
+                file=sys.stderr,
+            )
+            return 1
+    try:
+        result = kt.save_template(str(slug), yaml_text)
+        print(f"template {result.get('slug', slug)!r} saved ({len(result.get('tasks', []))} tasks)")
+        return 0
+    except kt.TemplateError as exc:
+        print(f"kanban template create: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_template_delete(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    slug = args.slug
+    if not getattr(args, "yes", False):
+        try:
+            answer = input(f"Delete template {slug!r}? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.", file=sys.stderr)
+            return 1
+        if answer not in {"y", "yes"}:
+            print("Aborted.")
+            return 0
+    try:
+        kt.delete_template(slug)
+        print(f"template {slug!r} deleted")
+        return 0
+    except kt.TemplateError as exc:
+        print(f"kanban template delete: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_template_instantiate(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    slug = args.slug
+    # Parse --var key=value pairs (split on first '=' only)
+    variables: dict[str, Any] = {}
+    for raw in (args.vars or []):
+        if "=" not in raw:
+            print(
+                f"kanban template instantiate: --var {raw!r} must be KEY=VALUE",
+                file=sys.stderr,
+            )
+            return 1
+        k, v = raw.split("=", 1)
+        variables[k.strip()] = v
+    board_slug = getattr(args, "template_board", None)
+    auto_dispatch = bool(getattr(args, "dispatch", False))
+    try:
+        result = kt.instantiate(
+            slug,
+            variables=variables or None,
+            board_slug=board_slug,
+            auto_dispatch=auto_dispatch,
+        )
+        print(f"board:      {result['board_slug']}")
+        print(f"instance:   {result['instance_id']}")
+        print(f"created:    {result['created']}")
+        print(f"skipped:    {result['skipped']}")
+        return 0
+    except kt.TemplateError as exc:
+        print(f"kanban template instantiate: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_template_save_board(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_templates as kt
+    board_slug = args.board_slug
+    template_slug = args.template_slug
+    name = getattr(args, "name", None)
+    reset_status = not bool(getattr(args, "keep_status", False))
+    try:
+        result = kt.save_board_as_template(
+            board_slug,
+            template_slug,
+            name=name,
+            reset_status=reset_status,
+        )
+        print(
+            f"template {template_slug!r} saved from board {board_slug!r} "
+            f"({len(result.get('tasks', []))} tasks)"
+        )
+        return 0
+    except kt.TemplateError as exc:
+        print(f"kanban template save-board: {exc}", file=sys.stderr)
+        return 1

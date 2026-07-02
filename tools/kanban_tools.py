@@ -333,6 +333,20 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
+def _check_kanban_template_mode() -> bool:
+    """Template tools are available only in orchestrator context."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    return _profile_has_kanban_toolset()
+
+
+def _require_template_tool(tool_name: str) -> Optional[dict]:
+    """Runtime guard for template-only handlers."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return {"error": "template tools are not available to kanban workers"}
+    return None
+
+
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
@@ -930,6 +944,7 @@ def _handle_create(args: dict, **kw) -> str:
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
+                scheduled_at=args.get("scheduled_at"),
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
@@ -1541,6 +1556,14 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "scheduled_at": {
+                "type": "integer",
+                "description": (
+                    "Unix epoch timestamp. The task will not be "
+                    "dispatched until this time arrives. NULL or "
+                    "omitted = dispatch immediately when ready."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
@@ -1584,6 +1607,147 @@ KANBAN_LINK_SCHEMA = {
         "required": ["parent_id", "child_id"],
     },
 }
+
+
+KANBAN_TEMPLATE_LIST_SCHEMA = {
+    "name": "kanban_template_list",
+    "description": (
+        "List all available Kanban board templates. Returns a compact summary "
+        "of each template: slug, name, description, required variable keys, "
+        "and task count. Orchestrator-only — not available to workers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+}
+
+KANBAN_TEMPLATE_INSTANTIATE_SCHEMA = {
+    "name": "kanban_template_instantiate",
+    "description": (
+        "Instantiate a Kanban board template, creating a board and tasks from "
+        "the template definition. Returns the board slug, instance ID, created "
+        "and skipped task IDs. Orchestrator-only — not available to workers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "slug": {
+                "type": "string",
+                "description": "Template slug to instantiate.",
+            },
+            "variables": {
+                "type": "object",
+                "description": (
+                    "Key/value pairs substituted into template task titles and "
+                    "descriptions. Required variables must all be supplied."
+                ),
+            },
+            "board_slug": {
+                "type": "string",
+                "description": (
+                    "Target board slug. Created if absent; defaults to the "
+                    "template's own slug when omitted."
+                ),
+            },
+            "auto_dispatch": {
+                "type": "boolean",
+                "description": (
+                    "If true, newly-created tasks are immediately eligible for "
+                    "dispatcher pick-up. Defaults to false."
+                ),
+            },
+        },
+        "required": ["slug"],
+    },
+}
+
+
+def _handle_template_list(args: dict, **kw) -> dict:
+    """Return a compact list of available templates."""
+    guard = _require_template_tool("kanban_template_list")
+    if guard is not None:
+        return guard
+    try:
+        from hermes_cli.kanban_templates import (
+            TemplateError,
+            list_templates,
+            load_template,
+        )
+    except ImportError as exc:
+        return tool_error(f"kanban_template_list: templates module unavailable — {exc}")
+
+    try:
+        raw = list_templates()
+    except Exception as exc:
+        logger.exception("kanban_template_list: list_templates() failed")
+        return tool_error(f"kanban_template_list: {exc}")
+
+    results = []
+    for entry in raw:
+        slug = entry["slug"]
+        task_count = None
+        required_vars: list[str] = []
+        try:
+            tdata = load_template(slug)
+            task_count = len(tdata.get("tasks") or [])
+            required_vars = [
+                v["key"]
+                for v in (tdata.get("variables") or [])
+                if v.get("required")
+            ]
+        except TemplateError as exc:
+            logger.warning("kanban_template_list: could not load %s: %s", slug, exc)
+        except Exception as exc:
+            logger.warning("kanban_template_list: unexpected error loading %s: %s", slug, exc)
+
+        results.append({
+            "slug": slug,
+            "name": entry["name"],
+            "description": entry.get("description"),
+            "required_variables": required_vars,
+            "task_count": task_count,
+        })
+
+    return {"templates": results, "count": len(results)}
+
+
+def _handle_template_instantiate(args: dict, **kw) -> dict:
+    """Instantiate a template onto a board."""
+    guard = _require_template_tool("kanban_template_instantiate")
+    if guard is not None:
+        return guard
+
+    slug = args.get("slug", "")
+    if not slug:
+        return tool_error("kanban_template_instantiate: 'slug' is required")
+
+    variables = args.get("variables") or None
+    board_slug = args.get("board_slug") or None
+    auto_dispatch, err = _parse_bool_arg(args, "auto_dispatch", default=False)
+    if err:
+        return tool_error(f"kanban_template_instantiate: {err}")
+
+    try:
+        from hermes_cli.kanban_templates import TemplateError, instantiate
+    except ImportError as exc:
+        return tool_error(
+            f"kanban_template_instantiate: templates module unavailable — {exc}"
+        )
+
+    try:
+        return instantiate(
+            slug=slug,
+            variables=variables,
+            board_slug=board_slug,
+            auto_dispatch=bool(auto_dispatch),
+        )
+    except TemplateError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        logger.exception("kanban_template_instantiate failed")
+        return tool_error(f"kanban_template_instantiate: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +1824,24 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_template_list",
+    toolset="kanban",
+    schema=KANBAN_TEMPLATE_LIST_SCHEMA,
+    handler=_handle_template_list,
+    check_fn=_check_kanban_template_mode,
+    emoji="📋",
+)
+
+registry.register(
+    name="kanban_template_instantiate",
+    toolset="kanban",
+    schema=KANBAN_TEMPLATE_INSTANTIATE_SCHEMA,
+    handler=_handle_template_instantiate,
+    check_fn=_check_kanban_template_mode,
+    emoji="🏗",
 )
 
 registry.register(
