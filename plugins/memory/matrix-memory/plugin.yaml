@@ -1,0 +1,21 @@
+name: matrix-memory
+version: 0.2.0
+description: >-
+  Matrix Memory v0.2 — thin contract layer over the Mnemosyne engine
+  (vector + KG + temporal + sync). Tier 1 MEMORY.md/USER.md passthrough
+  (read+delete only; built-in memory tool owns writes), Tier 2 Mnemosyne
+  episodic/semantic/triples/working recall, Tier 3 one-way markdown wiki
+  bridge into Tier 2. dry_run + confirm_token safety (opt-in via
+  MNEMOSYNE_MATRIX_SAFETY=1) and a 3-tier discipline skill.
+author: Interstellar-code (fork of AxDSan/mnemosyne)
+# Engine + contract live in the pinned submodule at
+#   plugins/memory/_matrix-memory-mnemosyne  (fork main @ aa09b29)
+# This dir is a thin registration shim that delegates to the fork's
+# hermes_memory_provider.register_memory_provider(ctx).
+provides_hooks:
+  - pre_llm_call
+  - on_session_start
+  - post_tool_call
+dependencies:
+  - fastembed
+  - sqlite-vec
