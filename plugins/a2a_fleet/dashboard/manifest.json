@@ -1,0 +1,11 @@
+{
+  "name": "a2a_fleet",
+  "label": "A2A Fleet",
+  "description": "Read-only API surfacing A2A fleet conversations (Hermes <-> Claude Code executors) from the per-repo receiver transcripts. API only; the Matrix3D tab is rendered by the front-end.",
+  "icon": "Network",
+  "version": "0.5.2",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}
