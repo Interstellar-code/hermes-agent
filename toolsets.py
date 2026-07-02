@@ -76,6 +76,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    "kanban_template_list", "kanban_template_instantiate",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -274,6 +275,7 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "kanban_template_list", "kanban_template_instantiate",
         ],
         "includes": [],
     },
