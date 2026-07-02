@@ -2915,9 +2915,12 @@ def run_job(
     agent = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
-    # This env var is process-wide and persists for the lifetime of the
-    # scheduler process — every job this process runs is a cron job.
-    os.environ["HERMES_CRON_SESSION"] = "1"
+    # This is now TASK-LOCAL (set via set_session_vars(is_cron=True) below),
+    # NOT a process-global os.environ write. The cron scheduler runs in a
+    # thread of the GATEWAY process (gateway/run.py: InProcessCronScheduler),
+    # so a process-global HERMES_CRON_SESSION env var leaked into every
+    # concurrent interactive session and got their execute_code denied. The
+    # per-job ContextVar is cleared in the finally via clear_session_vars.
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -2962,6 +2965,9 @@ def run_job(
         # inline/synchronous path, so results return within the job's own turn.
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
+        # Mark the job task-local so approval's cron gate cannot leak cron-ness
+        # into concurrent interactive sessions in this same process (#df69e9636a).
+        is_cron=True,
     )
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
