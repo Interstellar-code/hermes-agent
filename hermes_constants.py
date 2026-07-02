@@ -15,6 +15,33 @@ from pathlib import Path
 
 _profile_fallback_warned: bool = False
 _UNSET = object()
+
+
+# =========================================================================
+# Source repository (fork-aware `hermes update`, update-check, release links)
+# =========================================================================
+HERMES_REPO_URL = os.environ.get(
+    "HERMES_REPO_URL", "https://github.com/Interstellar-code/hermes-agent.git"
+).strip()
+
+
+def hermes_repo_web_url() -> str:
+    """Repo URL without the .git suffix."""
+    url = HERMES_REPO_URL
+    return url[:-4] if url.endswith(".git") else url
+
+
+def hermes_repo_url_variants() -> set[str]:
+    """Equivalent forms of the configured repo URL."""
+    web = hermes_repo_web_url()
+    variants = {web, web + ".git"}
+    prefix = "https://github.com/"
+    if web.startswith(prefix):
+        path = web[len(prefix):]
+        variants.add(f"git@github.com:{path}")
+        variants.add(f"git@github.com:{path}.git")
+    return variants
+
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
     "_HERMES_HOME_OVERRIDE", default=_UNSET
 )
