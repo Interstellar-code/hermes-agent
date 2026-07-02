@@ -25,6 +25,25 @@ from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cron_contextvar():
+    """Reset the cron-session ContextVar to the unset sentinel before each test.
+
+    In production ``clear_session_vars()`` sets ``_CRON_SESSION=""`` to suppress
+    the ``os.environ`` fallback. pytest runs these tests in one shared
+    thread/context, so a sibling test's clear leaves ``""`` behind and defeats
+    the env-var-based cron detection the cron tests here rely on. Resetting to
+    ``_UNSET`` restores per-test isolation and mirrors the fresh context a real
+    separate-process cron job starts with (where env fallback is the signal).
+    """
+    from gateway import session_context as _sc
+    tok = _sc._CRON_SESSION.set(_sc._UNSET)
+    try:
+        yield
+    finally:
+        _sc._CRON_SESSION.reset(tok)
+
+
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
 # ---------------------------------------------------------------------------
