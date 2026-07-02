@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for the Hermes Workflow Engine dispatcher.
+
+  Install (per-user):
+    cp launchd/ai.hermes.workflow-dispatcher.plist ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/ai.hermes.workflow-dispatcher.plist
+
+  Uninstall:
+    launchctl unload -w ~/Library/LaunchAgents/ai.hermes.workflow-dispatcher.plist
+    rm ~/Library/LaunchAgents/ai.hermes.workflow-dispatcher.plist
+
+  NOTE: A future upstream PR will add workflow.dispatch_in_gateway support so
+  the scheduler runs inside the gateway process. When that ships, unload this
+  plist and rely on the gateway instead. Running both simultaneously is NOT
+  supported.
+
+  IMPORTANT: If the daemon crashes and KeepAlive is true, launchd will restart
+  it automatically. On a dev laptop you may prefer KeepAlive false and run
+  `hermes workflow daemon` in the foreground instead.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.workflow-dispatcher</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>hermes</string>
+    <string>workflow</string>
+    <string>daemon</string>
+    <string>--interval</string>
+    <string>60</string>
+    <string>--pidfile</string>
+    <string>/tmp/hermes-workflow-dispatcher.pid</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Note: launchd does not expand ~ in plist values. Replace the path
+       below with your actual home directory or set HERMES_HOME appropriately.
+       Default assumes ~/.hermes/logs/ exists (created by hermes on first run). -->
+  <key>StandardOutPath</key>
+  <string>/tmp/hermes-workflow-dispatcher.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/hermes-workflow-dispatcher-error.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+  </dict>
+</dict>
+</plist>

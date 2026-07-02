@@ -1,0 +1,84 @@
+name: archon-feature-development
+description: |
+  Use when: implementing a feature from an existing plan file or planning issue.
+  Triggers: "implement plan", "ship this feature", "build from plan",
+            "execute plan.md", "implement and PR".
+  Input: existing plan file (e.g. $ARTIFACTS_DIR/plan.md or repo plan dir).
+  Does: implements the plan with validation -> creates PR -> verifies PR base.
+  NOT for: creating plans (use idea-to-pr or plan-to-pr), bug fixes
+           (use fix-github-issue), pure code reviews (use smart-pr-review).
+nodes:
+  - id: implement
+    hermes_task:
+      skills:
+        - coding
+        - testing
+      agent_hint: neo
+    prompt: |
+      Implement the feature described in the plan referenced by the run context.
+
+      ## Plan source
+      Look for the plan in this order:
+      1. $USER_MESSAGE if it names a file or inlines the plan
+      2. $ARTIFACTS_DIR/plan.md if a prior node wrote one
+      3. ./docs/plans/*.md most recently modified
+      4. Top of the GitHub issue thread referenced by $USER_MESSAGE
+
+      ## Implementation rules
+      - Follow the plan section by section. Do NOT invent scope.
+      - Write tests alongside code. Run the existing test suite after each chunk.
+      - If the plan is ambiguous on a decision, pick the safest option and note
+        the assumption in your summary — do not block on perfect clarity.
+      - Commit work in logical chunks with clear messages.
+
+      ## Output
+      Summarise: files changed, tests added, commands you ran to verify,
+      any plan items you skipped and why.
+    phase: Implement
+
+  - id: create-pr
+    hermes_task:
+      skills:
+        - github
+      agent_hint: switch
+    prompt: |
+      Open a pull request for the work implemented in the previous step.
+
+      ## Steps
+      1. Confirm working tree is clean: `git status`.
+      2. Push the branch: `git push -u origin HEAD`.
+      3. Open the PR with `gh pr create`:
+         - Title: derived from the plan title or a short summary
+         - Body: bullet list of changes (from `$implement.output`) plus a test
+           plan section
+         - Base: $BASE_BRANCH if set, otherwise repo default branch
+      4. Print the PR URL.
+
+      ## Constraints
+      - Do NOT push if the working tree has uncommitted changes — stop with an error.
+      - Do NOT use --force or --force-with-lease.
+      - Do NOT use --draft unless $USER_MESSAGE explicitly asks for a draft.
+
+      ## Context
+      Implementation summary from previous step:
+      $implement.output
+    depends_on:
+      - implement
+    context: fresh
+    phase: Publish
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="${BASE_BRANCH:-$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name')}"
+      ACTUAL=$(gh pr view --json baseRefName -q '.baseRefName')
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        PR_NUMBER=$(gh pr view --json number -q '.number')
+        echo "Base mismatch on PR #$PR_NUMBER: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        gh pr edit "$PR_NUMBER" --base "$EXPECTED"
+      else
+        echo "PR base verified: $EXPECTED"
+      fi
+    depends_on:
+      - create-pr
+    phase: Verify
