@@ -1,0 +1,11 @@
+{
+  "name": "karpathy-self-improve",
+  "label": "Self-Improve",
+  "description": "Karpathy-style self-improvement loop. Metrics, experiments, and scenarios per profile.",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/self-improve",
+    "position": "end"
+  },
+  "api": "plugin_api.py"
+}
