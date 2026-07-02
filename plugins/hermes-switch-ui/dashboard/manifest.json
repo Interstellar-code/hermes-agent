@@ -1,0 +1,11 @@
+{
+  "name": "hermes-switch-ui",
+  "label": "SwitchUI",
+  "description": "Backend awareness of the SwitchUI browser frontend — connection info, live status, and config-sync API.",
+  "icon": "Monitor",
+  "version": "0.1.0",
+  "api": "plugin_api.py",
+  "tab": {
+    "hidden": true
+  }
+}
