@@ -449,6 +449,13 @@ class LSPClient:
         if proc is None:
             return
         if proc.returncode is None:
+            # Give the server a grace period to honor the LSP ``exit``
+            # notification before escalating to SIGTERM.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+                return
+            except asyncio.TimeoutError:
+                pass
             try:
                 proc.terminate()
                 try:
