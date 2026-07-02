@@ -300,7 +300,9 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
             if collector.provider:
                 return collector.provider
         except Exception as e:
-            logger.debug("register() failed for %s: %s", name, e)
+            # fork: bumped from debug to warning+exc_info so register() failures
+            # aren't silently swallowed (see Interstellar-code/hermes-agent).
+            logger.warning("register() failed for %s: %s", name, e, exc_info=True)
 
     # Fallback: find a MemoryProvider subclass and instantiate it
     from agent.memory_provider import MemoryProvider
