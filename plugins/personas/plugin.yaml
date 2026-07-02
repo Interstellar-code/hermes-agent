@@ -1,0 +1,18 @@
+name: personas
+version: "0.1.0"
+description: "Canonical persona store + runtime tools (persona_list/get/apply) + persona_ref binding hook. Single source of truth for the 20 curated persona templates; REST API at /api/plugins/personas/."
+author: Interstellar-code
+
+kind: standalone
+
+provides_tools:
+  - persona_list
+  - persona_get
+  - persona_apply
+
+provides_hooks:
+  - pre_llm_call
+
+pip_dependencies:
+  - fastapi
+  - pyyaml
