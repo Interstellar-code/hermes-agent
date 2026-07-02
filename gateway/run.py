@@ -421,6 +421,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
+    # Defense-in-depth: strip any <memory-context> spans the model echoed into
+    # its reply. See Interstellar-code/hermes-agent#150.
+    try:
+        from agent.memory_manager import sanitize_context
+        text = sanitize_context(text)
+    except Exception:
+        pass
     if _gateway_surface_passes_raw_text(platform):
         return text
 

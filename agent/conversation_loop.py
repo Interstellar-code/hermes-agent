@@ -34,7 +34,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -4634,7 +4634,9 @@ def run_conversation(
             
             else:
                 # No tool calls - this is the final response
-                final_response = assistant_message.content or ""
+                # fork: scrub any echoed <memory-context> spans before this reply
+                # reaches the user. See Interstellar-code/hermes-agent#150.
+                final_response = sanitize_context(assistant_message.content or "")
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
