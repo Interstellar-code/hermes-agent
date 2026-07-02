@@ -2104,6 +2104,21 @@ def parse_coauthors(body: str) -> list:
     return results
 
 
+def origin_repo_slug() -> str:
+    """Return 'owner/repo' parsed from the origin remote URL."""
+    fallback = "NousResearch/hermes-agent"
+    url = git("remote", "get-url", "origin")
+    if not url:
+        return fallback
+    m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    return fallback
+
+
 def get_commits(since_tag=None):
     """Get commits since a tag (or all commits if None)."""
     if since_tag:
@@ -2111,11 +2126,10 @@ def get_commits(since_tag=None):
     else:
         range_spec = "HEAD"
 
-    # Format: hash<US>author_name<US>author_email<US>subject\0body
-    # Using %x1f (unit separator) to avoid conflict with | in author names
+    # Format: RS (0x1e) starts each record; US (0x1f) separates fields.
     log = git(
         "log", range_spec,
-        "--format=%H%x1f%an%x1f%ae%x1f%s%x00%b%x00",
+        "--format=%x1e%H%x1f%an%x1f%ae%x1f%s%x1f%b",
         "--no-merges",
     )
 
@@ -2123,23 +2137,18 @@ def get_commits(since_tag=None):
         return []
 
     commits = []
-    # Split on double-null to get each commit entry, since body ends with \0
-    # and format ends with \0, each record ends with \0\0 between entries
-    for entry in log.split("\0\0"):
-        entry = entry.strip()
-        if not entry:
+    for record in log.split("\x1e"):
+        record = record.strip()
+        if not record:
             continue
-        # Split on first null to separate "hash<US>name<US>email<US>subject" from "body"
-        if "\0" in entry:
-            header, body = entry.split("\0", 1)
-            body = body.strip()
-        else:
-            header = entry
-            body = ""
-        parts = header.split("\x1f", 3)
-        if len(parts) != 4:
+        parts = record.split("\x1f", 4)
+        if len(parts) < 4:
             continue
-        sha, name, email, subject = parts
+        sha = parts[0]
+        name = parts[1]
+        email = parts[2]
+        subject = parts[3]
+        body = parts[4].strip() if len(parts) == 5 else ""
         coauthor_info = parse_coauthors(body)
         coauthors = [resolve_author(ca["name"], ca["email"]) for ca in coauthor_info]
         commits.append({
@@ -2164,8 +2173,10 @@ def get_pr_number(subject: str) -> str | None:
     return None
 
 
-def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/hermes-agent",
+def generate_changelog(commits, tag_name, semver, repo_url=None,
                        prev_tag=None, first_release=False):
+    if repo_url is None:
+        repo_url = f"https://github.com/{origin_repo_slug()}"
     """Generate markdown changelog from categorized commits."""
     lines = []
 
@@ -2401,6 +2412,7 @@ def main():
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
+            "--repo", origin_repo_slug(),
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
