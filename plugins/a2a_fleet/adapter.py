@@ -101,7 +101,7 @@ class A2AFleetAdapter(BasePlatformAdapter):
     # BasePlatformAdapter abstract contract
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, is_reconnect: bool = False) -> bool:
         """Capture the gateway event loop, register the bridge, AND start the
         A2A listener here — this is the ONLY place that runs exclusively in the
         gateway/agent process. Starting the uvicorn server from plugin
