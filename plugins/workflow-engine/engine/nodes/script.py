@@ -89,6 +89,14 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
     # HIGH 6: Substitute workflow variables ($ARTIFACTS_DIR, $BASE_BRANCH, etc.)
     raw_script = node.script
     wf_vars = getattr(ctx, "workflow_vars", None) or {}
+    # ponytail: no shell here — interpreter source is passed as direct argv
+    # (create_subprocess_exec, no bash -c), so shell-quoting is wrong: it means
+    # nothing to python/bun and corrupts legitimate values (e.g. a template
+    # `msg = "$USER_MESSAGE"` with user_message="hello world" would become
+    # `msg = "'hello world'"`). Untrusted $USER_MESSAGE substituted into inline
+    # script SOURCE is trusted under the single-user dev-tool model. Real
+    # code-injection hardening = pass vars via env (see ARTIFACTS_DIR below)
+    # instead of string-substitution; deferred, needs bundled-workflow YAML migration.
     try:
         raw_script, _ = substitute_workflow_variables(
             raw_script,
@@ -98,15 +106,14 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
             base_branch=wf_vars.get("base_branch", ""),
             docs_dir=wf_vars.get("docs_dir", ""),
             issue_context=wf_vars.get("issue_context"),
-            escaped_for_bash=True,
         )
     except ValueError as exc:
         err = f"Script node '{node.id}' variable substitution failed: {exc}"
         ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
         return NodeExecutionResult(state="failed", error=err)
 
-    # Substitute $nodeId.output refs (shell-quoted for injection safety)
-    final_script = substitute_node_output_refs(raw_script, node_outputs, escaped_for_bash=True)
+    # Substitute $nodeId.output refs
+    final_script = substitute_node_output_refs(raw_script, node_outputs)
 
     # HIGH 8: inline-vs-named detection
     cwd = getattr(ctx, "cwd", None)
