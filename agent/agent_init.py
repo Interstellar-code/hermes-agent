@@ -1288,7 +1288,17 @@ def init_agent(
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
+                    # #157: a provider was explicitly configured but did not load
+                    # / is unavailable. Fail loud — the agent silently running
+                    # without its configured memory is the exact bug we hit.
+                    _ra().logger.error(
+                        "Memory provider '%s' is configured but failed to load or is "
+                        "unavailable — agent is running WITHOUT it. If this is "
+                        "'matrix-memory', the Mnemosyne engine submodule is likely "
+                        "missing: run `git submodule update --init "
+                        "plugins/memory/_matrix-memory-mnemosyne`.",
+                        _mem_provider_name,
+                    )
                     agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
