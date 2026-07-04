@@ -1342,6 +1342,12 @@ def make_handler(
             text = extract_text(params)
             if len(text) > MAX_PROMPT_CHARS:
                 text = text[:MAX_PROMPT_CHARS]
+            if "contextId" in params:
+                self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
+                                 "error": {"code": -32602,
+                                           "message": "contextId must be nested under params.message, "
+                                                      "not at params root (A2A spec)"}})
+                return
             message = params.get("message") or {}
             context_id = message.get("contextId") or f"anon-{uuid.uuid4()}"
             try:
