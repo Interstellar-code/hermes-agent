@@ -173,6 +173,46 @@ def test_substitute_workflow_variables_backref_in_context():
     assert ctx_sub is True
 
 
+# ── Issue #81: command injection via unescaped workflow variables ────────────
+
+def test_substitute_workflow_variables_escaped_for_bash_neutralizes_injection():
+    """
+    #81: a malicious $USER_MESSAGE must not be able to break out of its
+    substitution slot when the result is fed to `bash -c`.
+    """
+    payload = "foo'; touch /tmp/PWNED_test81; echo '"
+    result, _ = substitute_workflow_variables(
+        "echo $USER_MESSAGE",
+        user_message=payload,
+        base_branch="main",
+        escaped_for_bash=True,
+    )
+    # The payload must appear shell-quoted (single-quoted, internal quotes escaped)
+    # so it is inert as a single literal argument, not executable shell syntax.
+    assert result == "echo 'foo'\\''; touch /tmp/PWNED_test81; echo '\\'''"
+
+
+def test_substitute_workflow_variables_escaped_for_bash_empty_value():
+    """Empty/None substituted values must become '' when escaped, per _shell_quote convention."""
+    result, _ = substitute_workflow_variables(
+        "echo $USER_MESSAGE",
+        user_message="",
+        base_branch="main",
+        escaped_for_bash=True,
+    )
+    assert result == "echo ''"
+
+
+def test_substitute_workflow_variables_default_unescaped_unchanged():
+    """AI-prompt callers (escaped_for_bash default False) must not get shell quotes."""
+    result, _ = substitute_workflow_variables(
+        "echo $USER_MESSAGE",
+        user_message="hello world",
+        base_branch="main",
+    )
+    assert result == "echo hello world"
+
+
 # ── FINDING 7: Timeout unit mismatch ──────────────────────────────────────────
 
 @pytest.mark.asyncio

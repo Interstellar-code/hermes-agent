@@ -89,6 +89,14 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
     # HIGH 6: Substitute workflow variables ($ARTIFACTS_DIR, $BASE_BRANCH, etc.)
     raw_script = node.script
     wf_vars = getattr(ctx, "workflow_vars", None) or {}
+    # ponytail: no shell here — interpreter source is passed as direct argv
+    # (create_subprocess_exec, no bash -c), so shell-quoting is wrong: it means
+    # nothing to python/bun and corrupts legitimate values (e.g. a template
+    # `msg = "$USER_MESSAGE"` with user_message="hello world" would become
+    # `msg = "'hello world'"`). Untrusted $USER_MESSAGE substituted into inline
+    # script SOURCE is trusted under the single-user dev-tool model. Real
+    # code-injection hardening = pass vars via env (see ARTIFACTS_DIR below)
+    # instead of string-substitution; deferred, needs bundled-workflow YAML migration.
     try:
         raw_script, _ = substitute_workflow_variables(
             raw_script,

@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_node_output_refs
+from engine.core.executor_shared import substitute_node_output_refs, substitute_workflow_variables
 
 logger = logging.getLogger("workflow.nodes.loop")
 
@@ -155,7 +155,19 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
         signal_in_output = until_signal and until_signal in iteration_output
         bash_complete = False
         if until_bash:
-            bash_complete = await _run_until_bash(until_bash, cwd)
+            wf_vars = getattr(ctx, "workflow_vars", None) or {}
+            until_bash_script, _ = substitute_workflow_variables(
+                until_bash,
+                workflow_id=wf_vars.get("workflow_id", ""),
+                user_message=wf_vars.get("user_message", ""),
+                artifacts_dir=wf_vars.get("artifacts_dir", ""),
+                base_branch=wf_vars.get("base_branch", ""),
+                docs_dir=wf_vars.get("docs_dir", ""),
+                issue_context=wf_vars.get("issue_context"),
+                escaped_for_bash=True,
+            )
+            until_bash_script = substitute_node_output_refs(until_bash_script, node_outputs, escaped_for_bash=True)
+            bash_complete = await _run_until_bash(until_bash_script, cwd)
 
         completion_detected = bool(signal_in_output or bash_complete)
 
