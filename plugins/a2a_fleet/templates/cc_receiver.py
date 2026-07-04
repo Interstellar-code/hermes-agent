@@ -1079,6 +1079,12 @@ def make_handler(
             # Clamp prompt size before it can reach claude.
             if len(text) > MAX_PROMPT_CHARS:
                 text = text[:MAX_PROMPT_CHARS]
+            if "contextId" in params:
+                self._json(200, {"jsonrpc": "2.0", "id": rpc_id,
+                                 "error": {"code": -32602,
+                                           "message": "contextId must be nested under params.message, "
+                                                      "not at params root (A2A spec)"}})
+                return
             message = params.get("message") or {}
             # Missing contextId -> fresh uuid4 (no shared anon sentinel).
             context_id = message.get("contextId") or f"anon-{uuid.uuid4()}"

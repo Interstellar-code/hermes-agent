@@ -323,6 +323,39 @@ def test_oc_receiver_bearer_auth_correct_token_is_accepted(ocr, tmp_path) -> Non
     assert h._status != 401, f"Correct token was rejected with 401"
 
 
+def test_nested_context_id_is_accepted_and_threads(ocr, tmp_path) -> None:
+    cfg = _base_cfg(ocr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"message": {"contextId": "ctx-nested", "parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_oc_request(ocr, cfg, None,
+                         headers={"Content-Length": str(len(body))},
+                         body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert "error" not in resp
+    assert resp["result"]["message"]["contextId"] == "ctx-nested"
+
+
+def test_root_level_context_id_is_rejected_with_32602(ocr, tmp_path) -> None:
+    cfg = _base_cfg(ocr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"contextId": "ctx-root", "message": {"parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_oc_request(ocr, cfg, None,
+                         headers={"Content-Length": str(len(body))},
+                         body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == (
+        "contextId must be nested under params.message, not at params root (A2A spec)"
+    )
+    assert not ocr.INBOX_PATH.exists() or "ctx-root" not in ocr.INBOX_PATH.read_text()
+
+
 # ---------------------------------------------------------------------------
 # Fix A (#82): clear stale session_id before remint
 # ---------------------------------------------------------------------------

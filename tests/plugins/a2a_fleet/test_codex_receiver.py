@@ -433,6 +433,43 @@ def test_codex_receiver_bearer_auth_correct_token_is_accepted(cxr, tmp_path) -> 
 
 
 # ---------------------------------------------------------------------------
+# Issue #148: contextId must be nested under params.message, not at params root
+# ---------------------------------------------------------------------------
+
+def test_nested_context_id_is_accepted_and_threads(cxr, tmp_path) -> None:
+    cfg = _base_cfg(cxr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"message": {"contextId": "ctx-nested", "parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_codex_request(cxr, cfg, None,
+                            headers={"Content-Length": str(len(body))},
+                            body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert "error" not in resp
+    assert resp["result"]["message"]["contextId"] == "ctx-nested"
+
+
+def test_root_level_context_id_is_rejected_with_32602(cxr, tmp_path) -> None:
+    cfg = _base_cfg(cxr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"contextId": "ctx-root", "message": {"parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_codex_request(cxr, cfg, None,
+                            headers={"Content-Length": str(len(body))},
+                            body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == (
+        "contextId must be nested under params.message, not at params root (A2A spec)"
+    )
+    assert not cxr.INBOX_PATH.exists() or "ctx-root" not in cxr.INBOX_PATH.read_text()
+
+
+# ---------------------------------------------------------------------------
 # Fix 1: remint clears stale thread_id even when fresh retry yields no thread.started
 # ---------------------------------------------------------------------------
 

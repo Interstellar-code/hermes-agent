@@ -506,6 +506,39 @@ def test_agy_receiver_bearer_auth_correct_token_is_accepted(agr, tmp_path) -> No
     assert h._status != 401, "Correct token was rejected with 401"
 
 
+def test_nested_context_id_is_accepted_and_threads(agr, tmp_path) -> None:
+    cfg = _base_cfg(agr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"message": {"contextId": "ctx-nested", "parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_agy_request(agr, cfg, None,
+                          headers={"Content-Length": str(len(body))},
+                          body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert "error" not in resp
+    assert resp["result"]["message"]["contextId"] == "ctx-nested"
+
+
+def test_root_level_context_id_is_rejected_with_32602(agr, tmp_path) -> None:
+    cfg = _base_cfg(agr, tmp_path)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": "1", "method": "SendMessage",
+        "params": {"contextId": "ctx-root", "message": {"parts": [{"text": "hi"}]}},
+    }).encode()
+    h = _make_agy_request(agr, cfg, None,
+                          headers={"Content-Length": str(len(body))},
+                          body=body)
+    h.do_POST()
+    resp = json.loads(h.wfile.buf)
+    assert resp["error"]["code"] == -32602
+    assert resp["error"]["message"] == (
+        "contextId must be nested under params.message, not at params root (A2A spec)"
+    )
+    assert not agr.INBOX_PATH.exists() or "ctx-root" not in agr.INBOX_PATH.read_text()
+
+
 def test_main_fails_closed_for_non_loopback_without_auth(agr, monkeypatch, tmp_path) -> None:
     cfg = _base_cfg(agr, tmp_path)
     cfg["bind_host"] = "0.0.0.0"
