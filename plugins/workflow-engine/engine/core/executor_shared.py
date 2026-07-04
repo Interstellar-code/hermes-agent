@@ -137,11 +137,17 @@ def substitute_workflow_variables(
     loop_user_input: Optional[str] = None,
     rejection_reason: Optional[str] = None,
     loop_prev_output: Optional[str] = None,
+    escaped_for_bash: bool = False,
 ) -> tuple[str, bool]:
     """
     Substitute $WORKFLOW_ID, $ARGUMENTS/$USER_MESSAGE, $ARTIFACTS_DIR,
     $BASE_BRANCH, $CONTEXT/$EXTERNAL_CONTEXT/$ISSUE_CONTEXT, $DOCS_DIR,
     $LOOP_USER_INPUT, $REJECTION_REASON, $LOOP_PREV_OUTPUT in a prompt.
+
+    When escaped_for_bash is True, every substituted value is shell-quoted
+    (mirrors substitute_node_output_refs) so the result is safe to pass to
+    `bash -c` / interpreter `-c` invocations even when the value is
+    attacker-controlled (e.g. $USER_MESSAGE from an HTTP caller).
 
     Returns (substituted_prompt, context_substituted).
     """
@@ -155,6 +161,9 @@ def substitute_workflow_variables(
 
     def _lit(val: str):
         """Return a re.sub replacement function that inserts val as a literal string."""
+        if escaped_for_bash:
+            quoted = _shell_quote(val) if val else "''"
+            return lambda _m: quoted
         return lambda _m: val
 
     result = prompt

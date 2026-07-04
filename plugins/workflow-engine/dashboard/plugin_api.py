@@ -365,6 +365,15 @@ async def get_run(run_id: str) -> JSONResponse:
 
 @router.post("/runs/{run_id}/approve")
 async def approve_run(run_id: str, request: Request) -> JSONResponse:
+    """
+    Approve or reject a paused approval node.
+
+    Note: cross-session ownership is NOT enforced here, matching cancel_run
+    below — hermes-switchui is a single-user dev tool and no authenticated
+    session is threaded into this HTTP layer. Any caller with gateway auth
+    may approve/reject any run. The tool-layer path (tools/approve_workflow.py)
+    DOES enforce per-session ownership for agent-initiated approvals.
+    """
     run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "workflow_run not found"}, 404)

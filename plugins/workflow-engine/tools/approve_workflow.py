@@ -84,20 +84,22 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     # Ownership check
     owner_session = run.get("owner_session")
     if not _approve_any():
-        if _session_key and owner_session and owner_session != _session_key:
+        # Default-deny: the only way through is an explicit owner match.
+        # A falsy _session_key (cron/daemon/ownerless caller) must NOT be
+        # treated as an implicit pass — set workflow.approve_any=true instead.
+        if not _session_key:
+            return {
+                "error": (
+                    "No caller session identified. "
+                    "Set workflow.approve_any=true to allow ownerless/cron approvals."
+                ),
+                "ok": False,
+            }
+        if owner_session != _session_key:
             return {
                 "error": (
                     f"Run '{run_id}' was started by a different session. "
                     "Set workflow.approve_any=true to allow cross-session approvals."
-                ),
-                "ok": False,
-            }
-        if _session_key and owner_session is None:
-            # NULL owner — refuse unless approve_any
-            return {
-                "error": (
-                    f"Run '{run_id}' has no recorded owner (pre-migration run). "
-                    "Set workflow.approve_any=true to approve ownerless runs."
                 ),
                 "ok": False,
             }
