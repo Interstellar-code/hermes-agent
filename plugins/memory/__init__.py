@@ -288,7 +288,11 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
-            logger.debug("Failed to exec_module %s: %s", module_name, e)
+            # Surface import-time failures loudly (#157): a named provider whose
+            # module raises on import (e.g. matrix-memory's shim raising because
+            # the Mnemosyne submodule is missing) was previously logged at DEBUG
+            # and silently dropped. The exception message carries the fix hint.
+            logger.error("Failed to exec_module %s: %s", module_name, e, exc_info=True)
             sys.modules.pop(module_name, None)
             return None
 
