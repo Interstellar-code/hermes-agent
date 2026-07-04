@@ -1,7 +1,9 @@
 """Matrix Memory v0.2 — thin registration shim over the Mnemosyne fork.
 
 The actual engine + contract layer live in the pinned git submodule at
-``plugins/memory/_matrix-memory-mnemosyne`` (fork ``main`` @ ``aa09b29``):
+``plugins/memory/_matrix-memory-mnemosyne`` (fork ``main``; pinned SHA is
+recorded in ``.gitmodules`` + the tracked gitlink — run
+``git submodule update --init`` on a fresh clone):
 
     _matrix-memory-mnemosyne/
       mnemosyne/                  # ~30k LOC engine (vector + KG + temporal + sync)

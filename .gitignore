@@ -168,3 +168,7 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Serena MCP project cache (15M of cache/, memories/, project state).
+# Regenerated on demand; never a repo artifact.
+.serena/
