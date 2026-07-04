@@ -157,7 +157,3 @@ infographic/
 # Serena MCP project cache (15M of cache/, memories/, project state).
 # Regenerated on demand; never a repo artifact.
 .serena/
-
-# Mnemosyne memory-provider fork — a nested git repo loaded via the `_`-prefixed
-# shim (loader skips underscore dirs). Tracked in its own repo, not embedded here.
-plugins/memory/_matrix-memory-mnemosyne/

@@ -1,0 +1,4 @@
+[submodule "plugins/memory/matrix-memory-mnemosyne"]
+	path = plugins/memory/_matrix-memory-mnemosyne
+	url = https://github.com/Interstellar-code/mnemosyne.git
+	branch = main
