@@ -46,6 +46,7 @@ async def execute_bash_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
         base_branch=wf_vars.get("base_branch", ""),
         docs_dir=wf_vars.get("docs_dir", ""),
         issue_context=wf_vars.get("issue_context"),
+        escaped_for_bash=True,
     )
 
     # Substitute $nodeId.output refs (shell-quoted for bash safety)

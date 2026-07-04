@@ -98,14 +98,15 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
             base_branch=wf_vars.get("base_branch", ""),
             docs_dir=wf_vars.get("docs_dir", ""),
             issue_context=wf_vars.get("issue_context"),
+            escaped_for_bash=True,
         )
     except ValueError as exc:
         err = f"Script node '{node.id}' variable substitution failed: {exc}"
         ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
         return NodeExecutionResult(state="failed", error=err)
 
-    # Substitute $nodeId.output refs
-    final_script = substitute_node_output_refs(raw_script, node_outputs)
+    # Substitute $nodeId.output refs (shell-quoted for injection safety)
+    final_script = substitute_node_output_refs(raw_script, node_outputs, escaped_for_bash=True)
 
     # HIGH 8: inline-vs-named detection
     cwd = getattr(ctx, "cwd", None)
