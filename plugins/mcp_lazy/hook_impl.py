@@ -7,11 +7,12 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional, Set
 
 from .pool import _current_agent_var, evict, get_pool
-from .stubs import mix_full_and_stubs, is_stub_schema
+from .stubs import mix_full_and_stubs, is_stub_schema, _server_in_set
 from .server_stubs import is_server_stub_schema
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,33 @@ def _load_config() -> Dict[str, Any]:
         return load_config().get("mcp", {}) or {}
     except Exception:
         return {}
+
+
+def _lazy_mode(cfg: Dict[str, Any]) -> str:
+    """Normalize ``mcp.lazy_loading`` to 'off' | 'on' | 'auto'.
+
+    Accepts booleans (legacy) and the strings on/off/auto/true/false.
+    Unknown truthy values mean 'on' so legacy ``lazy_loading: true``
+    configs keep working; note the strings "off"/"false" are truthy
+    in Python, hence the explicit check.
+    """
+    val = cfg.get("lazy_loading")
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v == "auto":
+            return "auto"
+        if v in {"off", "false", "no", ""}:
+            return "off"
+        return "on"
+    return "on" if val else "off"
+
+
+def _schema_tokens(schema: Dict[str, Any]) -> int:
+    """Cheap tokenizer-free schema cost estimate (chars/4)."""
+    try:
+        return len(json.dumps(schema)) // 4
+    except Exception:
+        return 0
 
 
 def _eligible_servers() -> Optional[Set[str]]:
@@ -96,7 +124,8 @@ def transform_tools(
             getattr(agent, "session_id", None) if agent is not None else None,
             len(tools),
         )
-        if not cfg.get("lazy_loading"):
+        mode = _lazy_mode(cfg)
+        if mode == "off":
             logger.info("mcp_lazy: skipping — lazy_loading is off")
             return None  # master toggle off
 
@@ -123,7 +152,54 @@ def transform_tools(
         except Exception:
             pass
 
+        pool.tick()
+
         eligible = _eligible_servers()
+
+        if mode == "auto":
+            # Pass through when the stub-eligible MCP schemas are too small
+            # to be worth stubbing (Pattern 2). _lazy_active tells
+            # pre_tool_call not to intercept calls on pass-through turns.
+            candidate_cost = sum(
+                _schema_tokens(t) for t in tools
+                if t.get("function", {}).get("name", "").startswith("mcp_")
+                and (eligible is None
+                     or _server_in_set(t.get("function", {}).get("name", ""), eligible))
+            )
+            threshold = int(cfg.get("lazy_auto_threshold_tokens", 4000) or 4000)
+            if candidate_cost < threshold:
+                pool._lazy_active = False
+                logger.info(
+                    "mcp_lazy: auto mode pass-through — eligible MCP cost %d tok < threshold %d",
+                    candidate_cost, threshold,
+                )
+                return None
+        pool._lazy_active = True
+
+        # Batched idle eviction (Pattern 3): only when the promoted set's
+        # full-schema cost crosses the threshold, demote everything idle in
+        # one sweep — one prompt-cache bust per batch, not per tool.
+        idle_turns = int(cfg.get("lazy_evict_idle_turns", 10) or 0)
+        if idle_turns > 0:
+            promoted = pool.snapshot()
+            if promoted:
+                promoted_cost = sum(
+                    _schema_tokens(t) for t in tools
+                    if t.get("function", {}).get("name", "") in promoted
+                )
+                evict_threshold = int(
+                    cfg.get("lazy_evict_cost_threshold_tokens", 3000) or 3000
+                )
+                if promoted_cost > evict_threshold:
+                    evicted = pool.evict_idle(idle_turns)
+                    if evicted:
+                        logger.info(
+                            "mcp_lazy: evicted %d idle promoted tool(s) "
+                            "(promoted cost %d tok > %d): %s",
+                            len(evicted), promoted_cost, evict_threshold,
+                            ", ".join(sorted(evicted)),
+                        )
+
         discovery_mode = str(cfg.get("discovery_mode", "tool") or "tool")
         if discovery_mode not in {"tool", "server", "both"}:
             logger.warning(
@@ -213,7 +289,7 @@ def pre_tool_call(
     """
     try:
         cfg = _load_config()
-        if not cfg.get("lazy_loading"):
+        if _lazy_mode(cfg) == "off":
             return None
         if not tool_name or not tool_name.startswith("mcp_"):
             return None
@@ -221,6 +297,10 @@ def pre_tool_call(
             return None
 
         pool = get_pool(session_id)
+        if not pool._lazy_active:
+            # Auto-mode pass-through turn: full schemas were sent, no stubs
+            # exist to intercept — blocking here would break legit calls.
+            return None
 
         # Belt-and-suspenders for Interstellar-code/hermes-agent#18 and #27:
         # ``mcp_server_<name>`` *may* be a synthetic discovery stub, but a real
@@ -274,6 +354,7 @@ def pre_tool_call(
                 }
 
         if pool.is_promoted(tool_name):
+            pool.touch(tool_name)  # stamp use so idle eviction skips it
             return None  # already full schema — normal dispatch
 
         agent = _current_agent_var.get(None)
