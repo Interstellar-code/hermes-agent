@@ -68,6 +68,11 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100 — only used when enabled == "auto"
     search_default_limit: int
     max_search_limit: int
+    # Absolute activation floor for "auto" mode, in tokens. 0 disables.
+    # Complements threshold_pct: on huge-context models (1M+) a percentage
+    # threshold can be unreachable (10% of 2M = 200k tokens), leaving auto
+    # mode permanently dormant no matter how large the deferrable surface.
+    threshold_tokens: int = 0
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -106,11 +111,14 @@ class ToolSearchConfig:
         search_default_limit = max(1, min(max_search_limit,
                                           _safe_int(raw.get("search_default_limit"), 5)))
 
+        threshold_tokens = max(0, _safe_int(raw.get("threshold_tokens"), 0))
+
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
             search_default_limit=search_default_limit,
             max_search_limit=max_search_limit,
+            threshold_tokens=threshold_tokens,
         )
 
 
@@ -250,6 +258,10 @@ def should_activate(
     if config.enabled == "on":
         return True
     # auto
+    if config.threshold_tokens > 0 and deferrable_tokens >= config.threshold_tokens:
+        # Absolute floor crossed — activate regardless of context size.
+        # Guards against pct-threshold dormancy on huge-context models.
+        return True
     if not context_length or context_length <= 0:
         # Without a known context size, fall back to a fixed 20K-token cutoff
         # — the cliff above which Anthropic and OpenAI both saw quality drops.

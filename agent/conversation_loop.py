@@ -4782,11 +4782,21 @@ def run_conversation(
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
                         if _tc_name not in agent.valid_tool_names:
-                            # See _invalid_tool_name_error_content for the
-                            # blank-name anti-priming rationale (#47967).
-                            content = _invalid_tool_name_error_content(
-                                _tc_name, agent.valid_tool_names
-                            )
+                            # Blank name -> upstream's anti-priming terse error (#47967).
+                            # Non-blank -> give tool_search's deferred-tool recovery a shot
+                            # first (the name may be a real but not-yet-activated tool);
+                            # fall back to upstream's catalog message when it declines.
+                            content = None
+                            if (_tc_name or "").strip():
+                                try:
+                                    from agent.tool_executor import deferred_tool_recovery_message
+                                    content = deferred_tool_recovery_message(agent, _tc_name)
+                                except Exception:
+                                    content = None
+                            if content is None:
+                                content = _invalid_tool_name_error_content(
+                                    _tc_name, agent.valid_tool_names
+                                )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
                         messages.append({
