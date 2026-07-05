@@ -6418,6 +6418,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
         try:
+            # Boot-identity guard: log which checkout + commit + interpreter this
+            # gateway is actually running from, so a wrong-checkout/venv binding is
+            # loud at boot instead of silently serving stale code for a day (see the
+            # rebase-018 incident: gateway ran a stale checkout with no mnemosyne).
+            import sys as _sys
+            import subprocess as _sp
+            from pathlib import Path as _Path
+            _root = _Path(__file__).resolve().parents[1]
+            try:
+                _head = _sp.check_output(
+                    ["git", "-C", str(_root), "rev-parse", "--short", "HEAD"],
+                    text=True, stderr=_sp.DEVNULL, timeout=5,
+                ).strip() or "unknown"
+            except Exception:
+                _head = "unknown"
+            logger.info("Running checkout: %s @ %s (python=%s)", _root, _head, _sys.executable)
+        except Exception:
+            pass
+        try:
             from gateway.status import write_runtime_status
             write_runtime_status(gateway_state="starting", exit_reason=None)
         except Exception:
