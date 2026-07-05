@@ -4337,7 +4337,14 @@ def run_conversation(
                                     "otherwise reply in plain text."
                                 )
                             else:
-                                content = f"Tool '{_tc_name}' does not exist. Available tools: {available}"
+                                content = None
+                                try:
+                                    from agent.tool_executor import deferred_tool_recovery_message
+                                    content = deferred_tool_recovery_message(agent, _tc_name)
+                                except Exception:
+                                    content = None
+                                if content is None:
+                                    content = f"Tool '{_tc_name}' does not exist. Available tools: {available}"
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
                         messages.append({

@@ -244,6 +244,47 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def deferred_tool_recovery_message(agent, name: str):
+    """Recovery message when the model calls a deferred tool by bare name.
+
+    When Tool Search is active, deferred tools are absent from the visible
+    tools array; a model that saw a name in the system prompt, transcript,
+    or memory and calls it directly would otherwise dead-end on a generic
+    unknown-tool error until it thinks to use ``tool_search``. Instead,
+    hand it the schema and the ``tool_call`` instruction in one turn —
+    same auto-recover pattern as the mcp_lazy plugin's stub promotion.
+
+    Returns None when Tool Search is not active for this session or the
+    name is not a deferrable tool in the session's toolset scope (the
+    caller falls back to the normal unknown-tool error).
+    """
+    try:
+        valid = getattr(agent, "valid_tool_names", None) or set()
+        if "tool_search" not in valid:
+            return None  # assembly not active — normal unknown-tool path
+        if name not in _tool_search_scoped_names(agent):
+            return None  # not a deferred tool (typo, or out of scope)
+        import model_tools
+        from tools import tool_search as _ts
+        scoped_defs = model_tools.get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
+        described = _ts.dispatch_tool_describe(
+            {"name": name}, current_tool_defs=scoped_defs,
+        )
+        return (
+            f"Tool '{name}' exists but is deferred behind Tool Search and "
+            f"cannot be called directly. Full schema: {described}\n"
+            f"Retry now via tool_call with name='{name}' and 'arguments' "
+            "matching that schema."
+        )
+    except Exception:
+        return None
+
+
 def _apply_tool_request_middleware_for_agent(
     agent,
     *,
