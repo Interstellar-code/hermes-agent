@@ -44,7 +44,10 @@ class DeferredToolPool:
     """
 
     # ``__weakref__`` is required so WeakValueDictionary can hold us.
-    __slots__ = ("session_id", "_promoted", "_promoted_servers", "_prev_mode", "_lock", "__weakref__")
+    __slots__ = (
+        "session_id", "_promoted", "_promoted_servers", "_prev_mode",
+        "_turn", "_last_used", "_lazy_active", "_lock", "__weakref__",
+    )
 
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
@@ -55,6 +58,14 @@ class DeferredToolPool:
         # across sessions.  Stored here so evict() clears it automatically.
         # Fixes Interstellar-code/hermes-agent#29.
         self._prev_mode: Optional[str] = None
+        # Request counter + per-tool last-use stamps for idle eviction.
+        # "turn" = one transform_tools call = one LLM request.
+        self._turn: int = 0
+        self._last_used: Dict[str, int] = {}
+        # False when transform_tools decided to pass through (auto mode,
+        # below threshold) — tells pre_tool_call not to intercept calls
+        # this turn, since full schemas are in the prompt.
+        self._lazy_active: bool = True
         self._lock = threading.RLock()
 
     def promote(self, names) -> None:
@@ -69,7 +80,40 @@ class DeferredToolPool:
         with self._lock:
             for n in names:
                 if isinstance(n, str) and n.strip():
-                    self._promoted.add(n.strip())
+                    n = n.strip()
+                    self._promoted.add(n)
+                    self._last_used[n] = self._turn
+
+    def tick(self) -> int:
+        """Advance and return the per-session request counter."""
+        with self._lock:
+            self._turn += 1
+            return self._turn
+
+    def touch(self, name: str) -> None:
+        """Stamp ``name`` as used this turn (call on promoted-tool dispatch)."""
+        with self._lock:
+            if name in self._promoted:
+                self._last_used[name] = self._turn
+
+    def evict_idle(self, idle_turns: int) -> list:
+        """Demote promoted tools unused for ``idle_turns`` requests.
+
+        Batched by design: the caller gates this on total promoted-schema
+        cost so the tool list (and provider prompt-cache prefix) churns
+        once per batch, not once per tool. Returns evicted names.
+        """
+        if idle_turns <= 0:
+            return []
+        with self._lock:
+            evicted = [
+                n for n in self._promoted
+                if self._turn - self._last_used.get(n, 0) >= idle_turns
+            ]
+            for n in evicted:
+                self._promoted.discard(n)
+                self._last_used.pop(n, None)
+            return evicted
 
     def snapshot(self) -> frozenset:
         """Immutable view of currently-promoted names.
@@ -121,6 +165,9 @@ class DeferredToolPool:
             self._promoted.clear()
             self._promoted_servers.clear()
             self._prev_mode = None
+            self._turn = 0
+            self._last_used.clear()
+            self._lazy_active = True
 
 
 # Module-level registry. WeakValueDictionary so dropped sessions GC

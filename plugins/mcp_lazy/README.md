@@ -154,20 +154,26 @@ Stub discrimination uses a sentinel key (`__is_server_stub__`), **not** the name
 
 ```yaml
 mcp:
-  lazy_loading: true              # default false (opt-in)
+  lazy_loading: true              # false | true | auto (default false)
   lazy_stub_max_desc: 200         # max chars of description per TOOL stub
   discovery_mode: tool            # tool | server | both (default tool)
   server_stub_max_desc: 150       # max chars of description per SERVER stub
   server_eager_token_threshold: 1500  # eager load_mcp_server above this cost degrades to tool stubs
+  lazy_auto_threshold_tokens: 4000    # auto mode: pass through below this MCP schema cost
+  lazy_evict_idle_turns: 10           # demote promoted tools idle this many requests (0 = never)
+  lazy_evict_cost_threshold_tokens: 3000  # eviction only runs once promoted schemas cost this much
 ```
 
 | Key | Default | Purpose |
 |---|---|---|
-| `mcp.lazy_loading` | `false` | Master toggle. Off → hook returns `None`, tools flow through unchanged. |
+| `mcp.lazy_loading` | `false` | Master toggle: `false`/`"off"` = disabled; `true`/`"on"` = always stub; `"auto"` = stub only when the eligible MCP schemas cost ≥ `lazy_auto_threshold_tokens` (pure pass-through below — plugin is a per-turn no-op). |
 | `mcp.lazy_stub_max_desc` | `200` | Max description chars per per-tool stub. |
 | `mcp.discovery_mode` | `"tool"` | `tool` = per-tool stubs; `server` = per-server stubs; `both` = both meta-tools registered. Invalid values fall back to `tool`. |
 | `mcp.server_stub_max_desc` | `150` | Max description chars per server stub (server / both modes). |
 | `mcp.server_eager_token_threshold` | `1500` | When `load_mcp_server(eager=true)` would cost more than this many tokens of full schemas, it silently degrades to tool stubs. |
+| `mcp.lazy_auto_threshold_tokens` | `4000` | Auto mode only: minimum estimated token cost (chars/4) of stub-eligible MCP schemas before stubbing kicks in. |
+| `mcp.lazy_evict_idle_turns` | `10` | Idle eviction: a promoted tool unused for this many LLM requests is demoted back to a stub. `0` disables eviction (pre-eviction behavior). Re-promotion costs one `load_mcp_tools` call or one auto-promote retry. |
+| `mcp.lazy_evict_cost_threshold_tokens` | `3000` | Eviction gate: idle tools are only swept once the promoted set's full-schema cost exceeds this. Batches evictions so the tool list (and provider prompt-cache prefix) changes once per sweep, not once per tool. |
 
 ### Per-server override
 

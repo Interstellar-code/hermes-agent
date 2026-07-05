@@ -1,6 +1,6 @@
 name: mcp_lazy
-version: "0.2.0"
-description: "Lazy MCP tool schema loading. Master toggle: mcp.lazy_loading in config.yaml; per-server override via mcp_servers.<name>.lazy. Stubs MCP tool schemas in the API request, promotes on demand via load_mcp_tools meta-tool. Per-session pool keeps promotion state isolated across conversations. Phase 0 baseline cache hit-rate logger ships alongside for passive telemetry."
+version: "0.3.0"
+description: "Lazy MCP tool schema loading. Master toggle: mcp.lazy_loading in config.yaml (false | true | auto); per-server override via mcp_servers.<name>.lazy. Stubs MCP tool schemas in the API request, promotes on demand via load_mcp_tools meta-tool. Auto mode passes through when eligible schema cost is below lazy_auto_threshold_tokens; batched idle eviction (lazy_evict_idle_turns / lazy_evict_cost_threshold_tokens) demotes long-unused promoted tools so savings hold in long sessions. Per-session pool keeps promotion state isolated across conversations. Phase 0 baseline cache hit-rate logger ships alongside for passive telemetry."
 author: Interstellar-code
 hooks:
   - transform_tools
