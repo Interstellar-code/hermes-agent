@@ -2250,6 +2250,113 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _run_kanban_template_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a ``kanban_board_from_template`` cron job in-process.
+
+    Calls :func:`hermes_cli.kanban_templates.instantiate` directly — no
+    subprocess, no shell, no prompt assembly, no injection scanner.
+
+    Returns:
+        (success, full_output_doc, final_response, error_message)
+    """
+    job_id = job["id"]
+    job_name = str(job.get("name") or job_id or "kanban template job")
+    now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+
+    payload = job.get("payload") or {}
+    template_slug = payload.get("template_slug") or ""
+    variables = payload.get("variables") or {}
+    auto_dispatch = bool(payload.get("auto_dispatch", False))
+
+    if not template_slug:
+        err = "kanban_board_from_template job missing payload.template_slug"
+        logger.error("Job '%s': %s", job_id, err)
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** kanban_board_from_template\n"
+            f"**Status:** failed\n\n"
+            f"{err}\n"
+        )
+        return False, doc, err, err
+
+    try:
+        # Lazy import keeps the scheduler usable when kanban_templates is absent.
+        from hermes_cli.kanban_templates import instantiate, TemplateError
+    except ImportError as exc:
+        err = f"kanban_templates module unavailable: {exc}"
+        logger.error("Job '%s': %s", job_id, err)
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** kanban_board_from_template\n"
+            f"**Status:** failed\n\n"
+            f"{err}\n"
+        )
+        return False, doc, err, err
+
+    try:
+        result = instantiate(
+            slug=template_slug,
+            variables=variables if variables else None,
+            auto_dispatch=auto_dispatch,
+        )
+    except TemplateError as exc:
+        err = str(exc)
+        logger.error(
+            "Job '%s': kanban_board_from_template failed for template %r: %s",
+            job_id, template_slug, err,
+        )
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** kanban_board_from_template\n"
+            f"**Status:** failed\n\n"
+            f"Template error: {err}\n"
+        )
+        return False, doc, err, err
+    except Exception as exc:
+        err = f"unexpected error instantiating template {template_slug!r}: {exc}"
+        logger.exception("Job '%s': %s", job_id, err)
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** kanban_board_from_template\n"
+            f"**Status:** failed\n\n"
+            f"{err}\n"
+        )
+        return False, doc, err, err
+
+    board_slug = result.get("board_slug", "")
+    instance_id = result.get("instance_id", "")
+    created = result.get("created", 0)
+    skipped = result.get("skipped", 0)
+
+    summary = (
+        f"Instantiated template '{template_slug}' as board '{board_slug}' "
+        f"(instance {instance_id}): {created} task(s) created, {skipped} skipped."
+    )
+    logger.info("Job '%s': %s", job_id, summary)
+
+    doc = (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {now_iso}\n"
+        f"**Mode:** kanban_board_from_template\n"
+        f"**Status:** ok\n\n"
+        f"---\n\n"
+        f"board_slug: {board_slug}\n"
+        f"instance_id: {instance_id}\n"
+        f"created: {created}\n"
+        f"skipped: {skipped}\n"
+    )
+    return True, doc, summary, None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -2278,6 +2385,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
+    # ---------------------------------------------------------------
+    # kanban_board_from_template — structured in-process job type.
+    # Bypasses the prompt/agent path entirely: no LLM, no subprocess,
+    # no injection scanner.  Calls kanban_templates.instantiate() directly.
+    # ---------------------------------------------------------------
+    if job.get("type") == "kanban_board_from_template":
+        return _run_kanban_template_job(job)
+
     if job.get("no_agent"):
         script_path = job.get("script")
         if not script_path:

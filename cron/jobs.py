@@ -1210,6 +1210,99 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def upsert_kanban_template_job(
+    job_id: str,
+    schedule_expr: str,
+    template_slug: str,
+    variables: Optional[Dict[str, Any]] = None,
+    auto_dispatch: bool = False,
+) -> Dict[str, Any]:
+    """Upsert a ``kanban_board_from_template`` cron job with a deterministic ID.
+
+    If a job with *job_id* already exists it is updated in-place (schedule +
+    payload fields).  Otherwise a new job record is appended.
+
+    The deterministic job ID (``f"kanban-template-{slug}"``) means repeated
+    calls from :func:`hermes_cli.kanban_templates.sync_recurrence` are
+    idempotent — no duplicate jobs accumulate.
+
+    Args:
+        job_id:        Deterministic id, must satisfy ``_job_output_dir`` rules.
+        schedule_expr: Raw schedule string accepted by :func:`parse_schedule`
+                       (cron expression expected from ``recurrence.cron``).
+        template_slug: Template slug — stored in ``payload.template_slug``.
+        variables:     Optional dict stored in ``payload.variables``.
+        auto_dispatch: Stored in ``payload.auto_dispatch``.
+
+    Returns the upserted job dict.
+    """
+    # Validate the job_id early — it becomes a filesystem path component.
+    _job_output_dir(job_id)
+
+    parsed_schedule = parse_schedule(schedule_expr)
+    now = _hermes_now().isoformat()
+
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for i, existing in enumerate(jobs):
+            if existing["id"] == job_id:
+                existing["schedule"] = parsed_schedule
+                existing["schedule_display"] = parsed_schedule.get("display", schedule_expr)
+                existing["payload"] = {
+                    "template_slug": template_slug,
+                    "variables": variables or {},
+                    "auto_dispatch": bool(auto_dispatch),
+                }
+                existing["enabled"] = True
+                existing["state"] = "scheduled"
+                existing["next_run_at"] = compute_next_run(parsed_schedule)
+                jobs[i] = existing
+                save_jobs(jobs)
+                return _normalize_job_record(existing)
+
+        # New job
+        job: Dict[str, Any] = {
+            "id": job_id,
+            "name": f"Kanban template: {template_slug}",
+            "type": "kanban_board_from_template",
+            "payload": {
+                "template_slug": template_slug,
+                "variables": variables or {},
+                "auto_dispatch": bool(auto_dispatch),
+            },
+            "prompt": "",
+            "skills": [],
+            "skill": None,
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "script": None,
+            "no_agent": False,
+            "context_from": None,
+            "schedule": parsed_schedule,
+            "schedule_display": parsed_schedule.get("display", schedule_expr),
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "created_at": now,
+            "next_run_at": compute_next_run(parsed_schedule),
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "last_delivery_error": None,
+            "deliver": "local",
+            "origin": None,
+            "enabled_toolsets": None,
+            "workdir": None,
+            "profile": None,
+        }
+        jobs.append(job)
+        save_jobs(jobs)
+        return _normalize_job_record(job)
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
