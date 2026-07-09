@@ -1754,6 +1754,43 @@ class TestWebServerEndpoints:
         )
         assert denied.status_code == 403
 
+    def test_ops_backup_list_enumerates_zips_newest_first(self):
+        import os
+
+        import hermes_cli.web_server as ws
+
+        backup_dir = ws._dashboard_backup_dir()
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        old = backup_dir / "hermes-backup-old.zip"
+        new = backup_dir / "hermes-backup-new.zip"
+        old.write_bytes(b"old")
+        new.write_bytes(b"newer")
+        os.utime(old, (1_000_000, 1_000_000))
+        os.utime(new, (2_000_000, 2_000_000))
+        # Non-zip noise must be ignored.
+        (backup_dir / "notes.txt").write_text("skip me")
+
+        resp = self.client.get("/api/ops/backup/list")
+        assert resp.status_code == 200
+        backups = resp.json()["backups"]
+        names = [b["name"] for b in backups]
+        assert names == ["hermes-backup-new.zip", "hermes-backup-old.zip"]
+        assert backups[0]["size"] == len(b"newer")
+        assert backups[0]["modified"].endswith("Z")
+
+    def test_ops_backup_list_missing_dir_returns_empty(self):
+        import shutil
+
+        import hermes_cli.web_server as ws
+
+        backup_dir = ws._dashboard_backup_dir()
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+
+        resp = self.client.get("/api/ops/backup/list")
+        assert resp.status_code == 200
+        assert resp.json() == {"backups": []}
+
     def test_ops_import_upload_stages_archive_and_passes_force(self, tmp_path, monkeypatch):
         import zipfile
         from pathlib import Path
