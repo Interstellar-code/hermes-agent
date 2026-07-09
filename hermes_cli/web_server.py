@@ -9903,6 +9903,52 @@ async def download_dashboard_backup(archive: str):
     )
 
 
+@app.get("/api/ops/backup/list")
+async def list_dashboard_backups():
+    """Enumerate downloadable backups in the dashboard backup directory.
+
+    Returns newest-first. Missing directory → empty list (not an error), so a
+    fresh install with no backups yet renders a clean empty state. Symlinks and
+    anything resolving outside the backup dir are skipped, mirroring the
+    download route's containment guard.
+    """
+    backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+    backups: list[dict] = []
+    try:
+        entries = list(backup_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return {"backups": []}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read backup directory: {exc}")
+
+    for entry in entries:
+        if entry.is_symlink() or entry.suffix.lower() != ".zip":
+            continue
+        try:
+            resolved = entry.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_file() or not _path_is_under(backup_dir, resolved):
+            continue
+        try:
+            st = resolved.stat()
+        except OSError:
+            continue
+        backups.append(
+            {
+                "name": entry.name,
+                "path": str(resolved),
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
+
+    backups.sort(key=lambda b: b["modified"], reverse=True)
+    return {"backups": backups}
+
+
 class ImportRequest(BaseModel):
     archive: str
     # Pass --force to `hermes import`. The spawned action runs with
