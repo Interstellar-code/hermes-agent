@@ -181,6 +181,9 @@ class TestClarifyDictChoices:
     def test_flatten_unwraps_description_when_no_label(self):
         assert _flatten_choice({"description": "A loose layout"}) == "A loose layout"
 
+    def test_flatten_unwraps_content_when_no_label(self):
+        assert _flatten_choice({"content": "Use the existing catalog"}) == "Use the existing catalog"
+
     def test_flatten_unwrap_order_label_over_description(self):
         assert _flatten_choice({"description": "verbose", "label": "tight"}) == "tight"
 
@@ -211,7 +214,7 @@ class TestClarifyDictChoices:
         result = json.loads(clarify_tool(
             "Pick a layout",
             choices=[
-                {"choice": "Tight", "description": "Tight, covers all 3 points"},
+                {"content": "Tight, covers all 3 points"},
                 {"description": "Loose layout"},
                 {"name": "modelid", "value": "abc"},  # dropped, not leaked
                 "A plain string choice",
