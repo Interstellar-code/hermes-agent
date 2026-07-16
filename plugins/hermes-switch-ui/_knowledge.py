@@ -122,6 +122,8 @@ def connection_info() -> Dict[str, Any]:
         "dashboard_port": 9119,
         "frontend_port": 3002,
         "active_profile": None,
+        "active_profile_source": None,
+        "active_profile_stale": None,
         "enabled_plugins": None,
         "auth_mode": None,
     }
@@ -145,22 +147,49 @@ def connection_info() -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.debug("hermes-switch-ui: connection_info config read failed: %s", exc)
 
-    # Disk fallback (#336): ~/.hermes/active_profile is the source of truth,
-    # written by `hermes profile use` / setActiveProfile. The loaded config only
-    # carries a `profile` key when one was pinned there; when it is absent the
-    # gateway reported active_profile=None even though the disk file names the
-    # active profile, so both switchui_status and the /settings card showed "—".
+    if result["active_profile"]:
+        result["active_profile_source"] = "config"
+
+    # Runtime override (#336): a gateway started with --profile <name> runs with
+    # HERMES_HOME=~/.hermes/profiles/<name>. That is what this process is
+    # ACTUALLY serving — it beats both the config key and the disk file, which
+    # only record intent and can diverge from the running gateway (disk said
+    # "morpheus" while this gateway served hermes-switch sessions).
+    hermes_home = Path(
+        os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    )
+    if hermes_home.parent.name == "profiles":
+        result["active_profile"] = hermes_home.name
+        result["active_profile_source"] = "runtime"
+        hermes_root = hermes_home.parent.parent
+    else:
+        hermes_root = hermes_home
+
+    # Disk fallback (#336): ~/.hermes/active_profile (root, NOT the profile
+    # dir) is written by `hermes profile use` / setActiveProfile. Last resort —
+    # it names the *selected* profile, which the running gateway may not be on.
     if not result["active_profile"]:
         try:
-            hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser(
-                "~/.hermes"
-            )
-            name = (Path(hermes_home) / "active_profile").read_text(
+            name = (hermes_root / "active_profile").read_text(
                 encoding="utf-8"
             ).strip()
             if name:
                 result["active_profile"] = name
+                result["active_profile_source"] = "disk"
         except OSError:
             pass
+
+    # Staleness flag: disk selection differs from what this gateway is running.
+    try:
+        disk_name = (hermes_root / "active_profile").read_text(
+            encoding="utf-8"
+        ).strip()
+        result["active_profile_stale"] = bool(
+            disk_name
+            and result["active_profile"]
+            and disk_name != result["active_profile"]
+        )
+    except OSError:
+        result["active_profile_stale"] = None
 
     return result
