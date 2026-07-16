@@ -145,4 +145,22 @@ def connection_info() -> Dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.debug("hermes-switch-ui: connection_info config read failed: %s", exc)
 
+    # Disk fallback (#336): ~/.hermes/active_profile is the source of truth,
+    # written by `hermes profile use` / setActiveProfile. The loaded config only
+    # carries a `profile` key when one was pinned there; when it is absent the
+    # gateway reported active_profile=None even though the disk file names the
+    # active profile, so both switchui_status and the /settings card showed "—".
+    if not result["active_profile"]:
+        try:
+            hermes_home = os.environ.get("HERMES_HOME") or os.path.expanduser(
+                "~/.hermes"
+            )
+            name = (Path(hermes_home) / "active_profile").read_text(
+                encoding="utf-8"
+            ).strip()
+            if name:
+                result["active_profile"] = name
+        except OSError:
+            pass
+
     return result
