@@ -64,6 +64,40 @@ def _estimate_server_full_tokens(agent: object, server_name: str) -> int:
     return total
 
 
+def resolve_tool_name(name: str, valid: "set[str] | frozenset[str]") -> str:
+    """Resolve an MCP tool name to its Hermes-registered form.
+
+    Models frequently request tools using the MCP SDK native naming
+    convention (``mcp__server__tool``, double underscores at the prefix
+    and server/tool boundary). Hermes registers them as
+    ``mcp_server_tool`` (single underscores — ``sanitize_mcp_name_component``
+    never produces ``__``). Without bridging, the exact-string check in
+    :func:`promote_tools` rejects every MCP-native request and the agent
+    loops indefinitely on ``load_mcp_tools``. See issue #168.
+
+    Resolution order:
+    1. Exact match — if ``name`` is already in ``valid``, return as-is.
+    2. Collapse — replace ``__`` with ``_`` and re-check. Safe because
+       registered names never contain ``__`` (sanitizer uses single
+       ``_``), so any ``__`` in a requested name is structural.
+    3. Unresolved — return the original name; caller will reject it.
+
+    Args:
+        name: The tool name the model requested.
+        valid: The set of registered tool names (``agent.valid_tool_names``).
+
+    Returns:
+        The resolved Hermes-registered name, or the original if unresolved.
+    """
+    if not valid or name in valid:
+        return name
+    if "__" in name:
+        collapsed = name.replace("__", "_")
+        if collapsed in valid:
+            return collapsed
+    return name
+
+
 def promote_tools(agent, tool_names: Iterable[str]) -> List[str]:
     """Promote ``tool_names`` in the session's pool.
 
