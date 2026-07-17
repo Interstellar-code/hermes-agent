@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from .promote import promote_tools
+from .promote import promote_tools, resolve_tool_name
 
 SCHEMA: Dict[str, Any] = {
     # Name deliberately does NOT start with ``mcp_`` so the stub
@@ -81,8 +81,10 @@ async def handler(args: Dict[str, Any], **kwargs: Any) -> str:
             "error": "load_mcp_tools: agent context unavailable",
         })
 
-    accepted: List[str] = promote_tools(agent, raw_names)
-    rejected = [n for n in raw_names if isinstance(n, str) and n.strip() and n.strip() not in accepted]
+    valid = getattr(agent, "valid_tool_names", None) or set()
+    names = [resolve_tool_name(n, valid) if isinstance(n, str) else n for n in raw_names]
+    accepted: List[str] = promote_tools(agent, names)
+    rejected = [n for n in names if isinstance(n, str) and n.strip() and n.strip() not in accepted]
 
     return json.dumps({
         "ok": True,
