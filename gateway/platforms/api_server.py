@@ -1661,7 +1661,11 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
-        sessions = db.list_sessions_rich(
+        # Offloaded to a worker thread: this SQLite scan runs on the asyncio
+        # event loop otherwise and blocks every concurrent request (#169 —
+        # global loop starvation, /v1/models stalls behind it).
+        sessions = await asyncio.to_thread(
+            db.list_sessions_rich,
             source=source,
             limit=limit,
             offset=offset,
@@ -4308,7 +4312,12 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
-                agent = self._create_agent(
+                # Offloaded: AIAgent construction (toolset load, memory-provider
+                # init, config parse) is synchronous and multi-second; running it
+                # on the event loop blocks every concurrent request (#169). The
+                # streaming path already offloads this via _run/run_in_executor.
+                agent = await asyncio.to_thread(
+                    self._create_agent,
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
