@@ -137,11 +137,22 @@ def test_project_for_path_skips_archived(conn):
 def test_active_pointer(conn):
     pid = pdb.create_project(conn, name="P")
     assert pdb.get_active_id(conn) is None
-
     pdb.set_active(conn, pid)
     assert pdb.get_active_id(conn) == pid
-
     pdb.set_active(conn, None)
+    assert pdb.get_active_id(conn) is None
+
+
+def test_archived_only_delete_is_atomic_and_preserves_active_on_rejection(conn):
+    pid = pdb.create_project(conn, name="P")
+    pdb.set_active(conn, pid)
+    assert pdb.delete_project(conn, pid, clear_active=True, archived_only=True) is False
+    assert pdb.get_project(conn, pid) is not None
+    assert pdb.get_active_id(conn) == pid
+
+    pdb.archive_project(conn, pid)
+    assert pdb.delete_project(conn, pid, clear_active=True, archived_only=True) is True
+    assert pdb.get_project(conn, pid) is None
     assert pdb.get_active_id(conn) is None
 
 

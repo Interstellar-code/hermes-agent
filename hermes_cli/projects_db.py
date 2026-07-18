@@ -583,10 +583,30 @@ def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
     return cur.rowcount > 0
 
 
-def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    """Hard-delete a project and its folders (cascade)."""
+def delete_project(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    clear_active: bool = False,
+    archived_only: bool = False,
+) -> bool:
+    """Hard-delete a project and its folders (cascade).
+
+    ``clear_active`` keeps the active pointer cleanup in the same transaction
+    for callers exposing destructive deletion. ``archived_only`` makes the
+    archive gate part of the same transaction, avoiding a restore/delete race.
+    """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        where = "id = ?"
+        params: tuple[object, ...] = (project_id,)
+        if archived_only:
+            where += " AND archived = 1"
+        cur = conn.execute(f"DELETE FROM projects WHERE {where}", params)
+        if clear_active and cur.rowcount:
+            conn.execute(
+                "DELETE FROM project_meta WHERE key = ? AND value = ?",
+                (_ACTIVE_META_KEY, project_id),
+            )
     return cur.rowcount > 0
 
 

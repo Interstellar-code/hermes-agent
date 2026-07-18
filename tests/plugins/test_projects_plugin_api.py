@@ -236,3 +236,185 @@ def test_archived_projects_are_opt_in(client: TestClient) -> None:
 def test_missing_project_is_404(client: TestClient, path: str) -> None:
     response = client.get(f"/api/plugins/projects{path}")
     assert response.status_code == 404
+
+
+def _delete_json(client: TestClient, path: str, payload: dict):
+    return client.request("DELETE", path, json=payload)
+
+
+def test_create_update_and_validation_contract(client: TestClient) -> None:
+    response = client.post(
+        "/api/plugins/projects",
+        json={
+            "name": "  Demo Project  ",
+            "folders": ["/tmp/demo-a", "/tmp/demo-b"],
+            "description": "  keep spacing  ",
+            "board_slug": " Work-Board ",
+        },
+    )
+    assert response.status_code == 200
+    project = response.json()["project"]
+    assert project["name"] == "Demo Project"
+    assert project["slug"] == "demo-project"
+    assert project["description"] == "  keep spacing  "
+    assert project["board_slug"] == "work-board"
+    assert project["folders"][0]["is_primary"] is True
+    assert project["folder_count"] == 2
+    assert project["is_active"] is False
+
+    pid = project["id"]
+    response = client.patch(
+        f"/api/plugins/projects/{pid}",
+        json={"description": "", "icon": "", "color": "blue", "board_slug": ""},
+    )
+    assert response.status_code == 200
+    project = response.json()["project"]
+    assert project["description"] == ""
+    assert project["icon"] is None
+    assert project["color"] == "blue"
+    assert project["board_slug"] is None
+
+    # Omitted patch fields remain untouched; explicit null is not a clear value.
+    response = client.patch(f"/api/plugins/projects/{pid}", json={"description": None})
+    assert response.status_code == 422
+    assert client.patch(f"/api/plugins/projects/{pid}", json={"name": " "}).status_code == 400
+    assert client.patch(f"/api/plugins/projects/{pid}", json={"unknown": 1}).status_code == 422
+    assert client.post("/api/plugins/projects", json={"name": " "}).status_code == 400
+    assert client.post("/api/plugins/projects", json={"name": "x", "folders": [" "]}).status_code == 400
+    assert client.post("/api/plugins/projects", json={"name": "x", "slug": "Bad Slug"}).status_code == 400
+
+    duplicate = client.post("/api/plugins/projects", json={"name": "Demo Project", "slug": "demo-project"})
+    assert duplicate.status_code == 200
+    assert duplicate.json()["project"]["slug"] == "demo-project-2"
+
+
+def test_folder_mutations_preserve_primary_and_reject_missing(client: TestClient) -> None:
+    pid = _create_project()
+    response = client.post(
+        f"/api/plugins/projects/{pid}/folders", json={"path": "/tmp/second", "is_primary": True}
+    )
+    assert response.status_code == 200
+    project = response.json()["project"]
+    assert project["primary_path"] == "/tmp/second"
+    assert [f["is_primary"] for f in project["folders"]].count(True) == 1
+
+    response = client.post(
+        f"/api/plugins/projects/{pid}/folders/primary", json={"path": "/tmp/second"}
+    )
+    assert response.status_code == 200
+    response = _delete_json(
+        client, f"/api/plugins/projects/{pid}/folders", {"path": "/tmp/second"}
+    )
+    assert response.status_code == 200
+    project = response.json()["project"]
+    assert project["primary_path"].endswith("/src/hermes")
+    assert _delete_json(
+        client, f"/api/plugins/projects/{pid}/folders", {"path": "/does/not/exist"}
+    ).status_code == 404
+    assert client.post(
+        f"/api/plugins/projects/{pid}/folders/primary", json={"path": " "}
+    ).status_code == 400
+
+
+def test_write_routes_resolve_slugs_and_windows_style_paths(client: TestClient) -> None:
+    pid = _create_project()
+    response = client.patch("/api/plugins/projects/hermes-agent", json={"color": "green"})
+    assert response.status_code == 200
+    assert response.json()["project"]["id"] == pid
+
+    windows_path = r"C:\work\repo"
+    response = client.post(
+        f"/api/plugins/projects/{pid}/folders", json={"path": windows_path}
+    )
+    assert response.status_code == 200
+    assert any("C:\\work\\repo" in folder["path"] for folder in response.json()["project"]["folders"])
+
+
+def test_lifecycle_active_and_archived_only_delete(client: TestClient) -> None:
+    pid = _create_project()
+    assert client.post(f"/api/plugins/projects/{pid}/active").json()["active_id"] == pid
+
+    # Active projects may be archived, and the pointer remains until deletion.
+    archived = client.post(f"/api/plugins/projects/{pid}/archive")
+    assert archived.status_code == 200
+    assert archived.json()["project"]["archived"] is True
+    assert archived.json()["projects"][0]["archived"] is True
+    assert client.get("/api/plugins/projects").json()["active_id"] == pid
+    assert client.delete(f"/api/plugins/projects/{pid}").status_code == 200
+    assert client.get("/api/plugins/projects?include_archived=true").json() == {
+        "projects": [],
+        "active_id": None,
+    }
+
+    pid = _create_project()
+    assert client.delete(f"/api/plugins/projects/{pid}").status_code == 409
+    assert client.post(f"/api/plugins/projects/{pid}/archive").status_code == 200
+    assert client.post(f"/api/plugins/projects/{pid}/archive").json()["project"]["archived"] is True
+    restored = client.post(f"/api/plugins/projects/{pid}/restore")
+    assert restored.status_code == 200
+    assert restored.json()["project"]["archived"] is False
+    assert client.post(f"/api/plugins/projects/{pid}/restore").json()["project"]["archived"] is False
+    assert client.post("/api/plugins/projects/missing/active").status_code == 404
+
+
+def test_write_route_table_contract() -> None:
+    from plugins.projects.dashboard.plugin_api import router
+
+    routes = {(method, route.path) for route in router.routes for method in route.methods}
+    assert {
+        ("POST", ""),
+        ("PATCH", "/{project_id_or_slug}"),
+        ("POST", "/{project_id_or_slug}/folders"),
+        ("DELETE", "/{project_id_or_slug}/folders"),
+        ("POST", "/{project_id_or_slug}/folders/primary"),
+        ("POST", "/{project_id_or_slug}/archive"),
+        ("POST", "/{project_id_or_slug}/restore"),
+        ("POST", "/{project_id_or_slug}/active"),
+        ("DELETE", "/{project_id_or_slug}"),
+    } <= routes
+
+
+def test_mounted_projects_mutations_use_dashboard_auth(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "mounted-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    projects_db._INITIALIZED_PATHS.clear()
+
+    from hermes_cli import web_server
+
+    mounted = TestClient(web_server.app)
+    assert mounted.post("/api/plugins/projects", json={"name": "Nope"}).status_code == 401
+    mounted.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+    response = mounted.post("/api/plugins/projects", json={"name": "Mounted"})
+    assert response.status_code == 200
+
+
+def test_rest_projects_follow_active_profile(client: TestClient, tmp_path: Path, monkeypatch) -> None:
+    assert client.post("/api/plugins/projects", json={"name": "Profile A"}).status_code == 200
+    profile_b = tmp_path / "profile-b"
+    profile_b.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_b))
+    projects_db._INITIALIZED_PATHS.clear()
+    assert client.get("/api/plugins/projects?include_archived=true").json() == {
+        "projects": [],
+        "active_id": None,
+    }
+
+
+def test_profile_query_scopes_all_project_routes(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "hermes_home"
+    profile = root / "profiles" / "switch"
+    profile.mkdir(parents=True)
+    response = client.post(
+        "/api/plugins/projects?profile=switch", json={"name": "Scoped"}
+    )
+    assert response.status_code == 200
+    project_id = response.json()["project"]["id"]
+    assert client.get("/api/plugins/projects").json()["projects"] == []
+    scoped = client.get(f"/api/plugins/projects/{project_id}?profile=switch")
+    assert scoped.status_code == 200
+    assert scoped.json()["project"]["name"] == "Scoped"
+    assert client.get("/api/plugins/projects?profile=missing").status_code == 404
