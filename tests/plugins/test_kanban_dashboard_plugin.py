@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +271,17 @@ def test_dashboard_workspace_picker_explains_persistence_contract():
         "This workspace and any files left in it are deleted when the task completes."
         in bundle
     )
+def test_create_task_accepts_project_slug(client):
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Demo", slug="demo")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Linked task", "project_id": "demo"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["project_id"] == project_id
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
