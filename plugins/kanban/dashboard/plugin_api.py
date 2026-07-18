@@ -581,6 +581,7 @@ def get_task(
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
+    project_id: Optional[str] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
@@ -604,6 +605,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             conn,
             title=payload.title,
             body=payload.body,
+            project_id=payload.project_id,
             assignee=payload.assignee,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,

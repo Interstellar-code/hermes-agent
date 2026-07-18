@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,19 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_create_task_accepts_project_slug(client):
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Demo", slug="demo")
+
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Linked task", "project_id": "demo"},
+    )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["project_id"] == project_id
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
