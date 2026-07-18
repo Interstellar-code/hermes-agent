@@ -1,0 +1,11 @@
+{
+  "name": "projects",
+  "label": "Projects",
+  "description": "Read-only dashboard API for first-class Hermes projects.",
+  "icon": "FolderKanban",
+  "version": "1.0.0",
+  "tab": {
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}
