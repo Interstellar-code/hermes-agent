@@ -21,6 +21,7 @@ it here and return a clean error string instead.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,62 @@ def _load_models() -> tuple[str, str]:
             "plugins.karpathy_self_improve.judge_model in config.yaml"
         )
     return str(proposer_model), str(judge_model)
+
+
+def _load_profile_target_config(profile: str) -> Optional[Dict[str, Any]]:
+    """Read plugins.karpathy_self_improve.profiles.<profile> from config.yaml.
+
+    Returns None when no per-profile block is configured. When present,
+    ``profile_root`` is ``~``-expanded so config.yaml can use ``~/...``.
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        config = load_config()
+        block = cfg_get(
+            config, "plugins", "karpathy_self_improve", "profiles", profile,
+            default=None,
+        )
+    except Exception:
+        block = None
+
+    if not isinstance(block, dict):
+        return None
+
+    result = dict(block)
+    if result.get("profile_root"):
+        result["profile_root"] = str(Path(str(result["profile_root"])).expanduser())
+    return result
+
+
+def resolve_target_for_profile(profile: str, db: Any) -> tuple[str, str]:
+    """Resolve (target_relpath, profile_root) for *profile*.
+
+    Resolution order (#176):
+      1. Per-profile config block: plugins.karpathy_self_improve.profiles.<profile>
+         (wins over everything else — the explicit, operator-set source of truth).
+      2. The most recent prior experiment for the profile.
+      3. Fail fast with an actionable ValueError — never silently default to
+         "system_prompt.md" / "." (the daemon process CWD), which previously
+         caused proposals to write into the wrong directory for profiles that
+         were never bootstrapped.
+    """
+    block = _load_profile_target_config(profile)
+    if block and block.get("target_relpath") and block.get("profile_root"):
+        return str(block["target_relpath"]), str(block["profile_root"])
+
+    rows = db.list_experiments(profile=profile)
+    if rows:
+        exp = rows[0]
+        target_relpath = exp.get("target_relpath")
+        profile_root = exp.get("target_profile_root")
+        if target_relpath and profile_root:
+            return str(target_relpath), str(profile_root)
+
+    raise ValueError(
+        f"no target_relpath/profile_root for profile {profile!r}; add it under "
+        f"plugins.karpathy_self_improve.profiles.{profile} in config.yaml, or run "
+        f"`hermes karpathy bootstrap --profile {profile}`"
+    )
 
 
 # ---------------------------------------------------------------------------

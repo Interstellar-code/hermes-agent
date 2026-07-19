@@ -86,6 +86,78 @@ def test_load_models_raises_when_judge_model_not_configured(monkeypatch):
             _wiring._load_models()
 
 
+def test_load_profile_target_config_expands_profile_root():
+    """profile_root read from config.yaml is ~-expanded."""
+    import _wiring
+
+    fake_block = {"target_relpath": "SOUL.md", "profile_root": "~/some-profile"}
+
+    def fake_cfg_get(cfg, *keys, default=None):
+        return fake_block if keys[-1] == "coder" else default
+
+    with patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.cfg_get", side_effect=fake_cfg_get):
+        result = _wiring._load_profile_target_config("coder")
+
+    assert result["target_relpath"] == "SOUL.md"
+    assert result["profile_root"] == str(Path("~/some-profile").expanduser())
+
+
+def test_load_profile_target_config_none_when_absent():
+    import _wiring
+
+    with patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.cfg_get", side_effect=lambda cfg, *keys, default=None: default):
+        assert _wiring._load_profile_target_config("coder") is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_target_for_profile — config > prior experiment > fail-fast (#176)
+# ---------------------------------------------------------------------------
+
+def test_resolve_target_for_profile_config_wins_over_experiment():
+    from _wiring import resolve_target_for_profile
+
+    mock_db = MagicMock()
+    mock_db.list_experiments.return_value = [
+        {"target_relpath": "OLD.md", "target_profile_root": "/old/root"}
+    ]
+    block = {"target_relpath": "SOUL.md", "profile_root": "/new/root"}
+    with patch("_wiring._load_profile_target_config", return_value=block):
+        target_relpath, profile_root = resolve_target_for_profile("coder", mock_db)
+
+    assert (target_relpath, profile_root) == ("SOUL.md", "/new/root")
+    mock_db.list_experiments.assert_not_called()
+
+
+def test_resolve_target_for_profile_falls_back_to_prior_experiment():
+    from _wiring import resolve_target_for_profile
+
+    mock_db = MagicMock()
+    mock_db.list_experiments.return_value = [
+        {"target_relpath": "system_prompt.md", "target_profile_root": "/prof/root"}
+    ]
+    with patch("_wiring._load_profile_target_config", return_value=None):
+        target_relpath, profile_root = resolve_target_for_profile("coder", mock_db)
+
+    assert (target_relpath, profile_root) == ("system_prompt.md", "/prof/root")
+
+
+def test_resolve_target_for_profile_raises_when_unresolvable():
+    from _wiring import resolve_target_for_profile
+
+    mock_db = MagicMock()
+    mock_db.list_experiments.return_value = []
+    with patch("_wiring._load_profile_target_config", return_value=None):
+        with pytest.raises(ValueError) as excinfo:
+            resolve_target_for_profile("coder", mock_db)
+
+    msg = str(excinfo.value)
+    assert "no target_relpath/profile_root for profile 'coder'" in msg
+    assert "plugins.karpathy_self_improve.profiles.coder" in msg
+    assert "hermes karpathy bootstrap --profile coder" in msg
+
+
 def test_resolve_propose_kwargs_distinct_models_ok():
     from _wiring import resolve_propose_kwargs
     with patch("_wiring._load_models", return_value=("auto", "gpt-5.4")):
