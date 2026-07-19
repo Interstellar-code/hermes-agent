@@ -247,10 +247,7 @@ async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) ->
     """approved → live: write the proposed content, commit, store apply_commit_sha."""
     try:
         from _db import get_db
-        from _state_machine import transition
-        from _git_ratchet import apply_and_commit
         from datetime import datetime, timezone
-        import json
 
         db = get_db()
         exp = db.get_experiment(exp_id)
@@ -280,7 +277,7 @@ async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) ->
             original_content = target_path.read_text(encoding="utf-8", errors="replace")
 
         # Apply diff to get new content. Raises on failure — return 422
-        # BEFORE apply_and_commit/transition so a bad patch never commits.
+        # BEFORE any DB write so a bad patch never touches state.
         new_content = original_content
         if diff:
             from _proposer import apply_diff_to_text, PatchApplyError
@@ -292,45 +289,86 @@ async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) ->
                     status_code=422,
                 )
 
-        apply_result = apply_and_commit(
-            _Path(profile_root),
-            target_relpath,
-            new_content.encode("utf-8"),
-            message=f"feat(karpathy): apply experiment {exp_id}",
-        )
-        if not apply_result.ok:
-            return JSONResponse({"error": f"git apply failed: {apply_result.error}"}, status_code=500)
+        # #173: the DB snapshot row is the rollback source of truth (works on
+        # profile dirs that are not git repos); git becomes a best-effort
+        # audit trail only. Ordering matters: the DB transaction (snapshot +
+        # state=live + transition row) is committed BEFORE the file is
+        # written. If we crashed between them, the on-disk file still matches
+        # the snapshot's prior_bytes, so a revert is a safe no-op. Writing the
+        # file first would risk a live file with no recoverable snapshot if
+        # the DB write then failed — exactly the bug this closes.
+        import hashlib
 
+        prior_bytes = target_path.read_bytes() if target_path.is_file() else b""
+        prior_hash = hashlib.sha256(prior_bytes).hexdigest()
         now = datetime.now(timezone.utc).isoformat()
-        db.update_experiment_fields(
-            exp_id,
-            apply_commit_sha=apply_result.commit_sha,
-            live_sessions_target=10,
-            updated_at=now,
-        )
-        # H-2: if transition fails after the git commit, compensating-revert
-        # to avoid a patched profile with DB still showing 'approved'.
+
+        db._conn.execute("BEGIN IMMEDIATE")
         try:
-            transition(db, exp_id, "live", actor="api")
+            db.insert_snapshot(
+                experiment_id=exp_id,
+                prior_hash=prior_hash,
+                prior_bytes=prior_bytes,
+                target_relpath=target_relpath,
+                applied_at=now,
+                _commit=False,
+            )
+            db.update_experiment_fields(
+                exp_id,
+                _commit=False,
+                state="live",
+                applied_at=now,
+                live_sessions_target=10,
+                live_takes_effect_at_next_session=1,
+                updated_at=now,
+            )
+            # Self-commits — finalizes the transaction above atomically since
+            # nothing committed before it (transition() manages its own
+            # BEGIN IMMEDIATE and can't be nested here, so we insert the
+            # transition row directly).
+            db.insert_state_transition(
+                experiment_id=exp_id,
+                from_state="approved",
+                to_state="live",
+                actor="api",
+                created_at=now,
+            )
         except Exception:
-            try:
-                from _git_ratchet import revert_commit as _revert_commit
-                _revert_commit(
-                    _Path(profile_root),
-                    apply_result.commit_sha,
-                    f"chore: rollback failed apply of experiment {exp_id}",
-                )
-            except Exception as revert_exc:
-                log.error(
-                    "karpathy compensating revert failed for experiment %d: %s",
-                    exp_id,
-                    revert_exc,
-                )
+            db._conn.rollback()
             raise
+
+        # Snapshot safely committed — now perform the actual write.
+        target_path.write_bytes(new_content.encode("utf-8"))
+
+        # Best-effort audit-trail commit. Never fatal: the snapshot above is
+        # the real rollback mechanism, so a git failure here is just a
+        # missing history entry, not a broken apply.
+        apply_commit_sha = None
+        from _git_ratchet import is_git_repo, audit_commit
+        if is_git_repo(_Path(profile_root)):
+            try:
+                audit_result = audit_commit(
+                    _Path(profile_root),
+                    target_relpath,
+                    message=f"feat(karpathy): apply experiment {exp_id}",
+                )
+                if audit_result.ok:
+                    apply_commit_sha = audit_result.commit_sha
+                    db.update_experiment_fields(exp_id, apply_commit_sha=apply_commit_sha)
+                else:
+                    log.warning(
+                        "audit-trail commit failed for experiment %d: %s",
+                        exp_id, audit_result.error,
+                    )
+            except Exception as exc:
+                log.warning(
+                    "audit-trail commit failed; snapshot rollback still safe: %s", exc
+                )
+
         return JSONResponse({
             "ok": True,
             "state": "live",
-            "apply_commit_sha": apply_result.commit_sha,
+            "apply_commit_sha": apply_commit_sha,
         })
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=422)
@@ -383,7 +421,17 @@ async def revert_experiment(exp_id: int, body: dict, _auth: None = Depends(_requ
         reason = body.get("reason", "")
         apply_commit_sha = exp.get("apply_commit_sha") or ""
         profile_root = exp.get("target_profile_root") or ""
-        if apply_commit_sha and profile_root:
+
+        # #173: the DB snapshot is the source of truth for revert — restore
+        # the exact prior bytes, which works even when profile_root is not a
+        # git repo. Only pre-#173 rows (apply_commit_sha set, no snapshot)
+        # fall back to the legacy git-based revert.
+        snap = db.get_snapshot(exp_id)
+        if snap is not None:
+            if profile_root and snap.get("target_relpath"):
+                target_path = _Path(profile_root) / snap["target_relpath"]
+                target_path.write_bytes(snap["prior_bytes"])
+        elif apply_commit_sha and profile_root:
             revert_result = revert_commit(
                 _Path(profile_root),
                 apply_commit_sha,

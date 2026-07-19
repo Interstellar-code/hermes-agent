@@ -139,6 +139,16 @@ def _is_git_repo(root: Path) -> bool:
         return False
 
 
+def is_git_repo(root: Path) -> bool:
+    """Public check: is *root* a git repository?
+
+    #173: git is advisory/audit-only on the snapshot-based apply path — the
+    API apply handler uses this to decide whether a best-effort audit commit
+    (audit_commit) is even worth attempting.
+    """
+    return _is_git_repo(root)
+
+
 def _guard(root: Path) -> Optional[str]:
     """Return an error string if *root* is not a git repo, else None."""
     if not root.is_dir():
@@ -328,3 +338,42 @@ def revert_commit(root: Path, commit_sha: str, message: str) -> RevertResult:
         )
     except Exception as exc:
         return RevertResult(ok=False, error=str(exc))
+
+
+def audit_commit(root: Path, relpath: str, message: str) -> ApplyResult:
+    """Best-effort audit-trail commit (#173).
+
+    Assumes *relpath* was already written to disk by the caller (the DB
+    snapshot is the real rollback source of truth) — this only stages and
+    commits it so git history stays a nice-to-have audit trail. Unlike
+    apply_and_commit, this does NOT refuse on other staged changes and does
+    NOT write the file itself; it never raises, and callers should treat any
+    ok=False result as "no audit trail this time", not a failure to apply.
+    """
+    try:
+        _assert_profile_root(root)
+        _assert_contained(root, relpath)
+    except ValueError as exc:
+        return ApplyResult(ok=False, error=str(exc))
+
+    err = _guard(root)
+    if err:
+        return ApplyResult(ok=False, error=err)
+    try:
+        base = current_commit_sha(root)
+
+        r = _run(["git", "-C", str(root), "add", "--", relpath], root)
+        if r.returncode != 0:
+            return ApplyResult(ok=False, error=r.stderr.decode(errors="replace").strip())
+
+        r = _run(["git", "-C", str(root), "commit", "-m", message], root)
+        if r.returncode != 0:
+            return ApplyResult(ok=False, error=r.stderr.decode(errors="replace").strip())
+
+        new_sha = current_commit_sha(root)
+        if not new_sha.ok:
+            return ApplyResult(ok=False, error=f"committed but cannot get new sha: {new_sha.error}")
+
+        return ApplyResult(ok=True, commit_sha=new_sha.sha, base_sha=base.sha if base.ok else "")
+    except Exception as exc:
+        return ApplyResult(ok=False, error=str(exc))

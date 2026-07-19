@@ -93,6 +93,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     applied_at                  TEXT,
     verified_at                 TEXT,
     reverted_at                 TEXT,
+    -- #175 Option-C dashboard metadata: no behavior depends on this yet.
+    live_takes_effect_at_next_session INTEGER NOT NULL DEFAULT 1,
     -- reference
     baseline_id                 INTEGER,
     proposer_model              TEXT,
@@ -162,6 +164,18 @@ CREATE TABLE IF NOT EXISTS scenarios (
 CREATE TABLE IF NOT EXISTS controls (
     profile TEXT    PRIMARY KEY,
     paused  INTEGER NOT NULL DEFAULT 0
+);
+
+-- #173: DB-stored rollback snapshot — the source of truth for revert, so the
+-- self-improve loop works on profile dirs that are not git repos. Git commits
+-- become advisory/audit-only once this row exists for an experiment.
+CREATE TABLE IF NOT EXISTS experiment_snapshots (
+    experiment_id  INTEGER PRIMARY KEY,
+    prior_hash     TEXT NOT NULL,
+    prior_bytes    BLOB NOT NULL,
+    target_relpath TEXT NOT NULL,
+    applied_at     TEXT NOT NULL,
+    FOREIGN KEY(experiment_id) REFERENCES experiments(id)
 );
 """
 
@@ -233,6 +247,23 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     """Apply CREATE IF NOT EXISTS migrations. Safe on fresh or existing DB."""
     conn.executescript(_SCHEMA_SQL)
     conn.commit()
+    _ensure_column(
+        conn, "experiments", "live_takes_effect_at_next_session",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, coldef: str) -> None:
+    """Idempotent migration for a column added after a DB already exists.
+
+    CREATE TABLE IF NOT EXISTS is a no-op on pre-existing tables, so a new
+    column needs an explicit guarded ALTER TABLE.
+    """
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in cur.fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}")
+        conn.commit()
 
 
 def get_db() -> "KarpathyDB":
@@ -424,6 +455,7 @@ class KarpathyDB:
             "rejection_reason", "live_sessions_target", "live_sessions_observed",
             "applied_at", "verified_at", "reverted_at", "baseline_id",
             "proposer_model", "judge_model", "sentence_delta_count", "updated_at",
+            "live_takes_effect_at_next_session",
         }
         extra = {k: v for k, v in fields.items() if k in allowed}
         if not extra:
@@ -479,6 +511,43 @@ class KarpathyDB:
             (experiment_id,),
         )
         return [dict(row) for row in cur.fetchall()]
+
+    # --- experiment_snapshots (#173 rollback source of truth) ---------------
+
+    def insert_snapshot(
+        self,
+        *,
+        experiment_id: int,
+        prior_hash: str,
+        prior_bytes: bytes,
+        target_relpath: str,
+        applied_at: str,
+        _commit: bool = True,
+    ) -> None:
+        """Insert the rollback snapshot row for *experiment_id*.
+
+        One row per experiment (PRIMARY KEY = experiment_id). Pass
+        _commit=False to fold this into a caller-managed BEGIN IMMEDIATE
+        transaction (see dashboard/plugin_api.py apply_experiment).
+        """
+        self._conn.execute(
+            """
+            INSERT INTO experiment_snapshots
+                (experiment_id, prior_hash, prior_bytes, target_relpath, applied_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (experiment_id, prior_hash, prior_bytes, target_relpath, applied_at),
+        )
+        if _commit:
+            self._conn.commit()
+
+    def get_snapshot(self, experiment_id: int) -> Optional[Dict[str, Any]]:
+        cur = self._conn.execute(
+            "SELECT * FROM experiment_snapshots WHERE experiment_id = ?",
+            (experiment_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     # --- eval_runs ----------------------------------------------------------
 

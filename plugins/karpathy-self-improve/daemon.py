@@ -400,10 +400,19 @@ def _tick_live_experiments(db: Any) -> None:
             )
         else:
             # Score dropped — auto-revert.
+            # #173: the DB snapshot is the source of truth — restore the
+            # exact prior bytes (works on non-git profile dirs). Only
+            # pre-#173 rows (apply_commit_sha set, no snapshot) fall back
+            # to the legacy git-based revert.
             apply_commit_sha = exp.get("apply_commit_sha") or ""
             profile_root = exp.get("target_profile_root") or "."
 
-            if apply_commit_sha:
+            snap = db.get_snapshot(exp_id)
+            if snap is not None:
+                if snap.get("target_relpath"):
+                    target_path = Path(profile_root) / snap["target_relpath"]
+                    target_path.write_bytes(snap["prior_bytes"])
+            elif apply_commit_sha:
                 revert_result = revert_commit(
                     Path(profile_root),
                     apply_commit_sha,
