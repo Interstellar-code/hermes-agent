@@ -206,6 +206,72 @@ def test_full_lifecycle_create_approve_apply_verify(client):
 
 
 # ---------------------------------------------------------------------------
+# Apply with a diff that doesn't match the file — 422, no commit, no state change
+# ---------------------------------------------------------------------------
+
+def test_apply_returns_422_on_diff_context_mismatch(client):
+    """If the diff's context lines don't match the target file, /apply must
+    return 422 and leave the DB state + repo untouched (#172 Bug 1)."""
+    tc, repo, db_file = client
+
+    soul_path = repo / "SOUL.md"
+    original_content = soul_path.read_text()
+
+    # Context line ("This line does not exist in SOUL.md") doesn't match the
+    # real file content, so the `patch` CLI will fail to apply this diff.
+    bad_diff = (
+        "--- a/SOUL.md\n"
+        "+++ b/SOUL.md\n"
+        "@@ -1,1 +1,1 @@\n"
+        "-This line does not exist in SOUL.md\n"
+        "+You are a helpful assistant. Always be concise and accurate.\n"
+    )
+    resp = tc.post("/experiments", json={
+        "profile": "test-profile",
+        "file": "SOUL.md",
+        "diff": bad_diff,
+        "rationale": "Bad diff",
+    })
+    assert resp.status_code == 201
+    exp_id = resp.json()["experiment_id"]
+
+    db = _get_db(db_file)
+    db.update_experiment_fields(
+        exp_id,
+        target_profile_root=str(repo),
+        target_relpath="SOUL.md",
+        updated_at=_now(),
+    )
+
+    resp = tc.post(f"/experiments/{exp_id}/approve", json={"actor": "human"})
+    assert resp.status_code == 200
+
+    log_before = subprocess.run(
+        ["git", "-C", str(repo), "log", "--oneline"],
+        capture_output=True, text=True,
+    ).stdout
+
+    resp = tc.post(f"/experiments/{exp_id}/apply")
+    assert resp.status_code == 422, resp.json()
+    assert "failed to apply diff" in resp.json().get("error", "").lower()
+
+    # File must be untouched.
+    assert soul_path.read_text() == original_content
+
+    # No new commit must have been made.
+    log_after = subprocess.run(
+        ["git", "-C", str(repo), "log", "--oneline"],
+        capture_output=True, text=True,
+    ).stdout
+    assert log_after == log_before
+
+    # DB state must still be 'approved', not 'live', and no apply_commit_sha.
+    exp = db.get_experiment(exp_id)
+    assert exp["state"] == "approved"
+    assert not exp.get("apply_commit_sha")
+
+
+# ---------------------------------------------------------------------------
 # Revert path
 # ---------------------------------------------------------------------------
 

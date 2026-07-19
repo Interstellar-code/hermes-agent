@@ -8,8 +8,11 @@ as _default_llm_fn and gateway_scenario_runner in _proposer.py and
 _eval_runner.py respectively.
 
 Config is read from config.yaml via hermes_cli.config:
+  plugins.karpathy_self_improve.gateway_url     (default: GATEWAY_URL_DEFAULT)
   plugins.karpathy_self_improve.proposer_model  (default: "auto")
-  plugins.karpathy_self_improve.judge_model     (default: "gpt-5.4")
+  plugins.karpathy_self_improve.judge_model     (REQUIRED — no default; see
+    _load_models. A wrong hardcoded model ID would silently fail every eval
+    and trip auto-revert, so operators must configure it explicitly.)
 
 The two model IDs must differ — equal values are a programming error that
 the anti-gaming guard in _eval_runner will surface as ValueError; we catch
@@ -22,9 +25,28 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-_GATEWAY_CHAT_URL = "http://127.0.0.1:8642/chat"
+GATEWAY_URL_DEFAULT = "http://127.0.0.1:8642"
 _DEFAULT_PROPOSER_MODEL = "auto"
-_DEFAULT_JUDGE_MODEL = "gpt-5.4"
+
+
+def _load_gateway_url() -> str:
+    """Return the gateway base URL from config.yaml, or GATEWAY_URL_DEFAULT."""
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        config = load_config()
+        url = cfg_get(
+            config, "plugins", "karpathy_self_improve", "gateway_url",
+            default=GATEWAY_URL_DEFAULT,
+        ) or GATEWAY_URL_DEFAULT
+    except Exception:
+        url = GATEWAY_URL_DEFAULT
+    return str(url)
+
+
+# Single shared gateway URL — _proposer.py and _eval_runner.py import this
+# instead of hardcoding their own literal.
+GATEWAY_URL = _load_gateway_url()
+_GATEWAY_CHAT_URL = f"{GATEWAY_URL}/chat"
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +54,13 @@ _DEFAULT_JUDGE_MODEL = "gpt-5.4"
 # ---------------------------------------------------------------------------
 
 def _load_models() -> tuple[str, str]:
-    """Return (proposer_model, judge_model) from config.yaml or defaults."""
+    """Return (proposer_model, judge_model) from config.yaml.
+
+    proposer_model falls back to _DEFAULT_PROPOSER_MODEL if config.yaml or the
+    key is unavailable. judge_model has NO default: a wrong hardcoded model ID
+    would silently fail every eval and trip auto-revert, so a missing/empty
+    value raises instead of falling back.
+    """
     try:
         from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
         config = load_config()
@@ -42,11 +70,17 @@ def _load_models() -> tuple[str, str]:
         ) or _DEFAULT_PROPOSER_MODEL
         judge_model = cfg_get(
             config, "plugins", "karpathy_self_improve", "judge_model",
-            default=_DEFAULT_JUDGE_MODEL,
-        ) or _DEFAULT_JUDGE_MODEL
+            default=None,
+        )
     except Exception:
         proposer_model = _DEFAULT_PROPOSER_MODEL
-        judge_model = _DEFAULT_JUDGE_MODEL
+        judge_model = None
+
+    if not judge_model:
+        raise ValueError(
+            "judge_model not configured; set "
+            "plugins.karpathy_self_improve.judge_model in config.yaml"
+        )
     return str(proposer_model), str(judge_model)
 
 

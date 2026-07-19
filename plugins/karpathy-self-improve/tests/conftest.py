@@ -62,3 +62,18 @@ def patch_profiles_root(tmp_path, monkeypatch):
     import _git_ratchet
     monkeypatch.setattr(_git_ratchet, "_PROFILES_ROOT", tmp_path)
     return tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Default model wiring — judge_model has no hardcoded default (#172): a wrong
+# literal would silently fail every eval. Tests that only care about profile
+# routing / daemon scheduling (not model resolution itself) would otherwise
+# trip the new fail-fast ValueError. Give them a sane default here; tests
+# that specifically exercise model resolution (test_propose_wiring.py) patch
+# `_wiring._load_models` themselves, which overrides this for their duration.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _default_model_wiring(monkeypatch):
+    import _wiring
+    monkeypatch.setattr(_wiring, "_load_models", lambda: ("auto", "gpt-5.4"))
