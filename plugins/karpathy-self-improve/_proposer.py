@@ -106,12 +106,13 @@ def _default_llm_fn(prompt: str, *, model: Optional[str] = None) -> str:
     """Call the Hermes gateway LLM. Only used in production."""
     try:
         import requests  # type: ignore[import]
+        from _wiring import GATEWAY_URL
 
         payload: Dict[str, Any] = {"message": prompt}
         if model:
             payload["model"] = model
         resp = requests.post(
-            "http://127.0.0.1:8642/chat",
+            f"{GATEWAY_URL}/chat",
             json=payload,
             timeout=120,
         )
@@ -175,17 +176,23 @@ def _parse_llm_response(response: str) -> tuple[str, str]:
     return diff, rationale
 
 
-def _apply_diff_to_content(original: str, diff: str) -> Optional[str]:
-    """Apply a unified diff string to *original* content.
+class PatchApplyError(Exception):
+    """Raised by apply_diff_to_text() when a unified diff fails to apply."""
 
-    Returns the patched content, or None on failure.
-    Uses the `patch` utility if available, otherwise falls back to simple
-    line-by-line matching.
+
+def apply_diff_to_text(original: str, diff: str) -> str:
+    """Apply a unified diff string to *original* content using the `patch` utility.
+
+    Returns the patched content. Raises PatchApplyError if the `patch` binary
+    is missing, the diff fails to apply cleanly (non-zero exit), or any other
+    error occurs — callers that need a non-raising contract should catch this.
     """
     import subprocess
     import tempfile
     import os
 
+    orig_path = None
+    patch_path = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as orig_f:
             orig_f.write(original)
@@ -199,25 +206,37 @@ def _apply_diff_to_content(original: str, diff: str) -> Optional[str]:
             capture_output=True,
             timeout=10,
         )
-        if result.returncode == 0:
-            return result.stdout.decode(errors="replace")
-        logger.debug(
-            "karpathy-self-improve: patch failed: %s",
-            result.stderr.decode(errors="replace"),
-        )
-        return None
-    except FileNotFoundError:
-        logger.debug("karpathy-self-improve: patch utility not found")
-        return None
+        if result.returncode != 0:
+            raise PatchApplyError(
+                f"patch exited {result.returncode}: {result.stderr.decode(errors='replace')}"
+            )
+        return result.stdout.decode(errors="replace")
+    except FileNotFoundError as exc:
+        raise PatchApplyError("patch utility not found") from exc
+    except PatchApplyError:
+        raise
     except Exception as exc:  # pylint: disable=broad-except
-        logger.debug("karpathy-self-improve: _apply_diff_to_content failed: %s", exc)
-        return None
+        raise PatchApplyError(f"apply_diff_to_text failed: {exc}") from exc
     finally:
         for p in (orig_path, patch_path):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def _apply_diff_to_content(original: str, diff: str) -> Optional[str]:
+    """Apply a unified diff string to *original* content.
+
+    Returns the patched content, or None on failure. Delegates to
+    apply_diff_to_text(), which raises on failure.
+    """
+    try:
+        return apply_diff_to_text(original, diff)
+    except PatchApplyError as exc:
+        logger.debug("karpathy-self-improve: _apply_diff_to_content failed: %s", exc)
+        return None
 
 
 def _get_failing_scenarios(db: Any, profile: str) -> List[Dict[str, Any]]:
