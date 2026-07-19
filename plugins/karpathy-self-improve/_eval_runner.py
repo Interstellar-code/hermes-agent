@@ -108,7 +108,7 @@ def evaluate_checks(
 # Default production scenario runner
 # ---------------------------------------------------------------------------
 
-_GATEWAY_CHAT_URL = "http://127.0.0.1:8642"
+from _wiring import GATEWAY_URL as _GATEWAY_CHAT_URL
 
 
 def gateway_scenario_runner(scenario_input: str, *, model: Optional[str] = None) -> str:

@@ -273,41 +273,24 @@ async def apply_experiment(exp_id: int, _auth: None = Depends(_require_auth)) ->
             )
 
         from pathlib import Path as _Path
-        import subprocess
-        import tempfile
-        import os
 
         target_path = _Path(profile_root) / target_relpath
         original_content = ""
         if target_path.is_file():
             original_content = target_path.read_text(encoding="utf-8", errors="replace")
 
-        # Apply diff to get new content.
+        # Apply diff to get new content. Raises on failure — return 422
+        # BEFORE apply_and_commit/transition so a bad patch never commits.
         new_content = original_content
         if diff:
+            from _proposer import apply_diff_to_text, PatchApplyError
             try:
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as orig_f:
-                    orig_f.write(original_content)
-                    orig_path = orig_f.name
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as patch_f:
-                    patch_f.write(diff)
-                    patch_path = patch_f.name
-                result = subprocess.run(
-                    ["patch", "--no-backup-if-mismatch", "-s", "-o", "-", orig_path, patch_path],
-                    capture_output=True, timeout=10,
+                new_content = apply_diff_to_text(original_content, diff)
+            except PatchApplyError as patch_exc:
+                return JSONResponse(
+                    {"error": f"failed to apply diff: {patch_exc}"},
+                    status_code=422,
                 )
-                if result.returncode == 0:
-                    new_content = result.stdout.decode(errors="replace")
-                else:
-                    log.warning("patch failed: %s", result.stderr.decode(errors="replace"))
-            except Exception as patch_exc:
-                log.warning("apply patch failed: %s", patch_exc)
-            finally:
-                for p in (orig_path, patch_path):
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
 
         apply_result = apply_and_commit(
             _Path(profile_root),

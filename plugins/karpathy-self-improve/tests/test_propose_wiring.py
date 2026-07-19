@@ -72,6 +72,20 @@ def test_resolve_propose_kwargs_equal_models_raises():
             resolve_propose_kwargs()
 
 
+def test_load_models_raises_when_judge_model_not_configured(monkeypatch):
+    """judge_model has no hardcoded default (#172) — a wrong literal would
+    silently fail every eval. Missing config must raise a clear ValueError."""
+    # Undo the conftest autouse default-model patch so the REAL _load_models
+    # runs (this test is specifically about its config-missing behavior).
+    monkeypatch.undo()
+    import _wiring
+
+    with patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.cfg_get", side_effect=lambda cfg, *keys, default=None: default):
+        with pytest.raises(ValueError, match="judge_model"):
+            _wiring._load_models()
+
+
 def test_resolve_propose_kwargs_distinct_models_ok():
     from _wiring import resolve_propose_kwargs
     with patch("_wiring._load_models", return_value=("auto", "gpt-5.4")):
