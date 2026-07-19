@@ -191,39 +191,35 @@ def apply_diff_to_text(original: str, diff: str) -> str:
     import tempfile
     import os
 
-    orig_path = None
-    patch_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as orig_f:
-            orig_f.write(original)
-            orig_path = orig_f.name
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as patch_f:
-            patch_f.write(diff)
-            patch_path = patch_f.name
+        # Run inside a temp dir so patch's reject file (written as ``-.rej``
+        # because output goes to stdout via ``-o -``) lands here and is cleaned
+        # up, instead of littering the process CWD (the repo root).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            orig_path = os.path.join(tmpdir, "orig.txt")
+            patch_path = os.path.join(tmpdir, "change.patch")
+            with open(orig_path, "w", encoding="utf-8") as orig_f:
+                orig_f.write(original)
+            with open(patch_path, "w", encoding="utf-8") as patch_f:
+                patch_f.write(diff)
 
-        result = subprocess.run(
-            ["patch", "--no-backup-if-mismatch", "-s", "-o", "-", orig_path, patch_path],
-            capture_output=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            raise PatchApplyError(
-                f"patch exited {result.returncode}: {result.stderr.decode(errors='replace')}"
+            result = subprocess.run(
+                ["patch", "--no-backup-if-mismatch", "-s", "-o", "-", orig_path, patch_path],
+                capture_output=True,
+                timeout=10,
+                cwd=tmpdir,
             )
-        return result.stdout.decode(errors="replace")
+            if result.returncode != 0:
+                raise PatchApplyError(
+                    f"patch exited {result.returncode}: {result.stderr.decode(errors='replace')}"
+                )
+            return result.stdout.decode(errors="replace")
     except FileNotFoundError as exc:
         raise PatchApplyError("patch utility not found") from exc
     except PatchApplyError:
         raise
     except Exception as exc:  # pylint: disable=broad-except
         raise PatchApplyError(f"apply_diff_to_text failed: {exc}") from exc
-    finally:
-        for p in (orig_path, patch_path):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
 
 
 def _apply_diff_to_content(original: str, diff: str) -> Optional[str]:

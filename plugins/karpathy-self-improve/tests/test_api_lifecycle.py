@@ -458,3 +458,137 @@ def test_pause_and_resume_profile(client):
     assert resp.status_code == 200
     assert resp.json()["paused"] is False
     assert db.is_paused("my-profile") is False
+
+
+# ---------------------------------------------------------------------------
+# #173: snapshot-based apply/revert on a profile dir that is NOT a git repo
+# ---------------------------------------------------------------------------
+
+_NON_GIT_DIFF = (
+    "--- a/SOUL.md\n"
+    "+++ b/SOUL.md\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-You are a helpful assistant.\n"
+    "+You are a helpful assistant. Always be concise.\n"
+)
+
+
+def test_apply_on_non_git_profile_creates_snapshot(client, patch_profiles_root):
+    """apply on a non-git profile dir must still work: file gets written and
+    a DB snapshot row captures the exact pre-apply bytes (#173)."""
+    tc, repo, db_file = client
+
+    profile_dir = patch_profiles_root / "non-git-profile"
+    profile_dir.mkdir()
+    soul_path = profile_dir / "SOUL.md"
+    soul_path.write_text("You are a helpful assistant.\n")
+    original_bytes = soul_path.read_bytes()
+
+    resp = tc.post("/experiments", json={
+        "profile": "non-git-profile",
+        "file": "SOUL.md",
+        "diff": _NON_GIT_DIFF,
+        "rationale": "non-git apply test",
+    })
+    assert resp.status_code == 201
+    exp_id = resp.json()["experiment_id"]
+
+    db = _get_db(db_file)
+    db.update_experiment_fields(
+        exp_id,
+        target_profile_root=str(profile_dir),
+        target_relpath="SOUL.md",
+        updated_at=_now(),
+    )
+    tc.post(f"/experiments/{exp_id}/approve", json={"actor": "human"})
+
+    resp = tc.post(f"/experiments/{exp_id}/apply")
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["state"] == "live"
+
+    assert "concise" in soul_path.read_text()
+
+    import hashlib
+    snap = db.get_snapshot(exp_id)
+    assert snap is not None
+    assert snap["prior_bytes"] == original_bytes
+    assert snap["prior_hash"] == hashlib.sha256(original_bytes).hexdigest()
+
+
+def test_revert_from_snapshot_restores_exact_bytes_non_git(client, patch_profiles_root):
+    """revert on a non-git profile must restore the exact original bytes from
+    the DB snapshot, with no dependence on apply_commit_sha/git."""
+    tc, repo, db_file = client
+
+    profile_dir = patch_profiles_root / "non-git-revert-profile"
+    profile_dir.mkdir()
+    soul_path = profile_dir / "SOUL.md"
+    soul_path.write_text("You are a helpful assistant.\n")
+    original_bytes = soul_path.read_bytes()
+
+    resp = tc.post("/experiments", json={
+        "profile": "non-git-revert-profile",
+        "file": "SOUL.md",
+        "diff": _NON_GIT_DIFF,
+        "rationale": "non-git revert test",
+    })
+    exp_id = resp.json()["experiment_id"]
+
+    db = _get_db(db_file)
+    db.update_experiment_fields(
+        exp_id,
+        target_profile_root=str(profile_dir),
+        target_relpath="SOUL.md",
+        updated_at=_now(),
+    )
+    tc.post(f"/experiments/{exp_id}/approve", json={"actor": "human"})
+    apply_resp = tc.post(f"/experiments/{exp_id}/apply")
+    assert apply_resp.status_code == 200
+    assert not apply_resp.json().get("apply_commit_sha")  # no git repo here
+
+    resp = tc.post(f"/experiments/{exp_id}/revert", json={"reason": "test"})
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "reverted"
+
+    assert soul_path.read_bytes() == original_bytes
+
+
+def test_revert_legacy_falls_back_to_git_when_no_snapshot(client, patch_profiles_root, monkeypatch):
+    """A pre-#173 row (apply_commit_sha set, no snapshot row) must still take
+    the legacy git-revert path."""
+    tc, repo, db_file = client
+
+    db = _get_db(db_file)
+    exp_id = db.insert_experiment(
+        profile="test-profile",
+        file="SOUL.md",
+        state="live",
+        diff="",
+        rationale="legacy row",
+        created_at=_now(),
+        updated_at=_now(),
+    )
+    db.update_experiment_fields(
+        exp_id,
+        target_profile_root=str(repo),
+        target_relpath="SOUL.md",
+        apply_commit_sha="c" * 40,
+        updated_at=_now(),
+    )
+    assert db.get_snapshot(exp_id) is None
+
+    import _git_ratchet
+    from _git_ratchet import RevertResult
+
+    calls = []
+
+    def fake_revert_commit(root, sha, message):
+        calls.append(sha)
+        return RevertResult(ok=True, revert_sha="d" * 40)
+
+    monkeypatch.setattr(_git_ratchet, "revert_commit", fake_revert_commit)
+
+    resp = tc.post(f"/experiments/{exp_id}/revert", json={"reason": "legacy"})
+    assert resp.status_code == 200, resp.json()
+    assert resp.json()["state"] == "reverted"
+    assert calls == ["c" * 40]
