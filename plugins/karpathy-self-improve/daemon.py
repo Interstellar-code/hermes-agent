@@ -91,6 +91,31 @@ def setup_parser(sub: argparse.ArgumentParser) -> None:
         help="Custom DB path to write into config.yaml under plugins.karpathy_self_improve.db_path.",
     )
 
+    # hermes karpathy bootstrap
+    p_bootstrap = daemon_sub.add_parser(
+        "bootstrap",
+        help=(
+            "Write the per-profile target config (target_relpath, profile_root) to "
+            "config.yaml and set the profile paused. Run once per profile before "
+            "the daemon or `propose` will operate on it."
+        ),
+    )
+    p_bootstrap.add_argument("--profile", required=True, help="Profile to bootstrap.")
+
+    # hermes karpathy pause
+    p_pause = daemon_sub.add_parser(
+        "pause",
+        help="Pause self-improvement (propose/verify/revert) for a profile.",
+    )
+    p_pause.add_argument("--profile", required=True, help="Profile to pause.")
+
+    # hermes karpathy resume
+    p_resume = daemon_sub.add_parser(
+        "resume",
+        help="Resume self-improvement for a paused profile.",
+    )
+    p_resume.add_argument("--profile", required=True, help="Profile to resume.")
+
 
 # ---------------------------------------------------------------------------
 # Subcommand handlers
@@ -129,6 +154,83 @@ def _cmd_init(db_path_arg: "str | None") -> None:
     resolved = resolve_db_path()
     open_db(resolved)
     print(f"DB path: {resolved}")
+
+
+# Candidate identity files bootstrap looks for, in priority order (#176).
+_BOOTSTRAP_IDENTITY_CANDIDATES = ("SOUL.md", "USER.md", "MEMORY.md", "system_prompt.md")
+
+
+def _cmd_bootstrap(profile: str) -> None:
+    """Write plugins.karpathy_self_improve.profiles.<profile> to config.yaml.
+
+    Resolves the profile's real directory (same resolver the API uses),
+    detects its identity file, and persists {target_relpath, profile_root,
+    live_sessions_target, paused: true}. The profile starts paused — an
+    operator must explicitly `hermes karpathy resume --profile <profile>`.
+    """
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_cli.config import load_config, save_config
+    from _git_ratchet import is_git_repo
+
+    try:
+        profile_root = get_profile_dir(profile)
+    except Exception as exc:
+        print(f"Error: could not resolve profile dir for {profile!r}: {exc}", file=sys.stderr)
+        return
+
+    if not profile_root.is_dir():
+        print(f"Error: profile directory does not exist: {profile_root}", file=sys.stderr)
+        return
+
+    target_relpath = next(
+        (c for c in _BOOTSTRAP_IDENTITY_CANDIDATES if (profile_root / c).is_file()),
+        None,
+    )
+    if target_relpath is None:
+        print(
+            f"Error: no identity file ({', '.join(_BOOTSTRAP_IDENTITY_CANDIDATES)}) "
+            f"found under {profile_root}",
+            file=sys.stderr,
+        )
+        return
+
+    config = load_config()
+    plugins_section = config.setdefault("plugins", {})
+    ksi_section = plugins_section.setdefault("karpathy_self_improve", {})
+    profiles_section = ksi_section.setdefault("profiles", {})
+    block = {
+        "target_relpath": target_relpath,
+        "profile_root": str(profile_root),
+        "live_sessions_target": 10,
+        "paused": True,
+    }
+    profiles_section[profile] = block
+    save_config(config)
+
+    from _db import get_db
+    get_db().set_paused(profile, True)
+
+    print(f"Bootstrapped profile {profile!r}:")
+    for k, v in block.items():
+        print(f"  {k} = {v!r}")
+    if not is_git_repo(profile_root):
+        print(
+            f"tip: {profile_root} is not a git repo — the DB snapshot table is the "
+            "revert source of truth (#173), so this is not required."
+        )
+    print(f"Run `hermes karpathy resume --profile {profile}` when ready.")
+
+
+def _cmd_pause(profile: str) -> None:
+    from _db import get_db
+    get_db().set_paused(profile, True)
+    print(f"Paused profile {profile!r}.")
+
+
+def _cmd_resume(profile: str) -> None:
+    from _db import get_db
+    get_db().set_paused(profile, False)
+    print(f"Resumed profile {profile!r}.")
 
 
 def _cmd_status() -> None:
@@ -192,19 +294,15 @@ def _cmd_status() -> None:
 def _cmd_propose(profile: str) -> None:
     from _db import get_db
     from _proposer import propose_for_profile
-    from _wiring import resolve_propose_kwargs
+    from _wiring import resolve_propose_kwargs, resolve_target_for_profile
 
     db = get_db()
 
-    # Look up the profile's target_relpath and profile_root from recent experiments
-    # or fall back to a convention.
-    rows = db.list_experiments(profile=profile)
-    target_relpath = "system_prompt.md"
-    profile_root = "."
-    if rows:
-        exp = rows[0]
-        target_relpath = exp.get("target_relpath") or target_relpath
-        profile_root = exp.get("target_profile_root") or profile_root
+    try:
+        target_relpath, profile_root = resolve_target_for_profile(profile, db)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return
 
     try:
         propose_kwargs = resolve_propose_kwargs(profile)
@@ -405,25 +503,36 @@ def _tick_live_experiments(db: Any) -> None:
             # pre-#173 rows (apply_commit_sha set, no snapshot) fall back
             # to the legacy git-based revert.
             apply_commit_sha = exp.get("apply_commit_sha") or ""
-            profile_root = exp.get("target_profile_root") or "."
+            profile_root = exp.get("target_profile_root")
 
-            snap = db.get_snapshot(exp_id)
-            if snap is not None:
-                if snap.get("target_relpath"):
-                    target_path = Path(profile_root) / snap["target_relpath"]
-                    target_path.write_bytes(snap["prior_bytes"])
-            elif apply_commit_sha:
-                revert_result = revert_commit(
-                    Path(profile_root),
-                    apply_commit_sha,
-                    message=f"chore: revert karpathy experiment {exp_id} (live score dropped)",
+            if not profile_root:
+                # #176: never default to "." (daemon CWD) — that would write
+                # or revert files in the wrong directory. State transition to
+                # 'reverted' still proceeds below; only the byte/commit revert
+                # is skipped.
+                logger.warning(
+                    "karpathy-self-improve: experiment %d has no target_profile_root — "
+                    "skipping file/commit revert (state still transitions to 'reverted')",
+                    exp_id,
                 )
-                if not revert_result.ok:
-                    logger.warning(
-                        "karpathy-self-improve: revert failed for experiment %d: %s",
-                        exp_id,
-                        revert_result.error,
+            else:
+                snap = db.get_snapshot(exp_id)
+                if snap is not None:
+                    if snap.get("target_relpath"):
+                        target_path = Path(profile_root) / snap["target_relpath"]
+                        target_path.write_bytes(snap["prior_bytes"])
+                elif apply_commit_sha:
+                    revert_result = revert_commit(
+                        Path(profile_root),
+                        apply_commit_sha,
+                        message=f"chore: revert karpathy experiment {exp_id} (live score dropped)",
                     )
+                    if not revert_result.ok:
+                        logger.warning(
+                            "karpathy-self-improve: revert failed for experiment %d: %s",
+                            exp_id,
+                            revert_result.error,
+                        )
 
             try:
                 transition(
@@ -453,7 +562,7 @@ def _tick_live_experiments(db: Any) -> None:
 def _tick_proposals(db: Any) -> None:
     """For each enabled+non-paused profile with no active experiment, attempt propose."""
     from _proposer import propose_for_profile
-    from _wiring import resolve_propose_kwargs
+    from _wiring import resolve_propose_kwargs, resolve_target_for_profile
 
     profiles = _get_enabled_profiles(db)
     for profile in profiles:
@@ -468,14 +577,14 @@ def _tick_proposals(db: Any) -> None:
         if has_active:
             continue
 
-        # Look up target from last experiment, fallback to convention.
-        rows = db.list_experiments(profile=profile)
-        target_relpath = "system_prompt.md"
-        profile_root = "."
-        if rows:
-            exp = rows[0]
-            target_relpath = exp.get("target_relpath") or target_relpath
-            profile_root = exp.get("target_profile_root") or profile_root
+        try:
+            target_relpath, profile_root = resolve_target_for_profile(profile, db)
+        except ValueError as exc:
+            logger.error(
+                "karpathy-self-improve: skipping propose for %r — %s",
+                profile, exc,
+            )
+            continue
 
         try:
             propose_kwargs = resolve_propose_kwargs(profile)
@@ -582,5 +691,14 @@ def _run(ns: argparse.Namespace) -> None:
         _cmd_daemon(ns.interval)
     elif cmd == "init":
         _cmd_init(getattr(ns, "db_path", None))
+    elif cmd == "bootstrap":
+        _cmd_bootstrap(ns.profile)
+    elif cmd == "pause":
+        _cmd_pause(ns.profile)
+    elif cmd == "resume":
+        _cmd_resume(ns.profile)
     else:
-        print("Usage: hermes karpathy {collect,status,propose,daemon,init}")
+        print(
+            "Usage: hermes karpathy "
+            "{collect,status,propose,daemon,init,bootstrap,pause,resume}"
+        )

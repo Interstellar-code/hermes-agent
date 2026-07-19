@@ -172,6 +172,43 @@ def test_tick_live_reverts_when_score_drops(db, git_repo):
     assert exp["state"] == "reverted"
 
 
+def test_tick_live_revert_skips_file_io_when_profile_root_missing(db):
+    """#176: a live experiment with no target_profile_root must not fall back
+    to '.' (daemon CWD) for the revert. State still transitions to
+    'reverted'; revert_commit must simply not be called."""
+    from daemon import _tick_live_experiments
+
+    profile = "no-root-profile"
+    ts = _now()
+    exp_id = db.insert_experiment(
+        profile=profile,
+        state="proposed",
+        target_profile_root="",
+        target_relpath="SOUL.md",
+        proposer_model="model-a",
+        judge_model="model-b",
+        created_at=ts,
+        updated_at=ts,
+    )
+    db.update_experiment_fields(
+        exp_id,
+        state="live",
+        live_sessions_target=10,
+        live_sessions_observed=10,
+        apply_commit_sha="deadbeef",
+        updated_at=ts,
+    )
+    db.insert_baseline(profile=profile, file="SOUL.md", score=0.9, created_at=ts)
+
+    with patch("_eval_runner.run_eval", return_value=0.5), \
+         patch("_git_ratchet.revert_commit") as mock_revert:
+        _tick_live_experiments(db)
+
+    mock_revert.assert_not_called()
+    exp = db.get_experiment(exp_id)
+    assert exp["state"] == "reverted"
+
+
 def test_tick_live_skips_when_not_enough_sessions(db, git_repo):
     from daemon import _tick_live_experiments
 
@@ -255,7 +292,11 @@ def test_tick_proposals_calls_propose_for_unpaused_profile(db):
     # Not paused, no active experiment
 
     mock_result = ProposalResult(ok=True, skipped=False, experiment_id=42, offline_score=0.8)
-    with patch("_proposer.propose_for_profile", return_value=mock_result) as mock_propose:
+    # #176: target resolution now fails fast without a config block or prior
+    # experiment — patch it directly rather than relying on the old implicit
+    # "system_prompt.md" / "." default.
+    with patch("_proposer.propose_for_profile", return_value=mock_result) as mock_propose, \
+         patch("_wiring.resolve_target_for_profile", return_value=("system_prompt.md", ".")):
         _tick_proposals(db)
 
     mock_propose.assert_called_once()
@@ -291,3 +332,87 @@ def test_get_enabled_profiles_from_experiments(db):
 def test_get_enabled_profiles_empty(db):
     from daemon import _get_enabled_profiles
     assert _get_enabled_profiles(db) == []
+
+
+# ---------------------------------------------------------------------------
+# _cmd_bootstrap / _cmd_pause / _cmd_resume (#176)
+# ---------------------------------------------------------------------------
+
+def test_cmd_bootstrap_writes_config_and_starts_paused(tmp_path, db, monkeypatch):
+    from daemon import _cmd_bootstrap
+    import _db as db_mod
+
+    profile_root = tmp_path / "prof-root"
+    profile_root.mkdir()
+    (profile_root / "SOUL.md").write_text("You are helpful.\n")
+
+    monkeypatch.setattr(db_mod, "get_db", lambda: db)
+
+    saved = {}
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_root), \
+         patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.save_config", side_effect=saved.update):
+        _cmd_bootstrap("prof")
+
+    block = saved["plugins"]["karpathy_self_improve"]["profiles"]["prof"]
+    assert block["target_relpath"] == "SOUL.md"
+    assert block["profile_root"] == str(profile_root)
+    assert block["paused"] is True
+    assert db.is_paused("prof") is True
+
+
+def test_cmd_bootstrap_prefers_soul_over_system_prompt(tmp_path, db, monkeypatch):
+    """Identity-file priority: SOUL.md wins over system_prompt.md when both exist."""
+    from daemon import _cmd_bootstrap
+    import _db as db_mod
+
+    profile_root = tmp_path / "prof-root"
+    profile_root.mkdir()
+    (profile_root / "system_prompt.md").write_text("legacy\n")
+    (profile_root / "SOUL.md").write_text("current\n")
+
+    monkeypatch.setattr(db_mod, "get_db", lambda: db)
+
+    saved = {}
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_root), \
+         patch("hermes_cli.config.load_config", return_value={}), \
+         patch("hermes_cli.config.save_config", side_effect=saved.update):
+        _cmd_bootstrap("prof")
+
+    block = saved["plugins"]["karpathy_self_improve"]["profiles"]["prof"]
+    assert block["target_relpath"] == "SOUL.md"
+
+
+def test_cmd_bootstrap_errors_when_no_identity_file(tmp_path, capsys):
+    from daemon import _cmd_bootstrap
+
+    profile_root = tmp_path / "prof-root"
+    profile_root.mkdir()
+
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_root):
+        _cmd_bootstrap("prof")
+
+    assert "no identity file" in capsys.readouterr().err
+
+
+def test_cmd_bootstrap_errors_when_profile_dir_missing(tmp_path, capsys):
+    from daemon import _cmd_bootstrap
+
+    missing = tmp_path / "does-not-exist"
+    with patch("hermes_cli.profiles.get_profile_dir", return_value=missing):
+        _cmd_bootstrap("prof")
+
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_cmd_pause_and_resume(db, monkeypatch):
+    from daemon import _cmd_pause, _cmd_resume
+    import _db as db_mod
+
+    monkeypatch.setattr(db_mod, "get_db", lambda: db)
+
+    _cmd_pause("prof")
+    assert db.is_paused("prof") is True
+
+    _cmd_resume("prof")
+    assert db.is_paused("prof") is False
