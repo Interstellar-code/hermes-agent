@@ -131,6 +131,27 @@ def test_metrics_latest(client) -> None:
     assert profiles == {"x", "y"}
 
 
+def test_metrics_rejects_out_of_range_limit(client) -> None:
+    assert client.get("/api/plugins/karpathy-self-improve/metrics?limit=0").status_code == 400
+    assert client.get("/api/plugins/karpathy-self-improve/metrics?limit=1001").status_code == 400
+
+
+def test_collect_requires_profile(client) -> None:
+    response = client.post("/api/plugins/karpathy-self-improve/metrics/collect", json={})
+    assert response.status_code == 400
+    assert response.json()["error"] == "profile is required"
+
+
+def test_profile_status_defaults_false_and_reflects_pause(client) -> None:
+    path = "/api/plugins/karpathy-self-improve/profiles/default"
+    response = client.get(path)
+    assert response.status_code == 200
+    assert response.json() == {"profile": "default", "paused": False}
+
+    assert client.post(f"{path}/pause").status_code == 200
+    assert client.get(path).json() == {"profile": "default", "paused": True}
+
+
 # ---------------------------------------------------------------------------
 # /experiments
 # ---------------------------------------------------------------------------
@@ -260,8 +281,8 @@ def test_propose_uses_get_profile_dir_default(tmp_path, monkeypatch) -> None:
     assert captured.get("profile_root") == str(default_home)
 
 
-def test_propose_body_override_wins(tmp_path, monkeypatch) -> None:
-    """Explicit body profile_root overrides get_profile_dir resolution."""
+def test_propose_ignores_untrusted_profile_root_override(tmp_path, monkeypatch) -> None:
+    """The request cannot make the proposer read an arbitrary directory."""
     import types, sys
 
     resolver_dir = tmp_path / "profiles" / "coder"
@@ -294,4 +315,22 @@ def test_propose_body_override_wins(tmp_path, monkeypatch) -> None:
         headers={"Authorization": "Bearer test"},
     )
 
-    assert captured.get("profile_root") == override_dir
+    assert captured.get("profile_root") == str(resolver_dir)
+
+
+def test_propose_rejects_target_path_traversal(tmp_path, monkeypatch) -> None:
+    resolver_dir = tmp_path / "profiles" / "coder"
+    resolver_dir.mkdir(parents=True)
+    mod = _reload_plugin_api(monkeypatch, lambda _name: resolver_dir)
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/karpathy-self-improve")
+    response = TestClient(app).post(
+        "/api/plugins/karpathy-self-improve/propose",
+        json={"profile": "coder", "target_relpath": "../../etc/passwd"},
+    )
+    assert response.status_code == 400
+    assert "escapes" in response.json()["error"]

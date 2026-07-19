@@ -80,6 +80,8 @@ async def list_metrics(
     profile: Optional[str] = None,
     limit: int = 100,
 ) -> JSONResponse:
+    if limit < 1 or limit > 1000:
+        return JSONResponse({"error": "limit must be between 1 and 1000"}, status_code=400)
     try:
         from _db import get_db
         rows = get_db().list_metrics(profile=profile, limit=limit)
@@ -101,11 +103,16 @@ async def latest_metrics() -> JSONResponse:
 
 
 @router.post("/metrics/collect")
-async def collect_metrics() -> JSONResponse:
+async def collect_metrics(body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     try:
         from _metrics import collect_profile_metrics
-        snapshots = collect_profile_metrics()
+        profile = body.get("profile", "")
+        if not isinstance(profile, str) or not profile.strip():
+            return JSONResponse({"error": "profile is required"}, status_code=400)
+        snapshots = collect_profile_metrics(profile=profile)
         return JSONResponse({"collected": len(snapshots), "snapshots": snapshots})
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         log.exception("karpathy /metrics/collect error")
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -523,7 +530,7 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
         if not profile:
             return JSONResponse({"error": "profile is required"}, status_code=400)
         rows = db.list_experiments(profile=profile)
-        target_relpath = "system_prompt.md"
+        target_relpath = "SOUL.md"
         # Default the profile root to the profile's own directory so the very
         # first proposal can resolve its target file. Previously this defaulted
         # to "." (the dashboard process CWD), which only ever worked once a
@@ -546,11 +553,14 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
             exp = rows[0]
             target_relpath = exp.get("target_relpath") or target_relpath
             profile_root = exp.get("target_profile_root") or profile_root
-        # Allow explicit overrides via the request body for non-standard layouts.
+        # Allow an explicit target file for non-standard profile layouts.
         if isinstance(body.get("target_relpath"), str) and body["target_relpath"]:
             target_relpath = body["target_relpath"]
-        if isinstance(body.get("profile_root"), str) and body["profile_root"]:
-            profile_root = body["profile_root"]
+        target_path = (Path(profile_root) / target_relpath).resolve()
+        try:
+            target_path.relative_to(Path(profile_root).resolve())
+        except ValueError:
+            return JSONResponse({"error": "target_relpath escapes the profile root"}, status_code=400)
         # Resolve real gateway-backed model kwargs from config.
         try:
             from _wiring import resolve_propose_kwargs
@@ -580,6 +590,15 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
 # ---------------------------------------------------------------------------
 # Pause / Resume profiles
 # ---------------------------------------------------------------------------
+
+@router.get("/profiles/{profile}")
+async def profile_status(profile: str) -> JSONResponse:
+    try:
+        from _db import get_db
+        return JSONResponse({"profile": profile, "paused": get_db().is_paused(profile)})
+    except Exception as exc:
+        log.exception("karpathy /profiles/%s error", profile)
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 @router.post("/profiles/{profile}/pause")
 async def pause_profile(profile: str, _auth: None = Depends(_require_auth)) -> JSONResponse:
