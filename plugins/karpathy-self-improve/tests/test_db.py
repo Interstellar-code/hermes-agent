@@ -322,3 +322,11 @@ def test_insert_and_list_scenarios(db) -> None:
 def test_list_scenarios_empty(db) -> None:
     rows = db.list_scenarios("no-such-profile")
     assert rows == []
+
+
+# ---------------------------------------------------------------------------
+# experiment_snapshots (#173)
+# ---------------------------------------------------------------------------
+
+def test_get_snapshot_returns_none_for_unknown_experiment(db) -> None:
+    assert db.get_snapshot(999999) is None

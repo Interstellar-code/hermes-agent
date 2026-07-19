@@ -6,7 +6,8 @@ Covers:
   C-1  Profile root outside ~/.hermes/profiles rejected by apply_and_commit + revert_commit
   C-2  Invalid SHA rejected before git revert
   H-1  update_experiment_fields _commit=False keeps transition atomic
-  H-2  Compensating revert called when transition fails after apply_and_commit
+  H-2  #173: DB transaction failure during apply rolls back atomically —
+       state stays 'approved' and the target file is never written
   H-5  run_eval raises when judge_model is None / same as proposer_model
   H-6  Revert handler returns 500 and keeps state when git revert fails
   H-4  POST /experiments rejects '..' in file field (400)
@@ -346,22 +347,24 @@ class TestH6RevertFailure:
 
 
 # ---------------------------------------------------------------------------
-# H-2: Compensating revert when transition fails after apply_and_commit
+# H-2: #173 DB-transaction atomicity on apply
 # ---------------------------------------------------------------------------
 
 class TestH2CompensatingRevert:
-    def test_compensating_revert_called_when_transition_raises(
+    def test_apply_rolls_back_and_leaves_file_untouched_when_db_write_fails(
         self, tmp_path, monkeypatch, patch_profiles_root
     ):
-        """If transition raises after apply_and_commit succeeds, revert_commit
-        must be called to undo the git commit."""
-        import _git_ratchet
-
+        """If the snapshot/state-transition DB transaction raises partway
+        through, the whole transaction must roll back (state stays
+        'approved', no snapshot persisted) and the target file must never be
+        written — there is no git commit to compensate-revert anymore since
+        the DB transaction now commits before the file write."""
         profile_dir = _make_git_repo(patch_profiles_root / "comp-profile")
+        target_path = profile_dir / "prompt.md"
+        original_bytes = target_path.read_bytes()
 
         tc = _make_test_client(tmp_path, monkeypatch, patch_profiles_root)
 
-        # Create and approve experiment.
         resp = tc.post("/experiments", json={
             "profile": "comp-profile",
             "file": "prompt.md",
@@ -381,28 +384,19 @@ class TestH2CompensatingRevert:
             updated_at="2026-01-01T00:00:00+00:00",
         )
 
-        from _git_ratchet import ApplyResult, RevertResult
-        fake_sha = "b" * 40
-        fake_apply = ApplyResult(ok=True, commit_sha=fake_sha, base_sha="c" * 40)
-
-        revert_calls = []
-
-        def fake_revert(root, sha, message):
-            revert_calls.append((root, sha, message))
-            return RevertResult(ok=True, revert_sha="d" * 40)
-
-        with patch("_git_ratchet.apply_and_commit", return_value=fake_apply), \
-             patch("_git_ratchet.revert_commit", side_effect=fake_revert), \
-             patch("_state_machine.transition", side_effect=RuntimeError("DB crashed")):
+        with patch("_db.KarpathyDB.insert_state_transition", side_effect=RuntimeError("DB crashed")):
             resp = tc.post(f"/experiments/{exp_id}/apply")
 
-        # The endpoint should have raised (500) after the compensating revert.
         assert resp.status_code == 500
 
-        # revert_commit must have been called with the just-applied sha.
-        assert len(revert_calls) == 1
-        _, reverted_sha, _ = revert_calls[0]
-        assert reverted_sha == fake_sha
+        # File must be untouched — the DB transaction failed before the write.
+        assert target_path.read_bytes() == original_bytes
+
+        # State must still be 'approved', not 'live', and no snapshot row.
+        db2 = open_db(tmp_path / "sec-test.db")
+        exp = db2.get_experiment(exp_id)
+        assert exp["state"] == "approved"
+        assert db2.get_snapshot(exp_id) is None
 
 
 # ---------------------------------------------------------------------------
