@@ -1,7 +1,7 @@
 """
 _metrics.py — Per-profile metrics collection for karpathy-self-improve.
 
-P0: derives metrics from agent.log ONLY (errors.log is a strict subset of
+Derives metrics from agent.log ONLY (errors.log is a strict subset of
 agent.log — both files receive the same WARNING+ records via the shared
 RotatingFileHandler chain in hermes_logging.py — so counting both would
 double-count errors/warnings).
@@ -9,9 +9,8 @@ double-count errors/warnings).
 Metrics are collected over a window anchored by byte offsets so that
 successive collections can attribute delta counts to a specific window.
 
-Open Question P0: log lines are not profile-tagged yet. All metrics are
-written under profile="(unknown)" until the agent runtime begins tagging
-log lines with a profile identifier.
+Each profile has its own log directory, so collection is scoped by resolving
+that profile's Hermes home instead of trying to infer profile tags from lines.
 """
 from __future__ import annotations
 
@@ -20,8 +19,6 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
-
-from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -108,41 +105,59 @@ def _parse_log_metrics(
 # ---------------------------------------------------------------------------
 
 def collect_profile_metrics(
+    profile: Optional[str] = None,
     log_dir: Optional[Path] = None,
-    from_offset: int = 0,
+    from_offset: Optional[int] = None,
 ) -> List[Dict]:
     """
     Collect metrics from agent.log and write one metrics_snapshots row.
 
-    Returns the list of inserted snapshot dicts (one per profile — P0 always
-    returns a single entry with profile="(unknown)").
+    Returns the inserted snapshot for *profile*. When omitted, the active
+    profile is used (preserving the CLI/daemon no-argument contract).
 
     The *log_dir* parameter allows tests to inject a custom log directory;
-    defaults to get_hermes_home() / "logs".
+    defaults to the selected profile's ``logs`` directory.
 
-    *from_offset* is the byte offset to start reading agent.log from.  Pass
-    the ``to_offset`` from the previous snapshot to get only the delta window.
+    *from_offset* is the byte offset to start reading agent.log from. When
+    omitted, the previous snapshot's ``to_offset`` is used automatically.
     The returned dict includes ``from_offset`` and ``to_offset`` fields so
     callers can persist and re-pass them.
 
-    NOTE(#133-Q1): Log lines are not profile-tagged in P0. All metrics are
-    recorded under profile="(unknown)". Set needs_profile_tagging=True in
-    the returned dict as a signal to callers. This function does NOT block on
-    unresolved profile tagging — it returns usable data immediately.
+    Log truncation/rotation resets the offset to zero.
     """
     # Import here to avoid circular import at module load time.
     from _db import get_db  # absolute import; sys.path set by plugin loader
+    from hermes_cli.profiles import (
+        get_active_profile_name,
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+
+    profile = normalize_profile_name(profile or get_active_profile_name())
+    validate_profile_name(profile)
+    if not profile_exists(profile):
+        raise ValueError(f"profile does not exist: {profile}")
 
     if log_dir is None:
-        log_dir = get_hermes_home() / "logs"
+        log_dir = get_profile_dir(profile) / "logs"
+
+    db = get_db()
+    if from_offset is None:
+        previous = db.list_metrics(profile=profile, limit=1)
+        from_offset = int(previous[0].get("to_offset") or 0) if previous else 0
+    try:
+        if from_offset > (log_dir / "agent.log").stat().st_size:
+            from_offset = 0
+    except OSError:
+        pass
 
     window_started_at = datetime.now(timezone.utc).isoformat()
     counts = _parse_log_metrics(log_dir, from_offset=from_offset)
     to_offset = counts.pop("to_offset")
     window_ended_at = datetime.now(timezone.utc).isoformat()
 
-    profile = "(unknown)"
-    db = get_db()
     row_id = db.insert_metrics_snapshot(
         profile=profile,
         captured_at=window_started_at,
@@ -173,6 +188,5 @@ def collect_profile_metrics(
         **counts,
         "from_offset": from_offset,
         "to_offset": to_offset,
-        "needs_profile_tagging": True,  # TODO(#133-Q1)
     }
     return [snapshot]
