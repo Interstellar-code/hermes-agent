@@ -21,6 +21,7 @@ it here and return a clean error string instead.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -47,7 +48,77 @@ def _load_gateway_url() -> str:
 # Single shared gateway URL — _proposer.py and _eval_runner.py import this
 # instead of hardcoding their own literal.
 GATEWAY_URL = _load_gateway_url()
-_GATEWAY_CHAT_URL = f"{GATEWAY_URL}/chat"
+
+# The Hermes gateway exposes chat only via the OpenAI-compatible endpoint
+# (POST /v1/chat/completions) with Bearer auth — the pre-0.18 `/chat` route no
+# longer exists. See #184.
+_GATEWAY_CHAT_PATH = "/v1/chat/completions"
+
+
+def _load_api_key() -> str:
+    """Bearer token for the gateway's /v1 API — the same key the gateway checks.
+
+    Source order: ``API_SERVER_KEY`` env, then ``api_server.key`` in config,
+    then ``$HERMES_HOME/.env`` (where launchd loads it for the gateway).
+    Returns "" when none is found (a gateway with no key configured skips auth).
+    """
+    key = (os.environ.get("API_SERVER_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        key = (cfg_get(load_config(), "api_server", "key", default="") or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+    try:
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        with open(os.path.join(home, ".env"), "r", encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("API_SERVER_KEY="):
+                    return s.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return ""
+
+
+def call_gateway_chat(prompt: str, *, model: Optional[str] = None, timeout: int = 120) -> str:
+    """Call the gateway's OpenAI-compatible chat endpoint; return the reply text.
+
+    POSTs ``{GATEWAY_URL}/v1/chat/completions`` with a Bearer header and the
+    OpenAI request shape, and reads ``choices[0].message.content``. ``model``
+    defaults to ``"auto"`` so the request routes through the agent's configured
+    provider/model (config.yaml ``model:``) rather than any model id baked into
+    this plugin. Shared by _proposer._default_llm_fn and
+    _eval_runner.gateway_scenario_runner. Raises on transport/HTTP error.
+    """
+    import requests  # type: ignore[import]
+
+    headers = {"Content-Type": "application/json"}
+    key = _load_api_key()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    payload: Dict[str, Any] = {
+        "model": model or _DEFAULT_PROPOSER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    resp = requests.post(
+        f"{GATEWAY_URL}{_GATEWAY_CHAT_PATH}",
+        json=payload,
+        headers=headers,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    choices = data.get("choices") or []
+    if choices:
+        content = (choices[0].get("message") or {}).get("content")
+        if content:
+            return str(content)
+    # Legacy fallback (pre-0.18 {"text"/"response"} shape); harmless if absent.
+    return str(data.get("text") or data.get("response") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +221,7 @@ def _make_llm_fn(model: str) -> Callable[[str], str]:
 
     def llm_fn(prompt: str) -> str:
         try:
-            import requests  # type: ignore[import]
-            payload: Dict[str, Any] = {"message": prompt, "model": model}
-            resp = requests.post(_GATEWAY_CHAT_URL, json=payload, timeout=120)
-            resp.raise_for_status()
-            data = resp.json()
-            return str(data.get("text") or data.get("response") or "")
+            return call_gateway_chat(prompt, model=model, timeout=120)
         except Exception as exc:
             logger.warning("karpathy-self-improve: llm_fn(model=%r) failed: %s", model, exc)
             raise
@@ -168,16 +234,11 @@ def _make_judge_fn(model: str) -> Callable[[str, str], bool]:
 
     def judge_fn(rubric: str, response: str) -> bool:
         try:
-            import requests  # type: ignore[import]
             prompt = (
                 f"You are an evaluator. Based on the rubric, reply with a single word: "
                 f"yes or no.\n\nRubric: {rubric}\n\nResponse to evaluate:\n{response}"
             )
-            payload: Dict[str, Any] = {"message": prompt, "model": model}
-            resp = requests.post(_GATEWAY_CHAT_URL, json=payload, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-            raw = str(data.get("text") or data.get("response") or "").strip().lower()
+            raw = call_gateway_chat(prompt, model=model, timeout=60).strip().lower()
             return _parse_verdict(raw)
         except Exception as exc:
             logger.warning("karpathy-self-improve: judge_fn(model=%r) failed: %s", model, exc)
@@ -203,12 +264,7 @@ def _make_scenario_runner(model: str) -> Callable[[str], str]:
 
     def scenario_runner(scenario_input: str) -> str:
         try:
-            import requests  # type: ignore[import]
-            payload: Dict[str, Any] = {"message": scenario_input, "model": model}
-            resp = requests.post(_GATEWAY_CHAT_URL, json=payload, timeout=60)
-            resp.raise_for_status()
-            data = resp.json()
-            return str(data.get("text") or data.get("response") or "")
+            return call_gateway_chat(scenario_input, model=model, timeout=60)
         except Exception as exc:
             logger.warning(
                 "karpathy-self-improve: scenario_runner(model=%r) failed: %s", model, exc

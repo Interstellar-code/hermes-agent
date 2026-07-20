@@ -15,8 +15,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import requests  # type: ignore[import]
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -108,26 +106,14 @@ def evaluate_checks(
 # Default production scenario runner
 # ---------------------------------------------------------------------------
 
-from _wiring import GATEWAY_URL as _GATEWAY_CHAT_URL
-
-
 def gateway_scenario_runner(scenario_input: str, *, model: Optional[str] = None) -> str:
-    """POST scenario_input to the gateway chat API and return the response text.
+    """Run scenario_input through the gateway agent and return the reply text.
 
-    Only used in production — tests inject their own callable.
+    Only used in production — tests inject their own callable. Delegates to the
+    shared OpenAI-compatible client (POST /v1/chat/completions + Bearer). #184.
     """
-    payload: Dict[str, Any] = {"message": scenario_input}
-    if model:
-        payload["model"] = model
-    resp = requests.post(
-        f"{_GATEWAY_CHAT_URL}/chat",
-        json=payload,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    # Support both {"text": ...} and {"response": ...} shapes.
-    return str(data.get("text") or data.get("response") or "")
+    from _wiring import call_gateway_chat
+    return call_gateway_chat(scenario_input, model=model, timeout=60)
 
 
 # ---------------------------------------------------------------------------
