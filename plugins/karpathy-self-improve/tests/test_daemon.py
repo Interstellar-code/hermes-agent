@@ -416,3 +416,28 @@ def test_cmd_pause_and_resume(db, monkeypatch):
 
     _cmd_resume("prof")
     assert db.is_paused("prof") is False
+
+
+def test_resolve_cli_profile_reads_global_active_profile(monkeypatch):
+    """#180: per-profile subcommands take the profile from the global
+    `hermes --profile <name>` (HERMES_HOME), not a subcommand --profile flag."""
+    import daemon
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "hermes-switch")
+    assert daemon._resolve_cli_profile("bootstrap") == "hermes-switch"
+
+
+def test_resolve_cli_profile_errors_without_named_profile(monkeypatch, capsys):
+    """No `--profile` selected (default/empty) must fail with an actionable
+    message telling the operator to use `hermes --profile <name> karpathy ...`."""
+    import daemon
+    import hermes_cli.profiles as profiles
+
+    for value in ("default", ""):
+        monkeypatch.setattr(profiles, "get_active_profile_name", lambda: value)
+        with pytest.raises(SystemExit) as exc:
+            daemon._resolve_cli_profile("bootstrap")
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "hermes --profile <name> karpathy bootstrap" in err

@@ -155,7 +155,7 @@ def test_resolve_target_for_profile_raises_when_unresolvable():
     msg = str(excinfo.value)
     assert "no target_relpath/profile_root for profile 'coder'" in msg
     assert "plugins.karpathy_self_improve.profiles.coder" in msg
-    assert "hermes karpathy bootstrap --profile coder" in msg
+    assert "hermes --profile coder karpathy bootstrap" in msg
 
 
 def test_resolve_propose_kwargs_distinct_models_ok():
