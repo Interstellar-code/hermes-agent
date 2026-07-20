@@ -137,7 +137,7 @@ def resolve_target_for_profile(profile: str, db: Any) -> tuple[str, str]:
     raise ValueError(
         f"no target_relpath/profile_root for profile {profile!r}; add it under "
         f"plugins.karpathy_self_improve.profiles.{profile} in config.yaml, or run "
-        f"`hermes karpathy bootstrap --profile {profile}`"
+        f"`hermes --profile {profile} karpathy bootstrap`"
     )
 
 

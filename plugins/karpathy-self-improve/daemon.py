@@ -61,11 +61,14 @@ def setup_parser(sub: argparse.ArgumentParser) -> None:
     )
 
     # hermes karpathy propose
-    p_propose = daemon_sub.add_parser(
+    # Profile comes from the global `hermes --profile <name>` (pinned via
+    # HERMES_HOME by main._apply_profile_override, which strips --profile from
+    # argv before argparse). These per-profile subcommands must NOT declare
+    # their own --profile — it could never receive a value. See #180.
+    daemon_sub.add_parser(
         "propose",
-        help="Run the proposer once for a specific profile.",
+        help="Run the proposer once (target profile from `hermes --profile`).",
     )
-    p_propose.add_argument("--profile", required=True, help="Profile to propose for.")
 
     # hermes karpathy daemon
     p_daemon = daemon_sub.add_parser(
@@ -91,30 +94,26 @@ def setup_parser(sub: argparse.ArgumentParser) -> None:
         help="Custom DB path to write into config.yaml under plugins.karpathy_self_improve.db_path.",
     )
 
-    # hermes karpathy bootstrap
-    p_bootstrap = daemon_sub.add_parser(
+    # hermes karpathy bootstrap / pause / resume
+    # Target profile comes from the global `hermes --profile <name>` (see the
+    # note on `propose` above and #180); no per-subcommand --profile flag.
+    daemon_sub.add_parser(
         "bootstrap",
         help=(
             "Write the per-profile target config (target_relpath, profile_root) to "
             "config.yaml and set the profile paused. Run once per profile before "
-            "the daemon or `propose` will operate on it."
+            "the daemon or `propose` will operate on it. "
+            "Usage: hermes --profile <name> karpathy bootstrap"
         ),
     )
-    p_bootstrap.add_argument("--profile", required=True, help="Profile to bootstrap.")
-
-    # hermes karpathy pause
-    p_pause = daemon_sub.add_parser(
+    daemon_sub.add_parser(
         "pause",
         help="Pause self-improvement (propose/verify/revert) for a profile.",
     )
-    p_pause.add_argument("--profile", required=True, help="Profile to pause.")
-
-    # hermes karpathy resume
-    p_resume = daemon_sub.add_parser(
+    daemon_sub.add_parser(
         "resume",
         help="Resume self-improvement for a paused profile.",
     )
-    p_resume.add_argument("--profile", required=True, help="Profile to resume.")
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +165,7 @@ def _cmd_bootstrap(profile: str) -> None:
     Resolves the profile's real directory (same resolver the API uses),
     detects its identity file, and persists {target_relpath, profile_root,
     live_sessions_target, paused: true}. The profile starts paused — an
-    operator must explicitly `hermes karpathy resume --profile <profile>`.
+    operator must explicitly `hermes --profile <profile> karpathy resume`.
     """
     from hermes_cli.profiles import get_profile_dir
     from hermes_cli.config import load_config, save_config
@@ -218,7 +217,7 @@ def _cmd_bootstrap(profile: str) -> None:
             f"tip: {profile_root} is not a git repo — the DB snapshot table is the "
             "revert source of truth (#173), so this is not required."
         )
-    print(f"Run `hermes karpathy resume --profile {profile}` when ready.")
+    print(f"Run `hermes --profile {profile} karpathy resume` when ready.")
 
 
 def _cmd_pause(profile: str) -> None:
@@ -677,6 +676,31 @@ def _cmd_daemon(interval: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_cli_profile(cmd: str) -> str:
+    """Resolve the target profile for a per-profile karpathy subcommand.
+
+    The top-level ``hermes`` CLI consumes ``--profile/-p`` before argparse
+    (``main._apply_profile_override``) and pins it via ``HERMES_HOME``, so
+    these subcommands read the active profile instead of declaring their own
+    ``--profile`` flag (which the pre-strip would starve — #180).
+    Exits with a clear message when no named profile is selected.
+    """
+    name = ""
+    try:
+        from hermes_cli.profiles import get_active_profile_name  # type: ignore[import]
+        name = (get_active_profile_name() or "").strip()
+    except Exception:
+        name = ""
+    if not name or name == "default":
+        print(
+            f"error: `hermes karpathy {cmd}` needs a named profile.\n"
+            f"Run: hermes --profile <name> karpathy {cmd}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return name
+
+
 def _run(ns: argparse.Namespace) -> None:
     """Handler called by the CLI harness when `hermes karpathy ...` is invoked."""
     cmd = getattr(ns, "karpathy_cmd", None)
@@ -686,17 +710,17 @@ def _run(ns: argparse.Namespace) -> None:
     elif cmd == "status":
         _cmd_status()
     elif cmd == "propose":
-        _cmd_propose(ns.profile)
+        _cmd_propose(_resolve_cli_profile("propose"))
     elif cmd == "daemon":
         _cmd_daemon(ns.interval)
     elif cmd == "init":
         _cmd_init(getattr(ns, "db_path", None))
     elif cmd == "bootstrap":
-        _cmd_bootstrap(ns.profile)
+        _cmd_bootstrap(_resolve_cli_profile("bootstrap"))
     elif cmd == "pause":
-        _cmd_pause(ns.profile)
+        _cmd_pause(_resolve_cli_profile("pause"))
     elif cmd == "resume":
-        _cmd_resume(ns.profile)
+        _cmd_resume(_resolve_cli_profile("resume"))
     else:
         print(
             "Usage: hermes karpathy "
