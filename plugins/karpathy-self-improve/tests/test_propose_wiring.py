@@ -302,3 +302,68 @@ def test_post_propose_returns_400_on_equal_models(tmp_path):
     assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
     body = resp.json()
     assert "differ" in body.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# #184: gateway chat client uses the OpenAI-compatible endpoint + Bearer auth
+# ---------------------------------------------------------------------------
+
+def test_call_gateway_chat_uses_openai_endpoint_and_bearer(monkeypatch):
+    import _wiring
+    import requests
+
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "HELLO"}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["url"] = url
+        seen["json"] = json
+        seen["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(_wiring, "_load_api_key", lambda: "sekret")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    out = _wiring.call_gateway_chat("hi", model="auto")
+
+    assert out == "HELLO"
+    assert seen["url"].endswith("/v1/chat/completions")
+    assert "/chat/completions" in seen["url"] and not seen["url"].endswith("/chat")
+    assert seen["headers"]["Authorization"] == "Bearer sekret"
+    assert seen["json"]["model"] == "auto"
+    assert seen["json"]["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_call_gateway_chat_omits_auth_when_no_key(monkeypatch):
+    import _wiring
+    import requests
+
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "x"}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(_wiring, "_load_api_key", lambda: "")
+    monkeypatch.setattr(requests, "post", fake_post)
+    _wiring.call_gateway_chat("hi", model="auto")
+    assert "Authorization" not in seen["headers"]
+
+
+def test_load_api_key_prefers_env(monkeypatch):
+    import _wiring
+    monkeypatch.setenv("API_SERVER_KEY", "envkey")
+    assert _wiring._load_api_key() == "envkey"

@@ -105,20 +105,8 @@ def _diff_is_single_hunk(diff: str) -> bool:
 def _default_llm_fn(prompt: str, *, model: Optional[str] = None) -> str:
     """Call the Hermes gateway LLM. Only used in production."""
     try:
-        import requests  # type: ignore[import]
-        from _wiring import GATEWAY_URL
-
-        payload: Dict[str, Any] = {"message": prompt}
-        if model:
-            payload["model"] = model
-        resp = requests.post(
-            f"{GATEWAY_URL}/chat",
-            json=payload,
-            timeout=120,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return str(data.get("text") or data.get("response") or "")
+        from _wiring import call_gateway_chat
+        return call_gateway_chat(prompt, model=model)
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("karpathy-self-improve: _default_llm_fn failed: %s", exc)
         return ""
