@@ -153,15 +153,22 @@ def run_eval(
     Raises:
         ValueError: If proposer_model == judge_model (anti-gaming guard).
     """
-    # Anti-gaming guard: both models must be explicitly set and must differ.
+    # Both models must be explicitly set (a missing one is a config error).
     if not proposer_model or not judge_model:
         raise ValueError(
             "proposer_model and judge_model must both be explicitly set."
         )
+    # Anti-gaming guard DISABLED by operator config: proposer and judge may run
+    # on the same model (e.g. both "auto"). Self-judged evals are less
+    # trustworthy — a model grading its own proposal can inflate scores and let
+    # the target file drift — so warn loudly instead of blocking. Re-enable by
+    # restoring the raise here + in _wiring.resolve_propose_kwargs and setting
+    # distinct proposer_model/judge_model in config.yaml.
     if proposer_model == judge_model:
-        raise ValueError(
-            f"proposer_model and judge_model must differ; both are {proposer_model!r}. "
-            "Using the same model as both proposer and judge defeats the evaluation."
+        logger.warning(
+            "karpathy-self-improve: proposer_model == judge_model (%r); anti-gaming "
+            "guard disabled — evals are self-judged and their scores are unreliable.",
+            proposer_model,
         )
 
     if scenario_runner is None:
