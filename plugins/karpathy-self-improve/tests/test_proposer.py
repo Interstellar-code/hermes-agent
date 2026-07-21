@@ -67,16 +67,16 @@ def _make_scenario(db, profile, *, holdout=0):
     )
 
 
-# A minimal valid unified diff that changes exactly one sentence in SOUL.md.
-_GOOD_DIFF = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1 @@
--You are a helpful assistant. Always be concise.
-+You are a helpful assistant. Always be concise and precise.
-"""
+# The fixture's SOUL.md content — full-file rewrites below must match it
+# exactly except for the intended change.
+_ORIGINAL_SOUL = "You are a helpful assistant. Always be concise.\n"
 
-_GOOD_LLM_RESPONSE = f"DIFF:\n{_GOOD_DIFF}\nRATIONALE:\nAdds precision to the conciseness directive.\n"
+# Full-file rewrite changing exactly one sentence in SOUL.md.
+_GOOD_UPDATED = "You are a helpful assistant. Always be concise and precise.\n"
+
+_GOOD_LLM_RESPONSE = (
+    f"FILE:\n{_GOOD_UPDATED}RATIONALE:\nAdds precision to the conciseness directive.\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +141,14 @@ def test_propose_sets_sentence_delta_count(db, git_repo):
 # Multi-sentence edit rejected
 # ---------------------------------------------------------------------------
 
-_MULTI_SENTENCE_DIFF = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1,3 @@
--You are a helpful assistant. Always be concise.
-+You are a helpful assistant. Always be concise. Never be verbose. Be direct.
-+Be clear. Stay on topic.
-"""
+# Full-file rewrite adding multiple new sentences — must be rejected.
+_MULTI_SENTENCE_UPDATED = (
+    "You are a helpful assistant. Always be concise. Never be verbose. Be direct.\n"
+    "Be clear. Stay on topic.\n"
+)
 
 _MULTI_SENTENCE_RESPONSE = (
-    f"DIFF:\n{_MULTI_SENTENCE_DIFF}\nRATIONALE:\nAdded multiple sentences.\n"
+    f"FILE:\n{_MULTI_SENTENCE_UPDATED}RATIONALE:\nAdded multiple sentences.\n"
 )
 
 
@@ -339,15 +336,12 @@ def test_propose_proceeds_after_resume(db, git_repo):
 # ---------------------------------------------------------------------------
 
 # In-place single-sentence edit: "helpful" → "super helpful" in one sentence.
-_INPLACE_ONE_SENTENCE_DIFF = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1 @@
--You are a helpful assistant. Always be concise.
-+You are a super helpful assistant. Always be concise.
-"""
+_INPLACE_ONE_SENTENCE_UPDATED = (
+    "You are a super helpful assistant. Always be concise.\n"
+)
 _INPLACE_ONE_SENTENCE_RESPONSE = (
-    f"DIFF:\n{_INPLACE_ONE_SENTENCE_DIFF}\nRATIONALE:\nMakes the assistant more helpful.\n"
+    f"FILE:\n{_INPLACE_ONE_SENTENCE_UPDATED}"
+    "RATIONALE:\nMakes the assistant more helpful.\n"
 )
 
 
@@ -376,15 +370,12 @@ def test_atomicity_inplace_single_sentence_edit_accepted(db, git_repo):
 
 # In-place rewrite of two sentences (same total count) — the regression case.
 # Original: 2 sentences. Modified: 2 sentences, both changed.
-_INPLACE_TWO_SENTENCE_DIFF = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1 @@
--You are a helpful assistant. Always be concise.
-+You are an extremely capable assistant. Always be brief and direct.
-"""
+_INPLACE_TWO_SENTENCE_UPDATED = (
+    "You are an extremely capable assistant. Always be brief and direct.\n"
+)
 _INPLACE_TWO_SENTENCE_RESPONSE = (
-    f"DIFF:\n{_INPLACE_TWO_SENTENCE_DIFF}\nRATIONALE:\nRewrites both sentences.\n"
+    f"FILE:\n{_INPLACE_TWO_SENTENCE_UPDATED}"
+    "RATIONALE:\nRewrites both sentences.\n"
 )
 
 
@@ -419,16 +410,12 @@ def test_atomicity_net_add_two_sentences_rejected(db, git_repo):
     """Net add of 2 new sentences → rejected."""
     from _proposer import propose_for_profile
 
-    net_add_two_diff = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1,3 @@
--You are a helpful assistant. Always be concise.
-+You are a helpful assistant. Always be concise.
-+Be clear.
-+Stay on topic.
-"""
-    response = f"DIFF:\n{net_add_two_diff}\nRATIONALE:\nAdds two directives.\n"
+    net_add_two_updated = (
+        "You are a helpful assistant. Always be concise.\n"
+        "Be clear.\n"
+        "Stay on topic.\n"
+    )
+    response = f"FILE:\n{net_add_two_updated}RATIONALE:\nAdds two directives.\n"
 
     profile = "atomicity-net-add-two-profile"
     _make_scenario(db, profile)
@@ -452,15 +439,11 @@ def test_atomicity_net_add_one_sentence_accepted(db, git_repo):
     """Net add of exactly 1 new sentence → accepted, count == 1."""
     from _proposer import propose_for_profile
 
-    net_add_one_diff = """\
---- a/SOUL.md
-+++ b/SOUL.md
-@@ -1 +1,2 @@
--You are a helpful assistant. Always be concise.
-+You are a helpful assistant. Always be concise.
-+Be clear.
-"""
-    response = f"DIFF:\n{net_add_one_diff}\nRATIONALE:\nAdds one directive.\n"
+    net_add_one_updated = (
+        "You are a helpful assistant. Always be concise.\n"
+        "Be clear.\n"
+    )
+    response = f"FILE:\n{net_add_one_updated}RATIONALE:\nAdds one directive.\n"
 
     profile = "atomicity-net-add-one-profile"
     _make_scenario(db, profile)
@@ -482,27 +465,44 @@ def test_atomicity_net_add_one_sentence_accepted(db, git_repo):
 
 
 # ---------------------------------------------------------------------------
-# _clip_file_for_prompt — the proposer only ever shows the LLM whole lines, so
-# a truncated view can never induce a "repair the cut-off line" diff that then
-# fails to apply against the full file (the live /propose 500). #187 follow-up.
+# Full-file rewrite plumbing: _parse_llm_rewrite + _compute_unified_diff
 # ---------------------------------------------------------------------------
 
-def test_clip_file_for_prompt_returns_small_file_verbatim():
-    from _proposer import _clip_file_for_prompt
-    text = "line 1\nline 2\nline 3\n"
-    assert _clip_file_for_prompt(text, max_chars=1000) == text
+def test_parse_llm_rewrite_splits_rationale_from_end():
+    from _proposer import _parse_llm_rewrite
+
+    # File content itself contains a "RATIONALE:" line — only the LAST one
+    # (the real section, split off from the end) must be treated as rationale.
+    response = (
+        "FILE:\n"
+        "RATIONALE: decoy line inside the file.\n"
+        "Second line.\n"
+        "RATIONALE:\nBecause reasons.\n"
+    )
+    content, rationale = _parse_llm_rewrite(response)
+    assert content == "RATIONALE: decoy line inside the file.\nSecond line.\n"
+    assert rationale == "Because reasons."
 
 
-def test_clip_file_for_prompt_cuts_on_line_boundary_with_marker():
-    from _proposer import _clip_file_for_prompt
-    lines = [f"line-{i:03d} some persona content here" for i in range(300)]
-    text = "\n".join(lines)
-    clipped = _clip_file_for_prompt(text, max_chars=500)
+def test_parse_llm_rewrite_missing_file_section():
+    from _proposer import _parse_llm_rewrite
 
-    body, sep, _marker = clipped.partition("\n[...")
-    assert sep, "expected a truncation marker"
-    assert "truncated" in clipped
-    # Never a mid-line cut: every shown line is a complete original line.
-    for shown in body.split("\n"):
-        assert shown in lines
-    assert len(body) <= 500
+    content, rationale = _parse_llm_rewrite("no sections here at all")
+    assert content is None
+    assert rationale == ""
+
+    content, _ = _parse_llm_rewrite("FILE:\n\nRATIONALE:\nempty file body\n")
+    assert content is None
+
+
+def test_compute_unified_diff_round_trips():
+    from _proposer import _apply_diff_to_content, _compute_unified_diff
+
+    original = "line one.\nline two.\nline three.\n"
+    updated = "line one.\nline TWO changed.\nline three.\n"
+    diff = _compute_unified_diff(original, updated, "SOUL.md")
+    assert diff.startswith("--- a/SOUL.md")
+    assert "+++ b/SOUL.md" in diff
+    # The computed diff must re-apply with `patch` to exactly `updated` —
+    # the /apply endpoint consumes stored diffs this way.
+    assert _apply_diff_to_content(original, diff) == updated

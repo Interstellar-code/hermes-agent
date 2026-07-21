@@ -2,10 +2,12 @@
 _proposer.py — Meta-agent proposer for karpathy-self-improve.
 
 propose_for_profile() reads the latest metrics + failing offline scenarios for a
-profile, asks an LLM for ONE atomic sentence-level edit to the target file,
-validates the diff changes exactly one sentence/hunk, runs an offline eval on
-the candidate, and if the aggregate score improved (or tied with shorter prompt)
-creates an experiment row in state='proposed'.
+profile, asks an LLM for the COMPLETE rewritten target file with ONE atomic
+sentence-level change, computes the unified diff itself with difflib (so the
+stored diff always applies with `patch`), validates the change is exactly one
+sentence/hunk, runs an offline eval on the candidate, and if the aggregate
+score improved (or tied with shorter prompt) creates an experiment row in
+state='proposed'.
 
 Respects one-active-experiment-per-profile (skips if one exists).
 Never raises to caller — returns a ProposalResult object.
@@ -131,77 +133,78 @@ You are a self-improvement agent reviewing an AI assistant profile/system-prompt
 ## Failing offline scenarios:
 {failing_scenarios}
 
-Your task: propose ONE atomic sentence-level improvement to the target file that is
-most likely to address the failing scenarios or poor metrics. The edit must:
-1. Change exactly one sentence or one contiguous paragraph (single hunk).
-2. Be minimal — do not rewrite unrelated content.
-3. Be a VALID unified diff that applies with `patch`:
-   - headers `--- a/{target_relpath}` and `+++ b/{target_relpath}`;
-   - a NUMERIC hunk header `@@ -<start>,<count> +<start>,<count> @@` — never a
-     descriptive one like `@@ Voice section @@`;
-   - include at least 2 unchanged CONTEXT lines (copied verbatim from the file
-     above) immediately before and after the changed line, so the hunk locates
-     even if the line numbers are slightly off.
+Your task: make ONE atomic sentence-level improvement to the target file that is
+most likely to address the failing scenarios or poor metrics. The change must:
+1. Add, remove, or rewrite AT MOST ONE sentence.
+2. Be minimal — every other line of the file must be preserved VERBATIM
+   (same wording, same whitespace, same line order).
 
-Return your response in this exact format:
-DIFF:
-<unified diff here: ---/+++ headers, one numeric @@ hunk, context lines around the change>
+Return the ENTIRE updated file (not a diff, no code fences, no commentary) in
+this exact format:
+FILE:
+<the complete updated file content>
 RATIONALE:
-<one sentence explaining why this edit helps>
+<one sentence explaining why this change helps>
 """
 
 
-def _parse_llm_response(response: str) -> tuple[str, str]:
-    """Parse the LLM response for DIFF and RATIONALE sections.
+def _parse_llm_rewrite(response: str) -> tuple[Optional[str], str]:
+    """Parse the LLM full-file rewrite response for FILE and RATIONALE sections.
 
-    Returns (diff, rationale). Either may be empty on parse failure.
+    Returns (new_content, rationale). new_content is None when the FILE:
+    section is missing or empty. The RATIONALE is split off the END of the
+    response (rsplit) so file content that itself contains the word
+    "RATIONALE:" is safe.
     """
-    diff = ""
+    body = response
     rationale = ""
+    head, sep, tail = body.rpartition("\nRATIONALE:")
+    if sep:
+        body = head
+        rationale = tail.strip()
 
-    diff_match = re.search(r"DIFF:\s*\n(.*?)(?=\nRATIONALE:|\Z)", response, re.DOTALL)
-    if diff_match:
-        diff = diff_match.group(1).strip()
-
-    rationale_match = re.search(r"RATIONALE:\s*\n(.*)", response, re.DOTALL)
-    if rationale_match:
-        rationale = rationale_match.group(1).strip()
-
-    return diff, rationale
-
-
-# Cap the file content shown to the proposer LLM so a very large target file
-# can't blow the context window. Cut on a line boundary (never mid-word) and
-# flag the cut, so the model never "repairs" a truncation artifact and only
-# proposes edits to content it fully sees. The diff is applied against the FULL
-# file, so any edit within the shown whole-line region applies cleanly.
-# 32000 chars (~8k tokens) comfortably fits real system-prompt files whole.
-_MAX_PROMPT_FILE_CHARS = 32000
-
-# Max proposer draws per /propose call. LLM diffs apply ~40% of the time on the
-# first draw; 6 independent draws lift that to ~95% while capping worst-case
-# latency and gateway spend (a bad draw is rejected before the eval, so each
-# retry is one cheap gateway call).
-_PROPOSE_MAX_ATTEMPTS = 6
+    marker = re.search(r"^FILE:[ \t]*\n", body, re.MULTILINE)
+    if not marker:
+        return None, rationale
+    content = body[marker.end():]
+    if not content.strip():
+        return None, rationale
+    # The newline before "RATIONALE:" belongs to the file content (text files
+    # end with a newline); restore it so the rewrite matches the original.
+    if not content.endswith("\n"):
+        content += "\n"
+    return content, rationale
 
 
-def _clip_file_for_prompt(content: str, max_chars: int = _MAX_PROMPT_FILE_CHARS) -> str:
-    """Return *content* for the prompt, clipped to whole lines under *max_chars*.
+def _compute_unified_diff(original: str, updated: str, relpath: str) -> str:
+    """Compute a standard unified diff between *original* and *updated*.
 
-    A file at or under the cap is returned verbatim. A larger file is cut at the
-    last newline within the cap (so no partial line is ever shown) and a marker
-    is appended telling the model to edit only the content above.
+    Built with stdlib difflib, so it is correct by construction and always
+    applies with `patch` — the /apply endpoint later consumes it via
+    apply_diff_to_text().
     """
-    if len(content) <= max_chars:
-        return content
-    head = content[:max_chars]
-    nl = head.rfind("\n")
-    if nl > 0:
-        head = head[:nl]
-    return head + (
-        f"\n[... {len(content) - len(head)} more characters truncated; "
-        "propose edits only within the content shown above ...]"
+    return "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            updated.splitlines(keepends=True),
+            fromfile=f"a/{relpath}",
+            tofile=f"b/{relpath}",
+        )
     )
+
+
+# ponytail: full-file rewrite means the whole target goes into the prompt AND
+# comes back in the response; 100k chars (~25k tokens each way) is a hard cap.
+# Real system-prompt files are well under this. If one ever exceeds it, chunked
+# rewriting is the upgrade path — not clipping (a clipped input makes the model
+# return a partial file and the computed diff would delete the rest).
+_MAX_REWRITE_FILE_CHARS = 100000
+
+# Max proposer draws per /propose call. The diff is now computed by us and
+# always applies, so retries only cover semantic misses (no change proposed,
+# more than one sentence changed, malformed response) — far rarer than the old
+# LLM-authored-diff apply failures.
+_PROPOSE_MAX_ATTEMPTS = 6
 
 
 class PatchApplyError(Exception):
@@ -415,25 +418,32 @@ def _propose_for_profile_inner(
         for s in failing
     ) or "(none)"
 
-    # Build prompt and call LLM.
+    # Full-file rewrite needs the whole file in the prompt and back in the
+    # response — refuse files too large for that round trip.
+    if len(original_content) > _MAX_REWRITE_FILE_CHARS:
+        return ProposalResult(
+            ok=False,
+            error="target file too large for full-file proposer (%d chars)"
+            % len(original_content),
+        )
+
+    # Build prompt and call LLM. The FULL file goes in — no clipping — because
+    # the model must return the complete file (a clipped input would make it
+    # return a partial file and the computed diff would delete the rest).
     prompt = _PROPOSE_PROMPT_TEMPLATE.format(
         profile=profile,
         target_relpath=target_relpath,
-        file_content=_clip_file_for_prompt(original_content),
+        file_content=original_content,
         metrics_summary=metrics_summary,
         failing_scenarios=failing_summary,
     )
 
-    # An LLM-authored unified diff is unreliable on any single draw: the model
-    # often emits a non-standard hunk header or a wrong line-count, so `patch`
-    # rejects it (measured ~40% first-draw apply rate). Each failure is an
-    # independent bad draw, recoverable by re-asking, so try a few times and
-    # take the first proposal that is a single hunk, applies cleanly, and
-    # changes at most one sentence. This runs BEFORE the expensive eval, so a
-    # re-draw costs one gateway call, not an eval.
-    # ponytail: retry papers over LLM diff fragility. The durable fix is to have
-    # the model return the full rewritten file and compute the diff ourselves
-    # (always applies) — a larger contract change, deferred.
+    # The model returns the COMPLETE rewritten file (LLMs are reliable at
+    # that); we compute the unified diff ourselves with difflib, so the stored
+    # diff is correct by construction and always applies with `patch`.
+    # ponytail: kept the retry loop even though diff-apply can no longer fail —
+    # retries now only cover semantic misses (empty response, no change,
+    # non-atomic change), which are still per-draw independent.
     diff = None
     rationale = ""
     delta = 0
@@ -444,18 +454,26 @@ def _propose_for_profile_inner(
         if not response:
             last_error = "LLM returned empty response"
             continue
-        cand_diff, cand_rationale = _parse_llm_response(response)
-        if not cand_diff:
-            last_error = "LLM response did not contain a parseable DIFF section"
+        cand_updated, cand_rationale = _parse_llm_rewrite(response)
+        if cand_updated is None:
+            last_error = "LLM response did not contain a usable FILE section"
             continue
+        if cand_updated == original_content:
+            last_error = "LLM returned the file unchanged (no edit proposed)"
+            continue
+        cand_diff = _compute_unified_diff(
+            original_content, cand_updated, target_relpath
+        )
         if not _diff_is_single_hunk(cand_diff):
             last_error = f"diff has {_count_diff_hunks(cand_diff)} hunks; exactly 1 required (one atomic change)"
             continue
-        cand_modified = _apply_diff_to_content(original_content, cand_diff)
-        if cand_modified is None:
-            last_error = "failed to apply diff to original content"
+        # Round-trip guard: the stored diff must re-apply with `patch` to
+        # exactly the rewritten file — the /apply endpoint depends on it.
+        # Defensive; catches trailing-newline edge cases.
+        if _apply_diff_to_content(original_content, cand_diff) != cand_updated:
+            last_error = "computed diff failed round-trip apply check"
             continue
-        cand_delta = _sentence_delta_count(original_content, cand_modified)
+        cand_delta = _sentence_delta_count(original_content, cand_updated)
         if cand_delta > 1:
             last_error = f"diff changes {cand_delta} sentences; maximum is 1 (one atomic sentence-level edit)"
             last_delta = cand_delta
