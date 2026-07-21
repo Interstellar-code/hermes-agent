@@ -350,3 +350,204 @@ def test_colliding_repo_basenames_disambiguate_labels():
     labels = sorted(p["label"] for p in tree["projects"])
 
     assert labels == ["x/proj", "y/proj"]
+
+
+# ---------------------------------------------------------------------------
+# Per-session project binding (issue #191) — pure-function resolver
+# ---------------------------------------------------------------------------
+
+
+class _FakeBinding:
+    """Duck-typed stand-in for projects_db.SessionBinding (no DB needed)."""
+
+    def __init__(self, project_id: str) -> None:
+        self.project_id = project_id
+
+
+class _FakeProject:
+    """Duck-typed stand-in for projects_db.Project — only the resolver touches
+    three fields, so we don't need the full dataclass."""
+
+    def __init__(self, id_: str, slug: str, name: str) -> None:
+        self.id = id_
+        self.slug = slug
+        self.name = name
+
+
+class _FakeProjectsDB:
+    """In-memory backend satisfying ``resolve_session_project``'s contract.
+
+    The real ``hermes_cli.projects_db`` exposes ``get_session_project(id)``,
+    ``get_project(ident)``, and ``get_active_id()`` — three calls, no I/O.
+    The resolver reaches for them by name, so a literal works.
+    """
+
+    def __init__(self) -> None:
+        self.bindings: dict[str, str] = {}
+        self.projects: dict[str, _FakeProject] = {}
+        self.active_id: str | None = None
+
+    def add_project(self, id_: str, slug: str, name: str) -> _FakeProject:
+        proj = _FakeProject(id_, slug, name)
+        self.projects[id_] = proj
+        return proj
+
+    def bind(self, session_id: str, project_id: str) -> None:
+        self.bindings[session_id] = project_id
+
+    # --- The three names ``resolve_session_project`` looks for ---
+    def get_session_project(self, session_id: str):
+        pid = self.bindings.get(session_id)
+        return _FakeBinding(pid) if pid else None
+
+    def get_project(self, ident: str):
+        return self.projects.get(ident)
+
+    def get_active_id(self):
+        return self.active_id
+
+
+def _project_dict(proj: _FakeProject | None) -> dict | None:
+    return None if proj is None else {"id": proj.id, "slug": proj.slug, "name": proj.name}
+
+
+def test_resolver_returns_unbound_when_no_backend_and_no_cwd():
+    out = pt.resolve_session_project("s1", "/somewhere")
+    assert out == {"session_id": "s1", "project": None, "source": None}
+
+
+def test_resolver_precedence_explicit_binding_wins_over_active():
+    db = _FakeProjectsDB()
+    bound = db.add_project("p1", "bound", "Bound")
+    active = db.add_project("p2", "active", "Active")
+    db.bind("s1", "p1")
+    db.active_id = "p2"
+
+    out = pt.resolve_session_project("s1", "/x", projects_db=db)
+    assert out["source"] == "binding"
+    assert out["project"] == _project_dict(bound)
+    # Active was set but the binding takes precedence — caller never sees it.
+    assert out["project"]["id"] != active.id
+
+
+def test_resolver_precedence_active_wins_over_cwd_heuristic():
+    db = _FakeProjectsDB()
+    active = db.add_project("p2", "active", "Active")
+    db.active_id = "p2"
+    cwd_proj = _FakeProject("p3", "cwd", "CWD")
+
+    def _cwd_resolver(cwd: str):
+        return _project_dict(cwd_proj)
+
+    out = pt.resolve_session_project(
+        "s1", "/somewhere", projects_db=db, resolve_cwd_project=_cwd_resolver
+    )
+    assert out["source"] == "active"
+    assert out["project"] == _project_dict(active)
+
+
+def test_resolver_falls_through_to_cwd_when_no_binding_and_no_active():
+    db = _FakeProjectsDB()
+    # Note: no active_id set; the resolver must not return ``source="active"``
+    # for an unset pointer.
+    cwd_proj = db.add_project("p3", "cwd", "CWD")
+
+    def _cwd_resolver(cwd: str):
+        return _project_dict(cwd_proj)
+
+    out = pt.resolve_session_project(
+        "s1", "/somewhere", projects_db=db, resolve_cwd_project=_cwd_resolver
+    )
+    assert out["source"] == "cwd"
+    assert out["project"] == _project_dict(cwd_proj)
+
+
+def test_resolver_missing_binding_returns_none_cleanly():
+    db = _FakeProjectsDB()
+    db.add_project("p1", "bound", "Bound")
+    # No binding, no active, no cwd resolver.
+    out = pt.resolve_session_project("s_unknown", "/x", projects_db=db)
+    assert out == {"session_id": "s_unknown", "project": None, "source": None}
+
+
+def test_resolver_handles_empty_session_id():
+    db = _FakeProjectsDB()
+    bound = db.add_project("p1", "bound", "Bound")
+    # An empty session id must NOT accidentally pick up someone else's binding.
+    out = pt.resolve_session_project("", "/x", projects_db=db)
+    assert out == {"session_id": "", "project": None, "source": None}
+    # The bound project's id is the same one we will not see here.
+    assert bound.id == "p1"
+
+
+def test_resolver_tolerates_backend_errors_and_degrades():
+    class _Boom:
+        def get_session_project(self, sid):  # noqa: D401
+            raise RuntimeError("db down")
+
+        def get_project(self, ident):
+            raise RuntimeError("db down")
+
+        def get_active_id(self):
+            raise RuntimeError("db down")
+
+    out = pt.resolve_session_project("s1", "/x", projects_db=_Boom())
+    assert out == {"session_id": "s1", "project": None, "source": None}
+
+
+def test_build_tree_with_binding_overrides_cwd_heuristic():
+    """``build_tree`` should consult the binding BEFORE the cwd heuristic.
+
+    The session's cwd is under ``/www/other`` (which would normally claim it
+    for that auto project), but the binding pins it to the explicit
+    ``p_bound`` project. The session must end up under ``p_bound`` and the
+    auto /www/other project must NOT pick it up.
+    """
+    db = _FakeProjectsDB()
+    bound = db.add_project("p_bound", "bound", "Bound")
+    db.bind("s_known", bound.id)
+
+    project = _project("p_bound", "Bound", ["/elsewhere"])
+    resolve = _resolver(
+        {
+            "/www/other": ("/www/other", "/www/other"),
+            "/elsewhere": ("/elsewhere", "/elsewhere"),
+        }
+    )
+    sessions = [
+        _session("/www/other", branch="main", id="s_known"),
+        _session("/www/other", branch="main"),  # unbound, owns the auto project
+    ]
+
+    tree = pt.build_tree(
+        [project], sessions, [], resolve, hydrate=True, projects_db=db
+    )
+
+    by_id = {p["id"]: p for p in tree["projects"]}
+    assert by_id["p_bound"]["sessionCount"] == 1
+    # The unbound /www/other session falls through to the cwd heuristic and
+    # becomes its own auto project.
+    assert any(p["id"] == "/www/other" and p["isAuto"] for p in tree["projects"])
+    # The bound session is in the explicit project's scoped set, NOT the
+    # auto project's. (Catches the "auto project swallowed the bound session"
+    # regression directly.)
+    scoped = set(tree["scoped_session_ids"])
+    assert "s_known" in scoped
+    # The auto /www/other project owns only the OTHER (unbound) session.
+    auto = by_id["/www/other"]
+    assert auto["sessionCount"] == 1
+
+
+def test_build_tree_without_binding_backend_keeps_cwd_heuristic_behavior():
+    """When ``projects_db`` is None, the binding lookup is a no-op and the
+    cwd heuristic alone decides project ownership — i.e. the pre-binding
+    behavior is preserved for callers that don't opt in."""
+    project = _project("p_app", "App", ["/www/app"])
+    resolve = _resolver({"/www/app": ("/www/app", "/www/app")})
+    sessions = [_session("/www/app", branch="main", id="s1")]
+
+    # No projects_db → no binding → cwd heuristic wins.
+    tree = pt.build_tree([project], sessions, [], resolve, hydrate=True)
+
+    by_id = {p["id"]: p for p in tree["projects"]}
+    assert by_id["p_app"]["sessionCount"] == 1

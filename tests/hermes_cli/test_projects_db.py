@@ -183,3 +183,163 @@ def test_db_path_under_hermes_home():
     # Resolves under HERMES_HOME (set by the autouse isolation fixture).
     assert pdb.projects_db_path().name == "projects.db"
     assert os.path.basename(str(pdb.projects_db_path().parent))  # non-empty parent
+
+
+# ---------------------------------------------------------------------------
+# Per-session project binding (issue #191)
+# ---------------------------------------------------------------------------
+
+
+def test_project_sessions_table_idempotent(tmp_path):
+    """Opening the same DB twice must not duplicate the table or the index.
+
+    Uses a fresh DB path (not the shared ``conn`` fixture) so the second
+    ``pdb.connect`` call actually runs the schema script — proving the
+    ``CREATE TABLE IF NOT EXISTS`` / ``CREATE INDEX IF NOT EXISTS`` clauses
+    keep the second open idempotent.
+    """
+    db_path = tmp_path / "projects.db"
+    a = pdb.connect(db_path=db_path)
+    try:
+        # Touch the new helpers so the second-open path isn't a complete no-op.
+        pdb.create_project(a, name="P", folders=["/x"])
+    finally:
+        a.close()
+
+    b = pdb.connect(db_path=db_path)
+    try:
+        rows = b.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='project_sessions'"
+        ).fetchall()
+        assert [r["name"] for r in rows] == ["project_sessions"]
+        idx = b.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name='idx_project_sessions_session'"
+        ).fetchall()
+        assert [r["name"] for r in idx] == ["idx_project_sessions_session"]
+    finally:
+        b.close()
+
+
+def test_bind_unbind_happy_path(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    binding = pdb.bind_session(conn, pid, "s1", bound_by="alice")
+
+    assert binding.project_id == pid
+    assert binding.session_id == "s1"
+    assert binding.bound_by == "alice"
+    assert binding.bound_at > 0
+    # Round-trip.
+    got = pdb.get_session_project(conn, "s1")
+    assert got.project_id == pid
+    assert got.session_id == "s1"
+    # Per-project list shows it.
+    listed = pdb.list_session_bindings(conn, pid)
+    assert [b.session_id for b in listed] == ["s1"]
+
+
+def test_bind_session_idempotent_updates_bound_at_and_bound_by(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    first = pdb.bind_session(conn, pid, "s1", bound_by="alice")
+    second = pdb.bind_session(conn, pid, "s1", bound_by="bob")
+    # Same row, refreshed metadata.
+    assert second.project_id == first.project_id
+    assert second.session_id == first.session_id
+    assert second.bound_by == "bob"
+    assert second.bound_at >= first.bound_at
+    # Still exactly one row for the pair.
+    assert len(pdb.list_session_bindings(conn, pid)) == 1
+
+
+def test_unbind_returns_false_when_no_such_binding(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    assert pdb.unbind_session(conn, pid, "s1") is False
+    # Unbind of an existing row returns True.
+    pdb.bind_session(conn, pid, "s1")
+    assert pdb.unbind_session(conn, pid, "s1") is True
+    assert pdb.unbind_session(conn, pid, "s1") is False  # gone now
+
+
+def test_unbind_does_not_touch_other_sessions(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    pdb.bind_session(conn, pid, "s1")
+    pdb.bind_session(conn, pid, "s2")
+    pdb.unbind_session(conn, pid, "s1")
+    assert {b.session_id for b in pdb.list_session_bindings(conn, pid)} == {"s2"}
+
+
+def test_bind_rejects_empty_session_id_and_missing_project(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    with pytest.raises(ValueError):
+        pdb.bind_session(conn, pid, "")
+    with pytest.raises(ValueError):
+        pdb.bind_session(conn, pid, "   ")
+    with pytest.raises(ValueError):
+        pdb.bind_session(conn, "p_does_not_exist", "s1")
+    with pytest.raises(ValueError):
+        pdb.unbind_session(conn, "", "s1")
+
+
+def test_cascade_delete_removes_bindings_when_project_is_deleted(conn):
+    pid_keep = pdb.create_project(conn, name="Keep", folders=["/k"])
+    pid_drop = pdb.create_project(conn, name="Drop", folders=["/d"])
+    pdb.bind_session(conn, pid_keep, "shared-session", bound_by="ops")
+    pdb.bind_session(conn, pid_drop, "shared-session", bound_by="ops")
+    pdb.bind_session(conn, pid_drop, "another")
+
+    # ``delete_project`` with ``archived_only=True`` is the canonical
+    # destructive path; archive first, then drop.
+    pdb.archive_project(conn, pid_drop)
+    assert pdb.delete_project(conn, pid_drop, clear_active=True, archived_only=True) is True
+
+    remaining = pdb.get_session_project(conn, "shared-session")
+    assert remaining is not None
+    assert remaining.project_id == pid_keep
+
+    # ON DELETE CASCADE wipes bindings owned by the dropped project; the
+    # bindings still owned by the surviving project are untouched.
+    assert pdb.list_session_bindings(conn, pid_drop) == []
+    assert {b.session_id for b in pdb.list_session_bindings(conn, pid_keep)} == {
+        "shared-session"
+    }
+    # And the other session bound only to Drop is gone (its row cascaded out).
+    assert pdb.get_session_project(conn, "another") is None
+
+
+def test_get_session_project_prefers_most_recently_bound(conn):
+    """When a session is bound to multiple projects, the most recent binding
+    wins — the resolution downstream treats any binding as authoritative, so
+    callers see a stable, deterministic winner."""
+    pid_a = pdb.create_project(conn, name="A", folders=["/a"])
+    pid_b = pdb.create_project(conn, name="B", folders=["/b"])
+    pdb.bind_session(conn, pid_a, "s1")
+    # Force a later timestamp on the second bind by sleeping just over a second
+    # (bound_at is unix epoch seconds, the natural unit chosen to match the
+    # rest of the projects_db schema).
+    import time as _time
+
+    _time.sleep(1.1)
+    pdb.bind_session(conn, pid_b, "s1")
+    winner = pdb.get_session_project(conn, "s1")
+    assert winner is not None
+    assert winner.project_id == pid_b
+
+
+def test_list_session_bindings_orders_most_recent_first(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    pdb.bind_session(conn, pid, "s1")
+    import time as _time
+
+    _time.sleep(1.1)
+    pdb.bind_session(conn, pid, "s2")
+    _time.sleep(1.1)
+    pdb.bind_session(conn, pid, "s3")
+    bindings = pdb.list_session_bindings(conn, pid)
+    assert [b.session_id for b in bindings] == ["s3", "s2", "s1"]
+
+
+def test_get_session_project_returns_none_when_unbound(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    pdb.bind_session(conn, pid, "s1")
+    # Unbound session returns None.
+    assert pdb.get_session_project(conn, "s_unknown") is None

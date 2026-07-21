@@ -10654,6 +10654,12 @@ def _build_project_tree(
     sessions, projects, discovered, active_id = _project_tree_inputs(
         db, session_limit, include_discovered=include_discovered
     )
+    # Adapter exposing just the names ``project_tree`` consults on a binding
+    # backend. The real DB connection is short-lived (we open + close inside
+    # each lookup) so the per-tree call doesn't pin a connection across the
+    # network round-trips a large session list can take. The fake in
+    # tests/tui_gateway/test_project_tree.py can be a literal in-memory object.
+    binding_backend = _ProjectsBindingBackend()
     tree = project_tree.build_tree(
         projects,
         sessions,
@@ -10662,8 +10668,48 @@ def _build_project_tree(
         preview_limit=preview_limit,
         hydrate=hydrate,
         is_junk_root=_is_repo_junk,
+        projects_db=binding_backend,
     )
     return tree, active_id
+
+
+class _ProjectsBindingBackend:
+    """Tiny ``projects_db`` adapter for ``project_tree.build_tree`` (issue #191).
+
+    Exposes only the three methods ``build_tree`` consults on a binding
+    backend (``get_session_project``, ``get_project``, ``get_active_id``).
+    Opens + closes a short-lived projects.db connection per call so the tree
+    builder does not have to manage a connection across the network round-
+    trips a large session list can take. Errors degrade to "no binding" so a
+    flaky DB never bricks the tree RPC.
+    """
+
+    def get_session_project(self, session_id: str):
+        try:
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as conn:
+                return pdb.get_session_project(conn, session_id)
+        except Exception:
+            return None
+
+    def get_project(self, ident: str):
+        try:
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as conn:
+                return pdb.get_project(conn, ident)
+        except Exception:
+            return None
+
+    def get_active_id(self):
+        try:
+            from hermes_cli import projects_db as pdb
+
+            with pdb.connect_closing() as conn:
+                return pdb.get_active_id(conn)
+        except Exception:
+            return None
 
 
 @method("projects.tree")
@@ -10715,6 +10761,37 @@ def _(rid, params: dict) -> dict:
         )
         proj = next((p for p in tree["projects"] if p["id"] == project_id), None)
         return _ok(rid, {"project": proj})
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
+@method("projects.resolve_session")
+def _(rid, params: dict) -> dict:
+    """Resolve a session id to its owning project (binding > active > cwd).
+
+    Used by the desktop sidebar to render the "Bound to" badge in the session
+    drawer, and by SwitchUI's future per-session binding UI. Response shape:
+
+        {
+          "session_id": "...",
+          "project":    {"id": N, "slug": "...", "name": "..."} | None,
+          "source":     "binding" | "active" | "cwd" | None,
+        }
+    """
+    from tui_gateway import project_tree
+
+    try:
+        session_id = str(params.get("session_id") or "").strip()
+        if not session_id:
+            return _err(rid, 5063, "session_id required")
+        cwd = str(params.get("cwd") or "").strip()
+
+        resolved = project_tree.resolve_session_project(
+            session_id,
+            cwd,
+            projects_db=_ProjectsBindingBackend(),
+        )
+        return _ok(rid, resolved)
     except Exception as e:
         return _err(rid, 5061, str(e))
 
