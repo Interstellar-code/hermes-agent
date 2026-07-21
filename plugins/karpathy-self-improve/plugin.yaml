@@ -1,5 +1,5 @@
 name: karpathy-self-improve
-version: "0.1.0"
+version: "0.2.0"
 description: "Karpathy-style self-improvement engine. Collects per-profile metrics, persists improvement experiments, and exposes a dashboard API for analysis."
 author: Interstellar-code
 kind: standalone
