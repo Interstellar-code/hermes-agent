@@ -284,13 +284,17 @@ def test_run_eval_holdout_included_when_requested(db):
     assert "holdout" in splits
 
 
-def test_run_eval_raises_if_proposer_equals_judge(db):
+def test_run_eval_allows_equal_models_with_warning(db, caplog):
+    """Anti-gaming guard is intentionally disabled (operator runs proposer and
+    judge on the same model, e.g. both 'auto'). Equal models must NOT raise; the
+    guard warns and proceeds. With no scenarios, run_eval returns 0.0 right after
+    the guard — no judging, no network."""
+    import logging
     from _eval_runner import run_eval
-    exp_id = _make_experiment(db)
-    _make_scenario(db)
+    exp_id = _make_experiment(db)  # deliberately no _make_scenario
 
-    with pytest.raises(ValueError, match="must differ"):
-        run_eval(
+    with caplog.at_level(logging.WARNING):
+        score = run_eval(
             db=db,
             experiment_id=exp_id,
             profile="p",
@@ -299,6 +303,12 @@ def test_run_eval_raises_if_proposer_equals_judge(db):
             proposer_model="same-model",
             judge_model="same-model",
         )
+
+    assert score == 0.0
+    assert any(
+        "self-judged" in r.message.lower() or "anti-gaming" in r.message.lower()
+        for r in caplog.records
+    ), "expected an anti-gaming/self-judged warning"
 
 
 def test_run_eval_no_scenarios_returns_zero(db):

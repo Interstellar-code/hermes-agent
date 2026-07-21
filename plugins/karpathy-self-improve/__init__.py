@@ -17,7 +17,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_VERSION = "0.2.0"
+_VERSION = "0.3.0"
 
 
 # ---------------------------------------------------------------------------

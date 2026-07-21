@@ -62,14 +62,18 @@ def test_parse_verdict_ambiguous_defaults_false():
 
 
 # ---------------------------------------------------------------------------
-# resolve_propose_kwargs — equal models → ValueError
+# resolve_propose_kwargs — equal models allowed (anti-gaming guard disabled)
 # ---------------------------------------------------------------------------
 
-def test_resolve_propose_kwargs_equal_models_raises():
+def test_resolve_propose_kwargs_equal_models_allowed():
+    """Anti-gaming guard is intentionally disabled: proposer == judge (e.g. both
+    'auto') no longer raises — it warns and returns wired kwargs so /propose runs."""
     from _wiring import resolve_propose_kwargs
-    with patch("_wiring._load_models", return_value=("gpt-5.4", "gpt-5.4")):
-        with pytest.raises(ValueError, match="must differ"):
-            resolve_propose_kwargs()
+    with patch("_wiring._load_models", return_value=("auto", "auto")):
+        kw = resolve_propose_kwargs()
+    assert kw["proposer_model"] == "auto"
+    assert kw["judge_model"] == "auto"
+    assert callable(kw["llm_fn"]) and callable(kw["judge_fn"])
 
 
 def test_load_models_raises_when_judge_model_not_configured(monkeypatch):
@@ -275,8 +279,10 @@ def test_post_propose_passes_models_to_propose_for_profile(_mock_propose_for_pro
     assert captured.get("judge_model") == "gpt-5.4", f"captured={captured}"
 
 
-def test_post_propose_returns_400_on_equal_models(tmp_path):
-    """POST /propose should return 400 when proposer_model == judge_model."""
+def test_post_propose_allows_equal_models(_mock_propose_for_profile, tmp_path):
+    """Anti-gaming guard disabled: POST /propose with proposer_model == judge_model
+    (e.g. both 'auto') no longer 400s — it proceeds. propose_for_profile is mocked,
+    so no real LLM call happens."""
     _dashboard_dir = _PLUGIN_DIR / "dashboard"
     if str(_dashboard_dir) not in sys.path:
         sys.path.insert(0, str(_dashboard_dir))
@@ -289,7 +295,7 @@ def test_post_propose_returns_400_on_equal_models(tmp_path):
     mock_db = MagicMock()
     mock_db.list_experiments.return_value = []
 
-    with patch("_wiring._load_models", return_value=("gpt-5.4", "gpt-5.4")), \
+    with patch("_wiring._load_models", return_value=("auto", "auto")), \
          patch.object(db_mod, "get_db", return_value=mock_db), \
          patch("hermes_cli.profiles.get_profile_dir", return_value=str(profile_root)):
         client = _make_test_app(tmp_path)
@@ -299,9 +305,8 @@ def test_post_propose_returns_400_on_equal_models(tmp_path):
             headers={"X-KSI-Auth": ""},
         )
 
-    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
-    body = resp.json()
-    assert "differ" in body.get("error", "").lower()
+    assert resp.status_code != 400, f"guard should be disabled: {resp.status_code} {resp.text}"
+    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text}"
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
   "name": "karpathy-self-improve",
   "label": "Self-Improve",
   "description": "Karpathy-style self-improvement loop. Metrics, experiments, and scenarios per profile.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "tab": {
     "path": "/self-improve",
     "position": "end"

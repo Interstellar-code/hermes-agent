@@ -276,21 +276,23 @@ class TestH5JudgeGuard:
                 judge_model="claude-sonnet-4-6",
             )
 
-    def test_run_eval_raises_when_models_equal(self, tmp_path):
-        """run_eval must raise ValueError when proposer_model == judge_model."""
+    def test_run_eval_allows_equal_models_after_guard_disabled(self, tmp_path):
+        """Anti-gaming guard intentionally disabled: equal proposer/judge models no
+        longer raise (operator opt-in, e.g. both 'auto'). run_eval warns and
+        proceeds; with no scenarios it returns a score without raising."""
         import _db
         db = _db.open_db(tmp_path / "h5c.db")
 
         from _eval_runner import run_eval
-        with pytest.raises(ValueError, match="differ"):
-            run_eval(
-                db=db,
-                experiment_id=1,
-                profile="test",
-                kind="offline",
-                proposer_model="model-a",
-                judge_model="model-a",
-            )
+        score = run_eval(
+            db=db,
+            experiment_id=1,
+            profile="test",
+            kind="offline",
+            proposer_model="model-a",
+            judge_model="model-a",
+        )
+        assert isinstance(score, (int, float))
 
 
 # ---------------------------------------------------------------------------

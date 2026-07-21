@@ -290,10 +290,14 @@ def resolve_propose_kwargs(profile: Optional[str] = None) -> Dict[str, Any]:  # 
     """
     proposer_model, judge_model = _load_models()
 
+    # Anti-gaming guard DISABLED by operator config: proposer == judge is allowed
+    # (e.g. both "auto"). Self-judged evals are unreliable, so warn instead of
+    # raising, so /propose still runs. Mirror of _eval_runner.run_eval's policy.
     if proposer_model == judge_model:
-        raise ValueError(
-            f"proposer_model and judge_model must differ; both are {proposer_model!r}. "
-            "Set distinct values under plugins.karpathy_self_improve in config.yaml."
+        logger.warning(
+            "karpathy-self-improve: proposer_model == judge_model (%r); anti-gaming "
+            "guard disabled — self-judged evals are unreliable.",
+            proposer_model,
         )
 
     return {
