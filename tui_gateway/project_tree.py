@@ -389,6 +389,126 @@ def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[R
     return best
 
 
+def _bound_project_for_session(
+    session: dict, projects: list[dict], projects_db: Any
+) -> Optional[dict]:
+    """Return the explicit binding owner for ``session`` (issue #191).
+
+    The binding overrides both the cwd heuristic and the active pointer, so
+    consumers of ``build_tree`` consult this BEFORE ``_project_for_session``.
+    Returns ``None`` when the session is unbound, when ``projects_db`` is
+    missing, or when the bound project has been archived / deleted.
+    """
+    if projects_db is None:
+        return None
+    sid = (session.get("id") or session.get("session_id") or "").strip()
+    if not sid:
+        return None
+    try:
+        binding = projects_db.get_session_project(sid)
+    except Exception:
+        return None
+    if binding is None:
+        return None
+    proj_id = (
+        getattr(binding, "project_id", None)
+        if not isinstance(binding, dict)
+        else binding.get("project_id")
+    )
+    if not proj_id:
+        return None
+    for project in projects:
+        if project.get("id") == proj_id and not project.get("archived"):
+            return project
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Session resolver (issue #191)
+# ---------------------------------------------------------------------------
+
+
+def resolve_session_project(
+    session_id: str,
+    cwd: str,
+    projects_db: Any = None,
+    *,
+    resolve_cwd_project: Optional[Callable[[str], Optional[dict]]] = None,
+) -> dict:
+    """Resolve a session id to its owning project, in priority order:
+
+    1. explicit ``project_sessions`` row (binding) — caller injects a
+       ``projects_db``-shaped backend that exposes ``get_session_project(id)``
+       and ``get_project(ident)``; both already exist on
+       ``hermes_cli.projects_db``.
+    2. active project pointer (``get_active_id``) — same backend.
+    3. cwd + git-remote heuristic — ``resolve_cwd_project(cwd)`` (defaults to
+       ``None``, which lets the caller fall back to its own grouping).
+
+    Pure function: no I/O happens here, every input is passed in. Tests pass a
+    fake ``projects_db`` with two tiny methods and verify the precedence; the
+    gateway wraps this with the real DB.
+
+    Response shape (also the contract for the JSON-RPC ``projects.resolve_session``
+    and the REST ``GET /api/plugins/projects/session/<id>``):
+
+        {
+          "session_id":  str,
+          "project":     {"id": str, "slug": str, "name": str} | None,
+          "source":      "binding" | "active" | "cwd" | None,
+        }
+    """
+    sid = (session_id or "").strip()
+
+    def _to_project_dict(proj: Any) -> Optional[dict]:
+        if proj is None:
+            return None
+        pid = getattr(proj, "id", None)
+        slug = getattr(proj, "slug", None)
+        name = getattr(proj, "name", None)
+        if pid is None and isinstance(proj, dict):
+            pid = proj.get("id")
+            slug = proj.get("slug")
+            name = proj.get("name")
+        if not pid:
+            return None
+        return {"id": pid, "slug": slug, "name": name}
+
+    if projects_db is not None and sid:
+        try:
+            binding = projects_db.get_session_project(sid)
+        except Exception:
+            binding = None
+        if binding is not None:
+            proj_id = getattr(binding, "project_id", None) or (
+                binding.get("project_id") if isinstance(binding, dict) else None
+            )
+            if proj_id:
+                proj = projects_db.get_project(proj_id)
+                p = _to_project_dict(proj)
+                if p is not None:
+                    return {"session_id": sid, "project": p, "source": "binding"}
+
+    if projects_db is not None:
+        try:
+            active_id = projects_db.get_active_id()
+        except Exception:
+            active_id = None
+        if active_id:
+            proj = projects_db.get_project(active_id)
+            p = _to_project_dict(proj)
+            if p is not None:
+                return {"session_id": sid, "project": p, "source": "active"}
+
+    if resolve_cwd_project is not None and (cwd or "").strip():
+        proj = resolve_cwd_project(cwd.strip())
+        p = _to_project_dict(proj)
+        if p is not None:
+            return {"session_id": sid, "project": p, "source": "cwd"}
+
+    return {"session_id": sid, "project": None, "source": None}
+
+
 # ---------------------------------------------------------------------------
 # Public builder
 # ---------------------------------------------------------------------------
@@ -430,6 +550,7 @@ def build_tree(
     preview_limit: int = 3,
     hydrate: bool = False,
     is_junk_root: Optional[Callable[[str], bool]] = None,
+    projects_db: Any = None,
 ) -> dict:
     """Build the authoritative project tree.
 
@@ -440,6 +561,12 @@ def build_tree(
     ``is_junk_root`` flags roots that must never become an AUTO project (the
     bare home dir, the HERMES_HOME subtree) — their sessions fall through to the
     flat Recents list. User-created projects are honored regardless.
+
+    ``projects_db`` is the optional binding backend (issue #191); when supplied
+    it is consulted BEFORE the cwd heuristic so an explicit session → project
+    binding overrides folder-prefix grouping. Pass ``None`` (the default) to
+    keep the pre-binding behavior, which is what the unit tests in
+    ``tests/tui_gateway/test_project_tree.py`` exercise.
 
     Returns ``{"projects": [...], "scoped_session_ids": [...]}``. When
     ``hydrate`` is False (overview), lane ``sessions`` arrays are emptied but
@@ -453,7 +580,9 @@ def build_tree(
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
     for session in sessions:
-        owner = _project_for_session(session, folder_index, resolve)
+        owner = _bound_project_for_session(session, active_projects, projects_db)
+        if owner is None:
+            owner = _project_for_session(session, folder_index, resolve)
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
         else:
