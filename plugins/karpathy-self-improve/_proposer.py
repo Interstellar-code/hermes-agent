@@ -135,11 +135,17 @@ Your task: propose ONE atomic sentence-level improvement to the target file that
 most likely to address the failing scenarios or poor metrics. The edit must:
 1. Change exactly one sentence or one contiguous paragraph (single hunk).
 2. Be minimal — do not rewrite unrelated content.
-3. Be expressed as a unified diff (--- a/file, +++ b/file, @@ ... @@).
+3. Be a VALID unified diff that applies with `patch`:
+   - headers `--- a/{target_relpath}` and `+++ b/{target_relpath}`;
+   - a NUMERIC hunk header `@@ -<start>,<count> +<start>,<count> @@` — never a
+     descriptive one like `@@ Voice section @@`;
+   - include at least 2 unchanged CONTEXT lines (copied verbatim from the file
+     above) immediately before and after the changed line, so the hunk locates
+     even if the line numbers are slightly off.
 
 Return your response in this exact format:
 DIFF:
-<unified diff here, starting with ---, one hunk only>
+<unified diff here: ---/+++ headers, one numeric @@ hunk, context lines around the change>
 RATIONALE:
 <one sentence explaining why this edit helps>
 """
@@ -171,6 +177,12 @@ def _parse_llm_response(response: str) -> tuple[str, str]:
 # file, so any edit within the shown whole-line region applies cleanly.
 # 32000 chars (~8k tokens) comfortably fits real system-prompt files whole.
 _MAX_PROMPT_FILE_CHARS = 32000
+
+# Max proposer draws per /propose call. LLM diffs apply ~40% of the time on the
+# first draw; 6 independent draws lift that to ~95% while capping worst-case
+# latency and gateway spend (a bad draw is rejected before the eval, so each
+# retry is one cheap gateway call).
+_PROPOSE_MAX_ATTEMPTS = 6
 
 
 def _clip_file_for_prompt(content: str, max_chars: int = _MAX_PROMPT_FILE_CHARS) -> str:
@@ -412,36 +424,57 @@ def _propose_for_profile_inner(
         failing_scenarios=failing_summary,
     )
 
-    response = llm_fn(prompt)
-    if not response:
-        return ProposalResult(ok=False, error="LLM returned empty response")
+    # An LLM-authored unified diff is unreliable on any single draw: the model
+    # often emits a non-standard hunk header or a wrong line-count, so `patch`
+    # rejects it (measured ~40% first-draw apply rate). Each failure is an
+    # independent bad draw, recoverable by re-asking, so try a few times and
+    # take the first proposal that is a single hunk, applies cleanly, and
+    # changes at most one sentence. This runs BEFORE the expensive eval, so a
+    # re-draw costs one gateway call, not an eval.
+    # ponytail: retry papers over LLM diff fragility. The durable fix is to have
+    # the model return the full rewritten file and compute the diff ourselves
+    # (always applies) — a larger contract change, deferred.
+    diff = None
+    rationale = ""
+    delta = 0
+    last_error = "LLM returned no usable proposal"
+    last_delta = 0
+    for attempt in range(1, _PROPOSE_MAX_ATTEMPTS + 1):
+        response = llm_fn(prompt)
+        if not response:
+            last_error = "LLM returned empty response"
+            continue
+        cand_diff, cand_rationale = _parse_llm_response(response)
+        if not cand_diff:
+            last_error = "LLM response did not contain a parseable DIFF section"
+            continue
+        if not _diff_is_single_hunk(cand_diff):
+            last_error = f"diff has {_count_diff_hunks(cand_diff)} hunks; exactly 1 required (one atomic change)"
+            continue
+        cand_modified = _apply_diff_to_content(original_content, cand_diff)
+        if cand_modified is None:
+            last_error = "failed to apply diff to original content"
+            continue
+        cand_delta = _sentence_delta_count(original_content, cand_modified)
+        if cand_delta > 1:
+            last_error = f"diff changes {cand_delta} sentences; maximum is 1 (one atomic sentence-level edit)"
+            last_delta = cand_delta
+            continue
+        diff, rationale, delta = cand_diff, cand_rationale, cand_delta
+        if attempt > 1:
+            logger.info(
+                "karpathy-self-improve: propose succeeded on attempt %d/%d",
+                attempt, _PROPOSE_MAX_ATTEMPTS,
+            )
+        break
 
-    diff, rationale = _parse_llm_response(response)
-    if not diff:
-        return ProposalResult(ok=False, error="LLM response did not contain a parseable DIFF section")
-
-    # Validate: exactly one hunk.
-    if not _diff_is_single_hunk(diff):
-        hunk_count = _count_diff_hunks(diff)
+    if diff is None:
+        # Preserve the terminal failure reason (substring-compatible with the
+        # single-shot error messages callers/tests match on).
         return ProposalResult(
             ok=False,
-            error=f"diff has {hunk_count} hunks; exactly 1 required (one atomic change)",
-            diff=diff,
-        )
-
-    # Apply diff to get the modified content.
-    modified_content = _apply_diff_to_content(original_content, diff)
-    if modified_content is None:
-        return ProposalResult(ok=False, error="failed to apply diff to original content", diff=diff)
-
-    # Compute sentence delta.
-    delta = _sentence_delta_count(original_content, modified_content)
-    if delta > 1:
-        return ProposalResult(
-            ok=False,
-            error=f"diff changes {delta} sentences; maximum is 1 (one atomic sentence-level edit)",
-            diff=diff,
-            sentence_delta_count=delta,
+            error=f"no applicable single-sentence proposal after {_PROPOSE_MAX_ATTEMPTS} attempts (last error: {last_error})",
+            sentence_delta_count=last_delta,
         )
 
     # Capture git provenance.
