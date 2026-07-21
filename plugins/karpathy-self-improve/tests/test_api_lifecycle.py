@@ -392,3 +392,44 @@ def test_pause_and_resume_profile(client):
     assert resp.status_code == 200
     assert resp.json()["paused"] is False
     assert db.is_paused("my-profile") is False
+
+
+# ---------------------------------------------------------------------------
+# GET /profiles/{profile} — full config + status surface
+# ---------------------------------------------------------------------------
+
+def test_get_profile_status_surface(client):
+    tc, repo, db_file = client
+
+    # Seed one train + one holdout scenario for the profile.
+    tc.post("/scenarios", json={"profile": "scen-profile", "name": "t", "holdout": 0})
+    tc.post("/scenarios", json={"profile": "scen-profile", "name": "h", "holdout": 1})
+
+    resp = tc.get("/profiles/scen-profile")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Every contract key is present.
+    for key in (
+        "profile", "paused", "configured", "target_relpath", "profile_root",
+        "proposer_model", "judge_model", "live_sessions_target", "scenario_counts",
+        "experiment_counts", "latest_baseline_score", "last_collection_at",
+        "last_proposal_at", "last_verification_at",
+    ):
+        assert key in data, f"missing key {key!r}"
+
+    assert data["profile"] == "scen-profile"
+    assert data["paused"] is False
+    assert data["target_relpath"] == "system_prompt.md"
+    assert data["scenario_counts"] == {"train": 1, "holdout": 1}
+    assert set(data["experiment_counts"]) == {
+        "proposed", "approved", "live", "verified", "reverted", "rejected"
+    }
+    # No experiments/baselines/metrics seeded → optional fields are null.
+    assert data["last_proposal_at"] is None
+    assert data["latest_baseline_score"] is None
+    assert data["last_collection_at"] is None
+
+    # Pause is reflected in the surface.
+    tc.post("/profiles/scen-profile/pause")
+    assert tc.get("/profiles/scen-profile").json()["paused"] is True

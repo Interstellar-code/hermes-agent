@@ -512,6 +512,34 @@ async def delete_scenario(scenario_id: int, _auth: None = Depends(_require_auth)
 # Propose (async trigger)
 # ---------------------------------------------------------------------------
 
+def _resolve_target(db, profile: str) -> tuple[str, str]:
+    """Resolve (target_relpath, profile_root) for *profile*.
+
+    Default target_relpath is "system_prompt.md"; profile_root resolves via
+    hermes_cli.profiles.get_profile_dir with a ~/.hermes fallback (the "default"
+    profile lives at the ~/.hermes root, not ~/.hermes/profiles/default). The
+    newest experiment row overrides both when it carries target_relpath /
+    target_profile_root. Shared by POST /propose and GET /profiles/{profile}.
+    """
+    target_relpath = "system_prompt.md"
+    try:
+        from hermes_cli.profiles import get_profile_dir as _get_profile_dir
+        profile_root = str(_get_profile_dir(profile))
+    except Exception:
+        log.debug("hermes_cli.profiles unavailable; falling back to Path.home() logic")
+        _hermes_home = Path.home() / ".hermes"
+        if profile == "default":
+            profile_root = str(_hermes_home)
+        else:
+            profile_root = str(_hermes_home / "profiles" / profile)
+    rows = db.list_experiments(profile=profile)
+    if rows:
+        exp = rows[0]
+        target_relpath = exp.get("target_relpath") or target_relpath
+        profile_root = exp.get("target_profile_root") or profile_root
+    return target_relpath, profile_root
+
+
 @router.post("/propose")
 async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> JSONResponse:
     """Trigger the proposer for a profile (202 Accepted — runs synchronously for now)."""
@@ -522,30 +550,9 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
         profile = body.get("profile", "")
         if not profile:
             return JSONResponse({"error": "profile is required"}, status_code=400)
-        rows = db.list_experiments(profile=profile)
-        target_relpath = "system_prompt.md"
-        # Default the profile root to the profile's own directory so the very
-        # first proposal can resolve its target file. Previously this defaulted
-        # to "." (the dashboard process CWD), which only ever worked once a
-        # prior experiment had populated target_profile_root — a bootstrap
-        # deadlock that made /propose 500 on a fresh profile. The "default"
-        # profile lives at the ~/.hermes root, not ~/.hermes/profiles/default.
-        # Use the canonical resolver so HERMES_HOME is respected in multi-profile
-        # and hermes-switch setups.
-        try:
-            from hermes_cli.profiles import get_profile_dir as _get_profile_dir
-            profile_root = str(_get_profile_dir(profile))
-        except Exception:
-            log.debug("hermes_cli.profiles unavailable; falling back to Path.home() logic")
-            _hermes_home = Path.home() / ".hermes"
-            if profile == "default":
-                profile_root = str(_hermes_home)
-            else:
-                profile_root = str(_hermes_home / "profiles" / profile)
-        if rows:
-            exp = rows[0]
-            target_relpath = exp.get("target_relpath") or target_relpath
-            profile_root = exp.get("target_profile_root") or profile_root
+        # Resolve target file + profile root (shared with GET /profiles/{profile}).
+        # Falls back to the profile's own dir so a fresh profile can bootstrap.
+        target_relpath, profile_root = _resolve_target(db, profile)
         # Allow explicit overrides via the request body for non-standard layouts.
         if isinstance(body.get("target_relpath"), str) and body["target_relpath"]:
             target_relpath = body["target_relpath"]
@@ -574,6 +581,88 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
         )
     except Exception as exc:
         log.exception("karpathy POST /propose error")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Profile status (config + counts surface for the SwitchUI bootstrap check)
+# ---------------------------------------------------------------------------
+
+@router.get("/profiles/{profile}")
+async def get_profile_status(profile: str, _auth: None = Depends(_require_auth)) -> JSONResponse:
+    """Full config + status surface for *profile*.
+
+    Never 500s on missing optional data — returns null/0/empty per field. Lets
+    the SwitchUI tell a configured profile from an unbootstrapped one.
+    """
+    try:
+        from _db import get_db
+        db = get_db()
+
+        paused = db.is_paused(profile)
+        target_relpath, profile_root = _resolve_target(db, profile)
+        try:
+            configured = (Path(profile_root) / target_relpath).exists()
+        except Exception:
+            configured = False
+
+        # Models — null on ValueError (equal models) or any resolution failure.
+        proposer_model = None
+        judge_model = None
+        try:
+            from _wiring import resolve_propose_kwargs
+            _kw = resolve_propose_kwargs(profile)
+            proposer_model = _kw.get("proposer_model")
+            judge_model = _kw.get("judge_model")
+        except Exception:
+            pass
+
+        # Experiments: newest-first (list_experiments orders by created_at DESC).
+        experiments = db.list_experiments(profile=profile)
+        experiment_counts = {
+            s: 0 for s in ("proposed", "approved", "live", "verified", "reverted", "rejected")
+        }
+        live_sessions_target = None
+        last_verification_at = None
+        for exp in experiments:
+            st = exp.get("state")
+            if st in experiment_counts:
+                experiment_counts[st] += 1
+            if live_sessions_target is None and exp.get("live_sessions_target") is not None:
+                live_sessions_target = exp.get("live_sessions_target")
+            if last_verification_at is None and st == "verified":
+                last_verification_at = exp.get("verified_at") or exp.get("updated_at")
+        last_proposal_at = experiments[0].get("created_at") if experiments else None
+
+        # Scenarios split by holdout (0=train, 1=holdout).
+        scenario_counts = {"train": 0, "holdout": 0}
+        for s in db.list_scenarios(profile):
+            scenario_counts["holdout" if s.get("holdout") else "train"] += 1
+
+        baselines = db.list_baselines(profile)
+        latest_baseline_score = baselines[0].get("score") if baselines else None
+
+        metrics = db.list_metrics(profile=profile, limit=1)
+        last_collection_at = metrics[0].get("captured_at") if metrics else None
+
+        return JSONResponse({
+            "profile": profile,
+            "paused": paused,
+            "configured": configured,
+            "target_relpath": target_relpath,
+            "profile_root": profile_root,
+            "proposer_model": proposer_model,
+            "judge_model": judge_model,
+            "live_sessions_target": live_sessions_target,
+            "scenario_counts": scenario_counts,
+            "experiment_counts": experiment_counts,
+            "latest_baseline_score": latest_baseline_score,
+            "last_collection_at": last_collection_at,
+            "last_proposal_at": last_proposal_at,
+            "last_verification_at": last_verification_at,
+        })
+    except Exception as exc:
+        log.exception("karpathy GET /profiles/%s error", profile)
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
