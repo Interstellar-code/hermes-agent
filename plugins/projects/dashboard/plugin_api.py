@@ -86,6 +86,26 @@ class PathRequest(_Request):
     path: str
 
 
+class SessionBindRequest(_Request):
+    """Body for ``POST /api/plugins/projects/session``.
+
+    Exactly one of ``project_id`` / ``project_slug`` is required; ``bound_by``
+    is informational (caller identity for audit; default ``"api"``).
+    """
+
+    project_id: str | None = None
+    project_slug: str | None = None
+    bound_by: str | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_project(self):
+        if bool(self.project_id) == bool(self.project_slug):
+            raise ValueError(
+                "exactly one of project_id or project_slug is required"
+            )
+        return self
+
+
 def _clean(value: str | None) -> str | None:
     return value.strip() if value is not None else None
 
@@ -323,3 +343,138 @@ def get_project(project_id_or_slug: str) -> dict:
     if errors:
         response["enrichment_errors"] = errors
     return response
+
+
+# ---------------------------------------------------------------------------
+# Per-session project binding (issue #191)
+# ---------------------------------------------------------------------------
+
+
+def _binding_payload(conn, binding) -> dict:
+    return {
+        "binding": binding.to_dict(),
+        "project": {
+            "id": binding.project_id,
+        },
+    }
+
+
+def _resolve_session(conn, session_id: str) -> dict:
+    """Read-side resolver used by the dashboard endpoints.
+
+    Mirrors ``tui_gateway.project_tree.resolve_session_project`` for clients
+    that hit the REST surface directly (the desktop sidebar prefers JSON-RPC;
+    SwitchUI / external UIs hit these routes). Returns the same response shape
+    regardless of which tier answered: ``{"session_id", "project"|null, "source"}``.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session id must not be empty")
+
+    binding = projects_db.get_session_project(conn, sid)
+    if binding is not None:
+        project = projects_db.get_project(conn, binding.project_id)
+        if project is not None:
+            return {
+                "session_id": sid,
+                "project": {"id": project.id, "slug": project.slug, "name": project.name},
+                "source": "binding",
+            }
+
+    active_id = projects_db.get_active_id(conn)
+    if active_id:
+        project = projects_db.get_project(conn, active_id)
+        if project is not None:
+            return {
+                "session_id": sid,
+                "project": {"id": project.id, "slug": project.slug, "name": project.name},
+                "source": "active",
+            }
+
+    return {"session_id": sid, "project": None, "source": None}
+
+
+@router.post("/session")
+def bind_session(body: SessionBindRequest, session_id: str = Query(..., min_length=1)) -> dict:
+    """Bind a session to a project (upsert; refreshes ``bound_at``)."""
+    try:
+        with projects_db.connect_closing() as conn:
+            ident = (body.project_id or body.project_slug or "").strip()
+            project = projects_db.get_project(conn, ident)
+            if project is None:
+                raise HTTPException(status_code=404, detail="project not found")
+            binding = projects_db.bind_session(
+                conn,
+                project.id,
+                session_id,
+                bound_by=(body.bound_by or "api"),
+            )
+    except ValueError as exc:
+        raise _bad_value(exc) from exc
+    return _binding_payload(conn, binding)
+
+
+@router.delete("/session/{session_id}")
+def unbind_session(
+    session_id: str,
+    project_id_or_slug: str | None = Query(
+        None,
+        description="Project id or slug to unbind from. Omit to clear all bindings for the session.",
+    ),
+) -> dict:
+    """Remove a session binding (one project or all)."""
+    sid = (session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="session id must not be empty")
+    try:
+        with projects_db.connect_closing() as conn:
+            if project_id_or_slug:
+                project = projects_db.get_project(conn, project_id_or_slug)
+                if project is None:
+                    raise HTTPException(status_code=404, detail="project not found")
+                removed = projects_db.unbind_session(conn, project.id, sid)
+            else:
+                # Forget the session across every project it is bound to. The
+                # schema's single-table design means we read first, then delete
+                # by (project_id, session_id) PK so the cascade stays in the DB.
+                rows = conn.execute(
+                    "SELECT project_id FROM project_sessions WHERE session_id = ?",
+                    (sid,),
+                ).fetchall()
+                removed = 0
+                for row in rows:
+                    removed += int(
+                        projects_db.unbind_session(conn, row["project_id"], sid)
+                    )
+    except ValueError as exc:
+        raise _bad_value(exc) from exc
+    if removed == 0:
+        raise HTTPException(status_code=404, detail="no binding found for session")
+    return {"session_id": sid, "removed": removed}
+
+
+@router.get("/session/{session_id}")
+def resolve_session(session_id: str) -> dict:
+    """Return the resolved project for a session + the source tier that answered.
+
+    ``source`` is one of ``"binding"``, ``"active"``, or ``null`` (unbound).
+    The desktop sidebar uses this to render the "Bound to" badge in the
+    session drawer.
+    """
+    with projects_db.connect_closing() as conn:
+        return _resolve_session(conn, session_id)
+
+
+@router.get("/{project_id_or_slug}/sessions")
+def list_project_sessions(project_id_or_slug: str) -> dict:
+    """List every session explicitly bound to a project."""
+    with projects_db.connect_closing() as conn:
+        project = projects_db.get_project(conn, project_id_or_slug)
+        if project is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        bindings = projects_db.list_session_bindings(conn, project.id)
+    return {
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "bindings": [b.to_dict() for b in bindings],
+    }

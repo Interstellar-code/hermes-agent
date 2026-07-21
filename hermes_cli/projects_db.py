@@ -93,6 +93,25 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
     label         TEXT,
     last_seen     INTEGER NOT NULL
 );
+
+-- Explicit per-session project binding. Lets the user (or a UI) pin a chat
+-- session to a project that overrides the cwd + git-remote heuristic. Read
+-- precedence (see ``resolve_session_project``):
+--   1. explicit row here
+--   2. active project pointer (project_meta.active_id)
+--   3. cwd + git-remote heuristic
+-- Foreign key with ``ON DELETE CASCADE`` so dropping a project also drops all
+-- of its bindings — never leave dangling rows pointing at a deleted project.
+CREATE TABLE IF NOT EXISTS project_sessions (
+    project_id   TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id   TEXT    NOT NULL,
+    bound_at     INTEGER NOT NULL,
+    bound_by     TEXT,
+    PRIMARY KEY (project_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_sessions_session
+    ON project_sessions(session_id);
 """
 
 
@@ -688,6 +707,127 @@ def list_discovered_repos(conn: sqlite3.Connection) -> List[dict]:
         {"root": r["root"], "label": r["label"], "last_seen": r["last_seen"]}
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Per-session project binding
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SessionBinding:
+    """One row of the ``project_sessions`` table.
+
+    ``project_id`` and ``session_id`` are the natural pair (PK); ``bound_at`` is
+    a unix epoch and ``bound_by`` is the operator that set the binding (a CLI
+    username, a platform id, ``"api"`` for REST, etc. — purely informational).
+    """
+
+    project_id: str
+    session_id: str
+    bound_at: int
+    bound_by: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "project_id": self.project_id,
+            "session_id": self.session_id,
+            "bound_at": self.bound_at,
+            "bound_by": self.bound_by,
+        }
+
+
+def _session_binding_from_row(row: sqlite3.Row) -> SessionBinding:
+    return SessionBinding(
+        project_id=row["project_id"],
+        session_id=row["session_id"],
+        bound_at=row["bound_at"],
+        bound_by=row["bound_by"],
+    )
+
+
+def _require_session_id(session_id: object) -> str:
+    """Reject empty / non-string session ids early with a clear error."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise ValueError("session id must be a non-empty string")
+    return session_id.strip()
+
+
+def bind_session(
+    conn: sqlite3.Connection,
+    project_id: str,
+    session_id: str,
+    bound_by: Optional[str] = None,
+) -> SessionBinding:
+    """Bind ``session_id`` to ``project_id`` (upsert; refreshes ``bound_at``).
+
+    Raises ``ValueError`` when the project does not exist (so the CLI / REST
+    layer can return a 404 instead of silently creating a dangling FK row —
+    the FK is enforced by SQLite on commit, but a clean pre-check keeps error
+    messages actionable for the user).
+    """
+    if not project_id or not str(project_id).strip():
+        raise ValueError("project id must not be empty")
+    if get_project(conn, project_id) is None:
+        raise ValueError(f"no such project: {project_id}")
+    sid = _require_session_id(session_id)
+    now = _now()
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO project_sessions (project_id, session_id, bound_at, bound_by) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_id, session_id) DO UPDATE SET "
+            "bound_at = excluded.bound_at, bound_by = excluded.bound_by",
+            (project_id, sid, now, (bound_by or None)),
+        )
+    return SessionBinding(project_id=project_id, session_id=sid, bound_at=now, bound_by=bound_by)
+
+
+def unbind_session(
+    conn: sqlite3.Connection, project_id: str, session_id: str
+) -> bool:
+    """Remove a (project, session) binding. Returns True iff a row was removed."""
+    if not project_id or not str(project_id).strip():
+        raise ValueError("project id must not be empty")
+    sid = _require_session_id(session_id)
+    with write_txn(conn):
+        cur = conn.execute(
+            "DELETE FROM project_sessions WHERE project_id = ? AND session_id = ?",
+            (project_id, sid),
+        )
+    return cur.rowcount > 0
+
+
+def list_session_bindings(
+    conn: sqlite3.Connection, project_id: str
+) -> List[SessionBinding]:
+    """All sessions bound to ``project_id`` (most-recently-bound first)."""
+    rows = conn.execute(
+        "SELECT project_id, session_id, bound_at, bound_by "
+        "FROM project_sessions WHERE project_id = ? ORDER BY bound_at DESC",
+        (project_id,),
+    ).fetchall()
+    return [_session_binding_from_row(r) for r in rows]
+
+
+def get_session_project(
+    conn: sqlite3.Connection, session_id: str
+) -> Optional[SessionBinding]:
+    """The explicit binding for ``session_id``, or ``None`` when unbound.
+
+    When a session is bound to multiple projects (the schema allows it, the
+    issue spec says it is one-to-one at the API layer), the most recently
+    bound row wins — the resolution order downstream treats any binding as
+    authoritative over the active pointer, so the order between two bindings is
+    the order of last ``bind_session`` call.
+    """
+    sid = _require_session_id(session_id)
+    row = conn.execute(
+        "SELECT project_id, session_id, bound_at, bound_by "
+        "FROM project_sessions WHERE session_id = ? ORDER BY bound_at DESC LIMIT 1",
+        (sid,),
+    ).fetchone()
+    return _session_binding_from_row(row) if row else None
 
 
 # ---------------------------------------------------------------------------

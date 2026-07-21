@@ -101,6 +101,40 @@ def build_parser(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
 
+    p_session_bind = sub.add_parser(
+        "bind", help="Bind a session to a project (overrides cwd heuristic)"
+    )
+    p_session_bind.add_argument("project", help="Project id or slug")
+    p_session_bind.add_argument(
+        "--session", required=True, dest="session_id", metavar="ID",
+        help="Session id to bind (e.g. a chat session id)",
+    )
+    p_session_bind.add_argument(
+        "--by", default=None, metavar="WHO",
+        help="Who/what is making the binding (audit only; defaults to nothing)",
+    )
+
+    p_session_unbind = sub.add_parser(
+        "unbind", help="Remove a session → project binding"
+    )
+    p_session_unbind.add_argument(
+        "--session", required=True, dest="session_id", metavar="ID",
+        help="Session id to unbind",
+    )
+    p_session_unbind.add_argument(
+        "project", nargs="?", default=None,
+        help="Project id or slug to unbind from (omit to clear all bindings for the session)",
+    )
+
+    p_session_show = sub.add_parser(
+        "show-session",
+        help="Show the resolved project for a session (binding > active > cwd)",
+    )
+    p_session_show.add_argument(
+        "--session", required=True, dest="session_id", metavar="ID",
+        help="Session id to resolve",
+    )
+
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -133,6 +167,9 @@ def projects_command(args: argparse.Namespace) -> int:
         "archive": _cmd_archive,
         "restore": _cmd_restore,
         "bind-board": _cmd_bind_board,
+        "bind": _cmd_session_bind,
+        "unbind": _cmd_session_unbind,
+        "show-session": _cmd_session_show,
     }
     handler = handlers.get(action)
     if handler is None:
@@ -333,3 +370,144 @@ def _sync_board_default_workdir(proj, board_slug: str) -> None:
         kb.write_board_metadata(slug, default_workdir=proj.primary_path)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Per-session binding commands (issue #191)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_session_via_db(conn, session_id: str) -> dict:
+    """Run the full binding → active → cwd resolution for the CLI.
+
+    Mirrors ``tui_gateway.project_tree.resolve_session_project`` so the CLI
+    prints the same answer the desktop sidebar would render. The cwd heuristic
+    is delegated to the existing ``project_for_path`` helper; the binding and
+    active pointer live in projects.db itself.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        raise ValueError("session id must not be empty")
+
+    binding = pdb.get_session_project(conn, sid)
+    if binding is not None:
+        proj = pdb.get_project(conn, binding.project_id)
+        if proj is not None:
+            return {
+                "session_id": sid,
+                "project": proj,
+                "source": "binding",
+                "binding": binding,
+            }
+
+    active_id = pdb.get_active_id(conn)
+    if active_id:
+        proj = pdb.get_project(conn, active_id)
+        if proj is not None:
+            return {
+                "session_id": sid,
+                "project": proj,
+                "source": "active",
+                "binding": None,
+            }
+
+    return {
+        "session_id": sid,
+        "project": None,
+        "source": None,
+        "binding": None,
+    }
+
+
+def _cmd_session_bind(args: argparse.Namespace) -> int:
+    """`hermes project bind <slug> --session <id> [--by WHO]`."""
+    try:
+        with pdb.connect_closing() as conn:
+            proj = _resolve(conn, args.project)
+            if proj is None:
+                return 1
+            binding = pdb.bind_session(
+                conn, proj.id, args.session_id, bound_by=args.by
+            )
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    print(f"Bound session {binding.session_id} -> {proj.slug} ({proj.id})")
+    if binding.bound_by:
+        print(f"  by:      {binding.bound_by}")
+    return 0
+
+
+def _cmd_session_unbind(args: argparse.Namespace) -> int:
+    """`hermes project unbind --session <id> [project]`.
+
+    With ``project``, remove one (project, session) row. Without it, remove
+    every binding for the session — equivalent to forgetting the session
+    entirely across all projects.
+    """
+    try:
+        with pdb.connect_closing() as conn:
+            sid = (args.session_id or "").strip()
+            if not sid:
+                print("project: session id must not be empty", file=sys.stderr)
+                return 2
+            if args.project:
+                proj = _resolve(conn, args.project)
+                if proj is None:
+                    return 1
+                removed = pdb.unbind_session(conn, proj.id, sid)
+                label = f"{proj.slug} ({proj.id})"
+            else:
+                # Clear every binding for this session. Look up rows then
+                # delete by (project_id, session_id) PK; the schema is
+                # single-table so a session can in principle be bound to
+                # multiple projects, and the user just asked us to forget
+                # them all.
+                rows = conn.execute(
+                    "SELECT project_id FROM project_sessions WHERE session_id = ?",
+                    (sid,),
+                ).fetchall()
+                removed = 0
+                for row in rows:
+                    removed += int(
+                        pdb.unbind_session(conn, row["project_id"], sid)
+                    )
+                label = "all projects"
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    if removed == 0:
+        print(f"project: no binding found for session {sid}", file=sys.stderr)
+        return 1
+    print(f"Unbound session {sid} from {label} ({removed} row(s))")
+    return 0
+
+
+def _cmd_session_show(args: argparse.Namespace) -> int:
+    """`hermes project show-session --session <id>`.
+
+    Prints the resolved project plus the resolution source so the user can
+    tell at a glance whether the binding or the cwd heuristic answered.
+    """
+    try:
+        with pdb.connect_closing() as conn:
+            resolved = _resolve_session_via_db(conn, args.session_id)
+    except ValueError as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    sid = resolved["session_id"]
+    source = resolved["source"] or "unbound"
+    proj = resolved["project"]
+    print(f"Session: {sid}")
+    if proj is None:
+        print(f"  project: <none>  (source: {source})")
+        return 0
+    print(f"  project: {proj.slug} ({proj.id})")
+    print(f"  source:  {source}")
+    if resolved["binding"] is not None:
+        b = resolved["binding"]
+        when = b.bound_at
+        print(f"  bound_at: {when}")
+        if b.bound_by:
+            print(f"  bound_by: {b.bound_by}")
+    return 0
