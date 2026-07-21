@@ -622,13 +622,135 @@ async def trigger_propose(body: dict, _auth: None = Depends(_require_auth)) -> J
 # Pause / Resume profiles
 # ---------------------------------------------------------------------------
 
+def _resolve_target(db, profile: str) -> tuple[str, str]:
+    """Resolve (target_relpath, profile_root) for *profile*.
+
+    Default target_relpath is "system_prompt.md"; profile_root resolves via
+    hermes_cli.profiles.get_profile_dir with a ~/.hermes fallback (the "default"
+    profile lives at the ~/.hermes root, not ~/.hermes/profiles/default). The
+    newest experiment row overrides both when it carries target_relpath /
+    target_profile_root.
+    """
+    target_relpath = "system_prompt.md"
+    try:
+        from hermes_cli.profiles import get_profile_dir as _get_profile_dir
+        profile_root = str(_get_profile_dir(profile))
+    except Exception:
+        log.debug("hermes_cli.profiles unavailable; falling back to Path.home() logic")
+        _hermes_home = Path.home() / ".hermes"
+        if profile == "default":
+            profile_root = str(_hermes_home)
+        else:
+            profile_root = str(_hermes_home / "profiles" / profile)
+    rows = db.list_experiments(profile=profile)
+    if rows:
+        exp = rows[0]
+        target_relpath = exp.get("target_relpath") or target_relpath
+        profile_root = exp.get("target_profile_root") or profile_root
+    # config.yaml is the declared intent — plugins.karpathy_self_improve.profiles
+    # .<profile>.{target_relpath,profile_root}. It wins over the default and any
+    # experiment override so a configured-but-never-run profile resolves right.
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        cfg = load_config()
+        cfg_target = cfg_get(
+            cfg, "plugins", "karpathy_self_improve", "profiles", profile,
+            "target_relpath", default=None,
+        )
+        cfg_root = cfg_get(
+            cfg, "plugins", "karpathy_self_improve", "profiles", profile,
+            "profile_root", default=None,
+        )
+        if cfg_target:
+            target_relpath = str(cfg_target)
+        if cfg_root:
+            profile_root = str(cfg_root)
+    except Exception:
+        log.debug("karpathy _resolve_target: config.yaml unreadable", exc_info=True)
+    return target_relpath, profile_root
+
+
 @router.get("/profiles/{profile}")
-async def profile_status(profile: str) -> JSONResponse:
+async def get_profile_status(profile: str, _auth: None = Depends(_require_auth)) -> JSONResponse:
+    """Full config + status surface for *profile*.
+
+    Never 500s on missing optional data — returns null/0/empty per field. Lets
+    the SwitchUI tell a configured profile from an unbootstrapped one.
+    """
     try:
         from _db import get_db
-        return JSONResponse({"profile": profile, "paused": get_db().is_paused(profile)})
+        db = get_db()
+
+        paused = db.is_paused(profile)
+        target_relpath, profile_root = _resolve_target(db, profile)
+        try:
+            configured = (Path(profile_root) / target_relpath).exists()
+        except Exception:
+            configured = False
+
+        proposer_model = None
+        judge_model = None
+        try:
+            from _wiring import resolve_propose_kwargs
+            _kw = resolve_propose_kwargs(profile)
+            proposer_model = _kw.get("proposer_model")
+            judge_model = _kw.get("judge_model")
+        except Exception:
+            pass
+
+        experiments = db.list_experiments(profile=profile)
+        experiment_counts = {
+            s: 0 for s in ("proposed", "approved", "live", "verified", "reverted", "rejected")
+        }
+        live_sessions_target = None
+        last_verification_at = None
+        for exp in experiments:
+            st = exp.get("state")
+            if st in experiment_counts:
+                experiment_counts[st] += 1
+            if live_sessions_target is None and exp.get("live_sessions_target") is not None:
+                live_sessions_target = exp.get("live_sessions_target")
+            if last_verification_at is None and st == "verified":
+                last_verification_at = exp.get("verified_at") or exp.get("updated_at")
+        last_proposal_at = experiments[0].get("created_at") if experiments else None
+        if live_sessions_target is None:
+            try:
+                from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+                live_sessions_target = cfg_get(
+                    load_config(), "plugins", "karpathy_self_improve", "profiles",
+                    profile, "live_sessions_target", default=None,
+                )
+            except Exception:
+                pass
+
+        scenario_counts = {"train": 0, "holdout": 0}
+        for s in db.list_scenarios(profile):
+            scenario_counts["holdout" if s.get("holdout") else "train"] += 1
+
+        baselines = db.list_baselines(profile)
+        latest_baseline_score = baselines[0].get("score") if baselines else None
+
+        metrics = db.list_metrics(profile=profile, limit=1)
+        last_collection_at = metrics[0].get("captured_at") if metrics else None
+
+        return JSONResponse({
+            "profile": profile,
+            "paused": paused,
+            "configured": configured,
+            "target_relpath": target_relpath,
+            "profile_root": profile_root,
+            "proposer_model": proposer_model,
+            "judge_model": judge_model,
+            "live_sessions_target": live_sessions_target,
+            "scenario_counts": scenario_counts,
+            "experiment_counts": experiment_counts,
+            "latest_baseline_score": latest_baseline_score,
+            "last_collection_at": last_collection_at,
+            "last_proposal_at": last_proposal_at,
+            "last_verification_at": last_verification_at,
+        })
     except Exception as exc:
-        log.exception("karpathy /profiles/%s error", profile)
+        log.exception("karpathy GET /profiles/%s error", profile)
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 @router.post("/profiles/{profile}/pause")
