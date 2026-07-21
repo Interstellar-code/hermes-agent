@@ -479,3 +479,30 @@ def test_atomicity_net_add_one_sentence_accepted(db, git_repo):
     # Should not be rejected for atomicity
     assert result.ok is True
     assert result.sentence_delta_count == 1
+
+
+# ---------------------------------------------------------------------------
+# _clip_file_for_prompt — the proposer only ever shows the LLM whole lines, so
+# a truncated view can never induce a "repair the cut-off line" diff that then
+# fails to apply against the full file (the live /propose 500). #187 follow-up.
+# ---------------------------------------------------------------------------
+
+def test_clip_file_for_prompt_returns_small_file_verbatim():
+    from _proposer import _clip_file_for_prompt
+    text = "line 1\nline 2\nline 3\n"
+    assert _clip_file_for_prompt(text, max_chars=1000) == text
+
+
+def test_clip_file_for_prompt_cuts_on_line_boundary_with_marker():
+    from _proposer import _clip_file_for_prompt
+    lines = [f"line-{i:03d} some persona content here" for i in range(300)]
+    text = "\n".join(lines)
+    clipped = _clip_file_for_prompt(text, max_chars=500)
+
+    body, sep, _marker = clipped.partition("\n[...")
+    assert sep, "expected a truncation marker"
+    assert "truncated" in clipped
+    # Never a mid-line cut: every shown line is a complete original line.
+    for shown in body.split("\n"):
+        assert shown in lines
+    assert len(body) <= 500
