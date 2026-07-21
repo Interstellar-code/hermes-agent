@@ -537,6 +537,26 @@ def _resolve_target(db, profile: str) -> tuple[str, str]:
         exp = rows[0]
         target_relpath = exp.get("target_relpath") or target_relpath
         profile_root = exp.get("target_profile_root") or profile_root
+    # config.yaml is the declared intent — plugins.karpathy_self_improve.profiles
+    # .<profile>.{target_relpath,profile_root}. It wins over the default and any
+    # experiment override so a configured-but-never-run profile resolves right.
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+        cfg = load_config()
+        cfg_target = cfg_get(
+            cfg, "plugins", "karpathy_self_improve", "profiles", profile,
+            "target_relpath", default=None,
+        )
+        cfg_root = cfg_get(
+            cfg, "plugins", "karpathy_self_improve", "profiles", profile,
+            "profile_root", default=None,
+        )
+        if cfg_target:
+            target_relpath = str(cfg_target)
+        if cfg_root:
+            profile_root = str(cfg_root)
+    except Exception:
+        log.debug("karpathy _resolve_target: config.yaml unreadable", exc_info=True)
     return target_relpath, profile_root
 
 
@@ -633,6 +653,15 @@ async def get_profile_status(profile: str, _auth: None = Depends(_require_auth))
             if last_verification_at is None and st == "verified":
                 last_verification_at = exp.get("verified_at") or exp.get("updated_at")
         last_proposal_at = experiments[0].get("created_at") if experiments else None
+        if live_sessions_target is None:
+            try:
+                from hermes_cli.config import load_config, cfg_get  # type: ignore[import]
+                live_sessions_target = cfg_get(
+                    load_config(), "plugins", "karpathy_self_improve", "profiles",
+                    profile, "live_sessions_target", default=None,
+                )
+            except Exception:
+                pass
 
         # Scenarios split by holdout (0=train, 1=holdout).
         scenario_counts = {"train": 0, "holdout": 0}
