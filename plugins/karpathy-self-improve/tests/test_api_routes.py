@@ -143,13 +143,109 @@ def test_collect_requires_profile(client) -> None:
 
 
 def test_profile_status_defaults_false_and_reflects_pause(client) -> None:
-    path = "/api/plugins/karpathy-self-improve/profiles/default"
+    # Unbootstrapped profile: the full status surface with null/zero fields and
+    # configured=False. Use a never-configured profile name so the result does
+    # not depend on the host's real ~/.hermes contents (hermetic).
+    path = "/api/plugins/karpathy-self-improve/profiles/never-bootstrapped"
     response = client.get(path)
     assert response.status_code == 200
-    assert response.json() == {"profile": "default", "paused": False}
+    body = response.json()
+    assert body["profile"] == "never-bootstrapped"
+    assert body["paused"] is False
+    assert body["configured"] is False
+    assert body["experiment_counts"] == {
+        "proposed": 0, "approved": 0, "live": 0,
+        "verified": 0, "reverted": 0, "rejected": 0,
+    }
+    assert body["scenario_counts"] == {"train": 0, "holdout": 0}
+    assert body["latest_baseline_score"] is None
+    assert body["last_collection_at"] is None
+    assert body["last_proposal_at"] is None
+    assert body["last_verification_at"] is None
 
+    # Pause flips the flag within the same surface.
     assert client.post(f"{path}/pause").status_code == 200
-    assert client.get(path).json() == {"profile": "default", "paused": True}
+    assert client.get(path).json()["paused"] is True
+
+
+def test_get_profile_status_surface(client, tmp_path) -> None:
+    """Configured profile: a real target file + a verified experiment must surface
+    configured=True, the verified count, last_verification_at, the resolved target,
+    and live_sessions_target."""
+    from datetime import datetime, timezone
+    from _db import open_db
+
+    profile_root = tmp_path / "profiles" / "surface-test"
+    profile_root.mkdir(parents=True)
+    (profile_root / "SOUL.md").write_text("You are helpful.\n")
+
+    ts = datetime.now(timezone.utc).isoformat()
+    db = open_db(Path(os.environ["KARPATHY_DB_PATH"]))
+    exp_id = db.insert_experiment(
+        profile="surface-test",
+        file="SOUL.md",
+        state="verified",
+        target_profile_root=str(profile_root),
+        target_relpath="SOUL.md",
+        live_sessions_target=5,
+        created_at=ts,
+        updated_at=ts,
+    )
+    db.update_experiment_fields(exp_id, verified_at=ts, updated_at=ts)
+
+    r = client.get("/api/plugins/karpathy-self-improve/profiles/surface-test")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["configured"] is True
+    assert body["target_relpath"] == "SOUL.md"
+    assert body["profile_root"] == str(profile_root)
+    assert body["experiment_counts"]["verified"] == 1
+    assert body["last_verification_at"] == ts
+    assert body["live_sessions_target"] == 5
+
+
+def test_get_profile_status_config_target_overrides_experiment(
+    client, tmp_path, monkeypatch
+) -> None:
+    """config.yaml's declared target_relpath wins over the experiment's historical
+    target in the status surface (config is the declared source of truth)."""
+    from datetime import datetime, timezone
+    from _db import open_db
+    import hermes_cli.config as hcfg
+
+    profile_root = tmp_path / "profiles" / "cfg-wins"
+    profile_root.mkdir(parents=True)
+    (profile_root / "CONFIG_TARGET.md").write_text("declared\n")
+
+    def fake_cfg_get(cfg, *keys, default=None):
+        if keys[-1] == "target_relpath":
+            return "CONFIG_TARGET.md"
+        if keys[-1] == "profile_root":
+            return str(profile_root)
+        return default
+
+    monkeypatch.setattr(hcfg, "load_config", lambda: {})
+    monkeypatch.setattr(hcfg, "cfg_get", fake_cfg_get)
+
+    ts = datetime.now(timezone.utc).isoformat()
+    db = open_db(Path(os.environ["KARPATHY_DB_PATH"]))
+    exp_id = db.insert_experiment(
+        profile="cfg-wins",
+        file="OLD.md",
+        state="verified",
+        target_profile_root=str(tmp_path / "old-root"),
+        target_relpath="OLD.md",
+        created_at=ts,
+        updated_at=ts,
+    )
+    db.update_experiment_fields(exp_id, verified_at=ts, updated_at=ts)
+
+    r = client.get("/api/plugins/karpathy-self-improve/profiles/cfg-wins")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["target_relpath"] == "CONFIG_TARGET.md"
+    assert body["profile_root"] == str(profile_root)
+    assert body["configured"] is True
 
 
 # ---------------------------------------------------------------------------
