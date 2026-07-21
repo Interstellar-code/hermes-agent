@@ -164,6 +164,34 @@ def _parse_llm_response(response: str) -> tuple[str, str]:
     return diff, rationale
 
 
+# Cap the file content shown to the proposer LLM so a very large target file
+# can't blow the context window. Cut on a line boundary (never mid-word) and
+# flag the cut, so the model never "repairs" a truncation artifact and only
+# proposes edits to content it fully sees. The diff is applied against the FULL
+# file, so any edit within the shown whole-line region applies cleanly.
+# 32000 chars (~8k tokens) comfortably fits real system-prompt files whole.
+_MAX_PROMPT_FILE_CHARS = 32000
+
+
+def _clip_file_for_prompt(content: str, max_chars: int = _MAX_PROMPT_FILE_CHARS) -> str:
+    """Return *content* for the prompt, clipped to whole lines under *max_chars*.
+
+    A file at or under the cap is returned verbatim. A larger file is cut at the
+    last newline within the cap (so no partial line is ever shown) and a marker
+    is appended telling the model to edit only the content above.
+    """
+    if len(content) <= max_chars:
+        return content
+    head = content[:max_chars]
+    nl = head.rfind("\n")
+    if nl > 0:
+        head = head[:nl]
+    return head + (
+        f"\n[... {len(content) - len(head)} more characters truncated; "
+        "propose edits only within the content shown above ...]"
+    )
+
+
 class PatchApplyError(Exception):
     """Raised by apply_diff_to_text() when a unified diff fails to apply."""
 
@@ -379,7 +407,7 @@ def _propose_for_profile_inner(
     prompt = _PROPOSE_PROMPT_TEMPLATE.format(
         profile=profile,
         target_relpath=target_relpath,
-        file_content=original_content[:4000],  # Truncate to avoid token overflow.
+        file_content=_clip_file_for_prompt(original_content),
         metrics_summary=metrics_summary,
         failing_scenarios=failing_summary,
     )
