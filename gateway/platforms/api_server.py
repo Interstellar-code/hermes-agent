@@ -1601,6 +1601,47 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_profile_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract a validated, authenticated ``X-Hermes-Profile`` request scope.
+
+        The API server normally serves the gateway process's active profile.
+        This opt-in header lets trusted local control-plane callers evaluate a
+        named profile without mutating the process environment or that
+        profile's files.  It deliberately requires the API key even when the
+        endpoint itself is otherwise running without one: choosing another
+        profile is an authorization boundary, not a client preference.
+        """
+        raw = request.headers.get("X-Hermes-Profile", "").strip()
+        if not raw:
+            return None, None
+        if not self._api_key:
+            logger.warning("X-Hermes-Profile rejected: no API key configured")
+            return None, web.json_response(
+                _openai_error(
+                    "X-Hermes-Profile requires API key authentication. "
+                    "Configure API_SERVER_KEY to enable profile scoping."
+                ),
+                status=403,
+            )
+        try:
+            from hermes_cli.profiles import (
+                get_profile_dir,
+                normalize_profile_name,
+                validate_profile_name,
+            )
+
+            profile = normalize_profile_name(raw)
+            validate_profile_name(profile)
+            if not get_profile_dir(profile).is_dir():
+                raise ValueError("profile does not exist")
+        except Exception:
+            return None, web.json_response(
+                _openai_error("Unknown or invalid Hermes profile"), status=400
+            )
+        return profile, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -1885,6 +1926,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
+            # Surface the URL-derived session_id in the volatile prompt block
+            # (system_prompt.py:464) so the model answers "what is my session
+            # id" from ground truth instead of confabulating / latching onto a
+            # stale id carried through a compaction summary. Regenerated each
+            # turn from agent.session_id; compressor cannot touch it.
+            pass_session_id=True,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
@@ -2707,6 +2754,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            profile=profile,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2982,6 +3030,32 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        # Internal evaluation seam: replace SOUL.md only for this request.
+        # Kept out of the OpenAI message list so candidate content enters the
+        # same identity slot as the file it evaluates, not a lower-priority
+        # appended instruction. Requiring configured API auth keeps this from
+        # becoming a public persona-override surface.
+        identity_override = body.get("hermes_identity_override")
+        if identity_override is not None:
+            if not self._api_key:
+                return web.json_response(
+                    _openai_error(
+                        "hermes_identity_override requires API key authentication."
+                    ),
+                    status=403,
+                )
+            if not isinstance(identity_override, str) or not identity_override.strip():
+                return web.json_response(
+                    _openai_error(
+                        "hermes_identity_override must be a non-empty string"
+                    ),
+                    status=400,
+                )
+            if len(identity_override) > 100_000:
+                return web.json_response(
+                    _openai_error("hermes_identity_override is too large"), status=400
+                )
+
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -2990,6 +3064,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        profile, profile_err = self._parse_profile_header(request)
+        if profile_err is not None:
+            return profile_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -3142,6 +3219,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                identity_override=identity_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3162,6 +3240,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
                 route=route,
+                identity_override=identity_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -4911,6 +4990,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         interactive_clarify: bool = False,
         clarify_callback=None,
+        identity_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4935,6 +5015,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from contextlib import nullcontext
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -4954,6 +5035,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         interactive_clarify=interactive_clarify,
                     )
+                    # Karpathy offline-eval harness: the consumer half reads this
+                    # in agent/system_prompt.py. Auth-gated and validated at the
+                    # request boundary (hermes_identity_override).
+                    agent._eval_identity_override = identity_override
                     if clarify_callback is not None:
                         agent.clarify_callback = clarify_callback
                     if agent_ref is not None:
