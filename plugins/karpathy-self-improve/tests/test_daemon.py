@@ -140,6 +140,8 @@ def test_tick_live_verifies_when_score_holds(db, git_repo):
     with patch("_eval_runner.run_eval", return_value=0.8) as mock_eval:
         _tick_live_experiments(db)
 
+    assert callable(mock_eval.call_args.kwargs["scenario_runner"])
+
     exp = db.get_experiment(exp_id)
     assert exp["state"] == "verified"
 

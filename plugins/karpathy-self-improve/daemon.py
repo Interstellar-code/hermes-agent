@@ -380,6 +380,7 @@ def _tick_live_experiments(db: Any) -> None:
     from _eval_runner import run_eval
     from _git_ratchet import revert_commit
     from _state_machine import transition
+    from _wiring import make_scenario_runner
 
     live_exps = db.list_experiments(state="live")
     now = datetime.now(timezone.utc).isoformat()
@@ -419,6 +420,7 @@ def _tick_live_experiments(db: Any) -> None:
                 kind="live",
                 proposer_model=proposer_model,
                 judge_model=judge_model,
+                scenario_runner=make_scenario_runner(proposer_model, profile),
                 include_holdout=True,
             )
             # Reset failure counter on success.

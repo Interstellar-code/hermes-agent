@@ -114,6 +114,37 @@ def test_propose_creates_experiment(db, git_repo):
     assert exp["sentence_delta_count"] is not None
 
 
+def test_propose_scores_the_candidate_without_writing_target_file(db, git_repo):
+    """Offline eval must receive candidate content; the target stays unchanged."""
+    from _proposer import propose_for_profile
+
+    profile = "candidate-eval-profile"
+    _make_scenario(db, profile)
+    original = (git_repo / "SOUL.md").read_text()
+    seen = {}
+
+    def make_candidate_runner(content, relpath):
+        seen["content"] = content
+        seen["relpath"] = relpath
+        return lambda _input: "hello"
+
+    result = propose_for_profile(
+        db=db,
+        profile=profile,
+        target_relpath="SOUL.md",
+        profile_root=str(git_repo),
+        llm_fn=lambda prompt: _GOOD_LLM_RESPONSE,
+        scenario_runner=lambda _input: "wrong runner",
+        candidate_scenario_runner=make_candidate_runner,
+        proposer_model="proposer-model",
+        judge_model="judge-model",
+    )
+
+    assert result.ok is True
+    assert seen == {"content": _GOOD_UPDATED, "relpath": "SOUL.md"}
+    assert (git_repo / "SOUL.md").read_text() == original
+
+
 def test_propose_sets_sentence_delta_count(db, git_repo):
     from _proposer import propose_for_profile
 

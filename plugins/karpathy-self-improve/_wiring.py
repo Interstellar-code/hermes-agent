@@ -84,15 +84,23 @@ def _load_api_key() -> str:
     return ""
 
 
-def call_gateway_chat(prompt: str, *, model: Optional[str] = None, timeout: int = 120) -> str:
+def call_gateway_chat(
+    prompt: str,
+    *,
+    model: Optional[str] = None,
+    timeout: int = 120,
+    profile: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    identity_override: Optional[str] = None,
+) -> str:
     """Call the gateway's OpenAI-compatible chat endpoint; return the reply text.
 
     POSTs ``{GATEWAY_URL}/v1/chat/completions`` with a Bearer header and the
-    OpenAI request shape, and reads ``choices[0].message.content``. ``model``
-    defaults to ``"auto"`` so the request routes through the agent's configured
-    provider/model (config.yaml ``model:``) rather than any model id baked into
-    this plugin. Shared by _proposer._default_llm_fn and
-    _eval_runner.gateway_scenario_runner. Raises on transport/HTTP error.
+    OpenAI request shape, and reads ``choices[0].message.content``. ``profile``
+    selects an authenticated gateway profile; ``identity_override`` replaces
+    the profile's SOUL.md only in memory for an offline candidate evaluation.
+    ``model`` defaults to ``"auto"`` so the request routes through the agent's
+    configured provider/model rather than any model id baked into this plugin.
     """
     import requests  # type: ignore[import]
 
@@ -100,10 +108,19 @@ def call_gateway_chat(prompt: str, *, model: Optional[str] = None, timeout: int 
     key = _load_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
+    if profile:
+        if not key:
+            raise ValueError("profile-scoped gateway calls require API_SERVER_KEY")
+        headers["X-Hermes-Profile"] = profile
+    messages = [{"role": "user", "content": prompt}]
+    if system_prompt:
+        messages.insert(0, {"role": "system", "content": system_prompt})
     payload: Dict[str, Any] = {
         "model": model or _DEFAULT_PROPOSER_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
     }
+    if identity_override is not None:
+        payload["hermes_identity_override"] = identity_override
     resp = requests.post(
         f"{GATEWAY_URL}{_GATEWAY_CHAT_PATH}",
         json=payload,
@@ -216,12 +233,12 @@ def resolve_target_for_profile(profile: str, db: Any) -> tuple[str, str]:
 # Gateway-backed callables
 # ---------------------------------------------------------------------------
 
-def _make_llm_fn(model: str) -> Callable[[str], str]:
+def _make_llm_fn(model: str, profile: Optional[str] = None) -> Callable[[str], str]:
     """Return a callable that POSTs *prompt* to the gateway with *model*."""
 
     def llm_fn(prompt: str) -> str:
         try:
-            return call_gateway_chat(prompt, model=model, timeout=120)
+            return call_gateway_chat(prompt, model=model, timeout=120, profile=profile)
         except Exception as exc:
             logger.warning("karpathy-self-improve: llm_fn(model=%r) failed: %s", model, exc)
             raise
@@ -229,7 +246,7 @@ def _make_llm_fn(model: str) -> Callable[[str], str]:
     return llm_fn
 
 
-def _make_judge_fn(model: str) -> Callable[[str, str], bool]:
+def _make_judge_fn(model: str, profile: Optional[str] = None) -> Callable[[str, str], bool]:
     """Return a judge callable that uses *model* to get a yes/no verdict."""
 
     def judge_fn(rubric: str, response: str) -> bool:
@@ -238,7 +255,9 @@ def _make_judge_fn(model: str) -> Callable[[str, str], bool]:
                 f"You are an evaluator. Based on the rubric, reply with a single word: "
                 f"yes or no.\n\nRubric: {rubric}\n\nResponse to evaluate:\n{response}"
             )
-            raw = call_gateway_chat(prompt, model=model, timeout=60).strip().lower()
+            raw = call_gateway_chat(
+                prompt, model=model, timeout=60, profile=profile
+            ).strip().lower()
             return _parse_verdict(raw)
         except Exception as exc:
             logger.warning("karpathy-self-improve: judge_fn(model=%r) failed: %s", model, exc)
@@ -259,15 +278,30 @@ def _parse_verdict(raw: str) -> bool:
     return False
 
 
-def _make_scenario_runner(model: str) -> Callable[[str], str]:
-    """Return a scenario runner that sends input through the gateway with *model*."""
+def make_scenario_runner(
+    model: str,
+    profile: Optional[str],
+    *,
+    candidate_content: Optional[str] = None,
+    target_relpath: Optional[str] = None,
+) -> Callable[[str], str]:
+    """Return a profile-scoped runner, optionally with an in-memory candidate."""
 
     def scenario_runner(scenario_input: str) -> str:
         try:
-            return call_gateway_chat(scenario_input, model=model, timeout=60)
+            return call_gateway_chat(
+                scenario_input,
+                model=model,
+                timeout=60,
+                profile=profile,
+                identity_override=candidate_content,
+            )
         except Exception as exc:
             logger.warning(
-                "karpathy-self-improve: scenario_runner(model=%r) failed: %s", model, exc
+                "karpathy-self-improve: scenario_runner(model=%r, profile=%r) failed: %s",
+                model,
+                profile,
+                exc,
             )
             raise
 
@@ -278,7 +312,7 @@ def _make_scenario_runner(model: str) -> Callable[[str], str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def resolve_propose_kwargs(profile: Optional[str] = None) -> Dict[str, Any]:  # noqa: ARG001
+def resolve_propose_kwargs(profile: Optional[str] = None) -> Dict[str, Any]:
     """Return kwargs for propose_for_profile backed by the real gateway.
 
     Returns a dict with keys: proposer_model, judge_model, llm_fn,
@@ -303,7 +337,13 @@ def resolve_propose_kwargs(profile: Optional[str] = None) -> Dict[str, Any]:  # 
     return {
         "proposer_model": proposer_model,
         "judge_model": judge_model,
-        "llm_fn": _make_llm_fn(proposer_model),
-        "judge_fn": _make_judge_fn(judge_model),
-        "scenario_runner": _make_scenario_runner(proposer_model),
+        "llm_fn": _make_llm_fn(proposer_model, profile),
+        "judge_fn": _make_judge_fn(judge_model, profile),
+        "scenario_runner": make_scenario_runner(proposer_model, profile),
+        "candidate_scenario_runner": lambda content, relpath: make_scenario_runner(
+            proposer_model,
+            profile,
+            candidate_content=content,
+            target_relpath=relpath,
+        ),
     }

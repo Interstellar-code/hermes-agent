@@ -1154,6 +1154,59 @@ class TestChatCompletionsEndpoint:
             assert data["choices"][0]["message"]["content"] == mock_result["final_response"]
 
     @pytest.mark.asyncio
+    async def test_chat_completions_scopes_authenticated_profile(self, auth_adapter, monkeypatch, tmp_path):
+        profile_dir = tmp_path / "hermes-switch"
+        profile_dir.mkdir()
+        app = _create_app(auth_adapter)
+        result = {"final_response": "profiled", "messages": [], "api_calls": 1}
+        with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_dir), \
+             patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Profile": "hermes-switch",
+                    },
+                    json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["profile"] == "hermes-switch"
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_rejects_profile_scope_without_api_key(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                headers={"X-Hermes-Profile": "hermes-switch"},
+                json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            )
+        assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_forwards_identity_override_only_when_authenticated(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        result = {"final_response": "candidate", "messages": [], "api_calls": 1}
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "model": "test",
+                        "hermes_identity_override": "Candidate SOUL content.",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["identity_override"] == "Candidate SOUL content."
+
+    @pytest.mark.asyncio
     async def test_stream_task_done_callback_enqueues_eos_for_chat_completions(self, adapter):
         """Regression guard for #24451: completion callback must signal SSE EOS."""
         app = _create_app(adapter)

@@ -345,6 +345,64 @@ def test_call_gateway_chat_uses_openai_endpoint_and_bearer(monkeypatch):
     assert seen["json"]["messages"] == [{"role": "user", "content": "hi"}]
 
 
+def test_call_gateway_chat_scopes_profile_and_candidate_in_memory(monkeypatch):
+    import _wiring
+    import requests
+
+    seen = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        seen["json"] = json
+        seen["headers"] = headers or {}
+        return _Resp()
+
+    monkeypatch.setattr(_wiring, "_load_api_key", lambda: "sekret")
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    out = _wiring.call_gateway_chat(
+        "scenario input",
+        model="auto",
+        profile="hermes-switch",
+        identity_override="candidate SOUL content",
+    )
+
+    assert out == "ok"
+    assert seen["headers"]["X-Hermes-Profile"] == "hermes-switch"
+    assert seen["json"]["messages"] == [{"role": "user", "content": "scenario input"}]
+    assert seen["json"]["hermes_identity_override"] == "candidate SOUL content"
+
+
+def test_make_scenario_runner_uses_candidate_only_when_requested(monkeypatch):
+    import _wiring
+
+    calls = []
+
+    def fake_call(prompt, **kwargs):
+        calls.append((prompt, kwargs))
+        return "ok"
+
+    monkeypatch.setattr(_wiring, "call_gateway_chat", fake_call)
+
+    _wiring.make_scenario_runner("auto", "hermes-switch")("live input")
+    _wiring.make_scenario_runner(
+        "auto",
+        "hermes-switch",
+        candidate_content="Candidate directive.",
+        target_relpath="SOUL.md",
+    )("offline input")
+
+    assert calls[0][1]["profile"] == "hermes-switch"
+    assert calls[0][1]["identity_override"] is None
+    assert calls[1][1]["identity_override"] == "Candidate directive."
+
+
 def test_call_gateway_chat_omits_auth_when_no_key(monkeypatch):
     import _wiring
     import requests
