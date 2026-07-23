@@ -323,6 +323,7 @@ def propose_for_profile(
     proposer_model: Optional[str] = None,
     judge_model: Optional[str] = None,
     scenario_runner: Optional[Callable[[str], str]] = None,
+    candidate_scenario_runner: Optional[Callable[[str, str], Callable[[str], str]]] = None,
 ) -> ProposalResult:
     """Propose one atomic sentence-level edit for *profile*'s target file.
 
@@ -336,6 +337,8 @@ def propose_for_profile(
         proposer_model: LLM model ID for proposing edits.
         judge_model: LLM model ID for judging (must differ from proposer_model).
         scenario_runner: Callable(scenario_input) -> response_text. For eval.
+        candidate_scenario_runner: Builds a non-mutating runner for the
+            proposed target-file content during offline evaluation.
 
     Returns:
         ProposalResult (never raises).
@@ -351,6 +354,7 @@ def propose_for_profile(
             proposer_model=proposer_model,
             judge_model=judge_model,
             scenario_runner=scenario_runner,
+            candidate_scenario_runner=candidate_scenario_runner,
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("karpathy-self-improve: propose_for_profile failed unexpectedly")
@@ -368,6 +372,7 @@ def _propose_for_profile_inner(
     proposer_model: Optional[str],
     judge_model: Optional[str],
     scenario_runner: Optional[Callable[[str], str]],
+    candidate_scenario_runner: Optional[Callable[[str, str], Callable[[str], str]]],
 ) -> ProposalResult:
     from _eval_runner import run_eval
     from _git_ratchet import current_commit_sha, blob_sha
@@ -525,19 +530,19 @@ def _propose_for_profile_inner(
         updated_at=now,
     )
 
-    # Run offline eval to score the proposal.
-    # NOTE: We cannot actually apply the diff to the filesystem here (that's
-    # reserved for the apply step). The eval runs against the scenario_runner
-    # which tests the *current* state. In a real system, the proposer would
-    # need to write a temp file and point the scenario_runner at it.
-    # For now, we run the eval and record the score as the offline baseline.
+    # Run offline eval against the candidate content without writing the target
+    # file. The production wiring injects it as an ephemeral gateway system
+    # layer; injected test runners retain their existing simple callable shape.
+    offline_runner = scenario_runner
+    if candidate_scenario_runner is not None:
+        offline_runner = candidate_scenario_runner(cand_updated, target_relpath)
     try:
         offline_score = run_eval(
             db=db,
             experiment_id=exp_id,
             profile=profile,
             kind="offline",
-            scenario_runner=scenario_runner,
+            scenario_runner=offline_runner,
             judge_fn=judge_fn,
             proposer_model=proposer_model,
             judge_model=judge_model,
