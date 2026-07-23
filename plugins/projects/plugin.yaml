@@ -1,0 +1,5 @@
+name: projects
+version: "1.0.0"
+description: "First-class Hermes projects with CLI and dashboard API."
+kind: standalone
+dashboard_manifest: dashboard/manifest.json
