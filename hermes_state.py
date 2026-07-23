@@ -65,6 +65,12 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
+def _agent_id_json(col: str = "model_config") -> str:
+    """Owning agent identity marker written by delegate_task (#194).
+    Same JSON-blob pattern as ``_delegate_from``/``_branched_from``."""
+    return f"json_extract(COALESCE({col}, '{{}}'), '$._agent_id')"
+
+
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
     return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
@@ -3719,6 +3725,7 @@ class SessionDB:
         id_query: str = None,
         search_query: str = None,
         compact_rows: bool = False,
+        parent_session_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -3761,6 +3768,14 @@ class SessionDB:
         """
         where_clauses = []
         params = []
+
+        # Filtering by parent targets child rows by definition, so it implies
+        # include_children — otherwise the child-exclusion clauses below would
+        # make every parent_session_id query return an empty list (#194).
+        if parent_session_id:
+            where_clauses.append("s.parent_session_id = ?")
+            params.append(parent_session_id)
+            include_children = True
 
         if not include_children:
             # Show root sessions and branch sessions, while still hiding
@@ -3911,6 +3926,7 @@ class SessionDB:
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active,
+                    {_agent_id_json('s.model_config')} AS agent_id,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -3935,7 +3951,8 @@ class SessionDB:
                     COALESCE(
                         (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
-                    ) AS last_active
+                    ) AS last_active,
+                    {_agent_id_json('s.model_config')} AS agent_id
                 FROM sessions s
                 {where_sql}
                 ORDER BY s.started_at DESC
@@ -4082,7 +4099,8 @@ class SessionDB:
                 COALESCE(
                     (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
-                ) AS last_active
+                ) AS last_active,
+                {_agent_id_json('s.model_config')} AS agent_id
             FROM sessions s
             WHERE s.id = ?
         """

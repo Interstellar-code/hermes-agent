@@ -835,6 +835,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    agent_id: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -882,6 +883,8 @@ def _build_child_progress_callback(
             kw["model"] = model
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
+        if agent_id is not None:
+            kw["agent_id"] = agent_id
         # The child's own session id — filled into the shared ref once the
         # child agent exists (the callback is built first), so every relayed
         # event lets UIs open/inspect the subagent's session directly.
@@ -1086,6 +1089,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Explicit owning agent identity (#194); preserved verbatim, not inferred.
+    agent_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1219,6 +1224,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        agent_id=agent_id,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1416,6 +1422,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._agent_id = agent_id
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -1424,6 +1431,10 @@ def _build_child_agent(
     parent_sid = getattr(parent_agent, "session_id", None)
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+    # Persist the owning agent identity alongside lineage markers — JSON blob
+    # key mirrors _delegate_from/_branched_from (no schema migration, #194).
+    if agent_id and getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_agent_id"] = agent_id
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1917,10 +1928,14 @@ def _run_single_child(
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
+        _child_agent_id = getattr(child, "_agent_id", None)
         _register_subagent(
             {
                 "subagent_id": _subagent_id,
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+                "agent_id": (
+                    _child_agent_id if isinstance(_child_agent_id, str) else None
+                ),
                 "depth": _tui_depth,
                 "goal": goal,
                 "model": (
@@ -2423,6 +2438,16 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _normalize_agent_id(v) -> Optional[str]:
+    """Preserve-or-anonymous: return the verbatim (stripped) agent id string,
+    or None for anything missing/empty/non-string. No registry validation —
+    the string is an opaque caller-owned identity (#194)."""
+    if v is None or not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v or None
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2430,6 +2455,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    agent_id: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2532,7 +2558,9 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {"goal": goal, "context": context, "role": top_role, "agent_id": agent_id}
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2586,6 +2614,9 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task agent_id beats top-level; resolved inside the loop so a
+            # mixed-agent_id batch never shares one value across children.
+            effective_agent_id = _normalize_agent_id(t.get("agent_id") or agent_id)
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2606,6 +2637,7 @@ def delegate_task(
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
                 role=effective_role,
+                agent_id=effective_agent_id,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -3563,6 +3595,13 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "agent_id": {
+                            "type": "string",
+                            "description": (
+                                "Explicit owning agent identity (e.g. 'neo'); "
+                                "preserved verbatim, not inferred."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3586,6 +3625,13 @@ DELEGATE_TASK_SCHEMA = {
                     "the work finishes; just continue working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
+                ),
+            },
+            "agent_id": {
+                "type": "string",
+                "description": (
+                    "Explicit owning agent identity (e.g. 'neo'); "
+                    "preserved verbatim, not inferred."
                 ),
             },
         },
@@ -3647,6 +3693,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        agent_id=args.get("agent_id"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
