@@ -1666,7 +1666,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "_lineage_root_id", "agent_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # Avoid exposing full system prompts/model_config through the client API;
@@ -1726,6 +1726,7 @@ class APIServerAdapter(BasePlatformAdapter):
         offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
         source = request.query.get("source") or None
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+        parent_session_id = request.query.get("parent_session_id") or None
         # Offloaded to a worker thread: this SQLite scan runs on the asyncio
         # event loop otherwise and blocks every concurrent request (#169 —
         # global loop starvation, /v1/models stalls behind it).
@@ -1736,6 +1737,7 @@ class APIServerAdapter(BasePlatformAdapter):
             offset=offset,
             include_children=include_children,
             order_by_last_active=True,
+            parent_session_id=parent_session_id,
         )
         return web.json_response({
             "object": "list",

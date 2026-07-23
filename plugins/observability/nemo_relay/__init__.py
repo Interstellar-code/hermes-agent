@@ -758,6 +758,7 @@ def _subagent_child_metadata(kwargs: dict[str, Any], parent_metadata: dict[str, 
         ("parent_subagent_id", "parent_subagent_id"),
         ("parent_trajectory_id", "parent_trajectory_id"),
         ("telemetry_schema_version", "telemetry_schema_version"),
+        ("agent_id", "agent_id"),
     ):
         value = parent_metadata.get(source)
         if value is not None:
@@ -792,6 +793,7 @@ def _metadata(kwargs: dict[str, Any]) -> dict[str, Any]:
         "child_subagent_id",
         "child_role",
         "child_status",
+        "agent_id",
         "provider",
         "model",
         "api_mode",
