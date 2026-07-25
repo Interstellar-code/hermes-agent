@@ -32,6 +32,7 @@ from agent.conversation_compression import conversation_history_after_compressio
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
+from agent.memory_manager import sanitize_context
 from agent.turn_context import (
     build_turn_context,
     compose_user_api_content,
