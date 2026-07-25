@@ -19,6 +19,7 @@ the anti-gaming guard in _eval_runner will surface as ValueError; we catch
 it here and return a clean error string instead.
 """
 from __future__ import annotations
+import os as _os
 
 import logging
 import os
@@ -27,7 +28,9 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-GATEWAY_URL_DEFAULT = "http://127.0.0.1:8642"
+# Soak-isolation: port is env-overridable so a soak instance cannot talk to the
+# production gateway. Default is the prod value, so unset == unchanged behaviour.
+GATEWAY_URL_DEFAULT = f"http://127.0.0.1:{_os.environ.get('HERMES_GATEWAY_PORT', '8642')}"
 _DEFAULT_PROPOSER_MODEL = "auto"
 
 

@@ -9,6 +9,7 @@ node_run row.
 POST endpoint: http://127.0.0.1:8642/api/plugins/kanban/tasks
 """
 from __future__ import annotations
+import os as _os
 
 import asyncio
 import logging
@@ -18,7 +19,12 @@ import httpx  # type: ignore[import]
 
 logger = logging.getLogger("workflow.kanban-dispatcher")
 
-KANBAN_TASKS_URL: str = "http://127.0.0.1:8642/api/plugins/kanban/tasks"
+# Soak-isolation: port is env-overridable so a soak instance cannot talk to the
+# production gateway. Default is the prod value, so unset == unchanged behaviour.
+KANBAN_TASKS_URL: str = (
+    f"http://127.0.0.1:{_os.environ.get('HERMES_GATEWAY_PORT', '8642')}"
+    "/api/plugins/kanban/tasks"
+)
 
 
 class KanbanDispatcher:

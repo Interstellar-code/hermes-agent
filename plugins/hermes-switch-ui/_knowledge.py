@@ -13,6 +13,7 @@ connection_info()
     fields: active_profile, enabled_plugins, auth_mode.
 """
 from __future__ import annotations
+import os as _os
 
 import logging
 import os
@@ -84,7 +85,7 @@ def get_info(refresh: bool = False) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "source": "capability.md",
         "capability": _load_capability_text(),
-        "gateway_port": 8642,
+        "gateway_port": int(_os.environ.get("HERMES_GATEWAY_PORT", "8642")),
         "dashboard_port": 9119,
         "frontend_port": 3002,
         "repo": "https://github.com/Interstellar-code/hermes-switchui",
@@ -118,7 +119,7 @@ def connection_info() -> Dict[str, Any]:
     BEST-EFFORT / NULLABLE — None on any failure.
     """
     result: Dict[str, Any] = {
-        "gateway_port": 8642,
+        "gateway_port": int(_os.environ.get("HERMES_GATEWAY_PORT", "8642")),
         "dashboard_port": 9119,
         "frontend_port": 3002,
         "active_profile": None,
