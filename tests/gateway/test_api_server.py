@@ -1260,9 +1260,22 @@ class TestChatCompletionsEndpoint:
         profile_dir.mkdir()
         app = _create_app(auth_adapter)
         result = {"final_response": "profiled", "messages": [], "api_calls": 1}
+
+        # 0.19 replaced the fork's `profile=` kwarg on _run_agent with the
+        # _api_request_profile ContextVar, which _run_agent reads and feeds to
+        # _profile_scope(). Assert the scope the header actually establishes,
+        # not the old plumbing: the header is authorization-gated, so "does it
+        # reach the scope" is the property worth pinning.
+        from gateway.platforms.api_server import _api_request_profile
+
+        seen_profile = {}
+
+        async def _capture(*args, **kwargs):
+            seen_profile["value"] = _api_request_profile.get()
+            return (result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
         with patch("hermes_cli.profiles.get_profile_dir", return_value=profile_dir), \
-             patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = (result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+             patch.object(auth_adapter, "_run_agent", new=_capture):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.post(
                     "/v1/chat/completions",
@@ -1274,7 +1287,7 @@ class TestChatCompletionsEndpoint:
                 )
 
         assert resp.status == 200
-        assert mock_run.call_args.kwargs["profile"] == "hermes-switch"
+        assert seen_profile["value"] == "hermes-switch"
 
     @pytest.mark.asyncio
     async def test_chat_completions_rejects_profile_scope_without_api_key(self, adapter):

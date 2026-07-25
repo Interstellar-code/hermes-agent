@@ -1777,13 +1777,13 @@ class TestWebServerEndpoints:
         body = resp.json()
         assert [m["content"] for m in body["messages"]] == ["m2", "m3"]
 
+        # limit/offset are Query(ge=0) on this endpoint, so FastAPI's validator
+        # rejects bad input as 422 rather than the fork's old hand-rolled 400.
         bad_text = self.client.get("/api/sessions/paged-chat/messages?limit=abc")
-        assert bad_text.status_code == 400
-        assert bad_text.json()["detail"] == "limit and offset must be integers"
+        assert bad_text.status_code == 422
 
         bad_negative = self.client.get("/api/sessions/paged-chat/messages?limit=-5")
-        assert bad_negative.status_code == 400
-        assert bad_negative.json()["detail"] == "limit must be >= 0"
+        assert bad_negative.status_code == 422
 
     def test_archive_session_via_patch(self):
         """PATCH archived=true soft-hides a session; archived=false restores it."""

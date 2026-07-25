@@ -103,8 +103,11 @@ class TestRequestToolApproval:
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "env_var_enabled",
-                            lambda v: v == "HERMES_CRON_SESSION")
+        # Cron detection is task-local (_is_cron_session reads a ContextVar and
+        # falls back to os.environ), not a bare env_var_enabled read — the
+        # process-global form leaked cron-ness into concurrent interactive
+        # sessions. Patch the current seam.
+        monkeypatch.setattr(approval, "_is_cron_session", lambda: True)
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is False
@@ -113,8 +116,11 @@ class TestRequestToolApproval:
     def test_cron_approve_mode_allows(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
-        monkeypatch.setattr(approval, "env_var_enabled",
-                            lambda v: v == "HERMES_CRON_SESSION")
+        # Cron detection is task-local (_is_cron_session reads a ContextVar and
+        # falls back to os.environ), not a bare env_var_enabled read — the
+        # process-global form leaked cron-ness into concurrent interactive
+        # sessions. Patch the current seam.
+        monkeypatch.setattr(approval, "_is_cron_session", lambda: True)
         monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "approve")
         res = request_tool_approval("terminal", "smtp send")
         assert res["approved"] is True

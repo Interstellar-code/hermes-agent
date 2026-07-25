@@ -3069,6 +3069,16 @@ class APIServerAdapter(BasePlatformAdapter):
         profile, profile_err = self._parse_profile_header(request)
         if profile_err is not None:
             return profile_err
+        # Bridge the authenticated X-Hermes-Profile header into upstream's
+        # request-scope ContextVar, which is otherwise only populated by the
+        # /p/<profile>/ URL-prefix middleware. Without this the header is
+        # parsed and authorization-checked and then silently ignored, because
+        # every downstream consumer reads _api_request_profile rather than a
+        # kwarg. One mechanism, two entry points — not a parallel path.
+        # No reset needed: aiohttp runs each request in its own task, so the
+        # ContextVar is already request-scoped and cannot bleed across requests.
+        if profile:
+            _api_request_profile.set(profile)
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
