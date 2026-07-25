@@ -121,7 +121,6 @@ _UPDATE_CHECK_CACHE_SECONDS = 6 * 3600
 UPDATE_AVAILABLE_NO_COUNT = -1
 
 from hermes_constants import HERMES_REPO_URL as _UPSTREAM_REPO_URL
-_OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
 
 
 def _canonical_github_remote(url: str | None) -> str:
@@ -148,6 +147,16 @@ def _is_ssh_remote(url: str | None) -> bool:
         return False
     value = url.strip().lower()
     return value.startswith("git@") or value.startswith("ssh://")
+
+
+# "Official" means the repo THIS build updates from, not a hardcoded vendor.
+# Upstream pins nousresearch/hermes-agent here; the fork ships HERMES_REPO_URL
+# pointing at Interstellar-code, and _check_via_rev already probes that URL.
+# Hardcoding the vendor while probing the fork made the two disagree: a fork
+# checkout with an SSH origin failed the "official" test, fell through to
+# `git fetch origin`, and triggered the SSH auth prompt upstream added this
+# path to avoid. Derive it so both sides always name the same repo.
+_OFFICIAL_REPO_CANONICAL = _canonical_github_remote(_UPSTREAM_REPO_URL)
 
 
 def _is_official_ssh_remote(url: str | None) -> bool:
