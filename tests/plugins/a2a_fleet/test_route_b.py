@@ -296,10 +296,11 @@ class TestServerAgentModeHappyPath:
         finally:
             _ab.set_agent_bridge(None)
 
-    def test_agent_mode_busy_error_returns_minus_32000(self, fleet_home: Path) -> None:
+    def test_agent_mode_busy_error_returns_busy_code(self, fleet_home: Path) -> None:
         import os
         import a2a_fleet.agent_bridge as _ab
         from a2a_fleet.agent_bridge import A2ABusyError
+        from a2a_fleet.server import A2A_BUSY_CODE
 
         hermes_home = Path(os.environ["HERMES_HOME"])
         _fleet_yaml_with_handler(hermes_home, "agent")
@@ -316,7 +317,9 @@ class TestServerAgentModeHappyPath:
 
             assert response.status_code == 200
             body = response.json()
-            assert body["error"]["code"] == -32000
+            # Busy gets its own code (server.A2A_BUSY_CODE) so callers can
+            # branch on it instead of the generic -32000 server error.
+            assert body["error"]["code"] == A2A_BUSY_CODE
             assert "busy" in body["error"]["message"]
         finally:
             _ab.set_agent_bridge(None)
