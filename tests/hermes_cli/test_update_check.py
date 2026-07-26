@@ -107,18 +107,22 @@ def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
 
     calls = []
 
+    # "Official" is whichever repo this build updates from — upstream on
+    # NousResearch, the fork on Interstellar-code. Derive both the origin and
+    # the expected probe from HERMES_REPO_URL so the test follows the build
+    # instead of pinning a vendor.
+    probe_url = banner._UPSTREAM_REPO_URL
+    ssh_origin = "git@github.com:" + banner._canonical_github_remote(probe_url).removeprefix(
+        "github.com/"
+    ) + ".git"
+
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
         if cmd == ["git", "remote", "get-url", "origin"]:
-            return MagicMock(returncode=0, stdout="git@github.com:NousResearch/hermes-agent.git\n")
+            return MagicMock(returncode=0, stdout=ssh_origin + "\n")
         if cmd == ["git", "rev-parse", "HEAD"]:
             return MagicMock(returncode=0, stdout="local-sha\n")
-        if cmd == [
-            "git",
-            "ls-remote",
-            "https://github.com/NousResearch/hermes-agent.git",
-            "refs/heads/main",
-        ]:
+        if cmd == ["git", "ls-remote", probe_url, "refs/heads/main"]:
             return MagicMock(returncode=0, stdout="upstream-sha\trefs/heads/main\n")
         raise AssertionError(f"unexpected git command: {cmd!r}")
 

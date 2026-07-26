@@ -859,6 +859,171 @@ class TestPreToolCallBlocking:
         assert get_pre_tool_call_block_message("terminal", {}) == "first blocker"
 
 
+class TestPreToolCallDirective:
+    """Tests for the extended (block | approve) directive helper."""
+
+    def test_approve_directive_returned(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "needs human ok"}
+            ],
+        )
+        assert get_pre_tool_call_directive("write_file", {}) == (
+            "approve", "needs human ok")
+
+    def test_approve_without_message_is_valid(self, monkeypatch):
+        """approve may omit a message (block may not)."""
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve"}],
+        )
+        assert get_pre_tool_call_directive("write_file", {}) == ("approve", None)
+
+    def test_block_still_requires_message(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "block"}],
+        )
+        assert get_pre_tool_call_directive("terminal", {}) == (None, None)
+
+    def test_first_directive_wins_across_actions(self, monkeypatch):
+        from hermes_cli.plugins import get_pre_tool_call_directive
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "gate first"},
+                {"action": "block", "message": "block second"},
+            ],
+        )
+        assert get_pre_tool_call_directive("terminal", {}) == (
+            "approve", "gate first")
+
+    def test_shim_ignores_approve(self, monkeypatch):
+        """Back-compat shim only reports block, never approve."""
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {"action": "approve", "message": "gate"}
+            ],
+        )
+        assert get_pre_tool_call_block_message("write_file", {}) is None
+
+
+class TestResolvePreToolBlock:
+    """Tests for the single dispatch-site chokepoint that resolves a
+    directive (incl. the approve→gate escalation) to a block message."""
+
+    def test_block_returns_message(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "block", "message": "no"}],
+        )
+        assert resolve_pre_tool_block("terminal", {}) == "no"
+
+    def test_no_directive_returns_none(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook", lambda hook_name, **kwargs: [])
+        assert resolve_pre_tool_block("terminal", {}) is None
+
+    def test_approve_denied_blocks(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {"approved": False, "message": "user denied it"},
+        )
+        assert resolve_pre_tool_block("write_file", {}) == "user denied it"
+
+    def test_approve_granted_allows(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            lambda *a, **k: {"approved": True, "message": None},
+        )
+        assert resolve_pre_tool_block("write_file", {}) is None
+
+    def test_approve_passes_plugin_rule_key_to_gate(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [
+                {
+                    "action": "approve",
+                    "message": "why",
+                    "rule_key": "write_file:ssh",
+                }
+            ],
+        )
+
+        def _approve(tool_name, reason, **kwargs):
+            seen["tool_name"] = tool_name
+            seen["reason"] = reason
+            seen["rule_key"] = kwargs.get("rule_key")
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen == {
+            "tool_name": "write_file",
+            "reason": "why",
+            "rule_key": "write_file:ssh",
+        }
+
+    @pytest.mark.parametrize("rule_key", [None, "", "   ", 123, object()])
+    def test_approve_falls_back_to_tool_name_without_valid_rule_key(
+        self, monkeypatch, rule_key
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        seen = {}
+        directive = {"action": "approve", "message": "why"}
+        if rule_key is not None:
+            directive["rule_key"] = rule_key
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [directive],
+        )
+
+        def _approve(tool_name, reason, **kwargs):
+            seen["rule_key"] = kwargs.get("rule_key")
+            return {"approved": True, "message": None}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+
+        assert resolve_pre_tool_block("write_file", {}) is None
+        assert seen["rule_key"] == "write_file"
+
+    def test_approve_gate_exception_fails_closed(self, monkeypatch):
+        from hermes_cli.plugins import resolve_pre_tool_block
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+        )
+        def _boom(*a, **k):
+            raise RuntimeError("gate crashed")
+        monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
+        msg = resolve_pre_tool_block("terminal", {})
+        assert msg is not None and "gate failed" in msg  # fail-closed
+
+
 class TestGetPreVerifyContinueMessage:
     """`pre_verify` directive aggregation — mirrors the pre_tool_call block path."""
 
@@ -1582,11 +1747,11 @@ class TestPreLlmCallTargetRouting:
         assert "memory context" in contexts
         assert "guardrail text" in contexts
 
-    def test_routing_logic_splits_user_and_trusted_context(self, tmp_path, monkeypatch):
+    def test_routing_logic_all_to_user_message(self, tmp_path, monkeypatch):
         """Simulate the routing logic from run_agent.py.
 
-        Plain strings and target-less dicts go to the user message. Trusted
-        dicts with ``target="developer"`` route to system-tier context.
+        All plugin context — dicts and plain strings — ends up in a single
+        user message context string. There is no system_prompt target.
         """
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         self._make_pre_llm_plugin(
@@ -1601,10 +1766,6 @@ class TestPreLlmCallTargetRouting:
             plugins_dir, "ccc_plain",
             '"plain text C"',
         )
-        self._make_pre_llm_plugin(
-            plugins_dir, "ddd_trusted",
-            '{"context": "persona D", "target": "developer"}',
-        )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
@@ -1615,17 +1776,11 @@ class TestPreLlmCallTargetRouting:
             conversation_history=[], is_first_turn=True, model="test",
         )
 
-        # Replicate current routing logic: plain strings / target-less dicts go
-        # to user context; trusted targets feed the effective system string.
+        # Replicate run_agent.py routing logic — everything goes to user msg
         _ctx_parts = []
-        _trusted_parts = []
         for r in results:
             if isinstance(r, dict) and r.get("context"):
-                _target = r.get("target", "user_message")
-                if _target in ("system", "developer"):
-                    _trusted_parts.append(str(r["context"]))
-                else:
-                    _ctx_parts.append(str(r["context"]))
+                _ctx_parts.append(str(r["context"]))
             elif isinstance(r, str) and r.strip():
                 _ctx_parts.append(r)
 
@@ -1634,7 +1789,6 @@ class TestPreLlmCallTargetRouting:
         assert "memory A" in _plugin_user_context
         assert "rule B" in _plugin_user_context
         assert "plain text C" in _plugin_user_context
-        assert _trusted_parts == ["persona D"]
 
 
 # ── TestPluginCommands ────────────────────────────────────────────────────

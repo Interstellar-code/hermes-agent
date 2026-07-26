@@ -9,6 +9,7 @@ Uses in-process import of cron.jobs.list_jobs to avoid HTTP overhead.
 Falls back to httpx GET http://127.0.0.1:8642/api/cron/jobs on ImportError.
 """
 from __future__ import annotations
+import os as _os
 
 import asyncio
 import json
@@ -18,7 +19,9 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("workflow.cron-poller")
 
 POLL_INTERVAL_S: float = 10.0
-KANBAN_BASE_URL: str = "http://127.0.0.1:8642"
+# Soak-isolation: port is env-overridable so a soak instance cannot talk to the
+# production gateway. Default is the prod value, so unset == unchanged behaviour.
+KANBAN_BASE_URL: str = f"http://127.0.0.1:{_os.environ.get('HERMES_GATEWAY_PORT', '8642')}"
 
 
 def _list_jobs_direct() -> List[Dict[str, Any]]:

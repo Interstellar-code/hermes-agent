@@ -122,9 +122,16 @@ class TestListSessionsHandlerThreading:
         )
         db.create_session("unrelated-root", "cli")
 
+        async def _ensure_session_db_async():
+            return db
+
         stub = SimpleNamespace(
             _check_auth=lambda request: None,
+            # 0.19 moved the handler onto the async accessor so the SQLite open
+            # happens off the event loop; the sync one is kept for callers that
+            # still use it.
             _ensure_session_db=lambda: db,
+            _ensure_session_db_async=_ensure_session_db_async,
             _parse_nonnegative_int=lambda value, default, maximum: default,
             _session_response=APIServerAdapter._session_response,
         )

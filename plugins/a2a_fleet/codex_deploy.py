@@ -11,6 +11,7 @@ Design constraints:
   * Detached launch uses ``start_new_session=True``.
 """
 from __future__ import annotations
+import os as _os
 
 import hashlib
 import json
@@ -71,7 +72,11 @@ A2A_ROLE_TEXT = (
 # Start of the codex port band (9320-9329); see managed_peers._MODE_PORT_BANDS.
 # A parity test asserts this equals managed_peers.default_port_for("codex").
 DEFAULT_BIND_PORT = 9320
-DEFAULT_HERMES_URL = "http://127.0.0.1:9219/jsonrpc"
+# Soak-isolation: port is env-overridable so a soak instance cannot talk to the
+# production gateway. Default is the prod value, so unset == unchanged behaviour.
+DEFAULT_HERMES_URL = (
+    f"http://127.0.0.1:{_os.environ.get('HERMES_A2A_PORT', '9219')}/jsonrpc"
+)
 PID_FILENAME = "codex_receiver.pid"
 RECEIVER_FILENAME = "codex_receiver.py"
 CONFIG_FILENAME = "codex_receiver.json"
