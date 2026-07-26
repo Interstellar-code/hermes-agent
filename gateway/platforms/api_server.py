@@ -98,11 +98,31 @@ logger = logging.getLogger(__name__)
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
 
-    Tries the installed package metadata first (authoritative for a pip/uv
-    install), then the in-tree ``hermes_cli.__version__`` (covers editable /
-    source checkouts where metadata may be stale or absent). Never raises —
-    a version probe must not be able to break the health endpoint.
+    Prefers the in-tree ``hermes_cli.__version__`` when this is an editable /
+    source checkout, because there the source IS the running code and the
+    installed metadata can be arbitrarily stale — it only refreshes on
+    reinstall. Falls back to installed package metadata (authoritative for a
+    real pip/uv install, where there is no in-tree source to read). Never
+    raises — a version probe must not be able to break the health endpoint.
+
+    Ordering matters: metadata-first reported 0.18.3 from a dist-info stamped
+    ``hermes_agent-0.15.1`` for a checkout actually running 0.19.0, which is
+    exactly the kind of thing someone checks /health to rule out.
     """
+    try:
+        from hermes_cli import __version__ as _in_tree
+
+        # Only trust in-tree when it really is a source checkout — i.e. the
+        # package resolves next to a pyproject.toml rather than into
+        # site-packages.
+        import hermes_cli
+        from pathlib import Path
+
+        pkg_dir = Path(hermes_cli.__file__).resolve().parent
+        if (pkg_dir.parent / "pyproject.toml").is_file():
+            return _in_tree
+    except Exception:
+        pass
     try:
         from importlib.metadata import version
 
