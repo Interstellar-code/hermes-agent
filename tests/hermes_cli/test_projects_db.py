@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 
 import pytest
 
@@ -217,6 +218,8 @@ def test_project_sessions_table_idempotent(tmp_path):
             "WHERE type='index' AND name='idx_project_sessions_session'"
         ).fetchall()
         assert [r["name"] for r in idx] == ["idx_project_sessions_session"]
+        columns = b.execute("PRAGMA table_info(project_sessions)").fetchall()
+        assert {row["name"]: row["pk"] for row in columns}["session_id"] == 1
     finally:
         b.close()
 
@@ -281,9 +284,7 @@ def test_bind_rejects_empty_session_id_and_missing_project(conn):
 
 
 def test_cascade_delete_removes_bindings_when_project_is_deleted(conn):
-    pid_keep = pdb.create_project(conn, name="Keep", folders=["/k"])
     pid_drop = pdb.create_project(conn, name="Drop", folders=["/d"])
-    pdb.bind_session(conn, pid_keep, "shared-session", bound_by="ops")
     pdb.bind_session(conn, pid_drop, "shared-session", bound_by="ops")
     pdb.bind_session(conn, pid_drop, "another")
 
@@ -292,37 +293,98 @@ def test_cascade_delete_removes_bindings_when_project_is_deleted(conn):
     pdb.archive_project(conn, pid_drop)
     assert pdb.delete_project(conn, pid_drop, clear_active=True, archived_only=True) is True
 
-    remaining = pdb.get_session_project(conn, "shared-session")
-    assert remaining is not None
-    assert remaining.project_id == pid_keep
-
     # ON DELETE CASCADE wipes bindings owned by the dropped project; the
-    # bindings still owned by the surviving project are untouched.
+    # bindings owned by the dropped project are removed.
     assert pdb.list_session_bindings(conn, pid_drop) == []
-    assert {b.session_id for b in pdb.list_session_bindings(conn, pid_keep)} == {
-        "shared-session"
-    }
-    # And the other session bound only to Drop is gone (its row cascaded out).
+    assert pdb.get_session_project(conn, "shared-session") is None
     assert pdb.get_session_project(conn, "another") is None
 
 
-def test_get_session_project_prefers_most_recently_bound(conn):
-    """When a session is bound to multiple projects, the most recent binding
-    wins — the resolution downstream treats any binding as authoritative, so
-    callers see a stable, deterministic winner."""
+def test_bind_session_immediately_rebinds_to_new_project(conn):
     pid_a = pdb.create_project(conn, name="A", folders=["/a"])
     pid_b = pdb.create_project(conn, name="B", folders=["/b"])
     pdb.bind_session(conn, pid_a, "s1")
-    # Force a later timestamp on the second bind by sleeping just over a second
-    # (bound_at is unix epoch seconds, the natural unit chosen to match the
-    # rest of the projects_db schema).
-    import time as _time
-
-    _time.sleep(1.1)
     pdb.bind_session(conn, pid_b, "s1")
     winner = pdb.get_session_project(conn, "s1")
     assert winner is not None
     assert winner.project_id == pid_b
+    assert pdb.list_session_bindings(conn, pid_a) == []
+    assert [binding.session_id for binding in pdb.list_session_bindings(conn, pid_b)] == ["s1"]
+
+
+def test_get_session_projects_returns_bindings_in_one_lookup(conn):
+    pid = pdb.create_project(conn, name="P", folders=["/x"])
+    pdb.bind_session(conn, pid, "s1")
+    bindings = pdb.get_session_projects(conn, ["s1", "missing", "s1", *[f"s{i}" for i in range(1000)]])
+    assert set(bindings) == {"s1"}
+    assert bindings["s1"].project_id == pid
+
+
+def test_legacy_project_sessions_migration_keeps_latest_row(tmp_path):
+    db_path = tmp_path / "projects.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.executescript(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
+            "name TEXT NOT NULL, description TEXT, created_at INTEGER NOT NULL, "
+            "archived INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE project_sessions (project_id TEXT NOT NULL, session_id TEXT NOT NULL, "
+            "bound_at INTEGER NOT NULL, bound_by TEXT, PRIMARY KEY (project_id, session_id));"
+            "INSERT INTO projects VALUES ('p_a', 'a', 'A', NULL, 1, 0);"
+            "INSERT INTO projects VALUES ('p_b', 'b', 'B', NULL, 1, 0);"
+            "INSERT INTO project_sessions VALUES ('p_a', 's1', 10, 'a');"
+            "INSERT INTO project_sessions VALUES ('p_b', 's1', 20, 'b');"
+            "INSERT INTO project_sessions VALUES ('p_a', 'same-time', 30, 'a');"
+            "INSERT INTO project_sessions VALUES ('p_b', 'same-time', 30, 'b');"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    pdb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    migrated = pdb.connect(db_path=db_path)
+    try:
+        assert pdb.get_session_project(migrated, "s1").project_id == "p_b"
+        assert pdb.get_session_project(migrated, "same-time").project_id == "p_b"
+        assert migrated.execute("SELECT COUNT(*) FROM project_sessions").fetchone()[0] == 2
+    finally:
+        migrated.close()
+
+
+def test_legacy_project_sessions_migration_drops_orphan_rows(tmp_path):
+    """An orphan row must not brick connect().
+
+    connect() enables foreign_keys, so copying a row whose project_id no longer
+    exists into a table that REFERENCES projects(id) raises IntegrityError — and
+    since the migration re-runs on every connect, the DB would be permanently
+    unopenable rather than failing once. ON DELETE CASCADE only holds while FKs
+    are on, so a DB written with them off can carry orphans.
+    """
+    db_path = tmp_path / "projects.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.executescript(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
+            "name TEXT NOT NULL, description TEXT, created_at INTEGER NOT NULL, "
+            "archived INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE project_sessions (project_id TEXT NOT NULL, session_id TEXT NOT NULL, "
+            "bound_at INTEGER NOT NULL, bound_by TEXT, PRIMARY KEY (project_id, session_id));"
+            "INSERT INTO projects VALUES ('p_a', 'a', 'A', NULL, 1, 0);"
+            "INSERT INTO project_sessions VALUES ('p_a', 'keeps', 10, 'a');"
+            "INSERT INTO project_sessions VALUES ('p_gone', 'orphan', 20, 'x');"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    pdb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    migrated = pdb.connect(db_path=db_path)   # must not raise
+    try:
+        assert pdb.get_session_project(migrated, "keeps").project_id == "p_a"
+        assert pdb.get_session_project(migrated, "orphan") is None
+        assert migrated.execute("SELECT COUNT(*) FROM project_sessions").fetchone()[0] == 1
+    finally:
+        migrated.close()
 
 
 def test_list_session_bindings_orders_most_recent_first(conn):

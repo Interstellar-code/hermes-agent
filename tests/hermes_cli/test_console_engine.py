@@ -135,6 +135,9 @@ EXPECTED_CONSOLE_COMMANDS = {
     ("project", "archive"),
     ("project", "restore"),
     ("project", "bind-board"),
+    ("project", "bind"),
+    ("project", "unbind"),
+    ("project", "show-session"),
     ("kanban", "init"),
     ("kanban", "boards", "list"),
     ("kanban", "boards", "create"),
@@ -223,6 +226,8 @@ MUTATING_CONFIRMATION_SMOKE_COMMANDS = [
     "webhook subscribe test --prompt hello",
     "hooks test pre_tool_call",
     "project create demo",
+    "project bind demo --session chat-123",
+    "project unbind --session chat-123",
     "kanban create 'demo task'",
     "bundles create demo --skill skill-a",
     "checkpoints prune",
@@ -419,6 +424,22 @@ def test_config_set_requires_confirmation_then_writes(_isolate_hermes_home):
     assert result.status == "ok"
     assert "telegram.test" in result.output
     assert read_raw_config()["telegram"]["test"] is True
+
+
+def test_console_project_session_binding_commands(_isolate_hermes_home):
+    engine = HermesConsoleEngine()
+
+    assert engine.execute("project create Demo", confirmed=True).status == "ok"
+    assert engine.execute("project bind demo --session chat-123").status == "confirm_required"
+    assert engine.execute("project bind demo --session chat-123", confirmed=True).status == "ok"
+
+    shown = engine.execute("project show-session --session chat-123")
+    assert shown.status == "ok"
+    assert "project: demo" in shown.output
+    assert "source:  binding" in shown.output
+
+    assert engine.execute("project unbind --session chat-123").status == "confirm_required"
+    assert engine.execute("project unbind --session chat-123", confirmed=True).status == "ok"
 
 
 def test_sessions_list_and_stats_use_isolated_session_store(_isolate_hermes_home):

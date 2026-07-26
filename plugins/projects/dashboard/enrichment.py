@@ -97,8 +97,13 @@ def _session_activity(projects: list[projects_db.Project]) -> tuple[dict[str, di
         from hermes_state import SessionDB
 
         db = SessionDB(db_path=db_path, read_only=True)
+        projects_conn = None
         try:
-            project_dicts = [p.to_dict() for p in projects]
+            projects_conn = projects_db.connect()
+            project_dicts = [p.to_dict() for p in projects if not p.archived]
+            active_project_ids = {
+                project.id for project in projects_db.list_projects(projects_conn)
+            }
             index = project_tree._FolderIndex(project_dicts)
             activity: dict[str, dict] = {}
             offset = 0
@@ -112,8 +117,19 @@ def _session_activity(projects: list[projects_db.Project]) -> tuple[dict[str, di
                     exclude_sources=["cron"],
                     include_archived=False,
                 )
+                explicit_owners = projects_db.get_session_projects(
+                    projects_conn, (session["id"] for session in sessions)
+                )
                 for session in sessions:
-                    owner = project_tree._project_for_session(session, index, git_probe.resolve)
+                    binding = explicit_owners.get(session["id"])
+                    owner_id = (
+                        binding.project_id
+                        if binding and binding.project_id in active_project_ids
+                        else None
+                    )
+                    owner = {"id": owner_id} if owner_id else project_tree._project_for_session(
+                        session, index, git_probe.resolve
+                    )
                     if owner is None:
                         continue
                     at = int(float(session.get("last_active") or session.get("started_at") or 0))
@@ -125,6 +141,8 @@ def _session_activity(projects: list[projects_db.Project]) -> tuple[dict[str, di
                     break
                 offset += len(sessions)
         finally:
+            if projects_conn is not None:
+                projects_conn.close()
             db.close()
         return activity, []
     except Exception as exc:

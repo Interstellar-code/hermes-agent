@@ -1,7 +1,7 @@
 {
   "name": "projects",
   "label": "Projects",
-  "description": "Read-only dashboard API for first-class Hermes projects.",
+  "description": "Dashboard API for project management and session binding.",
   "icon": "FolderKanban",
   "version": "1.0.0",
   "tab": {

@@ -943,6 +943,9 @@ class HermesConsoleEngine:
                 ("archive",),
                 ("restore",),
                 ("bind-board",),
+                ("bind",),
+                ("unbind",),
+                ("show-session",),
             ],
             summaries=_builder_summaries("hermes_cli.projects_cmd", "build_parser"),
             mutating=[
@@ -955,6 +958,8 @@ class HermesConsoleEngine:
                 ("archive",),
                 ("restore",),
                 ("bind-board",),
+                ("bind",),
+                ("unbind",),
             ],
             handler_factory=lambda fixed: _builder_handler(
                 "project",

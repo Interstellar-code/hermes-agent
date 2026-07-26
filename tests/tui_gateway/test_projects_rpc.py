@@ -204,6 +204,46 @@ def test_project_info_for_cwd_unowned_and_blank_are_none(tmp_path):
     assert server._project_info_for_cwd("") is None
 
 
+def test_resolve_session_uses_project_for_cwd_when_unbound(tmp_path):
+    folder = tmp_path / "owned"
+    folder.mkdir()
+    created = _call("projects.create", {"name": "Owned", "folders": [str(folder)]})["project"]
+
+    resolved = _call("projects.resolve_session", {"session_id": "unbound", "cwd": str(folder)})
+
+    assert resolved == {
+        "session_id": "unbound",
+        "project": {"id": created["id"], "slug": "owned", "name": "Owned"},
+        "source": "cwd",
+    }
+
+
+def test_project_tree_loads_bindings_with_one_projects_db_connection(monkeypatch, tmp_path):
+    from hermes_cli import projects_db as pdb
+
+    folder = tmp_path / "owned"
+    folder.mkdir()
+    created = _call("projects.create", {"name": "Owned", "folders": [str(folder)]})["project"]
+    db = server._get_db()
+    db.create_session("bound", "cli", cwd=str(folder))
+    db.create_session("unbound", "cli", cwd=str(folder))
+    with pdb.connect_closing() as conn:
+        pdb.bind_session(conn, created["id"], "bound")
+
+    original_connect = pdb.connect_closing
+    calls = 0
+
+    def counted_connect():
+        nonlocal calls
+        calls += 1
+        return original_connect()
+
+    monkeypatch.setattr(pdb, "connect_closing", counted_connect)
+    _call("projects.tree", {"session_limit": 10})
+
+    assert calls == 1
+
+
 def test_session_info_carries_project_for_owned_cwd(tmp_path):
     # session.info threads the resolved project through so the desktop/TUI can
     # name the workspace without a second round-trip.

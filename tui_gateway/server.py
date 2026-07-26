@@ -12237,7 +12237,7 @@ def _project_tree_row(r: dict) -> dict:
 
 def _project_tree_inputs(
     db, session_limit: int, *, include_discovered: bool
-) -> tuple[list[dict], list[dict], list[dict], str | None]:
+) -> tuple[list[dict], list[dict], list[dict], str | None, "_ProjectsBindingBackend"]:
     """Gather (sessions, projects, discovered_repos, active_id) for build_tree.
 
     ``include_discovered`` is the zero-session-repo overview tier; the entered
@@ -12263,12 +12263,20 @@ def _project_tree_inputs(
     from hermes_cli import projects_db as pdb
 
     with pdb.connect_closing() as conn:
-        projects = [p.to_dict() for p in pdb.list_projects(conn)]
+        all_projects = [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)]
+        projects = [project for project in all_projects if not project["archived"]]
         active_id = pdb.get_active_id(conn)
+        bindings = pdb.get_session_projects(
+            conn, (session["id"] for session in sessions if session.get("id"))
+        )
         # backfill stays off the hot tree path — grouping uses the live resolver.
         discovered = _discover_repos_payload(db, conn=conn, backfill=False) if include_discovered else []
 
-    return sessions, projects, discovered, active_id
+    return sessions, projects, discovered, active_id, _ProjectsBindingBackend(
+        bindings=bindings,
+        projects=all_projects,
+        active_id=active_id,
+    )
 
 
 def _build_project_tree(
@@ -12277,15 +12285,9 @@ def _build_project_tree(
     """Gather inputs and run the one authoritative builder. Returns (tree, active_id)."""
     from tui_gateway import project_tree
 
-    sessions, projects, discovered, active_id = _project_tree_inputs(
+    sessions, projects, discovered, active_id, binding_backend = _project_tree_inputs(
         db, session_limit, include_discovered=include_discovered
     )
-    # Adapter exposing just the names ``project_tree`` consults on a binding
-    # backend. The real DB connection is short-lived (we open + close inside
-    # each lookup) so the per-tree call doesn't pin a connection across the
-    # network round-trips a large session list can take. The fake in
-    # tests/tui_gateway/test_project_tree.py can be a literal in-memory object.
-    binding_backend = _ProjectsBindingBackend()
     tree = project_tree.build_tree(
         projects,
         sessions,
@@ -12305,38 +12307,32 @@ class _ProjectsBindingBackend:
 
     Exposes only the three methods ``build_tree`` consults on a binding
     backend (``get_session_project``, ``get_project``, ``get_active_id``).
-    Opens + closes a short-lived projects.db connection per call so the tree
-    builder does not have to manage a connection across the network round-
-    trips a large session list can take. Errors degrade to "no binding" so a
-    flaky DB never bricks the tree RPC.
+    Holds one snapshot loaded from projects.db. This keeps a tree refresh from
+    opening one SQLite connection for every session it groups.
     """
 
-    def get_session_project(self, session_id: str):
-        try:
-            from hermes_cli import projects_db as pdb
+    def __init__(self, *, bindings=None, projects=None, active_id=None):
+        self._bindings = bindings or {}
+        self._projects = {project["id"]: project for project in (projects or [])}
+        self._active_id = active_id
 
-            with pdb.connect_closing() as conn:
-                return pdb.get_session_project(conn, session_id)
-        except Exception:
-            return None
+    @classmethod
+    def load(cls, session_ids=()):
+        from hermes_cli import projects_db as pdb
+
+        with pdb.connect_closing() as conn:
+            projects = [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)]
+            bindings = pdb.get_session_projects(conn, session_ids)
+            return cls(bindings=bindings, projects=projects, active_id=pdb.get_active_id(conn))
+
+    def get_session_project(self, session_id: str):
+        return self._bindings.get(session_id)
 
     def get_project(self, ident: str):
-        try:
-            from hermes_cli import projects_db as pdb
-
-            with pdb.connect_closing() as conn:
-                return pdb.get_project(conn, ident)
-        except Exception:
-            return None
+        return self._projects.get(ident)
 
     def get_active_id(self):
-        try:
-            from hermes_cli import projects_db as pdb
-
-            with pdb.connect_closing() as conn:
-                return pdb.get_active_id(conn)
-        except Exception:
-            return None
+        return self._active_id
 
 
 @method("projects.tree")
@@ -12416,7 +12412,8 @@ def _(rid, params: dict) -> dict:
         resolved = project_tree.resolve_session_project(
             session_id,
             cwd,
-            projects_db=_ProjectsBindingBackend(),
+            projects_db=_ProjectsBindingBackend.load([session_id]),
+            resolve_cwd_project=_project_info_for_cwd,
         )
         return _ok(rid, resolved)
     except Exception as e:
