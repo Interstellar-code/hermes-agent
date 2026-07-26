@@ -2,21 +2,30 @@
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
 
-# Hermes Agent ☤
+# Hermes Agent ☤ — Interstellar fork
 <p align="center">
-  <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
+  <a href="https://hermes-switchui.zi0n.space/">Hermes SwitchUI</a> |
+  <a href="https://hermes-switchui.zi0n.space/docs/welcome/">SwitchUI Docs</a> |
+  <a href="https://github.com/NousResearch/hermes-agent">Upstream Hermes</a>
 </p>
 <p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
+  <a href="https://hermes-switchui.zi0n.space/"><img src="https://img.shields.io/badge/SwitchUI-Live%20Site-18A558?style=for-the-badge" alt="Hermes SwitchUI website"></a>
+  <a href="https://github.com/Interstellar-code/hermes-agent"><img src="https://img.shields.io/badge/Fork-Interstellar--code-7B61FF?style=for-the-badge&logo=github" alt="Interstellar-code Hermes Agent fork"></a>
+  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Core%20Docs-Upstream-FFD700?style=for-the-badge" alt="Upstream Hermes documentation"></a>
   <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
-  <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
-  <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
 </p>
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+This is [Interstellar-code's](https://github.com/Interstellar-code) maintained fork of
+[Hermes Agent](https://github.com/NousResearch/hermes-agent), the open-source AI agent
+built by [Nous Research](https://nousresearch.com). It tracks the upstream runtime while
+adding the self-hosted [Hermes SwitchUI](https://hermes-switchui.zi0n.space/), multi-agent
+coordination, visual workflows, projects, personas, and fork-specific operational plugins.
+
+Hermes still provides the core learning loop: it creates and improves skills from
+experience, persists memory, searches past conversations, delegates to subagents, and
+runs across a real terminal, messaging platforms, and remote environments. This fork
+keeps those upstream capabilities and adds a browser workspace for operating them.
 
 Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
 
@@ -32,22 +41,53 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 
 ---
 
+## Hermes Agent + SwitchUI
+
+[Hermes SwitchUI](https://hermes-switchui.zi0n.space/) is the self-hosted browser
+workspace for this fork. It is a separate frontend repository, not a replacement for
+the Hermes runtime.
+
+| Layer | Responsibility |
+| --- | --- |
+| **Hermes Agent fork** | Models, conversations, tools, memory, sessions, gateway, scheduling, and persistence |
+| **Hermes SwitchUI** | Browser chat and workspace, files, terminal, projects, boards, workflows, operations, and plugin views |
+| **Plugins** | Optional capabilities such as A2A fleet coordination, specialist coding, personas, and Matrix Memory |
+
+- **Website:** [hermes-switchui.zi0n.space](https://hermes-switchui.zi0n.space/)
+- **Documentation:** [hermes-switchui.zi0n.space/docs](https://hermes-switchui.zi0n.space/docs/welcome/)
+- **Source:** [Interstellar-code/hermes-switchui](https://github.com/Interstellar-code/hermes-switchui)
+
+---
+
 ## Quick Install
 
-### Linux, macOS, WSL2, Termux
+### SwitchUI + this Hermes fork (recommended)
+
+The SwitchUI installer installs the required Interstellar Hermes fork first, then sets
+up the browser workspace. Supported by the installer on Linux, macOS, and WSL2.
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Interstellar-code/hermes-switchui/main/install.sh | bash
 ```
 
-### Windows (native, PowerShell)
+### Hermes Agent fork only
 
-> **Heads up:** Native Windows runs Hermes without WSL — CLI, gateway, TUI, and tools all work natively. If you'd rather use WSL2, the Linux/macOS one-liner above works there too. Found a bug? Please [file issues](https://github.com/NousResearch/hermes-agent/issues).
+#### Linux, macOS, WSL2, Termux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Interstellar-code/hermes-agent/main/scripts/install.sh | bash
+```
+
+#### Windows (native, PowerShell)
+
+> **Heads up:** Native Windows runs Hermes without WSL — CLI, gateway, TUI, and
+> tools all work natively. If you prefer WSL2, use the Linux installer above.
+> Found a fork-specific bug? [File it here](https://github.com/Interstellar-code/hermes-agent/issues).
 
 Run this in PowerShell:
 
 ```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+iex (irm https://raw.githubusercontent.com/Interstellar-code/hermes-agent/main/scripts/install.ps1)
 ```
 
 The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, completely isolated from any system Git install). Hermes uses this bundled Git Bash to run shell commands.
@@ -117,7 +157,8 @@ hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+📖 **[SwitchUI documentation](https://hermes-switchui.zi0n.space/docs/welcome/)** ·
+**[Upstream Hermes documentation](https://hermes-agent.nousresearch.com/docs/)**
 
 ---
 
@@ -160,29 +201,51 @@ For the full command lists, see the [CLI guide](https://hermes-agent.nousresearc
 
 ---
 
-## This fork — custom plugins
+## Interstellar extensions
 
-This [Interstellar-code](https://github.com/Interstellar-code/hermes-agent) fork tracks
-upstream Hermes and layers on a set of fork-specific plugins for agent-to-agent
-work, autonomous coding, and the [SwitchUI](https://github.com/Interstellar-code/hermes-switchui)
-browser frontend. Each ships its own README under `plugins/`.
+These are additions maintained in this fork. They build on Hermes' plugin and service
+surfaces so the upstream core can continue to move forward without turning every
+extension into a permanent model-tool cost.
 
-| Plugin                  | What it adds                                                                                          |
-| ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| **a2a_fleet**           | Agent-to-Agent peering — makes a profile a fleet member with an embedded A2A server, the `fleet_send` tool, and managed executors (Claude Code, OpenCode, Codex, Antigravity). |
-| **matrix_coder**        | Turns the active agent into a focused coding **specialist** via trusted developer-tier persona injection, with roles, review lenses, and Kanban audit mirroring. |
-| **kanban**              | Board + dispatcher that backs Matrix Coder's task flow.                                               |
-| **workflow-engine**     | DAG workflow engine — runs YAML-defined multi-node flows with conditional branching, parallel execution, approval gates, cron polling, and Kanban task dispatch. |
-| **personas**            | Makes personas first-class — canonical template library, runtime tools on every platform, and a REST API the SwitchUI profile wizard consumes. |
-| **mcp_lazy**            | Lazy MCP tool-schema loading — sends stub schemas and promotes full ones on demand, cutting ~80% of per-turn MCP token overhead. |
-| **hermes-switch-ui**    | Gives the agent awareness of the SwitchUI browser frontend and keeps the two sides in sync.          |
-| **karpathy-self-improve** | Autonomous self-improvement loop — collects metrics, proposes diffs, evaluates, and promotes or reverts via a git ratchet. |
+### Supported extensions
+
+| Extension | What it adds |
+| --- | --- |
+| [**Hermes SwitchUI bridge**](plugins/hermes-switch-ui/README.md) | Authenticated frontend registration, heartbeat/status, settings sync, agent tools, and the backend API used by the separate SwitchUI workspace. |
+| [**Projects**](plugins/projects/) | Named multi-folder workspaces, CLI and REST management, project activity, and explicit per-session project binding. |
+| [**A2A Fleet**](plugins/a2a_fleet/README.md) | Hermes-to-Hermes peering plus managed Claude Code, OpenCode, Codex, and Antigravity executor deployment. Executor capabilities depend on the installed CLI and its authentication. |
+| [**Workflow Engine**](plugins/workflow-engine/README.md) | YAML-defined DAG workflows with branching, parallel nodes, approval gates, cron polling, events, agent tools, and Kanban dispatch. The visual editor lives in SwitchUI. |
+| [**Matrix Coder**](plugins/matrix_coder/README.md) | Eight coding specialist roles, review lenses, domain/workflow personas, trusted developer-tier injection, and optional Kanban audit mirroring. Concurrency safety remains an orchestration responsibility. |
+| [**Personas**](plugins/personas/README.md) | A canonical library of 20 personas, runtime list/get/apply tools, trusted `persona_ref` overlays, and a read API. SwitchUI wizard migration and write-side promotion remain follow-up work. |
+| **Kanban extensions** | Board templates, scheduled tasks and board creation, project-linked tasks, dispatcher workflows, and restored dashboard APIs on top of Hermes Kanban. |
+
+### Optional and transitional
+
+| Extension | Status |
+| --- | --- |
+| [**Matrix Memory**](plugins/memory/matrix-memory/) | Optional Mnemosyne-backed vector, knowledge-graph, temporal, and wiki-bridge memory provider. Requires its pinned engine dependency and deliberate per-profile data-path configuration. |
+| [**MCP Lazy**](plugins/mcp_lazy/README.md) | Fork-local compatibility layer that defers MCP schemas and promotes them on demand. Savings are workload-dependent; prefer upstream `tool_search` when it works for your provider configuration. |
+
+`karpathy-self-improve` is being retired and is intentionally not presented as a
+supported extension.
 
 ---
 
 ## Documentation
 
-All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
+### Interstellar fork and SwitchUI
+
+| Resource | What's covered |
+| --- | --- |
+| [SwitchUI website](https://hermes-switchui.zi0n.space/) | Product overview, architecture, and the self-hosted browser workspace |
+| [SwitchUI documentation](https://hermes-switchui.zi0n.space/docs/welcome/) | Installation, chat, files, terminal, projects, boards, workflows, operations, plugins, and troubleshooting |
+| [Fork issues](https://github.com/Interstellar-code/hermes-agent/issues) | Bugs and feature requests specific to this repository |
+| [Plugin READMEs](plugins/) | Implementation, configuration, limitations, and operational guidance for fork extensions |
+
+### Upstream Hermes core
+
+The upstream documentation remains the authoritative reference for shared Hermes core
+behavior:
 
 | Section                                                                                             | What's Covered                                             |
 | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
@@ -236,7 +299,12 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ## Contributing
 
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
+We welcome contributions to this fork. Search the
+[fork issues](https://github.com/Interstellar-code/hermes-agent/issues) and
+[pull requests](https://github.com/Interstellar-code/hermes-agent/pulls) first. The
+[upstream contributing guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing)
+still applies to shared architecture and code style; fork-specific contribution rules
+live in [AGENTS.md](AGENTS.md).
 
 Quick start for contributors — use the standard installer, then work from the
 full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
@@ -244,7 +312,7 @@ full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
 managed venv, lazy dependencies, gateway, and docs tooling.
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Interstellar-code/hermes-agent/main/scripts/install.sh | bash
 cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
@@ -261,6 +329,8 @@ against its own checkout, destroying the running runtime mid-session.
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv ~/.hermes/venvs/hermes-dev --python 3.11
 source ~/.hermes/venvs/hermes-dev/bin/activate
+git clone https://github.com/Interstellar-code/hermes-agent.git
+cd hermes-agent
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
 ```
@@ -269,9 +339,12 @@ scripts/run_tests.sh
 
 ## Community
 
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
+- 🌐 [Hermes SwitchUI website](https://hermes-switchui.zi0n.space/)
+- 📚 [SwitchUI documentation](https://hermes-switchui.zi0n.space/docs/welcome/)
+- 🐛 [Interstellar fork issues](https://github.com/Interstellar-code/hermes-agent/issues)
+- 💬 [Nous Research Discord](https://discord.gg/NousResearch) — upstream/community discussion
+- 🧠 [Upstream Hermes Agent](https://github.com/NousResearch/hermes-agent)
+- 📦 [Agent Skills open standard](https://agentskills.io)
 - 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server for Hermes and other MCP hosts, with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting.
 - 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
 
@@ -281,4 +354,6 @@ scripts/run_tests.sh
 
 MIT — see [LICENSE](LICENSE).
 
-Built by [Nous Research](https://nousresearch.com).
+Based on [Hermes Agent](https://github.com/NousResearch/hermes-agent) by
+[Nous Research](https://nousresearch.com). This fork and its extensions are maintained
+by [Interstellar-code](https://github.com/Interstellar-code).
