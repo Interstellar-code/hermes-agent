@@ -258,6 +258,74 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    # ---------------------------------------------------- delegation transcripts
+    # The writer side (tools/delegation_live_log.py) already produced these
+    # files; until this endpoint existed nothing could read them back.
+
+    def _make_transcript(self, delegation_id="deleg_abcd1234", tasks=(0, 1)):
+        from tools.delegation_live_log import live_transcript_root
+
+        root = live_transcript_root() / delegation_id
+        root.mkdir(parents=True, exist_ok=True)
+        for i in tasks:
+            (root / f"task-{i}.log").write_text(f"line one t{i}\nline two t{i}\n")
+        (root / "manifest.json").write_text(json.dumps({"tasks": list(tasks)}))
+        return root
+
+    def test_delegation_transcript_returns_tasks_and_manifest(self):
+        self._make_transcript()
+        resp = self.client.get("/api/delegation/deleg_abcd1234/transcript")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["delegation_id"] == "deleg_abcd1234"
+        assert data["manifest"] == {"tasks": [0, 1]}
+        assert [t["index"] for t in data["tasks"]] == [0, 1]
+        assert "line two t0" in data["tasks"][0]["lines"][-1]
+
+    def test_delegation_transcript_task_filter(self):
+        self._make_transcript()
+        resp = self.client.get("/api/delegation/deleg_abcd1234/transcript?task=1")
+        assert resp.status_code == 200
+        assert [t["index"] for t in resp.json()["tasks"]] == [1]
+
+        missing = self.client.get("/api/delegation/deleg_abcd1234/transcript?task=9")
+        assert missing.status_code == 404
+
+    def test_delegation_transcript_unknown_id_is_404(self):
+        resp = self.client.get("/api/delegation/deleg_00000000/transcript")
+        assert resp.status_code == 404
+
+    @pytest.mark.parametrize("bad_id", [
+        # Traversal is stopped by the route shape, not the regex: %2f decodes
+        # to "/" during routing, so the path stops matching a single-segment
+        # {delegation_id} and the router 404s it before the handler runs.
+        # (Unencoded "../.." is collapsed by the client even earlier.)
+        "deleg_%2e%2e%2f%2e%2e",
+        "deleg_abcd1234%2f..%2f..",
+        "%2e%2e%2fetc%2fpasswd",
+        # These DO reach the handler, where the regex rejects them with 422.
+        "not-a-delegation",
+        "deleg_ABCD1234",   # uppercase: ids are lowercase hex
+        "deleg_abcd123",    # too short
+    ])
+    def test_delegation_transcript_rejects_malformed_ids(self, bad_id):
+        """The id lands in a filesystem path — nothing but deleg_<8 hex> may be served.
+
+        What matters is that no malformed id ever returns 200; whether it dies
+        at the router (404) or the regex (422) is an implementation detail.
+        """
+        resp = self.client.get(f"/api/delegation/{bad_id}/transcript")
+        assert resp.status_code in (404, 422), f"{bad_id!r} returned {resp.status_code}"
+
+    def test_delegation_transcript_survives_corrupt_manifest(self):
+        root = self._make_transcript(delegation_id="deleg_beef0000", tasks=(0,))
+        (root / "manifest.json").write_text("{not valid json")
+        resp = self.client.get("/api/delegation/deleg_beef0000/transcript")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["manifest"] is None          # bad manifest degrades...
+        assert data["tasks"][0]["lines"]         # ...but the logs still come back
+
     def test_get_status(self):
         resp = self.client.get("/api/status")
         assert resp.status_code == 200

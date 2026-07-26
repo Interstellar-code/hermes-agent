@@ -4199,6 +4199,82 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+# Delegation ids are minted by ``new_live_delegation_id()`` as ``deleg_<8 hex>``.
+# Matching that exactly is what keeps this endpoint's path join safe: the id
+# lands in a filesystem path, so anything looser (``..``, a slash, an absolute
+# path) must never reach ``live_transcript_root() / delegation_id``.
+_DELEGATION_ID_RE = re.compile(r"^deleg_[0-9a-f]{8}$")
+
+
+@app.get("/api/delegation/{delegation_id}/transcript")
+async def get_delegation_transcript(
+    delegation_id: str,
+    task: Optional[int] = None,
+    lines: int = 200,
+    profile: Optional[str] = None,
+):
+    """Return the live transcript(s) for one delegation.
+
+    The writer side already exists (``tools/delegation_live_log.py``): each
+    delegation gets ``<hermes_home>/cache/delegation/live/<id>/`` holding
+    ``task-<n>.log`` per child plus a ``manifest.json``. Until now nothing
+    could read them back out — ``_live_transcript_path`` was write-only.
+
+    Not in ``PUBLIC_API_PATHS``: transcripts carry conversation content, so
+    this stays behind the dashboard auth gate like session bodies do.
+    """
+    if not _DELEGATION_ID_RE.match(delegation_id or ""):
+        raise HTTPException(status_code=422, detail="Malformed delegation id")
+
+    n_lines = min(max(lines, 1), 2000)
+
+    def _run():
+        from tools.delegation_live_log import live_transcript_root
+
+        with _profile_scope(profile):
+            root = live_transcript_root() / delegation_id
+            if not root.is_dir():
+                return None
+
+            manifest: Optional[Dict[str, Any]] = None
+            manifest_file = root / "manifest.json"
+            if manifest_file.is_file():
+                try:
+                    manifest = json.loads(manifest_file.read_text())
+                except (OSError, ValueError):
+                    # A half-written manifest must not take the logs down with
+                    # it — the .log files are the payload that matters.
+                    manifest = None
+
+            wanted = sorted(root.glob("task-*.log"))
+            if task is not None:
+                wanted = [p for p in wanted if p.name == f"task-{task}.log"]
+
+            return {
+                "delegation_id": delegation_id,
+                "manifest": manifest,
+                "tasks": [
+                    {
+                        "index": int(p.stem.split("-", 1)[1])
+                        if p.stem.split("-", 1)[1].isdigit()
+                        else None,
+                        "lines": _tail_lines(p, n_lines),
+                    }
+                    for p in wanted
+                ],
+            }
+
+    # Directory walk + log tails are blocking; keep them off the event loop.
+    payload = await asyncio.get_running_loop().run_in_executor(None, _run)
+    if payload is None:
+        raise HTTPException(
+            status_code=404, detail=f"No live transcript for {delegation_id}"
+        )
+    if task is not None and not payload["tasks"]:
+        raise HTTPException(status_code=404, detail=f"No task-{task} in {delegation_id}")
+    return payload
+
+
 # Per-row fields that no session LIST consumer reads but that dominate the
 # payload. ``system_prompt`` is the fully rendered prompt — tens of KB per
 # row — and made a 21-row /api/sessions response 528KB (96% dead weight),
