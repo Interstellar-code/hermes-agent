@@ -351,6 +351,42 @@ def test_legacy_project_sessions_migration_keeps_latest_row(tmp_path):
         migrated.close()
 
 
+def test_legacy_project_sessions_migration_drops_orphan_rows(tmp_path):
+    """An orphan row must not brick connect().
+
+    connect() enables foreign_keys, so copying a row whose project_id no longer
+    exists into a table that REFERENCES projects(id) raises IntegrityError — and
+    since the migration re-runs on every connect, the DB would be permanently
+    unopenable rather than failing once. ON DELETE CASCADE only holds while FKs
+    are on, so a DB written with them off can carry orphans.
+    """
+    db_path = tmp_path / "projects.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.executescript(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, "
+            "name TEXT NOT NULL, description TEXT, created_at INTEGER NOT NULL, "
+            "archived INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE project_sessions (project_id TEXT NOT NULL, session_id TEXT NOT NULL, "
+            "bound_at INTEGER NOT NULL, bound_by TEXT, PRIMARY KEY (project_id, session_id));"
+            "INSERT INTO projects VALUES ('p_a', 'a', 'A', NULL, 1, 0);"
+            "INSERT INTO project_sessions VALUES ('p_a', 'keeps', 10, 'a');"
+            "INSERT INTO project_sessions VALUES ('p_gone', 'orphan', 20, 'x');"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    pdb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    migrated = pdb.connect(db_path=db_path)   # must not raise
+    try:
+        assert pdb.get_session_project(migrated, "keeps").project_id == "p_a"
+        assert pdb.get_session_project(migrated, "orphan") is None
+        assert migrated.execute("SELECT COUNT(*) FROM project_sessions").fetchone()[0] == 1
+    finally:
+        migrated.close()
+
+
 def test_list_session_bindings_orders_most_recent_first(conn):
     pid = pdb.create_project(conn, name="P", folders=["/x"])
     pdb.bind_session(conn, pid, "s1")

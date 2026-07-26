@@ -249,7 +249,15 @@ def _migrate_project_sessions(conn: sqlite3.Connection) -> None:
             "SELECT 1 FROM project_sessions AS newer "
             "WHERE newer.session_id = old.session_id AND "
             "(newer.bound_at > old.bound_at OR "
-            "(newer.bound_at = old.bound_at AND newer.rowid > old.rowid)))"
+            "(newer.bound_at = old.bound_at AND newer.rowid > old.rowid))) "
+            # Drop rows pointing at a project that no longer exists. connect()
+            # runs with foreign_keys=ON, so copying an orphan into a table that
+            # REFERENCES projects(id) raises IntegrityError — and because the
+            # migration re-runs on every connect, that would brick the projects
+            # DB permanently rather than fail once. ON DELETE CASCADE only holds
+            # while FKs are enabled, so a DB written with them off can carry
+            # orphans. Discarding them is exactly what CASCADE would have done.
+            "AND EXISTS (SELECT 1 FROM projects WHERE projects.id = old.project_id)"
         )
         conn.execute("DROP TABLE project_sessions")
         conn.execute("ALTER TABLE project_sessions_new RENAME TO project_sessions")
