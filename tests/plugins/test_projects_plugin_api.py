@@ -50,6 +50,7 @@ def test_manifest_is_backend_only() -> None:
     assert manifest["name"] == "projects"
     assert manifest["api"] == "plugin_api.py"
     assert manifest["tab"] == {"hidden": True}
+    assert "Read-only" not in manifest["description"]
 
 
 def test_dashboard_scanner_discovers_bundled_plugin() -> None:

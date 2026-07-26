@@ -10,6 +10,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
 from hermes_state import SessionDB
+from plugins.projects.dashboard.activity import project_activity
 from plugins.projects.dashboard.enrichment import enrich_projects
 
 
@@ -120,6 +121,57 @@ def test_enrichment_uses_secondary_folder_session_activity(stores):
     assert enriched[0]["last_session_activity_at"] == 200
     assert enriched[0]["last_task_activity_at"] is None
     assert enriched[0]["last_activity_at"] == 200
+
+
+def test_explicit_binding_overrides_cwd_for_enrichment_and_activity(stores):
+    home, repo = stores
+    cwd_project = _project(repo)
+    bound_repo = repo.parent / "bound-repo"
+    bound_repo.mkdir()
+    with pdb.connect_closing() as conn:
+        bound_id = pdb.create_project(conn, name="Bound", slug="bound", folders=[str(bound_repo)])
+        bound_project = pdb.get_project(conn, bound_id)
+        pdb.bind_session(conn, bound_project.id, "rebound", bound_by="test")
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.ensure_session("rebound", source="tui", cwd=str(repo))
+        db.append_message("rebound", "user", "hello", timestamp=200)
+    finally:
+        db.close()
+
+    enriched, errors = enrich_projects([cwd_project, bound_project], None)
+    assert not errors
+    counts = {item["id"]: item["session_count"] for item in enriched}
+    assert counts == {cwd_project.id: 0, bound_project.id: 1}
+    assert project_activity(cwd_project, limit=10, after=None)["items"] == []
+    assert [item["id"] for item in project_activity(bound_project, limit=10, after=None)["items"]] == ["rebound"]
+
+
+def test_archived_binding_falls_back_to_cwd_project(stores):
+    home, repo = stores
+    cwd_project = _project(repo)
+    with pdb.connect_closing() as conn:
+        archived_id = pdb.create_project(conn, name="Archived", slug="archived")
+        pdb.bind_session(conn, archived_id, "rebound")
+        pdb.archive_project(conn, archived_id)
+        archived_project = pdb.get_project(conn, archived_id)
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.ensure_session("rebound", source="tui", cwd=str(repo))
+        db.append_message("rebound", "user", "hello", timestamp=200)
+    finally:
+        db.close()
+
+    enriched, errors = enrich_projects([cwd_project, archived_project], None)
+    assert not errors
+    assert {item["id"]: item["session_count"] for item in enriched} == {
+        cwd_project.id: 1,
+        archived_project.id: 0,
+    }
+    assert [item["id"] for item in project_activity(cwd_project, limit=10, after=None)["items"]] == ["rebound"]
+    assert project_activity(archived_project, limit=10, after=None)["items"] == []
 
 
 def test_enrichment_unions_event_and_session_activity(stores):

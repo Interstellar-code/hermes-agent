@@ -104,10 +104,9 @@ CREATE TABLE IF NOT EXISTS discovered_repos (
 -- of its bindings — never leave dangling rows pointing at a deleted project.
 CREATE TABLE IF NOT EXISTS project_sessions (
     project_id   TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    session_id   TEXT    NOT NULL,
+    session_id   TEXT    PRIMARY KEY,
     bound_at     INTEGER NOT NULL,
-    bound_by     TEXT,
-    PRIMARY KEY (project_id, session_id)
+    bound_by     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_project_sessions_session
@@ -191,6 +190,7 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         if resolved not in _INITIALIZED_PATHS:
             conn.executescript(SCHEMA_SQL)
             _migrate_add_optional_columns(conn)
+            _migrate_project_sessions(conn)
             _INITIALIZED_PATHS.add(resolved)
     except Exception:
         conn.close()
@@ -228,6 +228,32 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     for col in _OPTIONAL_PROJECT_COLUMNS:
         if col not in cols:
             _add_column_if_missing(conn, "projects", col, f"{col} TEXT")
+
+
+def _migrate_project_sessions(conn: sqlite3.Connection) -> None:
+    """Upgrade legacy many-project session bindings to one binding per session."""
+    columns = conn.execute("PRAGMA table_info(project_sessions)").fetchall()
+    if any(row["name"] == "session_id" and row["pk"] == 1 for row in columns):
+        return
+
+    with write_txn(conn):
+        conn.execute(
+            "CREATE TABLE project_sessions_new ("
+            "project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, "
+            "session_id TEXT PRIMARY KEY, bound_at INTEGER NOT NULL, bound_by TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO project_sessions_new (project_id, session_id, bound_at, bound_by) "
+            "SELECT old.project_id, old.session_id, old.bound_at, old.bound_by "
+            "FROM project_sessions AS old WHERE NOT EXISTS ("
+            "SELECT 1 FROM project_sessions AS newer "
+            "WHERE newer.session_id = old.session_id AND "
+            "(newer.bound_at > old.bound_at OR "
+            "(newer.bound_at = old.bound_at AND newer.rowid > old.rowid)))"
+        )
+        conn.execute("DROP TABLE project_sessions")
+        conn.execute("ALTER TABLE project_sessions_new RENAME TO project_sessions")
+        conn.execute("CREATE INDEX idx_project_sessions_session ON project_sessions(session_id)")
 
 
 # ---------------------------------------------------------------------------
@@ -718,9 +744,9 @@ def list_discovered_repos(conn: sqlite3.Connection) -> List[dict]:
 class SessionBinding:
     """One row of the ``project_sessions`` table.
 
-    ``project_id`` and ``session_id`` are the natural pair (PK); ``bound_at`` is
-    a unix epoch and ``bound_by`` is the operator that set the binding (a CLI
-    username, a platform id, ``"api"`` for REST, etc. — purely informational).
+    ``session_id`` is the primary key, so a session can be explicitly bound to
+    exactly one project. ``bound_at`` is a unix epoch and ``bound_by`` is the
+    operator that set the binding (purely informational).
     """
 
     project_id: str
@@ -759,7 +785,7 @@ def bind_session(
     session_id: str,
     bound_by: Optional[str] = None,
 ) -> SessionBinding:
-    """Bind ``session_id`` to ``project_id`` (upsert; refreshes ``bound_at``).
+    """Bind ``session_id`` to ``project_id`` (replace; refreshes metadata).
 
     Raises ``ValueError`` when the project does not exist (so the CLI / REST
     layer can return a 404 instead of silently creating a dangling FK row —
@@ -776,7 +802,7 @@ def bind_session(
         conn.execute(
             "INSERT INTO project_sessions (project_id, session_id, bound_at, bound_by) "
             "VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(project_id, session_id) DO UPDATE SET "
+            "ON CONFLICT(session_id) DO UPDATE SET project_id = excluded.project_id, "
             "bound_at = excluded.bound_at, bound_by = excluded.bound_by",
             (project_id, sid, now, (bound_by or None)),
         )
@@ -815,19 +841,36 @@ def get_session_project(
 ) -> Optional[SessionBinding]:
     """The explicit binding for ``session_id``, or ``None`` when unbound.
 
-    When a session is bound to multiple projects (the schema allows it, the
-    issue spec says it is one-to-one at the API layer), the most recently
-    bound row wins — the resolution order downstream treats any binding as
-    authoritative over the active pointer, so the order between two bindings is
-    the order of last ``bind_session`` call.
+    The database enforces one binding per session, so no timestamp ordering is
+    needed to resolve an explicit project.
     """
     sid = _require_session_id(session_id)
     row = conn.execute(
         "SELECT project_id, session_id, bound_at, bound_by "
-        "FROM project_sessions WHERE session_id = ? ORDER BY bound_at DESC LIMIT 1",
+        "FROM project_sessions WHERE session_id = ?",
         (sid,),
     ).fetchone()
     return _session_binding_from_row(row) if row else None
+
+
+def get_session_projects(
+    conn: sqlite3.Connection, session_ids: Iterable[str]
+) -> dict[str, SessionBinding]:
+    """Explicit bindings for ``session_ids``, keyed by session id."""
+    ids = list(dict.fromkeys(_require_session_id(session_id) for session_id in session_ids))
+    if not ids:
+        return {}
+    bindings: dict[str, SessionBinding] = {}
+    for start in range(0, len(ids), 900):
+        batch = ids[start : start + 900]
+        placeholders = ", ".join("?" for _ in batch)
+        rows = conn.execute(
+            "SELECT project_id, session_id, bound_at, bound_by FROM project_sessions "
+            f"WHERE session_id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        bindings.update({row["session_id"]: _session_binding_from_row(row) for row in rows})
+    return bindings
 
 
 # ---------------------------------------------------------------------------

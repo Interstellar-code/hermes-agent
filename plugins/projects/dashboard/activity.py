@@ -98,8 +98,15 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
         from tui_gateway import git_probe, project_tree
 
         db = SessionDB(db_path=path, read_only=True)
+        projects_conn = None
         try:
-            index = project_tree._FolderIndex([project.to_dict()])
+            projects_conn = projects_db.connect()
+            active_project_ids = {
+                candidate.id for candidate in projects_db.list_projects(projects_conn)
+            }
+            index = project_tree._FolderIndex(
+                [project.to_dict()] if project.id in active_project_ids else []
+            )
             items: list[dict] = []
             offset = 0
             while True:
@@ -112,8 +119,20 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
                     exclude_sources=["cron"],
                     include_archived=False,
                 )
+                explicit_owners = projects_db.get_session_projects(
+                    projects_conn, (row["id"] for row in rows)
+                )
                 for row in rows:
-                    if project_tree._project_for_session(row, index, git_probe.resolve) is None:
+                    binding = explicit_owners.get(row["id"])
+                    owner_id = (
+                        binding.project_id
+                        if binding and binding.project_id in active_project_ids
+                        else None
+                    )
+                    if owner_id != project.id and (
+                        owner_id is not None
+                        or project_tree._project_for_session(row, index, git_probe.resolve) is None
+                    ):
                         continue
                     items.append(
                         {
@@ -132,6 +151,8 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
                     break
                 offset += len(rows)
         finally:
+            if projects_conn is not None:
+                projects_conn.close()
             db.close()
         return items, []
     except Exception as exc:
