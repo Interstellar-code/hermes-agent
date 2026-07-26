@@ -26,6 +26,19 @@ LAZY_DESC_PREFIX = "[LAZY] "
 MCP_PREFIX = "mcp_"
 
 
+def _strip_mcp_prefix(tool_name: str) -> str:
+    """Return the server/tool remainder of an MCP tool name.
+
+    0.19 core registers ``mcp__<server>__<tool>`` (``MCP_TOOL_NAME_PREFIX``
+    in ``tools/mcp_tool.py``); older names were ``mcp_<server>_<tool>``.
+    ``MCP_PREFIX`` only covers the single-underscore form, so the double
+    form left a stray leading ``_`` on the remainder and every
+    server-scoped check below silently failed to match.
+    """
+    rest = tool_name[len(MCP_PREFIX):]
+    return rest[1:] if rest.startswith("_") else rest
+
+
 def is_mcp_tool(schema: Dict[str, Any]) -> bool:
     """Return True if the schema is for an MCP-sourced tool."""
     name = schema.get("function", {}).get("name", "")
@@ -214,7 +227,7 @@ def _extract_server(tool_name: str, lazy_servers: "Optional[Set[str]]") -> "Opti
     """
     if not tool_name.startswith(MCP_PREFIX):
         return None
-    rest = tool_name[len(MCP_PREFIX):]
+    rest = _strip_mcp_prefix(tool_name)
     if lazy_servers is None:
         # All MCP tools eligible; server = first underscore-segment.
         return rest.split("_", 1)[0] if "_" in rest else rest
@@ -240,7 +253,7 @@ def _server_in_set(tool_name: str, server_set: "Set[str] | frozenset") -> bool:
     """
     if not tool_name.startswith(MCP_PREFIX):
         return False
-    rest = tool_name[len(MCP_PREFIX):]
+    rest = _strip_mcp_prefix(tool_name)
     candidates = sorted(server_set, key=lambda s: len(s.replace("-", "_").replace(".", "_")), reverse=True)
     for server in candidates:
         sanitised = server.replace("-", "_").replace(".", "_")

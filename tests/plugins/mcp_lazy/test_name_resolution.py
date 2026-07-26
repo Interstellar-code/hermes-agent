@@ -12,6 +12,7 @@ import pytest
 from plugins.mcp_lazy.meta_tool import handler as meta_tool_handler
 from plugins.mcp_lazy.pool import _reset_for_tests, get_pool
 from plugins.mcp_lazy.promote import resolve_tool_name
+from plugins.mcp_lazy.stubs import _extract_server, _server_in_set
 
 
 class FakeAgent:
@@ -111,3 +112,32 @@ async def test_promotion_actually_persists_in_pool():
 
     pool = get_pool("sess-pool")
     assert "mcp_lifeplan42_list_inbox" in pool.snapshot()
+
+
+# ------------------------------------------------- server parsing (0.19 naming)
+# 0.19 core registers ``mcp__<server>__<tool>`` (tools/mcp_tool.py
+# MCP_TOOL_NAME_PREFIX). ``MCP_PREFIX`` here is still ``mcp_``, so before the
+# fix the remainder kept a stray leading ``_`` and every server-scoped check
+# (stub filtering, per-server token counts, eviction) silently matched nothing.
+
+@pytest.mark.parametrize("tool_name", [
+    "mcp__serena__find_symbol",   # 0.19 registry form
+    "mcp_serena_find_symbol",     # legacy form
+])
+def test_server_parsing_handles_both_naming_conventions(tool_name):
+    assert _server_in_set(tool_name, {"serena"}) is True
+    assert _extract_server(tool_name, None) == "serena"
+    assert _extract_server(tool_name, {"serena"}) == "serena"
+
+
+def test_server_parsing_rejects_other_servers():
+    assert _server_in_set("mcp__other__tool", {"serena"}) is False
+    assert _extract_server("mcp__other__tool", {"serena"}) is None
+
+
+def test_server_parsing_keeps_longest_match_and_sanitization():
+    # hyphens sanitize to underscores; longest match still wins (EDGE #2)
+    assert _server_in_set("mcp__my_server__tool", {"my-server"}) is True
+    assert _extract_server(
+        "mcp__my_tool_v2__create", {"my_tool", "my_tool_v2"}
+    ) == "my_tool_v2"
