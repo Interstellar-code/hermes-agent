@@ -61,9 +61,21 @@ def _ensure_telegram_mock() -> None:
 
     mod = MagicMock()
     mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants.ParseMode.MARKDOWN = "Markdown"
-    mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    mod.constants.ParseMode.HTML = "HTML"
+    class _ParseModeValue(str):
+        def __repr__(self):
+            name = getattr(self, "name", str(self))
+            return f"<ParseMode.{name}: '{self}'>"
+
+    markdown_v2 = _ParseModeValue("MarkdownV2")
+    markdown_v2.name = "MARKDOWN_V2"
+    markdown = _ParseModeValue("Markdown")
+    markdown.name = "MARKDOWN"
+    html = _ParseModeValue("HTML")
+    html.name = "HTML"
+
+    mod.constants.ParseMode.MARKDOWN = markdown
+    mod.constants.ParseMode.MARKDOWN_V2 = markdown_v2
+    mod.constants.ParseMode.HTML = html
     mod.constants.ChatType.PRIVATE = "private"
     mod.constants.ChatType.GROUP = "group"
     mod.constants.ChatType.SUPERGROUP = "supergroup"
@@ -88,13 +100,13 @@ def _ensure_telegram_mock() -> None:
     # Update.ALL_TYPES used in start_polling()
     mod.Update.ALL_TYPES = []
 
-    for name in (
-        "telegram",
-        "telegram.ext",
-        "telegram.constants",
-        "telegram.request",
-    ):
-        sys.modules[name] = mod
+    mod.ChatType = mod.constants.ChatType
+    mod.ParseMode = mod.constants.ParseMode
+
+    sys.modules["telegram"] = mod
+    sys.modules["telegram.ext"] = mod.ext
+    sys.modules["telegram.constants"] = mod.constants
+    sys.modules["telegram.request"] = mod.request
     sys.modules["telegram.error"] = mod.error
 
 
@@ -454,14 +466,13 @@ def pytest_configure(config):
         violations = _run_adapter_antipattern_scan()
 
         if violations:
-            msg = (
-                "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
-                + "\n".join(violations)
-                + "\n\n"
-                + _GUARD_HINT
-            )
+            msg = _format_antipattern_error(violations)
             cache_file.write_text(msg, encoding="utf-8")
             raise pytest.UsageError(msg)
-        else:
-            cache_file.write_text("clean", encoding="utf-8")
 
+        cache_file.write_text("clean", encoding="utf-8")
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"

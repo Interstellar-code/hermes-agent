@@ -20,28 +20,7 @@ import pytest
 from gateway.config import PlatformConfig
 
 
-def _ensure_telegram_mock():
-    telegram_mod = MagicMock()
-    telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-
-    # Register telegram.constants as a separate module mock so that
-    # ``from telegram.constants import ChatType`` resolves to our mock
-    # with string-valued members (not auto-generated MagicMocks).
-    constants_mod = MagicMock()
-    constants_mod.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    constants_mod.ChatType.GROUP = "group"
-    constants_mod.ChatType.SUPERGROUP = "supergroup"
-    constants_mod.ChatType.CHANNEL = "channel"
-    constants_mod.ChatType.PRIVATE = "private"
-
-    sys.modules["telegram"] = telegram_mod
-    sys.modules["telegram.ext"] = telegram_mod.ext
-    sys.modules["telegram.constants"] = constants_mod
-    sys.modules["telegram.request"] = telegram_mod.request
-
-    # Force reimport so the adapter picks up the mock ChatType.
-    sys.modules.pop("plugins.platforms.telegram.adapter", None)
-
+from tests.gateway.conftest import _ensure_telegram_mock
 
 _ensure_telegram_mock()
 

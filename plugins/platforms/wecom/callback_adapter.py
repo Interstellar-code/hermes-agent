@@ -26,7 +26,8 @@ try:
 
     DEFUSEDXML_AVAILABLE = True
 except ImportError:
-    ET = None  # type: ignore[assignment]
+    import xml.etree.ElementTree as ET  # type: ignore[no-redef]
+
     DEFUSEDXML_AVAILABLE = False
 
 try:
