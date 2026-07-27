@@ -61,6 +61,20 @@ def _pre_llm_call(session_id: str = "", **kwargs) -> Dict[str, Any] | None:
     _nudged_sessions.add(session_id)
     return {"context": _NUDGE}
 
+import functools
+import json
+
+def _json_tool_result(fn):
+    """Wrap a tool handler so a dict/list return is JSON-stringified for 0.19 contract."""
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
+    return _wrapper
+
+
 # ---------------------------------------------------------------------------
 # Tool handlers — receive whole args dict as first positional argument
 # ---------------------------------------------------------------------------
@@ -102,7 +116,7 @@ def register(ctx) -> None:  # noqa: ANN001
             },
             "additionalProperties": False,
         },
-        handler=_tool_switchui_info,
+        handler=_json_tool_result(_tool_switchui_info),
         description="Return SwitchUI capability information (repo, ports, env vars, features).",
         emoji="🖥️",
     )
@@ -116,7 +130,7 @@ def register(ctx) -> None:  # noqa: ANN001
             "properties": {},
             "additionalProperties": False,
         },
-        handler=_tool_switchui_status,
+        handler=_json_tool_result(_tool_switchui_status),
         description="Return SwitchUI connection info and live status (ports, active profile, enabled plugins).",
         emoji="📡",
     )

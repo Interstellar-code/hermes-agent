@@ -133,3 +133,32 @@ def test_register_succeeds_without_register_skill():
     plugin.register(ctx)  # must not raise
     assert len(ctx.hooks) == 1
     assert len(ctx.tools) == 3
+
+
+def test_registered_handlers_return_json_strings():
+    """Verify registered tool handlers conform to 0.19 contract by returning JSON strings."""
+    import json
+    plugin = _load_plugin()
+    ctx = FakeCtx()
+    plugin.register(ctx)
+
+    tools_by_name = {t["name"]: t["handler"] for t in ctx.tools}
+
+    # persona_list
+    res_list = tools_by_name["persona_list"]({})
+    assert isinstance(res_list, str)
+    data_list = json.loads(res_list)
+    assert "personas" in data_list and data_list["count"] == 20
+
+    # persona_get
+    res_get = tools_by_name["persona_get"]({"persona_id": "engineering-security-engineer"})
+    assert isinstance(res_get, str)
+    data_get = json.loads(res_get)
+    assert "persona" in data_get
+
+    # persona_apply
+    res_apply = tools_by_name["persona_apply"]({"persona_id": "engineering-security-engineer"})
+    assert isinstance(res_apply, str)
+    data_apply = json.loads(res_apply)
+    assert data_apply["target"] == "delegate"
+

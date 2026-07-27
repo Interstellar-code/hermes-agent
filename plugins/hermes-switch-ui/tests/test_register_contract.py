@@ -196,3 +196,26 @@ def test_register_succeeds_without_register_skill():
     # Core registrations still happen
     assert len(ctx.hooks) == 1
     assert len(ctx.tools) == 2
+
+
+def test_registered_handlers_return_json_strings():
+    """Verify registered tool handlers conform to 0.19 contract by returning JSON strings."""
+    import json
+    plugin = _load_plugin()
+    ctx = FakeCtx()
+    plugin.register(ctx)
+
+    tools_by_name = {t["name"]: t["handler"] for t in ctx.tools}
+
+    # switchui_info
+    res_info = tools_by_name["switchui_info"]({})
+    assert isinstance(res_info, str)
+    data_info = json.loads(res_info)
+    assert "capabilities" in data_info or "version" in data_info or isinstance(data_info, dict)
+
+    # switchui_status
+    res_status = tools_by_name["switchui_status"]({})
+    assert isinstance(res_status, str)
+    data_status = json.loads(res_status)
+    assert "runtime_profile" in data_status or "connection" in data_status or isinstance(data_status, dict)
+

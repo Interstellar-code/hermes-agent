@@ -92,6 +92,20 @@ def _pre_llm_call(session_id: str = "", **kwargs) -> Optional[Dict[str, Any]]:
         return None
 
 
+import functools
+import json
+
+def _json_tool_result(fn):
+    """Wrap a tool handler so a dict/list return is JSON-stringified for 0.19 contract."""
+    @functools.wraps(fn)
+    def _wrapper(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
+    return _wrapper
+
+
 # ---------------------------------------------------------------------------
 # Tool handlers — receive the whole args dict as the first positional argument
 # ---------------------------------------------------------------------------
@@ -162,7 +176,7 @@ def register(ctx) -> None:  # noqa: ANN001
             },
             "additionalProperties": False,
         },
-        handler=_tool_persona_list,
+        handler=_json_tool_result(_tool_persona_list),
         description="List available personas (metadata: id, name, category, tags, suggested model/mcps/toolsets).",
         emoji="🎭",
     )
@@ -178,7 +192,7 @@ def register(ctx) -> None:  # noqa: ANN001
             "required": ["persona_id"],
             "additionalProperties": False,
         },
-        handler=_tool_persona_get,
+        handler=_json_tool_result(_tool_persona_get),
         description="Get a persona's full definition including its system_prompt overlay text.",
         emoji="🎭",
     )
@@ -199,7 +213,7 @@ def register(ctx) -> None:  # noqa: ANN001
             "required": ["persona_id"],
             "additionalProperties": False,
         },
-        handler=_tool_persona_apply,
+        handler=_json_tool_result(_tool_persona_apply),
         description="Compose a persona overlay for injection (e.g. into a delegate_task goal). Returns overlay text + metadata; does not mutate config.",
         emoji="🎭",
     )
