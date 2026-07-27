@@ -27,7 +27,7 @@ nodes:
 
       UA = "hermes-switchui-workflow/1.0 (+tool-catalog-write)"
 
-      msg = """$USER_MESSAGE"""
+      msg = os.environ.get("USER_MESSAGE", "")
       m = re.search(r"https?://[^\s'\"<>]+", msg)
       if not m:
           print("ERROR: no URL found in user_message", file=sys.stderr)
