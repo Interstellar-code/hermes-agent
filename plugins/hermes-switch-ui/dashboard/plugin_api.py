@@ -31,7 +31,7 @@ def _require_auth(request: Request) -> None:
 
     Reuses hermes_cli.web_server._is_authenticated (session cookie / token).
     No-ops gracefully when web_server is not importable (test / standalone context).
-    Mirrors karpathy-self-improve pattern.
+    Mirrors standard plugin auth pattern.
     """
     try:
         from hermes_cli.web_server import _is_authenticated  # type: ignore[import]
