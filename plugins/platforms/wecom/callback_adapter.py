@@ -26,8 +26,13 @@ try:
 
     DEFUSEDXML_AVAILABLE = True
 except ImportError:
-    import xml.etree.ElementTree as ET  # type: ignore[no-redef]
-
+    # Deliberately None, NOT a stdlib xml.etree fallback: these bodies are
+    # unauthenticated and pre-signature-verification, so the stdlib parser is
+    # the exact thing the comment above says must not touch them. Leaving ET
+    # unusable keeps this fail-closed even if check_wecom_callback_requirements()
+    # is ever refactored away or bypassed. The type: ignore is the cost of that
+    # guarantee — do not "clean it up" by importing the unsafe parser here.
+    ET = None  # type: ignore[assignment]
     DEFUSEDXML_AVAILABLE = False
 
 try:

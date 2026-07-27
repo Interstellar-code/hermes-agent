@@ -271,6 +271,22 @@ _GUARD_HINT = (
 )
 
 
+def _format_antipattern_error(violations: list[str]) -> str:
+    """Build the guard's failure message.
+
+    Kept as a function because ``pytest_configure`` both writes it to the cache
+    file and raises it. It is only reachable when a violation is detected, so a
+    missing definition here fails silently in every green run — which is
+    exactly how it went undefined once already.
+    """
+    return (
+        "Plugin-adapter-import anti-pattern detected in gateway tests:\n"
+        + "\n".join(violations)
+        + "\n\n"
+        + _GUARD_HINT
+    )
+
+
 def _scan_for_plugin_adapter_antipattern(source: str) -> list[str]:
     """Return a list of offending-line descriptions, or [] if clean.
 
