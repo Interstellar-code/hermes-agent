@@ -64,7 +64,30 @@ def resolve_sessions_file(profile_path_arg: str | Path | None = None) -> Path:
         if (p / "sessions.json").exists():
             return p / "sessions.json"
         return p / "sessions" / "sessions.json"
-    return get_hermes_home() / "sessions" / "sessions.json"
+    return _active_profile_home() / "sessions" / "sessions.json"
+
+
+def _active_profile_home() -> Path:
+    """Home directory of the profile this script should target by default.
+
+    ``get_hermes_home()`` is NOT the right default on its own: with HERMES_HOME
+    unset it returns ``~/.hermes``, which is the *default* profile — so a bare
+    invocation would silently target a different profile's data than the active
+    one (``~/.hermes/profiles/<name>``). Since this script deletes keys, aiming
+    at the wrong profile is the worst failure mode it has.
+
+    An explicitly set HERMES_HOME wins: that means the caller pinned a profile.
+    Otherwise fall back to the sticky active profile on disk.
+    """
+    if os.environ.get("HERMES_HOME"):
+        return get_hermes_home()
+
+    from hermes_cli.profiles import get_active_profile, get_profile_dir
+
+    name = get_active_profile()
+    if name in ("", "default"):
+        return get_hermes_home()
+    return get_profile_dir(name)
 
 
 def prune_invalid_session_keys(
@@ -248,15 +271,12 @@ def main() -> None:
         action="store_true",
         help="Perform a dry-run without writing changes to disk",
     )
-    parser.add_argument(
-        "--self-test",
-        action="store_true",
-        help="Run script internal self-tests before executing",
-    )
-
     args = parser.parse_args()
 
-    # Always run self-tests first to ensure 100% code path verification
+    # Self-tests always run: this script deletes keys from a live data file, and
+    # they cost milliseconds against a temp dir. There is deliberately no flag to
+    # skip them — a --self-test flag existed here but was never read, which is
+    # worse than no flag at all.
     run_self_tests()
 
     profile_arg = args.profile_path_opt or args.profile_path
