@@ -118,13 +118,15 @@ def promote_tools(agent, tool_names: Iterable[str]) -> List[str]:
         name = name.strip()
         if not name:
             continue
-        if valid and name not in valid:
+        resolved_name = resolve_tool_name(name, valid)
+        if valid and resolved_name not in valid:
             logger.debug(
-                "mcp_lazy: refusing to promote unknown tool '%s' (not in valid_tool_names)",
+                "mcp_lazy: refusing to promote unknown tool '%s' (resolved '%s' not in valid_tool_names)",
                 name,
+                resolved_name,
             )
             continue
-        accepted.append(name)
+        accepted.append(resolved_name)
     if accepted:
         pool.promote(accepted)
         logger.debug(

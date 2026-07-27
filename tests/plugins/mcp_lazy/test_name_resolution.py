@@ -11,7 +11,7 @@ import pytest
 
 from plugins.mcp_lazy.meta_tool import handler as meta_tool_handler
 from plugins.mcp_lazy.pool import _reset_for_tests, get_pool
-from plugins.mcp_lazy.promote import resolve_tool_name
+from plugins.mcp_lazy.promote import promote_tools, resolve_tool_name
 from plugins.mcp_lazy.stubs import _extract_server, _server_in_set
 
 
@@ -141,3 +141,11 @@ def test_server_parsing_keeps_longest_match_and_sanitization():
     assert _extract_server(
         "mcp__my_tool_v2__create", {"my_tool", "my_tool_v2"}
     ) == "my_tool_v2"
+
+
+def test_promote_tools_resolves_double_underscore_native_names():
+    agent = FakeAgent("sess-promote-direct", ["mcp_lifeplan42_list_inbox"])
+    promoted = promote_tools(agent, ["mcp__lifeplan42__list_inbox"])
+    assert promoted == ["mcp_lifeplan42_list_inbox"]
+    pool = get_pool("sess-promote-direct")
+    assert "mcp_lifeplan42_list_inbox" in pool.snapshot()

@@ -150,6 +150,14 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
         exec_env = dict(os.environ)
         if wf_vars.get("artifacts_dir"):
             exec_env["ARTIFACTS_DIR"] = wf_vars["artifacts_dir"]
+        if wf_vars.get("user_message"):
+            exec_env["USER_MESSAGE"] = str(wf_vars["user_message"])
+        if wf_vars.get("base_branch"):
+            exec_env["BASE_BRANCH"] = str(wf_vars["base_branch"])
+        if wf_vars.get("docs_dir"):
+            exec_env["DOCS_DIR"] = str(wf_vars["docs_dir"])
+        if wf_vars.get("workflow_id"):
+            exec_env["WORKFLOW_ID"] = str(wf_vars["workflow_id"])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd_parts,

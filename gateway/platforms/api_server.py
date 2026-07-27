@@ -2748,6 +2748,18 @@ class APIServerAdapter(BasePlatformAdapter):
         except ValueError as exc:
             return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
+        # Inherit project binding if the source session was bound to a project
+        try:
+            from hermes_cli import projects_db
+            def _inherit_project_binding():
+                with projects_db.connect_closing() as pconn:
+                    binding = projects_db.get_session_project(pconn, source_id)
+                    if binding is not None:
+                        projects_db.bind_session(pconn, binding.project_id, fork_id, bound_by="fork")
+            await asyncio.to_thread(_inherit_project_binding)
+        except Exception as p_exc:
+            logger.debug("Failed to inherit project binding for fork %s: %s", fork_id, p_exc)
+
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
     @_admit_api_agent_request
@@ -4532,6 +4544,58 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    def _enrich_job_status(self, job: Dict[str, Any], session_db: Optional[Any] = None) -> Dict[str, Any]:
+        """Enrich a cron job dict with live execution status from SessionDB.
+
+        Cron execution sessions use session IDs formatted as ``cron_{job_id}_{timestamp}``.
+        If a session row exists and has not finished (end_reason is null/empty), the job
+        is currently running. If finished, surfaces last execution end_reason and ended_at.
+        """
+        if not isinstance(job, dict):
+            return job
+        job_id = job.get("id")
+        if not job_id:
+            return job
+
+        enriched = dict(job)
+        enriched["status"] = "idle"
+        enriched["active_session_id"] = None
+        enriched["last_execution"] = None
+
+        if session_db is None:
+            return enriched
+
+        try:
+            prefix = f"cron_{job_id}_%"
+            rows = session_db.execute_query(
+                "SELECT session_id, created_at, ended_at, end_reason FROM sessions "
+                "WHERE session_id LIKE ? ORDER BY created_at DESC LIMIT 1",
+                (prefix,),
+            )
+            if rows:
+                row = rows[0]
+                session_id = row.get("session_id")
+                created_at = row.get("created_at")
+                ended_at = row.get("ended_at")
+                end_reason = row.get("end_reason")
+
+                is_active = ended_at is None or str(ended_at).strip() == ""
+                if is_active:
+                    enriched["status"] = "running"
+                    enriched["active_session_id"] = session_id
+
+                enriched["last_execution"] = {
+                    "session_id": session_id,
+                    "created_at": created_at,
+                    "ended_at": ended_at,
+                    "end_reason": end_reason,
+                    "status": "running" if is_active else (end_reason or "completed"),
+                }
+        except Exception as e:
+            logger.debug("Failed to query cron job execution status from SessionDB: %s", e)
+
+        return enriched
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -4543,7 +4607,9 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
-            return web.json_response({"jobs": jobs})
+            session_db = await self._ensure_session_db_async()
+            enriched_jobs = [self._enrich_job_status(j, session_db) for j in jobs]
+            return web.json_response({"jobs": enriched_jobs})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -4616,7 +4682,9 @@ class APIServerAdapter(BasePlatformAdapter):
             job = _cron_get(job_id)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
-            return web.json_response({"job": job})
+            session_db = await self._ensure_session_db_async()
+            enriched_job = self._enrich_job_status(job, session_db)
+            return web.json_response({"job": enriched_job})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 

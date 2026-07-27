@@ -190,7 +190,13 @@ async def test_session_messages_follow_compression_tip(adapter, session_db):
 
 
 @pytest.mark.asyncio
-async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db):
+async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, session_db, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_cli import projects_db
+    with projects_db.connect_closing() as pconn:
+        pid = projects_db.create_project(pconn, name="Test Project", folders=[str(tmp_path)])
+        projects_db.bind_session(pconn, pid, "source-session", bound_by="test")
+
     source_id = session_db.create_session("source-session", "api_server", model="test-model")
     session_db.set_session_title(source_id, "Original")
     session_db.append_message(source_id, "user", "first path")
@@ -209,6 +215,13 @@ async def test_session_fork_uses_current_sessiondb_branch_primitives(adapter, se
     assert fork["title"] == "Alternative"
     assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path", "answer"]
     assert session_db.get_session(source_id)["end_reason"] == "branched"
+
+    # Assert inherited project binding
+    with projects_db.connect_closing() as pconn:
+        binding = projects_db.get_session_project(pconn, fork["id"])
+        assert binding is not None
+        assert binding.project_id == pid
+        assert binding.bound_by == "fork"
 
 
 @pytest.mark.asyncio

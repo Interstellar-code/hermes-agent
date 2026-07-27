@@ -95,7 +95,9 @@ class TestListJobs:
                 assert resp.status == 200
                 data = await resp.json()
                 assert "jobs" in data
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert len(data["jobs"]) == 1
+                assert data["jobs"][0]["id"] == SAMPLE_JOB["id"]
+                assert data["jobs"][0]["status"] == "idle"
 
     # -------------------------------------------------------------------
     # 2. test_list_jobs_include_disabled
@@ -260,7 +262,8 @@ class TestGetJob:
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == SAMPLE_JOB
+                assert data["job"]["id"] == SAMPLE_JOB["id"]
+                assert data["job"]["status"] == "idle"
                 mock_get.assert_called_once_with(VALID_JOB_ID)
 
     @pytest.mark.asyncio
@@ -623,7 +626,9 @@ class TestCronUnavailable:
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert len(data["jobs"]) == 1
+                assert data["jobs"][0]["id"] == SAMPLE_JOB["id"]
+                assert data["jobs"][0]["status"] == "idle"
                 assert captured["include_disabled"] is True
 
     @pytest.mark.asyncio
