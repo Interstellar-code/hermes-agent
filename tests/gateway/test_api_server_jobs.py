@@ -804,3 +804,95 @@ class TestCronPromptScanParity:
                 })
                 assert resp.status == 200
                 mock_update.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _enrich_job_status — against a REAL SessionDB, not a mock
+# ---------------------------------------------------------------------------
+# These run the actual SQL against the actual schema on purpose. The original
+# enrichment shipped broken three ways at once — it called a SessionDB method
+# that does not exist, selected two columns that do not exist (`session_id`,
+# `created_at`, rather than `id`/`started_at`), and used `.get()` on a
+# sqlite3.Row. Every failure was swallowed by a bare `except Exception` at
+# DEBUG, so the endpoint reported every job as "idle" forever — and the tests
+# passed, because they only ever asserted "idle", which is exactly what the
+# failure path returns. Asserting "running" is what makes them mean something.
+
+class TestEnrichJobStatus:
+    JOB = {"id": "deadbeef1234", "name": "cron-job"}
+
+    @staticmethod
+    def _seed(db, session_id, *, ended_at=None, end_reason=None):
+        def _insert(conn):
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at, ended_at, end_reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "cron", 1000.0, ended_at, end_reason),
+            )
+        db._execute_write(_insert)
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        from hermes_state import SessionDB
+        d = SessionDB(db_path=tmp_path / "state.db")
+        yield d
+        try:
+            d.close()
+        except Exception:
+            pass
+
+    def test_running_when_execution_session_is_open(self, adapter, db):
+        self._seed(db, "cron_deadbeef1234_1700000000")
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "running"
+        assert out["active_session_id"] == "cron_deadbeef1234_1700000000"
+        assert out["last_execution"]["status"] == "running"
+
+    def test_finished_execution_reports_end_reason(self, adapter, db):
+        self._seed(
+            db, "cron_deadbeef1234_1700000000",
+            ended_at=2000.0, end_reason="completed",
+        )
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["active_session_id"] is None
+        assert out["last_execution"]["end_reason"] == "completed"
+        assert out["last_execution"]["ended_at"] == 2000.0
+
+    def test_newest_execution_wins(self, adapter, db):
+        # older row is open, newer row finished — newest must win, so the job
+        # is idle rather than being pinned "running" by a stale session
+        def _insert(conn):
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?,?,?)",
+                ("cron_deadbeef1234_old", "cron", 1000.0),
+            )
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at, ended_at, end_reason) "
+                "VALUES (?,?,?,?,?)",
+                ("cron_deadbeef1234_new", "cron", 5000.0, 6000.0, "completed"),
+            )
+        db._execute_write(_insert)
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["last_execution"]["session_id"] == "cron_deadbeef1234_new"
+        assert out["status"] == "idle"
+
+    def test_other_jobs_sessions_are_not_claimed(self, adapter, db):
+        self._seed(db, "cron_someotherjob_1700000000")
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["last_execution"] is None
+
+    def test_no_sessions_is_idle(self, adapter, db):
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["last_execution"] is None
+
+    def test_query_failure_is_logged_loudly_and_degrades(self, adapter, caplog):
+        """A broken session_db must warn, not vanish at DEBUG."""
+        broken = SimpleNamespace()   # no _execute_write at all -> AttributeError
+        with caplog.at_level(logging.WARNING):
+            out = adapter._enrich_job_status(self.JOB, broken)
+        assert out["status"] == "idle"
+        assert "enrichment failed" in caplog.text
+        assert "AttributeError" in caplog.text

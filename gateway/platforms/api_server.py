@@ -4548,8 +4548,14 @@ class APIServerAdapter(BasePlatformAdapter):
         """Enrich a cron job dict with live execution status from SessionDB.
 
         Cron execution sessions use session IDs formatted as ``cron_{job_id}_{timestamp}``.
-        If a session row exists and has not finished (end_reason is null/empty), the job
-        is currently running. If finished, surfaces last execution end_reason and ended_at.
+        A row whose ``ended_at`` is unset is still running; a finished row surfaces its
+        ``end_reason`` and ``ended_at`` as the last execution.
+
+        The sessions table keys on ``id`` (not ``session_id``) and timestamps the start as
+        ``started_at`` (not ``created_at``) — see ``hermes_state.py``. Reads go through
+        ``SessionDB._execute_write``, which is the serialized connection accessor used for
+        reads as well as writes in this codebase, and hands back ``sqlite3.Row`` objects
+        (hence ``dict(row)`` rather than ``row.get``).
         """
         if not isinstance(job, dict):
             return job
@@ -4565,34 +4571,46 @@ class APIServerAdapter(BasePlatformAdapter):
         if session_db is None:
             return enriched
 
+        def _latest_run(conn):
+            return conn.execute(
+                "SELECT id, started_at, ended_at, end_reason FROM sessions "
+                "WHERE id LIKE ? ORDER BY started_at DESC LIMIT 1",
+                (f"cron_{job_id}_%",),
+            ).fetchone()
+
         try:
-            prefix = f"cron_{job_id}_%"
-            rows = session_db.execute_query(
-                "SELECT session_id, created_at, ended_at, end_reason FROM sessions "
-                "WHERE session_id LIKE ? ORDER BY created_at DESC LIMIT 1",
-                (prefix,),
+            row = session_db._execute_write(_latest_run)
+        except (sqlite3.Error, AttributeError, TypeError) as e:
+            # Narrow on purpose, and WARNING not DEBUG: the two ways this
+            # originally failed — a method that did not exist and columns that
+            # did not exist — are both programming errors, and a bare
+            # ``except Exception`` at DEBUG hid them so the endpoint reported
+            # every job as "idle" forever. Enrichment stays best-effort so
+            # /api/jobs still answers, but a failure must be visible.
+            logger.warning(
+                "Cron job %s: execution-status enrichment failed (%s: %s)",
+                job_id, type(e).__name__, e,
             )
-            if rows:
-                row = rows[0]
-                session_id = row.get("session_id")
-                created_at = row.get("created_at")
-                ended_at = row.get("ended_at")
-                end_reason = row.get("end_reason")
+            return enriched
 
-                is_active = ended_at is None or str(ended_at).strip() == ""
-                if is_active:
-                    enriched["status"] = "running"
-                    enriched["active_session_id"] = session_id
+        if row:
+            run = dict(row)   # sqlite3.Row has no .get()
+            session_id = run.get("id")
+            ended_at = run.get("ended_at")
+            end_reason = run.get("end_reason")
 
-                enriched["last_execution"] = {
-                    "session_id": session_id,
-                    "created_at": created_at,
-                    "ended_at": ended_at,
-                    "end_reason": end_reason,
-                    "status": "running" if is_active else (end_reason or "completed"),
-                }
-        except Exception as e:
-            logger.debug("Failed to query cron job execution status from SessionDB: %s", e)
+            is_active = ended_at is None or str(ended_at).strip() == ""
+            if is_active:
+                enriched["status"] = "running"
+                enriched["active_session_id"] = session_id
+
+            enriched["last_execution"] = {
+                "session_id": session_id,
+                "started_at": run.get("started_at"),
+                "ended_at": ended_at,
+                "end_reason": end_reason,
+                "status": "running" if is_active else (end_reason or "completed"),
+            }
 
         return enriched
 
