@@ -89,14 +89,22 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
     # HIGH 6: Substitute workflow variables ($ARTIFACTS_DIR, $BASE_BRANCH, etc.)
     raw_script = node.script
     wf_vars = getattr(ctx, "workflow_vars", None) or {}
-    # ponytail: no shell here — interpreter source is passed as direct argv
-    # (create_subprocess_exec, no bash -c), so shell-quoting is wrong: it means
-    # nothing to python/bun and corrupts legitimate values (e.g. a template
-    # `msg = "$USER_MESSAGE"` with user_message="hello world" would become
-    # `msg = "'hello world'"`). Untrusted $USER_MESSAGE substituted into inline
-    # script SOURCE is trusted under the single-user dev-tool model. Real
-    # code-injection hardening = pass vars via env (see ARTIFACTS_DIR below)
-    # instead of string-substitution; deferred, needs bundled-workflow YAML migration.
+
+    # Caller-controlled variables ($USER_MESSAGE, $ARGUMENTS) are prohibited from
+    # being interpolated into script bodies. Interpreter source is passed as direct
+    # argv via create_subprocess_exec (no shell), so script bodies are not shell-quoted
+    # by design. Interpolating caller-controlled inputs into script source is code injection.
+    # Env-var hardening is now active for caller-controlled variables: script nodes must
+    # read os.environ["USER_MESSAGE"] instead.
+    # System-generated / validated variables ($ARTIFACTS_DIR, $BASE_BRANCH, $DOCS_DIR,
+    # $WORKFLOW_ID) still interpolate into the script source via substitute_workflow_variables.
+    if "$USER_MESSAGE" in raw_script or "$ARGUMENTS" in raw_script:
+        err = (
+            f"Script node '{node.id}' cannot interpolate $USER_MESSAGE or $ARGUMENTS into script body; "
+            f"use os.environ[\"USER_MESSAGE\"] instead"
+        )
+        ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
+        return NodeExecutionResult(state="failed", error=err)
     try:
         raw_script, _ = substitute_workflow_variables(
             raw_script,
