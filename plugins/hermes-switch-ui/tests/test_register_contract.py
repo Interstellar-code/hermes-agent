@@ -37,7 +37,7 @@ def _load_plugin() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# FakeCtx — mirrors karpathy harness conventions
+# FakeCtx — mirrors plugin test harness conventions
 # ---------------------------------------------------------------------------
 
 @dataclass

@@ -215,7 +215,6 @@ extension into a permanent model-tool cost.
 | [**Projects**](plugins/projects/) | Named multi-folder workspaces, CLI and REST management, project activity, and explicit per-session project binding. |
 | [**A2A Fleet**](plugins/a2a_fleet/README.md) | Hermes-to-Hermes peering plus managed Claude Code, OpenCode, Codex, and Antigravity executor deployment. Executor capabilities depend on the installed CLI and its authentication. |
 | [**Workflow Engine**](plugins/workflow-engine/README.md) | YAML-defined DAG workflows with branching, parallel nodes, approval gates, cron polling, events, agent tools, and Kanban dispatch. The visual editor lives in SwitchUI. |
-| [**Matrix Coder**](plugins/matrix_coder/README.md) | Eight coding specialist roles, review lenses, domain/workflow personas, trusted developer-tier injection, and optional Kanban audit mirroring. Concurrency safety remains an orchestration responsibility. |
 | [**Personas**](plugins/personas/README.md) | A canonical library of 20 personas, runtime list/get/apply tools, trusted `persona_ref` overlays, and a read API. SwitchUI wizard migration and write-side promotion remain follow-up work. |
 | **Kanban extensions** | Board templates, scheduled tasks and board creation, project-linked tasks, dispatcher workflows, and restored dashboard APIs on top of Hermes Kanban. |
 
@@ -226,8 +225,7 @@ extension into a permanent model-tool cost.
 | [**Matrix Memory**](plugins/memory/matrix-memory/) | Optional Mnemosyne-backed vector, knowledge-graph, temporal, and wiki-bridge memory provider. Requires its pinned engine dependency and deliberate per-profile data-path configuration. |
 | [**MCP Lazy**](plugins/mcp_lazy/README.md) | Fork-local compatibility layer that defers MCP schemas and promotes them on demand. Savings are workload-dependent; prefer upstream `tool_search` when it works for your provider configuration. |
 
-`karpathy-self-improve` is being retired and is intentionally not presented as a
-supported extension.
+`karpathy-self-improve` and `matrix_coder` have been retired and are no longer shipped.
 
 ---
 
