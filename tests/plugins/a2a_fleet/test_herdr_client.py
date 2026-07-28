@@ -226,6 +226,33 @@ def test_normalize_ignores_foreground_cwd() -> None:
     assert "foreground_cwd" not in normalized
 
 
+def test_error_envelope_on_stderr_with_nonzero_exit_is_parsed() -> None:
+    """Regression: herdr writes FAILURE envelopes to stderr and exits non-zero.
+
+    Found live — `herdr agent get term_doesnotexist` exits 1 with an EMPTY stdout
+    and the {"error":{"code":"agent_not_found"}} envelope on stderr. Parsing only
+    stdout collapsed every structured Herdr error into an opaque
+    HerdrUnavailable, losing the error code (so callers saw "herdr_error" instead
+    of "not_found"). The unit tests all mocked exit 0, which is why this survived.
+    """
+    from a2a_fleet.herdr_client import HerdrClient, HerdrNotFound
+
+    client = HerdrClient(binary="/nonexistent/herdr")
+
+    async def fake_exec(argv):
+        return (
+            1,
+            b"",
+            b'{"id":"cli:agent:get","error":{"code":"agent_not_found",'
+            b'"message":"agent target term_x not found"}}',
+        )
+
+    client._exec = fake_exec  # type: ignore[assignment]
+
+    with pytest.raises(HerdrNotFound):
+        asyncio.run(client.get_agent("term_x"))
+
+
 def test_herdr_client_does_not_import_pane_parsing() -> None:
     """Enforce the no-scraping non-goal: no pane-content/screen-state verbs."""
     import a2a_fleet.herdr_client as herdr_client

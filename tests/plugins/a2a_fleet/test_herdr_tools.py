@@ -110,6 +110,55 @@ _HANDLERS = {
 }
 
 
+def test_inspect_session_rejects_non_unique_agent_label(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: Herdr resolves kind labels, we must not accept them.
+
+    Found live — `herdr agent get claude` succeeds, because Herdr's target
+    resolution accepts terminal ids, unique agent names AND non-unique kind
+    labels. Passing "claude" therefore returned status "ok" for whichever pane
+    happened to match, which is exactly the ambiguous selection this tool is
+    supposed to make impossible. The resolved record must be the session that
+    was actually asked for.
+    """
+    _add_herdr_host(fleet_home, alias="mac-mini")
+    _patch_capability_ok(monkeypatch)
+
+    async def fake_get_agent(self, target):
+        # Herdr happily resolves the label to a real, differently-identified pane.
+        return {"agent": _agent_record(terminal_id="term_realpane")}
+
+    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+
+    result = _run(
+        herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="claude")
+    )
+
+    assert result["status"] == "ambiguous_identifier"
+    assert result["requested"] == "claude"
+    assert result["resolved_terminal_id"] == "term_realpane"
+
+
+def test_inspect_session_rejects_pane_id_as_identifier(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pane_id addresses pane verbs; it is not the session identifier."""
+    _add_herdr_host(fleet_home, alias="mac-mini")
+    _patch_capability_ok(monkeypatch)
+
+    async def fake_get_agent(self, target):
+        return {"agent": _agent_record(terminal_id="term_realpane", pane_id="w1:pH")}
+
+    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+
+    result = _run(
+        herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="w1:pH")
+    )
+
+    assert result["status"] == "ambiguous_identifier"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch shape: dict-first-positional vs kwargs, task_id absorption
 # ---------------------------------------------------------------------------

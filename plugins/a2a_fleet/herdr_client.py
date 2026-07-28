@@ -144,13 +144,27 @@ class HerdrClient:
     async def _call(self, *args: str, enveloped: bool = True) -> Any:
         argv = self._build_argv(*args)
         returncode, stdout, stderr = await self._exec(argv)
-        try:
-            payload = json.loads(stdout)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # herdr routes FAILURE envelopes to stderr and exits non-zero, while
+        # success envelopes go to stdout (same split as its --help output).
+        # Verified live: `herdr agent get term_doesnotexist` exits 1 and writes
+        # {"id":...,"error":{"code":"agent_not_found",...}} to stderr with an
+        # EMPTY stdout. Parsing stdout only would turn every structured Herdr
+        # error into an opaque HerdrUnavailable and lose the error code, so try
+        # stderr before giving up.
+        payload = None
+        for buf in (stdout, stderr):
+            if not buf:
+                continue
+            try:
+                payload = json.loads(buf)
+                break
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+        if payload is None:
             snippet = stderr.decode("utf-8", "replace")[:500] or repr(stdout[:500])
             raise HerdrUnavailable(
                 f"herdr exited {returncode} with unparseable output: {snippet}"
-            ) from exc
+            )
         if isinstance(payload, dict) and "error" in payload:
             raise self._error_to_exception(payload["error"])
         if not enveloped:

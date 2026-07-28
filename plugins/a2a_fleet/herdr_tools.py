@@ -234,6 +234,28 @@ async def herdr_inspect_session_handler(
         record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
         normalized = normalize_agent_record(record)
 
+        # EXACT IDENTIFIER ENFORCEMENT. Herdr's `agent get` accepts terminal ids,
+        # unique agent names, AND non-unique kind labels ("claude", "opencode"),
+        # resolving a label to whichever pane happens to match. Verified live:
+        # passing "claude" returned a session successfully. That is the ambiguous
+        # selection this tool exists to prevent, so require the resolved record
+        # to be the exact session asked for and reject anything else — a caller
+        # that wants to search should use herdr_list_sessions.
+        resolved_id = normalized.get("terminal_id")
+        if resolved_id != terminal_id:
+            return {
+                "status": "ambiguous_identifier",
+                "host_alias": host_alias,
+                "requested": terminal_id,
+                "resolved_terminal_id": resolved_id,
+                "reason": (
+                    f"{terminal_id!r} is not a terminal_id — Herdr resolved it to session "
+                    f"{resolved_id!r}. Agent kind labels are not unique across panes and are "
+                    f"rejected as identifiers. Use herdr_list_sessions to get the exact "
+                    f"terminal_id."
+                ),
+            }
+
         if not _workspace_allowed(normalized.get("cwd"), allowed):
             return {
                 "status": "workspace_denied",
