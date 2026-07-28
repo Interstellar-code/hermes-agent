@@ -69,6 +69,13 @@ hermes_cli/web_dist/
 apps/desktop/build/
 apps/desktop/dist/
 
+# setuptools bdist output at repo root (pip install / python -m build)
+/build/
+
+# local session-analysis dumps (weekly-digests skill scratch).
+# analysis/*.md reports ARE tracked — only the raw jsonl exports are ignored.
+/analysis/*.jsonl
+
 # tsc-emitted artifacts (a stray `tsc -b` compiles into src/, and vite then
 # resolves the stale .js OVER the .tsx — never track these)
 apps/desktop/src/**/*.js
