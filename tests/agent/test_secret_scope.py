@@ -128,3 +128,20 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_build_profile_secret_scope_with_external_sources(self, tmp_path, monkeypatch):
+        (tmp_path / ".env").write_text("DOTENV_KEY=sk-env\n")
+        (tmp_path / "config.yaml").write_text("secrets:\n  bitwarden:\n    enabled: true\n")
+
+        fake_report = __import__("agent.secret_sources.registry", fromlist=["ApplyReport"]).ApplyReport()
+        def mock_apply_all(cfg, home, environ=None):
+            if environ is not None:
+                environ["BW_SECRET_KEY"] = "sk-bitwarden"
+            return fake_report
+
+        monkeypatch.setattr("agent.secret_sources.registry.apply_all", mock_apply_all)
+        res = ss.build_profile_secret_scope(tmp_path)
+        assert res == {
+            "DOTENV_KEY": "sk-env",
+            "BW_SECRET_KEY": "sk-bitwarden",
+        }
