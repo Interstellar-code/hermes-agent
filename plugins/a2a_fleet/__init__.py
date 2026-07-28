@@ -505,6 +505,107 @@ def register(ctx) -> None:
         emoji="🛑",
     )
 
+    # v0.9 read-only Herdr session tools. Herdr is a terminal workspace manager
+    # for AI coding agents; these tools inspect already-running Herdr-managed
+    # sessions. Read-only by construction — no pane mutation verb is wrapped.
+    #
+    # FAIL SAFE: register() does NOT blanket-swallow exceptions (only the
+    # fleet.yaml scaffold and load_fleet are guarded above), so anything raising
+    # here would abort registration of fleet_send and every managed-executor
+    # tool. A Herdr fault must never cost the fleet its existing tools, so the
+    # whole block is wrapped. The tools themselves run their own capability
+    # probe per call and return a structured status when Herdr is unavailable —
+    # registration deliberately does NOT probe, so a hung socket cannot stall
+    # plugin load.
+    try:
+        from . import herdr_tools  # noqa: WPS433 — lazy import is the contract.
+
+        _HERDR_HOST_ALIAS_SCHEMA = {
+            "type": "string",
+            "description": (
+                "Herdr host alias as defined under fleet.herdr.hosts in fleet.yaml "
+                "(NOT a network address). Unknown aliases are rejected."
+            ),
+        }
+
+        ctx.register_tool(
+            name="herdr_status",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {"host_alias": _HERDR_HOST_ALIAS_SCHEMA},
+                "required": ["host_alias"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_status_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "Report Herdr version, protocol, transport, and reachability for a "
+                "configured host. Read-only."
+            ),
+            emoji="🐘",
+        )
+        ctx.register_tool(
+            name="herdr_list_sessions",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional exact cwd filter. Sessions outside the host's allowed_workspaces are always excluded.",
+                    },
+                    "agent_kind": {
+                        "type": "string",
+                        "description": "Optional kind filter, e.g. 'claude', 'opencode', 'agy'.",
+                    },
+                },
+                "required": ["host_alias"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_list_sessions_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "List Herdr-managed agent sessions on a host, filtered to its "
+                "allowed workspaces. Read-only; performs no action on any pane."
+            ),
+            emoji="📋",
+        )
+        ctx.register_tool(
+            name="herdr_inspect_session",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "terminal_id": {
+                        "type": "string",
+                        "description": (
+                            "Exact stable session handle (e.g. 'term_656fd55fd56381a') from "
+                            "herdr_list_sessions. The agent kind label ('claude') is NOT a valid "
+                            "identifier — it is not unique across panes."
+                        ),
+                    },
+                },
+                "required": ["host_alias", "terminal_id"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_inspect_session_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "Inspect exactly one Herdr session by terminal_id. Exact identifier "
+                "only, no fallback selection. Read-only."
+            ),
+            emoji="🔎",
+        )
+    except Exception:
+        logger.warning(
+            "a2a_fleet: Herdr tool registration failed; fleet_send and managed "
+            "executor tools are unaffected.",
+            exc_info=True,
+        )
+
     # Plugin-scoped skill: end-to-end fleet bring-up + ping/pong verification.
     # Resolvable as 'a2a_fleet:deploy-fleet' via explicit load only.
     if hasattr(ctx, "register_skill"):
@@ -517,6 +618,14 @@ def register(ctx) -> None:
             )
         except Exception:
             logger.debug("a2a_fleet: register_skill failed", exc_info=True)
+        try:
+            ctx.register_skill(
+                name="herdr-sessions",
+                path=Path(__file__).parent / "skills" / "herdr-sessions" / "SKILL.md",
+                description="Discover and inspect running Herdr-managed agent sessions (read-only) and configure fleet.herdr hosts.",
+            )
+        except Exception:
+            logger.debug("a2a_fleet: register_skill(herdr-sessions) failed", exc_info=True)
 
     # ``register_platform`` exists on every PluginContext, so this attempt runs
     # in any context; it is a no-op / debug-logged failure outside the gateway.
