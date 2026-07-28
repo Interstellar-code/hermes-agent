@@ -17,7 +17,15 @@ from engine.store.definition_store import DefinitionStore
 
 logger = logging.getLogger("workflow.manifest")
 
-_MANIFEST_PATH = get_hermes_home() / "workflows-manifest.json"
+def get_manifest_path() -> Path:
+    """Return manifest path evaluated dynamically at call time."""
+    return get_hermes_home() / "workflows-manifest.json"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_MANIFEST_PATH":
+        return get_manifest_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ManifestWriter:
@@ -29,7 +37,7 @@ class ManifestWriter:
         Enumerate workflow definitions, write manifest JSON.
         Returns {"entries_written": N, "path": str}.
         """
-        path = out_path or _MANIFEST_PATH
+        path = out_path or get_manifest_path()
         try:
             rows = self._def_store.list_definitions(kind="workflow")
             entries: List[Dict[str, Any]] = []

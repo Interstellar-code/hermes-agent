@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from typing import Optional
+from typing import Optional, Any
 
 from engine.schemas.workflow import WorkflowDefinition, WorkflowLoadError, WorkflowWithSource, WorkflowSource
 from engine.discovery.validator import validate_workflow_yaml
@@ -34,7 +34,15 @@ _PLUGIN_DIR = Path(__file__).resolve().parent.parent.parent
 _BUNDLED_DEFAULTS_DIR = _PLUGIN_DIR / "defaults"
 
 # User workflows directory
-_USER_WORKFLOWS_DIR = get_hermes_home() / "workflows"
+def get_user_workflows_dir() -> Path:
+    """Return user workflows directory evaluated dynamically at call time."""
+    return get_hermes_home() / "workflows"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_USER_WORKFLOWS_DIR":
+        return get_user_workflows_dir()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _sha256(content: str) -> str:
@@ -172,7 +180,7 @@ def discover_and_upsert(
 
     sources: list[tuple[WorkflowSource, Path, Optional[str]]] = [
         ("bundled", _BUNDLED_DEFAULTS_DIR, None),
-        ("global", _USER_WORKFLOWS_DIR, None),
+        ("global", get_user_workflows_dir(), None),
     ]
     if extra_dirs:
         for d in extra_dirs:

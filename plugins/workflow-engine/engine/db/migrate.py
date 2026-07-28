@@ -27,10 +27,20 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from typing import Optional
+from typing import Optional, Any
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
-_DEFAULT_LOCK_PATH = get_hermes_home() / "switchui-workflows.db.migrate.lock"
+
+
+def get_default_lock_path() -> Path:
+    """Return default lock path evaluated dynamically at call time."""
+    return get_hermes_home() / "switchui-workflows.db.migrate.lock"
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_DEFAULT_LOCK_PATH":
+        return get_default_lock_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _migration_version(filename: str) -> int:
@@ -55,7 +65,7 @@ def ensure_schema(
     Cross-process safety: acquires a file lock before checking schema version
     so concurrent callers (dashboard + daemon) serialise safely.
     """
-    _lock_path = lock_path or _DEFAULT_LOCK_PATH
+    _lock_path = lock_path or get_default_lock_path()
 
     # Acquire OS-level cross-process lock before any schema work.
     if sys.platform != "win32":

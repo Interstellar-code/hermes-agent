@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from typing import Optional
+from typing import Optional, Any
 
 from engine.db.client import open_db
 from engine.db.migrate import ensure_schema
@@ -25,12 +25,20 @@ from engine.runtime.seed_defaults import seed_defaults
 
 logger = logging.getLogger("workflow.wiring")
 
-_DEFAULT_DB_PATH = str(get_hermes_home() / "switchui-workflows.db")
+def get_default_db_path() -> str:
+    """Return default DB path evaluated dynamically at call time."""
+    return str(get_hermes_home() / "switchui-workflows.db")
 
 
 def _resolve_db_path(db_path: Optional[str]) -> str:
-    """Return db_path, falling back to WORKFLOW_DB_PATH env var, then the compiled default."""
-    return db_path or os.environ.get("WORKFLOW_DB_PATH") or _DEFAULT_DB_PATH
+    """Return db_path, falling back to WORKFLOW_DB_PATH env var, then the dynamic default."""
+    return db_path or os.environ.get("WORKFLOW_DB_PATH") or get_default_db_path()
+
+
+def __getattr__(name: str) -> Any:
+    if name == "_DEFAULT_DB_PATH":
+        return get_default_db_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def create_engine(
