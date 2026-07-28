@@ -161,12 +161,23 @@ class TestThresholdGate:
         assert should_activate(cfg, deferrable_tokens=20_000, context_length=200_000)
         assert should_activate(cfg, deferrable_tokens=50_000, context_length=200_000)
 
-    def test_auto_without_context_length_uses_20k_cutoff(self):
-        """Fallback cutoff used when the active model is unknown."""
-        from tools.tool_search import ToolSearchConfig, should_activate
-        cfg = ToolSearchConfig.from_raw({"enabled": "auto"})
         assert not should_activate(cfg, deferrable_tokens=10_000, context_length=0)
         assert should_activate(cfg, deferrable_tokens=25_000, context_length=0)
+
+    def test_should_activate_logs_diagnostics(self, caplog):
+        import logging
+        from tools.tool_search import ToolSearchConfig, should_activate
+
+        cfg_off = ToolSearchConfig.from_raw({"enabled": "off"})
+        with caplog.at_level(logging.DEBUG):
+            should_activate(cfg_off, deferrable_tokens=5000, context_length=200_000)
+        assert any("tool_search inactive: enabled=off" in r.getMessage() for r in caplog.records)
+
+        caplog.clear()
+        cfg_auto = ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10})
+        with caplog.at_level(logging.DEBUG):
+            should_activate(cfg_auto, deferrable_tokens=5000, context_length=200_000)
+        assert any("tool_search inactive: enabled=auto" in r.getMessage() and "threshold_tokens=20000" in r.getMessage() for r in caplog.records)
 
     def test_token_estimate_proportional_to_schema_size(self):
         from tools.tool_search import estimate_tokens_from_schemas

@@ -562,7 +562,7 @@ def _compute_tool_definitions(
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
-        logger.warning("Tool search assembly skipped: %s", e)
+        logger.warning("Tool search assembly skipped: %s", e, exc_info=True)
 
     return filtered_tools
 
@@ -581,6 +581,7 @@ def _resolve_active_context_length() -> int:
             model_cfg = {}
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
+            logger.debug("Could not resolve active context length: no model ID or default in config")
             return 0
         from agent.model_metadata import get_model_context_length
         # Honor explicit `model.context_length` in config.yaml — short-circuits
@@ -589,7 +590,12 @@ def _resolve_active_context_length() -> int:
         # CLI startup.  See issue #46620.
         raw_ctx = model_cfg.get("context_length")
         config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        return int(get_model_context_length(model_id, config_context_length=config_ctx) or 0)
+        ctx = int(get_model_context_length(model_id, config_context_length=config_ctx) or 0)
+        if ctx <= 0:
+            logger.debug("Could not resolve active context length for model_id='%s' (lookup returned 0)", model_id)
+        else:
+            logger.debug("Resolved active context length for model_id='%s': %d tokens", model_id, ctx)
+        return ctx
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

@@ -252,22 +252,35 @@ def should_activate(
     would consume ``threshold_pct`` of context or more.
     """
     if config.enabled == "off":
+        logger.debug("tool_search inactive: enabled=off")
         return False
     if deferrable_tokens <= 0:
+        logger.debug("tool_search inactive: deferrable_tokens=0")
         return False
     if config.enabled == "on":
+        logger.debug("tool_search active: enabled=on (deferrable_tokens=%d)", deferrable_tokens)
         return True
     # auto
     if config.threshold_tokens > 0 and deferrable_tokens >= config.threshold_tokens:
-        # Absolute floor crossed — activate regardless of context size.
-        # Guards against pct-threshold dormancy on huge-context models.
+        logger.debug(
+            "tool_search active: enabled=auto, threshold_tokens floor crossed (%d >= %d)",
+            deferrable_tokens, config.threshold_tokens,
+        )
         return True
     if not context_length or context_length <= 0:
-        # Without a known context size, fall back to a fixed 20K-token cutoff
-        # — the cliff above which Anthropic and OpenAI both saw quality drops.
-        return deferrable_tokens >= 20_000
+        activated = deferrable_tokens >= 20_000
+        logger.debug(
+            "tool_search %s: enabled=auto, unknown/invalid context_length=%s, 20K fallback cutoff (%d >= 20000)",
+            "active" if activated else "inactive", context_length, deferrable_tokens,
+        )
+        return activated
     threshold_tokens = int(context_length * (config.threshold_pct / 100.0))
-    return deferrable_tokens >= threshold_tokens
+    activated = deferrable_tokens >= threshold_tokens
+    logger.debug(
+        "tool_search %s: enabled=auto, deferrable_tokens=%d, context_length=%d, threshold_pct=%.1f%% (threshold_tokens=%d)",
+        "active" if activated else "inactive", deferrable_tokens, context_length, config.threshold_pct, threshold_tokens,
+    )
+    return activated
 
 
 # ---------------------------------------------------------------------------
@@ -569,12 +582,17 @@ def assemble_tool_defs(
 
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
     if not should_activate(config, deferrable_tokens, context_length):
+        threshold_tokens = int((context_length or 0) * (config.threshold_pct / 100.0))
+        logger.debug(
+            "tool_search inactive: %d core/visible tools kept, %d deferred (~%d tokens, threshold ~%d)",
+            len(visible), len(deferrable), deferrable_tokens, threshold_tokens,
+        )
         return AssemblyResult(
             tool_defs=incoming,
             activated=False,
             deferred_count=len(deferrable),
             deferred_tokens=deferrable_tokens,
-            threshold_tokens=int((context_length or 0) * (config.threshold_pct / 100.0)),
+            threshold_tokens=threshold_tokens,
         )
 
     bridge = bridge_tool_schemas(len(deferrable))
