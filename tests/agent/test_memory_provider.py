@@ -665,6 +665,26 @@ class TestUserInstalledProviderDiscovery:
         assert p is not None
         assert p.name == "nestedimpl"
 
+    def test_load_user_plugin_import_failure_logs_error(self, tmp_path, monkeypatch, caplog):
+        """A memory provider whose import raises an exception logs an ERROR with exc_info (#157)."""
+        import logging
+        from plugins.memory import load_memory_provider
+
+        plugin_dir = tmp_path / "plugins" / "brokenimport"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "# MemoryProvider\nraise RuntimeError('Broken import test error')\n"
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir",
+            lambda: tmp_path / "plugins",
+        )
+        with caplog.at_level(logging.ERROR):
+            p = load_memory_provider("brokenimport")
+        assert p is None
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("Failed to exec_module" in r.getMessage() and r.exc_info is not None for r in error_records)
+
 
 class TestUserInstalledProviderCli:
     """CLI commands of user-installed providers must be discoverable.
