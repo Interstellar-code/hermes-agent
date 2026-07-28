@@ -3,6 +3,20 @@
 This module is intentionally small and dependency-light so both config loading
 and future boot-reconcile paths can share the same managed-peer mode contracts
 without pulling in receiver runtime code at import time.
+
+Herdr session-manager peers (``mode: herdr_session``) are a SIBLING set
+(``SUPPORTED_HERDR_MODES``), not a fifth entry in ``SUPPORTED_MANAGED_MODES``.
+A managed Hermes receiver (claude_code/opencode/codex/agy) owns a TCP port
+band, writes a receiver transcript file, and is unlocked with a stable
+env-var bearer token — Herdr has none of that: it is reached through a local
+Unix socket or an SSH bridge with no HTTP endpoint at all. Folding it into
+``SUPPORTED_MANAGED_MODES`` would make ``port_band_for`` /
+``allocate_band_port`` / ``transcript_filename_for`` / ``stable_token_env_name``
+either silently misbehave or need herdr-specific branches sprinkled through
+code that has nothing to do with Herdr. Keeping it a separate set means those
+functions keep raising/falling back for ``herdr_session`` exactly as they do
+for any other mode they don't recognise, and callers that care about Herdr
+opt in explicitly via ``supports_herdr_mode``.
 """
 from __future__ import annotations
 
@@ -68,6 +82,16 @@ _MODE_SPECS: Dict[str, Dict[str, str]] = {
 def supports_managed_mode(mode: str | None) -> bool:
     """True when ``mode`` is a Hermes-managed receiver mode we understand."""
     return bool(mode in SUPPORTED_MANAGED_MODES)
+
+
+# Herdr session-manager peers: sibling set, see module docstring for why this
+# is not folded into SUPPORTED_MANAGED_MODES.
+SUPPORTED_HERDR_MODES = frozenset({"herdr_session"})
+
+
+def supports_herdr_mode(mode: str | None) -> bool:
+    """True when ``mode`` is a Herdr session-manager peer mode."""
+    return bool(mode in SUPPORTED_HERDR_MODES)
 
 
 def port_band_for(mode: str) -> Tuple[int, int]:

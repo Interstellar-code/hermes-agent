@@ -92,6 +92,17 @@ def _expected_registered_tool_names() -> set[str]:
             "agy_receiver_status",
             "agy_receiver_stop",
         })
+    # v0.9.0 read-only Herdr tools. Registered UNCONDITIONALLY and deliberately:
+    # registration never probes Herdr (a hung socket must not stall plugin load),
+    # so the tools always exist and instead report a structured status
+    # ("herdr_missing" / "herdr_unreachable" / "unknown_host_alias") at call time
+    # when Herdr or fleet.herdr is absent. No find_spec guard — herdr_tools is a
+    # first-party module, not an optional dependency.
+    names.update({
+        "herdr_status",
+        "herdr_list_sessions",
+        "herdr_inspect_session",
+    })
     return names
 
 

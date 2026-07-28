@@ -29,6 +29,7 @@ import yaml
 
 from .managed_peers import (
     stable_token_env_name,
+    supports_herdr_mode,
     supports_managed_mode,
     token_filename_for,
 )
@@ -66,6 +67,160 @@ def _validate_peer_url(url: str | None, field: str, peer_name: str, path: Path) 
 
 class FleetConfigError(ValueError):
     """Raised when fleet.yaml is missing, malformed, or unsupported."""
+
+
+_HERDR_TRANSPORTS = {"local_socket", "ssh_bridge"}
+
+_HERDR_BOOL_FIELDS = (
+    "read_only_default",
+    "require_exact_session",
+    "require_confirmation_for_mutations",
+    "deny_raw_input",
+    "deny_wildcard_operations",
+)
+
+
+def _parse_herdr_hosts(hosts_raw: Any, path: Path) -> Dict[str, Dict[str, Any]]:
+    """Validate + normalize ``fleet.herdr.hosts`` (see TASK 5 schema)."""
+    if not isinstance(hosts_raw, dict):
+        raise FleetConfigError(
+            f"{path}: fleet.herdr.hosts must be a mapping, got {type(hosts_raw).__name__}"
+        )
+    hosts_out: Dict[str, Dict[str, Any]] = {}
+    for alias, host_entry in hosts_raw.items():
+        if not isinstance(host_entry, dict):
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.hosts.{alias} must be a mapping, got "
+                f"{type(host_entry).__name__}"
+            )
+        transport = host_entry.get("transport")
+        if transport not in _HERDR_TRANSPORTS:
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.hosts.{alias}.transport must be one of "
+                f"{sorted(_HERDR_TRANSPORTS)}, got {transport!r}"
+            )
+        ssh_target = host_entry.get("ssh_target")
+        if transport == "ssh_bridge":
+            if not isinstance(ssh_target, str) or not ssh_target.strip():
+                raise FleetConfigError(
+                    f"{path}: fleet.herdr.hosts.{alias}.ssh_target is required when "
+                    "transport is 'ssh_bridge'"
+                )
+        elif ssh_target is not None:
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.hosts.{alias}.ssh_target is only valid when "
+                "transport is 'ssh_bridge'"
+            )
+        allowed_raw = host_entry.get("allowed_workspaces")
+        if not isinstance(allowed_raw, list) or not allowed_raw:
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.hosts.{alias}.allowed_workspaces must be a "
+                "non-empty list of absolute path strings"
+            )
+        allowed_workspaces = []
+        for workspace in allowed_raw:
+            if not isinstance(workspace, str) or not Path(workspace).is_absolute():
+                raise FleetConfigError(
+                    f"{path}: fleet.herdr.hosts.{alias}.allowed_workspaces entries must "
+                    f"be absolute path strings, got {workspace!r}"
+                )
+            allowed_workspaces.append(str(Path(workspace).resolve()))
+        hosts_out[alias] = {
+            "transport": transport,
+            "ssh_target": ssh_target,
+            "allowed_workspaces": allowed_workspaces,
+        }
+    return hosts_out
+
+
+def _parse_herdr_block(herdr_raw: Any, path: Path) -> Dict[str, Any]:
+    """Parse the optional ``fleet.herdr`` policy/hosts block (TASK 5).
+
+    Absent block = feature off, not an error: returns the all-default dict
+    with ``hosts={}``, which fails closed for any herdr peer (no known alias).
+    """
+    if herdr_raw is None:
+        return {field: True for field in _HERDR_BOOL_FIELDS} | {"hosts": {}}
+    if not isinstance(herdr_raw, dict):
+        raise FleetConfigError(
+            f"{path}: fleet.herdr must be a mapping, got {type(herdr_raw).__name__}"
+        )
+    out: Dict[str, Any] = {}
+    for field in _HERDR_BOOL_FIELDS:
+        value = herdr_raw.get(field, True)
+        if not isinstance(value, bool):
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.{field} must be a boolean, got "
+                f"{type(value).__name__} {value!r}"
+            )
+        out[field] = value
+    out["hosts"] = _parse_herdr_hosts(herdr_raw.get("hosts") or {}, path)
+    return out
+
+
+def _validate_herdr_peer(
+    entry: Dict[str, Any], name: str, path: Path, herdr_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Validate a ``managed: true`` herdr_session peer and return its fields (TASK 3/4).
+
+    Herdr has no bearer-token transport and no repo-aware receiver deploy, so a
+    peer declaring ``token_env``/``repo_path`` is rejected rather than silently
+    ignored — a token the operator thought was protecting something, dropped
+    on the floor, is worse than requiring one.
+    """
+    if entry.get("token_env"):
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name} is a herdr peer and must not set token_env "
+            "(Herdr has no bearer-token transport)"
+        )
+    if entry.get("repo_path"):
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name} is a herdr peer and must not set repo_path "
+            "(use workspace instead)"
+        )
+    host_alias = entry.get("host_alias")
+    if not isinstance(host_alias, str) or not host_alias.strip():
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.host_alias is required for a herdr peer"
+        )
+    workspace = entry.get("workspace")
+    if not isinstance(workspace, str) or not workspace.strip() or not Path(workspace).is_absolute():
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.workspace must be an absolute path string"
+        )
+    agent_kind = entry.get("agent_kind")
+    if not isinstance(agent_kind, str) or not agent_kind.strip():
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.agent_kind is required for a herdr peer"
+        )
+    transport = entry.get("transport")
+    if transport not in _HERDR_TRANSPORTS:
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.transport must be one of "
+            f"{sorted(_HERDR_TRANSPORTS)}, got {transport!r}"
+        )
+    host = herdr_cfg["hosts"].get(host_alias)
+    if host is None:
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.host_alias {host_alias!r} is not defined in "
+            "fleet.herdr.hosts"
+        )
+    resolved_workspace = str(Path(workspace).resolve())
+    if not any(
+        resolved_workspace == allowed or resolved_workspace.startswith(allowed.rstrip("/") + "/")
+        for allowed in host["allowed_workspaces"]
+    ):
+        raise FleetConfigError(
+            f"{path}: fleet.agents.{name}.workspace {workspace!r} is not inside any of "
+            f"host {host_alias!r}'s allowed_workspaces {host['allowed_workspaces']}"
+        )
+    return {
+        "host_alias": host_alias,
+        "workspace": resolved_workspace,
+        "agent_kind": agent_kind,
+        "transport": transport,
+        "terminal_id": entry.get("terminal_id"),
+    }
 
 
 def _legacy_profile_name(profile: str | None = None) -> str:
@@ -193,6 +348,10 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
             f"{path}: expected 'fleet.agents:' mapping, got {type(agents_in).__name__}"
         )
 
+    # fleet.herdr is parsed before the agents loop below: a herdr peer's
+    # host_alias/workspace validation (TASK 4) needs the hosts table (TASK 5).
+    herdr_cfg = _parse_herdr_block(fleet.get("herdr"), path)
+
     agents_out: Dict[str, Dict[str, Any]] = {}
     has_managed_receiver_peer = False
     for name, entry in agents_in.items():
@@ -200,16 +359,11 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
             raise FleetConfigError(
                 f"{path}: fleet.agents.{name} must be a mapping, got {type(entry).__name__}"
             )
-        peer_url = entry.get("url")
-        peer_card_url = entry.get("agent_card_url")
-        _validate_peer_url(peer_url, "url", name, path)
-        if peer_card_url:
-            _validate_peer_url(peer_card_url, "agent_card_url", name, path)
-        # v0.3+ repo-aware peer fields (additive, all OPTIONAL). A plain url/token
-        # peer omits these and gets inert defaults below, so existing fleets are
-        # unaffected. ``managed`` + supported ``mode`` + ``repo_path`` together
-        # mark a Hermes-managed receiver that boot-reconcile owns.
-        repo_path = entry.get("repo_path")
+        # ``managed`` and ``mode`` are read BEFORE the url check below: a herdr
+        # peer (managed=true, mode=herdr_session) has no url at all (no TCP
+        # port, per managed_peers.SUPPORTED_HERDR_MODES) and must be exempted
+        # from the url requirement rather than fail to parse.
+        #
         # ``managed`` must be a real Python bool. A truthy string such as the YAML
         # value "false" would otherwise bool()-coerce to True and silently flip a
         # peer into managed mode (#5). Absent -> default False.
@@ -219,8 +373,37 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
                 f"{path}: fleet.agents.{name}.managed must be a boolean (true/false), "
                 f"got {type(managed_raw).__name__} {managed_raw!r}"
             )
-        token_env = entry.get("token_env")
         mode = entry.get("mode")
+        is_herdr_peer = managed_raw and supports_herdr_mode(mode)
+
+        peer_url = entry.get("url")
+        peer_card_url = entry.get("agent_card_url")
+        if not is_herdr_peer:
+            _validate_peer_url(peer_url, "url", name, path)
+            if peer_card_url:
+                _validate_peer_url(peer_card_url, "agent_card_url", name, path)
+
+        if is_herdr_peer:
+            herdr_fields = _validate_herdr_peer(entry, name, path, herdr_cfg)
+            agents_out[name] = {
+                "url": None,
+                "agent_card_url": None,
+                "token": None,
+                "token_env": None,
+                "description": entry.get("description", ""),
+                "repo_path": None,
+                "managed": True,
+                "mode": mode,
+                **herdr_fields,
+            }
+            continue
+
+        # v0.3+ repo-aware peer fields (additive, all OPTIONAL). A plain url/token
+        # peer omits these and gets inert defaults below, so existing fleets are
+        # unaffected. ``managed`` + supported ``mode`` + ``repo_path`` together
+        # mark a Hermes-managed receiver that boot-reconcile owns.
+        repo_path = entry.get("repo_path")
+        token_env = entry.get("token_env")
 
         # Single source of truth for the token env-var NAME of a managed
         # receiver: it MUST equal the mode-specific stable name so boot-reconcile
@@ -304,6 +487,7 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
         "agents": agents_out,
         "llm": llm_block,
         "agent": agent_block,
+        "herdr": herdr_cfg,
     }
 
 

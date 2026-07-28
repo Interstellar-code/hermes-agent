@@ -10,15 +10,35 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 
 from .fleet_config import get_agent
+from .managed_peers import supports_herdr_mode
 
 
 class FleetClientError(RuntimeError):
     """Raised when a peer request fails for any reason."""
+
+
+# ---------------------------------------------------------------------------
+# Portless transport seam (herdr peers)
+#
+# Herdr peers (managed=true, mode in SUPPORTED_HERDR_MODES) have no url — they
+# are reached over a local Unix socket or SSH bridge, never HTTP. A registered
+# handler is called instead of the httpx JSON-RPC path below; it must return
+# the same ``{"reply": ..., "context_id": ...}`` shape as send_message.
+# ---------------------------------------------------------------------------
+
+_PORTLESS_HANDLERS: Dict[str, Callable[..., Awaitable[Dict[str, str]]]] = {}
+
+
+def register_portless_handler(
+    mode: str, handler: Callable[..., Awaitable[Dict[str, str]]]
+) -> None:
+    """Register the transport handler for a portless peer ``mode`` (e.g. herdr_session)."""
+    _PORTLESS_HANDLERS[mode] = handler
 
 
 def _peer_jsonrpc_url(agent_entry: Dict[str, Any]) -> str:
@@ -88,6 +108,18 @@ async def send_message(
         entry = get_agent(agent_name)
     except KeyError as exc:
         raise FleetClientError(exc.args[0] if exc.args else "unknown agent") from exc
+
+    if entry.get("managed") is True and supports_herdr_mode(entry.get("mode")):
+        handler = _PORTLESS_HANDLERS.get(entry["mode"])
+        if handler is None:
+            raise FleetClientError(
+                f"peer {agent_name!r} is a herdr peer (mode={entry.get('mode')!r}) but "
+                "no portless transport handler is registered for it"
+            )
+        return await handler(
+            agent_name, text, context_id=context_id, timeout=timeout, client=client
+        )
+
     url = _peer_jsonrpc_url(entry)
     payload = _send_message_payload(text, context_id=context_id)
     headers: Dict[str, str] = {"content-type": "application/json"}
