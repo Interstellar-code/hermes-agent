@@ -110,17 +110,31 @@ herdr_inspect_session(host_alias="mac-mini", terminal_id="term_656fd55fd56381a")
 
 `agent_status` is `idle | working | blocked | done | unknown`.
 
-`revision` is a **pane-output counter, not a session version.** In the Herdr
-protocol (16) it appears on exactly one event, `pane_output_changed`, and the
-subscription filter that consumes it is `min_revision` on that same event.
-Status transitions ride a separate event, `pane_agent_status_changed`, which
-carries no revision — so an agent can go `done -> working` with `revision`
-unchanged. That is correct behavior, not a stale read.
+`revision` is a **presentation counter, not an output counter and not a session
+version.** It rides on the `pane_output_changed` event, which makes it look like
+an output counter; it is not. In Herdr 0.7.4 it is incremented in exactly three
+places, none of them terminal output:
 
-Read it as "has the visible output advanced since I last looked", which is what
-a Phase 2 send/wait cycle actually needs. Do not read it as "has anything about
-this session changed": as a general optimistic-concurrency guard it silently
-misses every status-only change.
+| Site | Trigger |
+|---|---|
+| `src/terminal/state.rs:198` | stripped terminal title changed |
+| `src/app/actions.rs:1083` | metadata-token expiry |
+| `src/app/api/panes.rs:1408` | metadata-token patch (`report-metadata`) |
+
+Consequences, both verified live on 2026-07-29:
+
+- An agent can go `done -> working` with `revision` unchanged (status rides
+  `pane_agent_status_changed`, which carries no revision).
+- A pane can **produce output and receive typed text with `revision` still 0**.
+  A throwaway `bash` pane did exactly that, and a deliberately stale
+  confirmation token was accepted as a result.
+
+So the staleness guard in `herdr_request_action` is meaningful for agents that
+rewrite their title as they work (Claude Code, OpenCode both do) and blind for
+anything that does not. Every preview and send reports `revision_guard` saying
+which case you are in. When it says `blind`, the protections that remain are
+the single-use token, its 300 s TTL, and the human who confirmed it — do not
+treat a passed revision check as evidence the pane was idle.
 
 ## Reading the status field
 

@@ -231,6 +231,47 @@ def test_takeover_is_checked_before_the_token_is_spent(
     assert _request(preview["confirmation_token"])["status"] == "sent"
 
 
+def test_revision_guard_reports_when_it_is_blind(herdr_env, monkeypatch) -> None:
+    """A guard that cannot see must say so, not pass quietly.
+
+    `revision` tracks terminal-title and metadata-token changes, not output
+    (Herdr 0.7.4: state.rs:198, actions.rs:1083, panes.rs:1408). A session that
+    never sets a title sits at revision 0 forever, so a stale token passes the
+    comparison. That was verified live: a bash pane took delivered text with
+    revision 0 -> 0 and a stale token was accepted.
+
+    The delivery is not the bug — the silence would be. Both preview and send
+    must label the guard blind so nobody reads a passed check as "the pane was
+    idle".
+    """
+
+    async def fake_send(self, target, text):
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+
+    herdr_env["session"]["revision"] = 0  # a pane that never sets a title
+    preview = _preview()
+    assert preview["revision_guard"].startswith("blind")
+
+    sent = _request(preview["confirmation_token"])
+    assert sent["status"] == "sent"
+    assert sent["revision_guard"].startswith("blind")
+
+
+def test_revision_guard_reports_active_for_title_updating_sessions(
+    herdr_env, monkeypatch
+) -> None:
+    async def fake_send(self, target, text):
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+
+    preview = _preview()  # SESSION revision is 40
+    assert preview["revision_guard"].startswith("active")
+    assert _request(preview["confirmation_token"])["revision_guard"].startswith("active")
+
+
 def test_unknown_token_rejected(herdr_env) -> None:
     assert _request("not-a-real-token")["status"] == "unknown_token"
 

@@ -34,6 +34,39 @@ log = logging.getLogger("a2a_fleet.herdr_tools")
 COMPLETION_SIGNAL = "herdr wait agent-status --status done"
 
 
+def _revision_guard_state(revision: Any) -> str:
+    """Say whether the staleness guard can actually see change in this session.
+
+    ``revision`` is NOT an output counter, despite riding on the
+    ``pane_output_changed`` event. In Herdr 0.7.4 it is incremented in exactly
+    three places, none of them terminal output:
+
+      src/terminal/state.rs:198   stripped terminal title changed
+      src/app/actions.rs:1083     metadata-token expiry
+      src/app/api/panes.rs:1408   metadata-token patch (report-metadata)
+
+    So it tracks *presentation*, not work. Agents that rewrite their title as
+    they run (Claude Code, OpenCode) move it and the guard is meaningful; a
+    plain shell never moves it and the guard is blind — verified on
+    2026-07-29, where a throwaway bash pane stayed at revision 0 across
+    delivered text and a stale token was therefore accepted.
+
+    Reporting "blind" is the point: a guard that silently sees nothing is worse
+    than no guard, because the operator believes they are protected. When it is
+    blind, the real protections are the single-use token, its short TTL, and
+    the human who confirmed it.
+    """
+    if revision is None:
+        return "unavailable: session reports no revision"
+    if revision == 0:
+        return (
+            "blind: this session has never bumped its revision (it does not set a "
+            "terminal title), so a change between preview and send cannot be "
+            "detected — rely on the token TTL and your own confirmation"
+        )
+    return "active: revision moves when this session updates its title or metadata"
+
+
 def _terminal_id_problem(terminal_id: str) -> Optional[Dict[str, str]]:
     """Return a structured complaint for a malformed ``terminal_id``, else None.
 
@@ -450,13 +483,15 @@ async def herdr_preview_action_handler(
             "action": action,
             "summary": summary,
             "revision_at_preview": session.get("revision"),
+            "revision_guard": _revision_guard_state(session.get("revision")),
             "completion_signal": COMPLETION_SIGNAL,
             "confirmation_token": issued["token"],
             "action_id": issued["action_id"],
             "expires_in_seconds": herdr_binding.TOKEN_TTL_SECONDS,
             "note": (
                 "Single use. herdr_request_action refuses if the session's revision "
-                "has moved since this preview."
+                "has moved since this preview — see revision_guard for whether that "
+                "check can see anything in this session."
             ),
         }
     except HerdrError as exc:
@@ -545,10 +580,13 @@ async def herdr_request_action_handler(
         token_row = claim["row"]
         action_id = token_row["action_id"]
 
-        # Optimistic concurrency. The token is already spent, so a moved
-        # revision fails closed rather than re-arming. `revision` counts pane
-        # *output* changes (protocol 16 carries it on pane_output_changed
-        # only), which is exactly "something happened here since you looked".
+        # Optimistic concurrency, with a documented blind spot. The token is
+        # already spent, so a moved revision fails closed rather than
+        # re-arming. But `revision` tracks title/metadata changes, NOT output
+        # (see _revision_guard_state for the three increment sites), so it
+        # detects change only in sessions that rewrite their title. The
+        # response carries revision_guard so a blind check is never mistaken
+        # for a passed one.
         live_revision = session.get("revision")
         if token_row["revision"] is not None and live_revision != token_row["revision"]:
             await _audit(
@@ -639,6 +677,7 @@ async def herdr_request_action_handler(
             "action_id": action_id,
             "completion_state": "pending",
             "completion_signal": COMPLETION_SIGNAL,
+            "revision_guard": _revision_guard_state(token_row["revision"]),
         }
 
         if wait_timeout_ms and session.get("pane_id"):

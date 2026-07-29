@@ -22,20 +22,44 @@ negotiation, timeouts, and the SSH bridge. Budget ~25 ms per call, not ~1 ms.
 
 ## Two protocol findings that changed the design
 
-### `revision` is a pane-output counter, not a session version
+### `revision` is a presentation counter — NOT an output counter
 
-In protocol 16, `revision` appears on exactly one event, `pane_output_changed`,
-and the subscription filter that consumes it is `min_revision` on that same
-event. Status transitions ride `pane_agent_status_changed`, which carries no
-revision.
+**This correction supersedes an earlier claim in this file and in the Phase 2/3
+commit messages.** `revision` rides on the `pane_output_changed` event, which
+made it look like an output counter. It is not: the event carries the current
+value, it does not increment it.
 
-Consequence: an agent can go `done -> working` with `revision` unchanged. This
-was observed live and initially looked like a stale read. It is not.
+In Herdr 0.7.4 `revision` is incremented in exactly three places, none of them
+terminal output:
 
-- Correct use: "has this pane produced output since I looked" — which is
-  exactly the staleness guard `herdr_request_action` needs.
-- Incorrect use: a general optimistic-concurrency guard. It silently misses
-  every status-only change.
+| Site | Trigger |
+|---|---|
+| `src/terminal/state.rs:198` | stripped terminal title changed |
+| `src/app/actions.rs:1083` | metadata-token expiry |
+| `src/app/api/panes.rs:1408` | metadata-token patch (`report-metadata`) |
+
+Two consequences, both verified live on 2026-07-29:
+
+- An agent can go `done -> working` with `revision` unchanged — status rides
+  `pane_agent_status_changed`, which carries no revision.
+- **A pane can receive typed text and produce output with `revision` still 0.**
+  A throwaway `bash` pane did exactly that in the write-path soak, and a
+  deliberately stale confirmation token was accepted as a result.
+
+So the `herdr_request_action` staleness guard is:
+
+- **meaningful** for agents that rewrite their terminal title as they work —
+  Claude Code and OpenCode both do, and these are the real targets;
+- **blind** for anything that does not, e.g. a plain shell.
+
+Every preview and send now returns `revision_guard` naming which case applies.
+A guard that silently sees nothing is worse than no guard, because the operator
+believes they are covered. When it reports `blind`, the remaining protections
+are the single-use token, its 300 s TTL, and the human confirmation — and a
+passed revision check is not evidence that the pane was idle.
+
+No sound output-derived alternative exists in the read-only API: proving what a
+pane produced requires reading its content, which this design forbids.
 
 ### Hermes cannot hold Herdr authority
 
