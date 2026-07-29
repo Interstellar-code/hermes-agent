@@ -125,10 +125,20 @@ def _parse_herdr_hosts(hosts_raw: Any, path: Path) -> Dict[str, Dict[str, Any]]:
                     f"be absolute path strings, got {workspace!r}"
                 )
             allowed_workspaces.append(str(Path(workspace).resolve()))
+        # Per-host opt-in for Phase 2 mutations. Absent means read-only: an
+        # operator who configures a host for inspection must not discover that
+        # they also authorized writes into a live pane someone is working in.
+        allow_actions = host_entry.get("allow_actions", False)
+        if not isinstance(allow_actions, bool):
+            raise FleetConfigError(
+                f"{path}: fleet.herdr.hosts.{alias}.allow_actions must be a boolean, "
+                f"got {type(allow_actions).__name__}"
+            )
         hosts_out[alias] = {
             "transport": transport,
             "ssh_target": ssh_target,
             "allowed_workspaces": allowed_workspaces,
+            "allow_actions": allow_actions,
         }
     return hosts_out
 

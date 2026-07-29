@@ -277,11 +277,27 @@ def test_local_socket_host_with_ssh_target_raises(fleet_home: Path) -> None:
 
 
 def test_fleet_send_to_herdr_peer_with_no_registered_handler_returns_error(
-    fleet_home: Path,
+    fleet_home: Path, request: pytest.FixtureRequest
 ) -> None:
     """No handler registered for herdr_session -> FleetClientError, converted
-    by fleet_send_handler into {"error": ...} rather than an unhandled raise."""
+    by fleet_send_handler into {"error": ...} rather than an unhandled raise.
+
+    The registry is cleared explicitly because it is process-global and
+    ``register()`` installs the real Phase 3 route: any earlier test that
+    registers the plugin would otherwise make this precondition unreachable
+    and quietly turn the assertion into a test of the happy path.
+    """
+    import a2a_fleet.client as client_mod
     import a2a_fleet.fleet_tools as fleet_tools
+
+    saved = dict(client_mod._PORTLESS_HANDLERS)
+    client_mod._PORTLESS_HANDLERS.clear()
+    request.addfinalizer(
+        lambda: (
+            client_mod._PORTLESS_HANDLERS.clear(),
+            client_mod._PORTLESS_HANDLERS.update(saved),
+        )
+    )
 
     data = _load_data(fleet_home)
     _add_herdr_host(data)

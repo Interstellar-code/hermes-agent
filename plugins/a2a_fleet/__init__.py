@@ -599,6 +599,130 @@ def register(ctx) -> None:
             ),
             emoji="🔎",
         )
+
+        # -- Phase 2: confirmation-gated actions ---------------------------
+        # Registered unconditionally, but inert until a host sets
+        # allow_actions: true — the tools themselves refuse otherwise. That is
+        # deliberate: a tool that is absent teaches the model nothing, while a
+        # tool that explains why it refused teaches it the switch exists.
+        _HERDR_TERMINAL_ID_SCHEMA = {
+            "type": "string",
+            "description": (
+                "Exact stable session handle (e.g. 'term_656fd55fd56381a') from "
+                "herdr_list_sessions. Never the agent kind label."
+            ),
+        }
+        ctx.register_tool(
+            name="herdr_preview_action",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "terminal_id": _HERDR_TERMINAL_ID_SCHEMA,
+                    "action": {
+                        "type": "string",
+                        "description": (
+                            "The literal text that would be sent into the session. "
+                            "Shown to the human for confirmation; nothing is sent."
+                        ),
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short human-readable description of the intent.",
+                    },
+                },
+                "required": ["host_alias", "terminal_id", "action"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_preview_action_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "Preview one Herdr session action and get a single-use confirmation "
+                "token. Mutates nothing. The token is bound to the session's current "
+                "revision, so it is refused if the pane moves on."
+            ),
+            emoji="📝",
+        )
+        ctx.register_tool(
+            name="herdr_request_action",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "terminal_id": _HERDR_TERMINAL_ID_SCHEMA,
+                    "confirmation_token": {
+                        "type": "string",
+                        "description": "Token from herdr_preview_action. Single use.",
+                    },
+                    "wait_timeout_ms": {
+                        "type": "integer",
+                        "description": (
+                            "Optional. Wait this long for Herdr's 'done' signal. "
+                            "0 (default) returns immediately with completion_state "
+                            "'pending'. A timeout is never reported as completion."
+                        ),
+                    },
+                },
+                "required": ["host_alias", "terminal_id", "confirmation_token"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_request_action_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "Send one previewed, confirmed action to exactly one Herdr session. "
+                "Never retries: herdr agent send has no request ID, so an unknown "
+                "outcome is reported as unknown rather than repeated."
+            ),
+            emoji="▶️",
+        )
+        ctx.register_tool(
+            name="herdr_claim_human_takeover",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "terminal_id": _HERDR_TERMINAL_ID_SCHEMA,
+                },
+                "required": ["host_alias", "terminal_id"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_claim_human_takeover_handler),
+            check_fn=None,
+            is_async=True,
+            description=(
+                "Pause Fleet automation for one Herdr session. The session keeps "
+                "running and is not touched; only Fleet stands down."
+            ),
+            emoji="✋",
+        )
+        ctx.register_tool(
+            name="herdr_release_human_takeover",
+            toolset="a2a",
+            schema={
+                "type": "object",
+                "properties": {
+                    "host_alias": _HERDR_HOST_ALIAS_SCHEMA,
+                    "terminal_id": _HERDR_TERMINAL_ID_SCHEMA,
+                },
+                "required": ["host_alias", "terminal_id"],
+            },
+            handler=_json_tool_result(herdr_tools.herdr_release_human_takeover_handler),
+            check_fn=None,
+            is_async=True,
+            description="Hand one Herdr session back to Fleet automation.",
+            emoji="🤝",
+        )
+
+        # -- Phase 3: fleet_send routing to herdr_session peers -------------
+        # Installs the portless transport handler. Inside this guarded region
+        # on purpose: if it ever raises, fleet_send keeps working over HTTP and
+        # only herdr peers become unroutable (with an explicit error from the
+        # seam), rather than the whole plugin losing its tools.
+        from . import herdr_receiver  # noqa: WPS433 — lazy import is the contract.
+
+        herdr_receiver.register_herdr_route()
     except Exception:
         logger.warning(
             "a2a_fleet: Herdr tool registration failed; fleet_send and managed "

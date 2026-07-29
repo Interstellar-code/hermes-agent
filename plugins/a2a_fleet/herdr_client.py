@@ -209,6 +209,38 @@ class HerdrClient:
     async def get_agent(self, target: str) -> Dict[str, Any]:
         return await self._call("agent", "get", target)
 
+    # -- action verbs (Phase 2, confirmation-gated at the tool layer) ---------
+
+    async def send_agent_text(self, target: str, text: str) -> Dict[str, Any]:
+        """Write literal text into one agent session via ``herdr agent send``.
+
+        This is the ONLY mutating verb wrapped anywhere in this client, and it
+        is the sanctioned one: it addresses an *agent* session, not a raw pane.
+        The keystroke-level verbs remain permanently unwrapped — they bypass
+        the agent abstraction and cannot be distinguished from a human typing.
+
+        Herdr attaches no request ID to this call and offers no dedup, so it is
+        not idempotent and never can be. Callers must not retry an unknown
+        outcome; the confirmation token and revision guard upstream exist to
+        make a second attempt impossible rather than merely discouraged.
+        """
+        return await self._call("agent", "send", target, text)
+
+    async def wait_agent_status(
+        self, pane_id: str, status: str, timeout_ms: int
+    ) -> Dict[str, Any]:
+        """Block until the pane reaches ``status`` or the timeout expires.
+
+        ``wait agent-status`` is used rather than ``agent wait`` because only
+        the former accepts ``done`` — the completion state Fleet actually needs.
+        This is the sole admissible completion signal: silence, an idle prompt,
+        or a quiet pane are never completion evidence.
+        """
+        return await self._call(
+            "wait", "agent-status", pane_id, "--status", status,
+            "--timeout", str(int(timeout_ms)),
+        )
+
     async def check_protocol(self) -> None:
         """Raise HerdrProtocolMismatch if the live protocol has drifted."""
         schema = await self.schema()
