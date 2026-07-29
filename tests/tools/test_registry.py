@@ -20,6 +20,110 @@ def _make_schema(name="test_tool"):
     }
 
 
+class TestFunctionObjectShape:
+    """Regression tests for the plugin-vs-builtin schema envelope.
+
+    Plugin tools register a BARE JSON-Schema as ``schema=`` with ``description=``
+    as a sibling kwarg; built-ins embed the complete function object. The old
+    serializer assumed the built-in convention, so every plugin tool reached the
+    model with no ``parameters`` and no ``description`` — providers read that as
+    a zero-argument tool and the handler then rejected the empty call.
+    """
+
+    @staticmethod
+    def _bare_plugin_schema():
+        return {
+            "type": "object",
+            "properties": {"host_alias": {"type": "string", "description": "alias"}},
+            "required": ["host_alias"],
+        }
+
+    def test_bare_plugin_schema_is_wrapped_in_parameters(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="plugin_tool",
+            toolset="a2a",
+            schema=self._bare_plugin_schema(),
+            handler=_dummy_handler,
+            description="Sibling kwarg description",
+        )
+        fn = reg.get_definitions({"plugin_tool"})[0]["function"]
+
+        assert fn["name"] == "plugin_tool"
+        assert fn["description"] == "Sibling kwarg description"
+        assert fn["parameters"] == self._bare_plugin_schema()
+        assert fn["parameters"]["required"] == ["host_alias"]
+        # JSON-Schema keywords must NOT leak onto the function object itself.
+        for leaked in ("properties", "required"):
+            assert leaked not in fn
+        assert fn.get("type") != "object"
+
+    def test_builtin_schema_passes_through_untouched(self):
+        reg = ToolRegistry()
+        schema = _make_schema("builtin_tool")
+        reg.register(
+            name="builtin_tool",
+            toolset="core",
+            schema=schema,
+            handler=_dummy_handler,
+        )
+        fn = reg.get_definitions({"builtin_tool"})[0]["function"]
+
+        assert fn == {**schema, "name": "builtin_tool"}
+
+    def test_plugin_tool_without_description_omits_the_key(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="no_desc",
+            toolset="a2a",
+            schema=self._bare_plugin_schema(),
+            handler=_dummy_handler,
+        )
+        fn = reg.get_definitions({"no_desc"})[0]["function"]
+
+        assert "parameters" in fn
+        # Better to omit than to emit an empty description.
+        assert fn.get("description") in (None, "") or "description" not in fn
+
+    def test_schema_matching_neither_convention_is_not_guessed_at(self):
+        """No parameters and no properties -> pass through, do not invent one."""
+        reg = ToolRegistry()
+        reg.register(
+            name="odd_tool",
+            toolset="core",
+            schema={"name": "odd_tool", "description": "already a function object"},
+            handler=_dummy_handler,
+        )
+        fn = reg.get_definitions({"odd_tool"})[0]["function"]
+
+        assert fn == {"name": "odd_tool", "description": "already a function object"}
+        assert "parameters" not in fn
+
+    def test_every_emitted_definition_is_well_formed(self):
+        """Mixed registry: no definition may leak schema keywords onto function."""
+        reg = ToolRegistry()
+        reg.register(
+            name="plugin_style",
+            toolset="a2a",
+            schema=self._bare_plugin_schema(),
+            handler=_dummy_handler,
+            description="d",
+        )
+        reg.register(
+            name="builtin_style",
+            toolset="core",
+            schema=_make_schema("builtin_style"),
+            handler=_dummy_handler,
+        )
+        for definition in reg.get_definitions({"plugin_style", "builtin_style"}):
+            assert definition["type"] == "function"
+            fn = definition["function"]
+            assert "name" in fn
+            assert "parameters" in fn
+            assert fn.get("type") != "object"
+            assert "properties" not in fn
+
+
 class TestRegisterAndDispatch:
     def test_register_and_dispatch(self):
         reg = ToolRegistry()

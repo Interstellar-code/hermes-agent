@@ -527,6 +527,57 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _as_function_object(entry: "ToolEntry") -> dict:
+        """Return the OpenAI ``function`` object for ``entry``, normalising shape.
+
+        Two authoring conventions exist in this codebase and only one used to
+        survive serialization:
+
+        * **Built-in tools** define the COMPLETE function object as their
+          schema — ``{"name":..., "description":..., "parameters": {...}}`` (see
+          ``tools/close_terminal_tool.py``). All 74 built-ins do this.
+        * **Plugin tools** registered through ``PluginContext.register_tool``
+          pass a BARE JSON-Schema as ``schema=`` (``{"type": "object",
+          "properties": {...}, "required": [...]}``) and supply ``description=``
+          as a sibling keyword argument.
+
+        The old code was ``{**entry.schema, "name": entry.name}``, which assumed
+        the first convention. For the second it produced a function object with
+        NO ``parameters`` key and NO ``description``, leaving the JSON-Schema
+        keywords (``type``/``properties``/``required``) flattened onto
+        ``function`` where the OpenAI tool-calling contract does not define
+        them. Providers read that as a tool taking no arguments, so the model
+        would call e.g. ``herdr_status()`` or ``cc_receiver_status()`` with no
+        arguments and the handler would reject with "host_alias is required" /
+        "repo_path is empty". The failure looked intermittent only because a
+        model sometimes volunteers an argument from the surrounding prompt text
+        despite being shown no schema — the request itself was always wrong.
+        ``entry.description`` was stored but never read, which is the other half
+        of the same bug.
+
+        Detection is deliberately conservative: wrap ONLY when the schema is
+        recognisably a bare JSON-Schema (an object-typed schema, or one carrying
+        ``properties``) AND has no ``parameters`` key. Anything already carrying
+        ``parameters`` is passed through untouched, so built-ins are
+        bit-for-bit unaffected. Anything matching neither shape is also passed
+        through rather than guessed at.
+        """
+        schema = entry.schema or {}
+        looks_bare = "parameters" not in schema and (
+            "properties" in schema or schema.get("type") == "object"
+        )
+        if not looks_bare:
+            return {**schema, "name": entry.name}
+
+        function_obj: dict = {"name": entry.name, "parameters": schema}
+        # Prefer the sibling description= kwarg; fall back to one embedded in the
+        # schema. Omit the key entirely rather than emit an empty description.
+        description = entry.description or schema.get("description")
+        if description:
+            function_obj["description"] = description
+        return function_obj
+
     def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
@@ -555,8 +606,10 @@ class ToolRegistry:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
                     continue
-            # Ensure schema always has a "name" field — use entry.name as fallback
-            schema_with_name = {**entry.schema, "name": entry.name}
+            # Build the OpenAI ``function`` object: always carries "name", and
+            # normalises the two schema-authoring conventions (see
+            # _as_function_object).
+            schema_with_name = self._as_function_object(entry)
             # Apply runtime-dynamic overrides (e.g. delegate_task description
             # depends on current delegation.max_concurrent_children /
             # max_spawn_depth). Caller side (model_tools.get_tool_definitions)
