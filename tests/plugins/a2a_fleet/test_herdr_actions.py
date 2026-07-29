@@ -20,7 +20,7 @@ import yaml
 
 import a2a_fleet.herdr_binding as herdr_binding
 import a2a_fleet.herdr_tools as herdr_tools
-from a2a_fleet.herdr_client import HerdrClient
+from a2a_fleet.herdr_client import HerdrClient, HerdrError
 
 SESSION = {
     "agent": "claude",
@@ -97,11 +97,11 @@ def _preview(action: str = "run the tests") -> Dict[str, Any]:
 def test_preview_mints_token_and_mutates_nothing(herdr_env, monkeypatch) -> None:
     sent: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append((target, text))
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     result = _preview()
     assert result["status"] == "preview"
@@ -148,34 +148,174 @@ def _request(token: str, **kw) -> Dict[str, Any]:
 def test_confirmed_action_sends_once_and_records_it(herdr_env, tmp_path, monkeypatch) -> None:
     sent: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append((target, text))
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview("run the tests")
     result = _request(preview["confirmation_token"])
 
-    assert result["status"] == "sent"
+    assert result["status"] == "submitted"
     assert sent == [("term_abc123", "run the tests")]
     # Not complete: nothing waited for a done signal.
     assert result["completion_state"] == "pending"
     events = [row["event"] for row in _audit(tmp_path)]
-    assert "send_attempted" in events and "sent" in events
+    assert "submit_attempted" in events and "submitted" in events
+
+
+def test_submission_uses_herdrs_atomic_prompt_verb(herdr_env, monkeypatch) -> None:
+    """The prompt must be submitted, not left sitting in the composer.
+
+    The original wrapper called `agent send`, which inserts literal text and
+    stops — so a confirmed action reported success while the prompt sat
+    unsubmitted. This asserts the argv actually handed to Herdr: `agent prompt`,
+    which writes the text AND schedules its Enter in one call
+    (src/app/api/agents.rs:62).
+    """
+    argv: List[Any] = []
+
+    async def record_call(self, *args, **kw):
+        argv.append(args)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "_call", record_call)
+
+    preview = _preview("continue the refactor")
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+
+    assert argv == [("agent", "prompt", "term_abc123", "continue the refactor")]
+
+
+def test_no_arbitrary_key_injection_route_exists(herdr_env, monkeypatch) -> None:
+    """The action path must not offer a way to send chosen keystrokes.
+
+    Submission goes through Herdr's `agent prompt`, whose parameters are
+    (target, text) only — there is no `keys` array to smuggle anything into.
+    A caller putting key names in the action text gets them as literal text,
+    not as key presses.
+    """
+    argv: List[Any] = []
+
+    async def record_call(self, *args, **kw):
+        argv.append(args)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "_call", record_call)
+
+    preview = _preview("ENTER C-c ESC")
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+
+    (call,) = argv
+    assert call[:2] == ("agent", "prompt")
+    assert call[3] == "ENTER C-c ESC", "key names travel as literal text"
+    assert "send-keys" not in call and "pane" not in call
+
+
+def test_clean_rejection_is_not_reported_as_uncertain(herdr_env, tmp_path, monkeypatch) -> None:
+    """Herdr names the failures that happened before it wrote anything.
+
+    agent_not_ready fires before try_send_bytes, so nothing is in the composer.
+    Reporting that as "may or may not have submitted" would send the operator
+    to inspect a pane that was never touched.
+    """
+
+    async def not_ready(self, target, text, **kw):
+        raise HerdrError("agent is no longer the pane foreground process",
+                         code="agent_not_ready")
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", not_ready)
+
+    preview = _preview()
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submission_rejected"
+    assert result["herdr_error_code"] == "agent_not_ready"
+    assert result["mutation"].startswith("none")
+    assert "submission_rejected" in [r["event"] for r in _audit(tmp_path)]
+
+
+def test_unknown_transport_failure_is_never_reported_as_submitted(
+    herdr_env, tmp_path, monkeypatch
+) -> None:
+    """A transport death after the request leaves the outcome genuinely unknown.
+
+    Herdr has no request ID, so a submitted prompt and a lost one look
+    identical afterwards. This must never collapse into "submitted", and must
+    never invite a retry that could double-submit into a live session.
+    """
+
+    async def transport_died(self, target, text, **kw):
+        raise OSError("socket closed")
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", transport_died)
+
+    preview = _preview()
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "draft_inserted_submission_unknown"
+    assert result["status"] != "submitted"
+    assert "never" in result["retry"]
+    assert "submission_unknown" in [r["event"] for r in _audit(tmp_path)]
+
+
+def test_gates_block_submission_before_any_herdr_call(herdr_env, monkeypatch) -> None:
+    """Takeover and allow_actions must stop the submission, not just the send.
+
+    Both steps of the old design (text, then Enter) collapse into one call, so
+    the gates only have to hold once — but they must hold before Herdr is
+    touched at all.
+    """
+    calls: List[Any] = []
+
+    async def record_call(self, *args, **kw):
+        calls.append(args)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "_call", record_call)
+
+    preview = _preview()
+    _run(
+        herdr_tools.herdr_claim_human_takeover_handler(
+            host_alias="mac-mini", terminal_id="term_abc123"
+        )
+    )
+    assert _request(preview["confirmation_token"])["status"] == "human_takeover"
+    assert calls == [], "no Herdr verb may run while a human holds the session"
+
+
+def test_audit_records_intent_before_the_submission(herdr_env, tmp_path, monkeypatch) -> None:
+    """submit_attempted must precede submitted in the trail.
+
+    recent_audit returns newest first, so the attempt is the LATER row. If the
+    process dies between them the trail still shows an action whose outcome is
+    unknown, which is the honest state.
+    """
+
+    async def fake_send(self, target, text, **kw):
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    preview = _preview()
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+
+    events = [r["event"] for r in _audit(tmp_path)]
+    assert events.index("submitted") < events.index("submit_attempted")
 
 
 def test_token_is_single_use(herdr_env, monkeypatch) -> None:
     calls: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         calls.append(text)
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()
-    assert _request(preview["confirmation_token"])["status"] == "sent"
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
     replay = _request(preview["confirmation_token"])
     assert replay["status"] == "token_already_used"
     assert len(calls) == 1, "a replayed token must not produce a second send"
@@ -197,11 +337,11 @@ def test_takeover_is_checked_before_the_token_is_spent(
     """
     sent: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append(text)
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()
     _run(
@@ -228,7 +368,7 @@ def test_takeover_is_checked_before_the_token_is_spent(
             host_alias="mac-mini", terminal_id="term_abc123"
         )
     )
-    assert _request(preview["confirmation_token"])["status"] == "sent"
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
 
 
 def test_revision_guard_reports_when_it_is_blind(herdr_env, monkeypatch) -> None:
@@ -245,27 +385,27 @@ def test_revision_guard_reports_when_it_is_blind(herdr_env, monkeypatch) -> None
     idle".
     """
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     herdr_env["session"]["revision"] = 0  # a pane that never sets a title
     preview = _preview()
     assert preview["revision_guard"].startswith("blind")
 
     sent = _request(preview["confirmation_token"])
-    assert sent["status"] == "sent"
+    assert sent["status"] == "submitted"
     assert sent["revision_guard"].startswith("blind")
 
 
 def test_revision_guard_reports_active_for_title_updating_sessions(
     herdr_env, monkeypatch
 ) -> None:
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()  # SESSION revision is 40
     assert preview["revision_guard"].startswith("active")
@@ -286,11 +426,11 @@ def test_stale_revision_refuses_send(herdr_env, tmp_path, monkeypatch) -> None:
     """The pane moved between preview and confirmation: refuse, don't guess."""
     sent: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append(text)
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()
     herdr_env["session"]["revision"] = 41  # output advanced under us
@@ -316,12 +456,12 @@ def test_token_bound_to_its_own_session(herdr_env, monkeypatch) -> None:
             return {"agent": second}
         return {"agent": dict(herdr_env["session"])}
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append(target)
         return {}
 
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()  # token is for term_abc123
     other = _run(
@@ -333,7 +473,7 @@ def test_token_bound_to_its_own_session(herdr_env, monkeypatch) -> None:
     assert other["status"] == "token_session_mismatch"
     assert sent == []
     # The token survives the misdirected attempt — it was never claimed.
-    assert _request(preview["confirmation_token"])["status"] == "sent"
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
 
 
 # ---------------------------------------------------------------------------
@@ -344,48 +484,48 @@ def test_token_bound_to_its_own_session(herdr_env, monkeypatch) -> None:
 def test_send_failure_is_unknown_not_failed_silently(herdr_env, tmp_path, monkeypatch) -> None:
     """A dropped connection leaves a truthful record and forbids retry."""
 
-    async def boom(self, target, text):
+    async def boom(self, target, text, **kw):
         raise OSError("connection reset")
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", boom)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", boom)
 
     preview = _preview()
     result = _request(preview["confirmation_token"])
 
-    assert result["status"] == "outcome_unknown"
+    assert result["status"] == "draft_inserted_submission_unknown"
     assert "never" in result["retry"]
-    assert "send_outcome_unknown" in [row["event"] for row in _audit(tmp_path)]
+    assert "submission_unknown" in [row["event"] for row in _audit(tmp_path)]
 
 
 def test_wait_timeout_is_not_completion(herdr_env, tmp_path, monkeypatch) -> None:
     """Silence is never completion evidence."""
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         return {}
 
     async def timeout_wait(self, pane_id, status, timeout_ms):
         raise TimeoutError("no done signal")
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
     monkeypatch.setattr(HerdrClient, "wait_agent_status", timeout_wait)
 
     preview = _preview()
     result = _request(preview["confirmation_token"], wait_timeout_ms=50)
 
-    assert result["status"] == "sent"
+    assert result["status"] == "submitted"
     assert result["completion_state"] == "pending"
     assert "not treated as complete" in result["completion_note"].lower()
 
 
 def test_done_signal_marks_completed(herdr_env, tmp_path, monkeypatch) -> None:
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         return {}
 
     async def done_wait(self, pane_id, status, timeout_ms):
         assert status == "done", "completion must be the done signal, not idle"
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
     monkeypatch.setattr(HerdrClient, "wait_agent_status", done_wait)
 
     preview = _preview()
@@ -411,7 +551,7 @@ def test_takeover_blocks_automation_without_touching_the_session(
     sent: List[Any] = []
     herdr_calls: List[Any] = []
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         sent.append(text)
         return {}
 
@@ -419,7 +559,7 @@ def test_takeover_blocks_automation_without_touching_the_session(
         herdr_calls.append(args)
         return {}
 
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
     monkeypatch.setattr(HerdrClient, "_call", spy_call)
 
     preview = _preview()
@@ -442,7 +582,7 @@ def test_takeover_blocks_automation_without_touching_the_session(
         )
     )
     assert released["status"] == "automation_permitted"
-    assert _request(preview["confirmation_token"])["status"] == "sent"
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
 
 
 def test_takeover_survives_a_fresh_store_connection(herdr_env, tmp_path) -> None:

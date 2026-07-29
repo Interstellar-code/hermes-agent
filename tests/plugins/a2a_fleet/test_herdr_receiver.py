@@ -113,13 +113,13 @@ def route_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
         raise HerdrNotFound(f"no such agent {target}")
 
-    async def fake_send(self, target, text):
+    async def fake_send(self, target, text, **kw):
         live["sent"].append((target, text))
         return {}
 
     monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
-    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
     return live
 
 

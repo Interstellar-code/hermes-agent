@@ -188,7 +188,7 @@ async def send_to_herdr_session(
         confirmation_token=preview["confirmation_token"],
         wait_timeout_ms=int(entry.get("wait_timeout_ms") or 0),
     )
-    if sent.get("status") != "sent":
+    if sent.get("status") != "submitted":
         return {
             "reply": f"[herdr] dispatch failed ({sent.get('status')}): "
                      f"{sent.get('reason') or ''}".strip(),

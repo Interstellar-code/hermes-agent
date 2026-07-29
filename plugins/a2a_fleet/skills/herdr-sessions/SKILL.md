@@ -1,9 +1,9 @@
 ---
 name: herdr-sessions
-description: Invoke as `a2a_fleet:herdr-sessions` (the bare name does not resolve). Discover and inspect running Herdr-managed agent sessions from Hermes — fleet.herdr host/allowlist config, the three read-only tools (herdr_status, herdr_list_sessions, herdr_inspect_session), the terminal_id vs agent-label identifier rule, the cwd vs foreground_cwd trap, and why no pane-mutation tool exists yet. Use when asked to look at, list, inspect, or connect to Herdr sessions / panes / terminals, or to configure fleet.herdr hosts.
+description: Invoke as `a2a_fleet:herdr-sessions` (the bare name does not resolve). Discover and inspect running Herdr-managed agent sessions from Hermes — fleet.herdr host/allowlist config, the read-only tools (herdr_status, herdr_list_sessions, herdr_inspect_session), the confirmation-gated action tools (herdr_preview_action, herdr_request_action) and human takeover, the terminal_id vs agent-label identifier rule, and the cwd vs foreground_cwd trap. Use when asked to look at, list, inspect, or connect to Herdr sessions / panes / terminals, or to configure fleet.herdr hosts.
 metadata:
   hermes:
-    tags: [a2a_fleet, herdr, sessions, read-only]
+    tags: [a2a_fleet, herdr, sessions]
 ---
 
 # a2a_fleet: herdr-sessions
@@ -15,18 +15,22 @@ Herdr is a terminal workspace manager for AI coding agents. It keeps live Claude
 Code / Codex / OpenCode / Antigravity panes running with their terminal context
 and local auth intact. These tools let Hermes **look at** those sessions.
 
-Phase 1 is **read-only by construction**. There is no tool here that types into a
-pane, and that is deliberate — not an oversight. See "Why there is no send tool".
+Discovery and inspection are read-only. Writing into a session is possible but
+gated at five separate points and off by default — see "Submitting a prompt into
+a session".
 
-## The three tools
+## The tools
 
 | Tool | Purpose |
 |---|---|
 | `herdr_status(host_alias)` | Version, protocol, transport, reachability, allowed workspaces |
 | `herdr_list_sessions(host_alias, workspace?, agent_kind?)` | Sessions on a host, allowlist-filtered |
 | `herdr_inspect_session(host_alias, terminal_id)` | One exact session |
+| `herdr_preview_action(host_alias, terminal_id, action, summary?)` | Describe a pending submission, mint a confirmation token. Mutates nothing |
+| `herdr_request_action(host_alias, terminal_id, confirmation_token, wait_timeout_ms?)` | Submit that prompt, once |
+| `herdr_claim_human_takeover` / `herdr_release_human_takeover` | Pause / resume Fleet automation for one session |
 
-All three return a structured dict and never raise. When Herdr is missing,
+The read-only three return a structured dict and never raise. When Herdr is missing,
 unreachable, or on a different protocol, you get a `status` field explaining
 which — not an exception and not a silent empty list.
 
@@ -47,6 +51,7 @@ fleet:
     hosts:
       mac-mini:
         transport: local_socket
+        allow_actions: true        # default false; required before any submission
         allowed_workspaces:
           - /Users/rohits/hermes
           - /Users/rohits/.hermes/hermes-agent
@@ -149,23 +154,40 @@ treat a passed revision check as evidence the pane was idle.
 | `workspace_denied` | Session outside `allowed_workspaces` | Widen the allowlist *deliberately*, or pick another session |
 | `invalid_terminal_id` | Padded with whitespace, or contains control characters | Pass the exact `term_...` handle; the `hint` field shows the trimmed form. Ids are never normalized for you |
 
-## Why there is no send tool
+## Submitting a prompt into a session
 
-Wrapping `herdr agent send` would let Hermes type into a pane a human may be
-using. Three things must exist first, and none do yet:
+Typing into a pane a human may be using is gated, not forbidden. The gates that
+had to exist first now do, and every one of them applies to every submission:
 
-- a confirmation token bound to a preview of the exact action;
-- a `revision` guard so a stale action cannot land on a pane whose output moved
-  (output only — pair it with `herdr agent wait --status` for state changes,
-  which `revision` does not track);
-- an audit record that survives a gateway restart.
+1. exact `terminal_id` — never an agent label;
+2. `allow_actions: true` on the host (default off);
+3. no human takeover held on that session;
+4. a single-use confirmation token from `herdr_preview_action`, bound to this
+   session and its `revision` at preview time;
+5. an audit record written **before** the submission, in the profile `state.db`.
 
-`herdr agent send` also has **no request ID**, so it can never be made idempotent
-— a timeout leaves a genuinely unknown outcome. The rule is therefore: an unknown
-outcome stays unknown and is surfaced, never retried.
+The flow is two calls: `herdr_preview_action` (mutates nothing, returns a token
+that expires in 300 s) then `herdr_request_action` with that token.
 
-Do not work around this by shelling out to `herdr` directly to type into a pane.
-If a task truly needs it, say so and it gets designed properly.
+Submission uses Herdr's own `agent prompt` verb, which writes the text and
+schedules its Enter in one call. It is deliberately NOT built from a
+literal-text write plus a separate keystroke verb: the submission encoding is
+per-runtime, Herdr enforces preconditions we cannot see (it refuses when the
+agent is no longer the pane's foreground process), and the delay between text
+and Enter is a race Herdr already gets right. It is also the narrower surface —
+the call takes `(target, text)` and no key list, so there is no arbitrary-key
+route at all. Key names inside your action text travel as literal text.
+
+**There is no request ID and no dedup**, so a submission can never be made
+idempotent. Read the status exactly:
+
+| Status | Meaning | What to do |
+|---|---|---|
+| `submitted` | Herdr accepted the prompt and scheduled its Enter | Nothing. It is an acknowledgement, not observed proof the agent acted |
+| `submission_rejected` | Herdr refused before writing anything (`agent_not_ready`, `agent_not_found`, …) | Nothing is in the composer. Fix the cause and preview again |
+| `draft_inserted_submission_unknown` | The call did not complete cleanly | **Never retry** — inspect the session first; the text may or may not have gone in |
+
+Do not work around any of this by shelling out to `herdr` directly.
 
 ## Implementation notes
 

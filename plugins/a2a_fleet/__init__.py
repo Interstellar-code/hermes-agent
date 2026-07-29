@@ -671,9 +671,10 @@ def register(ctx) -> None:
             check_fn=None,
             is_async=True,
             description=(
-                "Send one previewed, confirmed action to exactly one Herdr session. "
-                "Never retries: herdr agent send has no request ID, so an unknown "
-                "outcome is reported as unknown rather than repeated."
+                "Submit one previewed, confirmed prompt to exactly one Herdr session "
+                "(text AND its Enter, atomically, via Herdr's own agent prompt verb). "
+                "Never retries: there is no request ID, so an unknown outcome is "
+                "reported as draft_inserted_submission_unknown rather than repeated."
             ),
             emoji="▶️",
         )

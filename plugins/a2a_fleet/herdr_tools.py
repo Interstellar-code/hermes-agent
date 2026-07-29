@@ -1,9 +1,19 @@
-"""Agent-facing read-only Herdr tools for the a2a_fleet plugin.
+"""Agent-facing Herdr session tools for the a2a_fleet plugin.
 
-Phase 1 ships three tools — ``herdr_status``, ``herdr_list_sessions``, and
-``herdr_inspect_session`` — all strictly read-only. No tool here mutates a live
-pane; ``agent send`` / ``pane send-keys`` / ``pane run`` are deliberately not
-wrapped (Phase 2, gated on confirmation tokens that do not exist yet).
+Discovery and inspection — ``herdr_status``, ``herdr_list_sessions``,
+``herdr_inspect_session`` — are strictly read-only.
+
+Exactly ONE operation here mutates a live session: ``herdr_request_action``
+submits a previewed, confirmed prompt through Herdr's own ``agent prompt``
+verb. Pane-level verbs and keystroke verbs remain deliberately unwrapped —
+they bypass the agent-session identity boundary, and ``agent prompt`` takes
+``(target, text)`` with no key list, so no arbitrary-key route exists at all.
+
+Every mutation passes the same gates in this order: exact ``terminal_id``,
+per-host ``allow_actions``, human takeover, single-use confirmation token,
+revision guard, durable binding, then an audit record written BEFORE the
+submission. Nothing here ever retries: Herdr issues no request ID, so a
+delivered prompt and a lost one are indistinguishable afterwards.
 
 Every handler returns a plain dict and never raises, mirroring
 :mod:`fleet_tools`: the calling agent can surface the string verbatim in chat
@@ -24,7 +34,13 @@ from typing import Any, Dict, List, Optional
 
 from . import herdr_binding
 from .herdr_capability import check_herdr_capability
-from .herdr_client import HerdrClient, HerdrError, HerdrNotFound, normalize_agent_record
+from .herdr_client import (
+    PROMPT_REJECTED_BEFORE_SUBMISSION,
+    HerdrClient,
+    HerdrError,
+    HerdrNotFound,
+    normalize_agent_record,
+)
 
 log = logging.getLogger("a2a_fleet.herdr_tools")
 
@@ -622,12 +638,12 @@ async def herdr_request_action_handler(
                 completion_state="pending",
             )
         )
-        # Audit the intent BEFORE the send. If this process dies mid-call the
-        # trail still shows an action whose outcome is unknown — which is the
-        # honest state. An audit written only on success would leave a
-        # delivered action with no record of it at all.
+        # Audit the intent BEFORE the submission. If this process dies mid-call
+        # the trail still shows an action whose outcome is unknown — which is
+        # the honest state. An audit written only on success would leave a
+        # submitted prompt with no record of it at all.
         await _audit(
-            event="send_attempted",
+            event="submit_attempted",
             host_alias=host_alias,
             terminal_id=terminal_id,
             action_id=action_id,
@@ -636,10 +652,55 @@ async def herdr_request_action_handler(
 
         client = _client_for(host_cfg)
         try:
-            await client.send_agent_text(terminal_id, token_row["action"])
+            await client.submit_prompt(terminal_id, token_row["action"])
+        except HerdrError as exc:
+            # Herdr names the failures that happened before it wrote anything
+            # (see PROMPT_REJECTED_BEFORE_SUBMISSION). Those are clean
+            # rejections: nothing is sitting in the composer, so say so rather
+            # than leaving the operator to check by hand.
+            rejected_cleanly = getattr(exc, "code", None) in PROMPT_REJECTED_BEFORE_SUBMISSION
+            await _audit(
+                event="submission_rejected" if rejected_cleanly else "submission_unknown",
+                host_alias=host_alias,
+                terminal_id=terminal_id,
+                action_id=action_id,
+                detail=f"{getattr(exc, 'code', '?')}: {exc}"[:500],
+            )
+            await _with_db(
+                lambda conn: herdr_binding.upsert_binding(
+                    conn,
+                    host_alias=host_alias,
+                    terminal_id=terminal_id,
+                    completion_state="failed",
+                )
+            )
+            if rejected_cleanly:
+                return {
+                    "status": "submission_rejected",
+                    "host_alias": host_alias,
+                    "terminal_id": terminal_id,
+                    "action_id": action_id,
+                    "herdr_error_code": getattr(exc, "code", None),
+                    "mutation": "none — Herdr rejected the prompt before writing to the pane",
+                    "reason": str(exc),
+                }
+            return {
+                "status": "draft_inserted_submission_unknown",
+                "host_alias": host_alias,
+                "terminal_id": terminal_id,
+                "action_id": action_id,
+                "herdr_error_code": getattr(exc, "code", None),
+                "reason": f"submission did not complete cleanly: {exc}",
+                "guidance": (
+                    "The text may be sitting unsubmitted in the session's composer, "
+                    "or may have been submitted — Herdr gives no request ID to tell "
+                    "them apart. Inspect the session before doing anything else."
+                ),
+                "retry": "never — a second attempt could double-submit",
+            }
         except Exception as exc:  # noqa: BLE001 — outcome is genuinely unknown.
             await _audit(
-                event="send_outcome_unknown",
+                event="submission_unknown",
                 host_alias=host_alias,
                 terminal_id=terminal_id,
                 action_id=action_id,
@@ -654,23 +715,27 @@ async def herdr_request_action_handler(
                 )
             )
             return {
-                "status": "outcome_unknown",
+                "status": "draft_inserted_submission_unknown",
                 "host_alias": host_alias,
                 "terminal_id": terminal_id,
                 "action_id": action_id,
-                "reason": f"send did not complete cleanly: {exc}",
-                "retry": "never — this action has no request ID and may have landed",
+                "reason": f"submission did not complete cleanly: {exc}",
+                "guidance": (
+                    "The text may be sitting unsubmitted in the session's composer, "
+                    "or may have been submitted — inspect the session before retrying."
+                ),
+                "retry": "never — a second attempt could double-submit",
             }
 
         await _audit(
-            event="sent",
+            event="submitted",
             host_alias=host_alias,
             terminal_id=terminal_id,
             action_id=action_id,
         )
 
         result: Dict[str, Any] = {
-            "status": "sent",
+            "status": "submitted",
             "host_alias": host_alias,
             "terminal_id": terminal_id,
             "pane_id": session.get("pane_id"),
@@ -678,6 +743,11 @@ async def herdr_request_action_handler(
             "completion_state": "pending",
             "completion_signal": COMPLETION_SIGNAL,
             "revision_guard": _revision_guard_state(token_row["revision"]),
+            "submission": (
+                "Herdr accepted the prompt and scheduled its Enter. Submission is "
+                "asynchronous, so this is Herdr's acknowledgement rather than "
+                "observed proof the agent has acted on it."
+            ),
         }
 
         if wait_timeout_ms and session.get("pane_id"):

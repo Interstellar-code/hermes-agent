@@ -60,6 +60,25 @@ _ERROR_CODE_MAP: Dict[str, type] = {
 }
 
 
+# Herdr error codes that ``agent prompt`` returns BEFORE it writes anything to
+# the pane (``src/app/api/agents.rs:62``). ``agent_prompt_failed`` belongs here
+# too: it is raised by the failed ``try_send_bytes`` itself, so the text was
+# never queued and the Enter was never scheduled.
+#
+# The distinction is the whole point. These prove no mutation occurred, so the
+# caller can say so plainly. Anything else — a transport death, a timeout, an
+# unrecognised code — leaves the outcome genuinely unknown, and must be
+# reported as unknown rather than assumed either way.
+PROMPT_REJECTED_BEFORE_SUBMISSION = frozenset(
+    {
+        "empty_agent_prompt",
+        "agent_not_found",
+        "agent_not_ready",
+        "agent_prompt_failed",
+    }
+)
+
+
 class HerdrClient:
     """Shells out to ``herdr`` and parses its JSON envelope."""
 
@@ -211,20 +230,60 @@ class HerdrClient:
 
     # -- action verbs (Phase 2, confirmation-gated at the tool layer) ---------
 
-    async def send_agent_text(self, target: str, text: str) -> Dict[str, Any]:
-        """Write literal text into one agent session via ``herdr agent send``.
+    async def submit_prompt(
+        self,
+        target: str,
+        text: str,
+        *,
+        until: Optional[List[str]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Submit a prompt to one agent session via ``herdr agent prompt``.
 
-        This is the ONLY mutating verb wrapped anywhere in this client, and it
-        is the sanctioned one: it addresses an *agent* session, not a raw pane.
-        The keystroke-level verbs remain permanently unwrapped — they bypass
-        the agent abstraction and cannot be distinguished from a human typing.
+        This is the ONLY mutating verb wrapped anywhere in this client.
 
-        Herdr attaches no request ID to this call and offers no dedup, so it is
-        not idempotent and never can be. Callers must not retry an unknown
-        outcome; the confirmation token and revision guard upstream exist to
-        make a second attempt impossible rather than merely discouraged.
+        It replaces the earlier ``agent send`` wrapper, which inserted literal
+        text and stopped — leaving the prompt sitting unsubmitted in the CLI
+        composer while the tool reported success. ``agent prompt`` is Herdr's
+        purpose-built verb for this and does the whole job atomically
+        (``src/app/api/agents.rs:62``)::
+
+            let (text, enter) = encode_api_submission_parts(runtime, &text);
+            runtime.try_send_bytes(text);
+            runtime.send_bytes_after(enter, AGENT_PROMPT_SUBMIT_DELAY);
+
+        Deliberately NOT composed from a literal-text write plus a separate
+        ENTER keystroke verb, even though Herdr exposes both. Three reasons,
+        all of which make the composed version worse rather than merely longer:
+
+        * the submission encoding is per-runtime (bracketed paste and
+          agent-specific quirks); hand-rolling it re-implements
+          ``encode_api_submission_parts`` badly;
+        * Herdr enforces preconditions we cannot see — ``effective_known_agent``,
+          ``managed_agent_launch_pending``, and ``runtime_hosts_agent``, which
+          refuse when the agent is no longer the pane's foreground process;
+        * the delay between text and Enter is a real race that Herdr already
+          gets right.
+
+        It is also the *narrower* surface: there is no ``keys`` array anywhere
+        in this call, so no arbitrary-key injection route exists to be abused.
+        The keystroke-level verbs stay permanently unwrapped.
+
+        Success means Herdr accepted the prompt and scheduled the Enter — the
+        submission is asynchronous, so a success response is an acknowledgement,
+        not proof the agent has acted. Pass ``until`` for observed evidence.
+
+        Herdr attaches no request ID and offers no dedup, so this is not
+        idempotent and never can be. Callers must not retry an unknown outcome.
         """
-        return await self._call("agent", "send", target, text)
+        argv = ["agent", "prompt", target, text]
+        if until:
+            argv.append("--wait")
+            for status in until:
+                argv += ["--until", status]
+            if timeout_ms:
+                argv += ["--timeout", str(int(timeout_ms))]
+        return await self._call(*argv)
 
     async def wait_agent_status(
         self, pane_id: str, status: str, timeout_ms: int
