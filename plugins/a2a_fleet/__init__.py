@@ -714,6 +714,15 @@ def register(ctx) -> None:
             description="Hand one Herdr session back to Fleet automation.",
             emoji="🤝",
         )
+
+        # -- Phase 3: fleet_send routing to herdr_session peers -------------
+        # Installs the portless transport handler. Inside this guarded region
+        # on purpose: if it ever raises, fleet_send keeps working over HTTP and
+        # only herdr peers become unroutable (with an explicit error from the
+        # seam), rather than the whole plugin losing its tools.
+        from . import herdr_receiver  # noqa: WPS433 — lazy import is the contract.
+
+        herdr_receiver.register_herdr_route()
     except Exception:
         logger.warning(
             "a2a_fleet: Herdr tool registration failed; fleet_send and managed "

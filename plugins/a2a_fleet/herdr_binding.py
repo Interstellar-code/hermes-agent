@@ -266,6 +266,25 @@ def get_binding(
     return dict(row) if row is not None else None
 
 
+def get_binding_by_context(
+    conn: sqlite3.Connection, fleet_context_id: str
+) -> Optional[Dict[str, Any]]:
+    """Find the session a Fleet context is already bound to.
+
+    This is what makes ``context_id`` continuity real across gateway restarts:
+    the same A2A context must reach the same pane, not merely a pane that
+    currently looks similar. Most recent wins if a context was ever rebound.
+    """
+    if not fleet_context_id:
+        return None
+    row = conn.execute(
+        "SELECT * FROM herdr_bindings WHERE fleet_context_id = ? "
+        "ORDER BY last_observed_at DESC LIMIT 1",
+        (fleet_context_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
 def automation_blocked(
     conn: sqlite3.Connection, host_alias: str, terminal_id: str
 ) -> bool:
