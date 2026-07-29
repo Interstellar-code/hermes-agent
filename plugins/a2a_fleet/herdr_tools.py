@@ -392,6 +392,36 @@ def _actions_allowed(cfg: Dict[str, Any], host_cfg: Dict[str, Any]) -> Optional[
     return None
 
 
+async def _submit_supported(host_cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Refuse before touching a session if this Herdr cannot submit prompts.
+
+    ``agent prompt`` — the only agent-scoped verb that writes text AND submits
+    it — landed in Herdr 0.7.5. On 0.7.4 there is no agent-scoped submit route
+    at all, and the pane-level keystroke verbs are deliberately out of bounds
+    because they bypass the agent-session identity boundary.
+
+    Checked here rather than discovered at submission time. Against 0.7.4 the
+    wrapper previously invoked a subcommand the binary did not have, and the
+    failure surfaced only after the confirmation token had been spent on a real
+    session — an operator left to wonder whether a prompt had landed.
+    """
+    if await _client_for(host_cfg).supports_submit():
+        return None
+    return {
+        "status": "submission_unsupported",
+        "reason": (
+            "this Herdr build has no agent-scoped submit verb (`agent prompt`, "
+            "added in Herdr 0.7.5), so a prompt could only be typed in, never "
+            "submitted"
+        ),
+        "required": "herdr >= 0.7.5",
+        "note": (
+            "Upgrading also moves the wire protocol (16 -> 18), so the pinned "
+            "protocol in herdr_client must be re-verified at the same time."
+        ),
+    }
+
+
 async def _with_db(fn: Any) -> Any:
     """Run one unit of SQLite work on a worker thread, connection and all.
 
@@ -458,6 +488,10 @@ async def herdr_preview_action_handler(
                 "terminal_id": terminal_id,
                 "reason": refusal,
             }
+
+        unsupported = await _submit_supported(host_cfg)
+        if unsupported:
+            return {"host_alias": host_alias, "terminal_id": terminal_id, **unsupported}
 
         if await _with_db(
             lambda conn: herdr_binding.automation_blocked(conn, host_alias, terminal_id)
@@ -559,6 +593,10 @@ async def herdr_request_action_handler(
                 "terminal_id": terminal_id,
                 "reason": refusal,
             }
+
+        unsupported = await _submit_supported(host_cfg)
+        if unsupported:
+            return {"host_alias": host_alias, "terminal_id": terminal_id, **unsupported}
 
         if await _with_db(
             lambda conn: herdr_binding.automation_blocked(conn, host_alias, terminal_id)
@@ -699,6 +737,36 @@ async def herdr_request_action_handler(
                 "retry": "never — a second attempt could double-submit",
             }
         except Exception as exc:  # noqa: BLE001 — outcome is genuinely unknown.
+            # One shape is NOT unknown: the CLI refusing the invocation itself
+            # (unknown subcommand -> exit 2 plus its help text). Nothing ran, so
+            # nothing was typed. Reporting that as a possible draft sends the
+            # operator to inspect a session that was never touched — which is
+            # exactly what happened when this wrapper called a verb the
+            # installed binary did not have.
+            if "herdr agent commands:" in str(exc):
+                await _audit(
+                    event="submission_rejected",
+                    host_alias=host_alias,
+                    terminal_id=terminal_id,
+                    action_id=action_id,
+                    detail=f"cli rejected the invocation: {exc}"[:500],
+                )
+                await _with_db(
+                    lambda conn: herdr_binding.upsert_binding(
+                        conn,
+                        host_alias=host_alias,
+                        terminal_id=terminal_id,
+                        completion_state="failed",
+                    )
+                )
+                return {
+                    "status": "submission_rejected",
+                    "host_alias": host_alias,
+                    "terminal_id": terminal_id,
+                    "action_id": action_id,
+                    "mutation": "none — the Herdr CLI rejected the command before running it",
+                    "reason": str(exc)[:300],
+                }
             await _audit(
                 event="submission_unknown",
                 host_alias=host_alias,

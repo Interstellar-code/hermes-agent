@@ -117,6 +117,10 @@ def route_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         live["sent"].append((target, text))
         return {}
 
+    async def _supports_submit(self):
+        return True
+
+    monkeypatch.setattr(HerdrClient, "supports_submit", _supports_submit)
     monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
     monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)

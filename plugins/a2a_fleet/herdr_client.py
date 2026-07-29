@@ -300,6 +300,29 @@ class HerdrClient:
             "--timeout", str(int(timeout_ms)),
         )
 
+    async def supports_submit(self) -> bool:
+        """True if the INSTALLED binary has the agent-scoped submit verb.
+
+        Probed by invoking ``agent prompt`` with no arguments, which prints its
+        usage line and exits 2 without touching a session. A binary that does
+        not know the subcommand prints the agent command list instead.
+
+        Deliberately not probed via ``--help`` substring like the other verbs:
+        ``agent prompt`` is absent from Herdr's hand-written agent help even in
+        versions that implement it, so a help-based probe reports it missing on
+        a binary that has it.
+
+        This check exists because reading Herdr's source is NOT evidence about
+        the binary on this machine. ``agent prompt`` landed in 0.7.5; against
+        an installed 0.7.4 the wrapper invoked a subcommand that did not exist
+        and the failure only surfaced at submission time, on a real session.
+        """
+        try:
+            usage = await self.help_text("agent", "prompt")
+        except HerdrError:
+            return False
+        return "usage: herdr agent prompt" in usage
+
     async def check_protocol(self) -> None:
         """Raise HerdrProtocolMismatch if the live protocol has drifted."""
         schema = await self.schema()

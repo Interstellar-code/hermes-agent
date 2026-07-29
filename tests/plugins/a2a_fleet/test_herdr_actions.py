@@ -68,6 +68,12 @@ def herdr_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     async def fake_get_agent(self, target):
         return {"agent": dict(live["session"])}
 
+    async def _supports_submit(self):
+        return True
+
+    # Default to a Herdr that CAN submit; the capability-gate test overrides
+    # this. Without it every test would shell out to the real binary.
+    monkeypatch.setattr(HerdrClient, "supports_submit", _supports_submit)
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
     return live
 
@@ -163,6 +169,64 @@ def test_confirmed_action_sends_once_and_records_it(herdr_env, tmp_path, monkeyp
     assert result["completion_state"] == "pending"
     events = [row["event"] for row in _audit(tmp_path)]
     assert "submit_attempted" in events and "submitted" in events
+
+
+def test_refuses_before_touching_a_session_when_herdr_cannot_submit(
+    herdr_env, monkeypatch
+) -> None:
+    """A Herdr without `agent prompt` must be caught at the gate, not at submit.
+
+    `agent prompt` landed in Herdr 0.7.5. Against an installed 0.7.4 this
+    wrapper invoked a subcommand the binary did not have; the failure surfaced
+    only after the confirmation token had been spent on a real session, leaving
+    the operator to wonder whether a prompt had landed. Both tools must now
+    refuse up front, and preview must not even mint a token.
+    """
+    calls: List[Any] = []
+
+    async def no_submit_support(self):
+        return False
+
+    async def record_call(self, *args, **kw):
+        calls.append(args)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "supports_submit", no_submit_support)
+    monkeypatch.setattr(HerdrClient, "_call", record_call)
+
+    preview = _preview()
+    assert preview["status"] == "submission_unsupported"
+    assert "0.7.5" in preview["required"]
+    assert "confirmation_token" not in preview, "no token for a submit that cannot happen"
+
+    request = _request("any-token")
+    assert request["status"] == "submission_unsupported"
+    assert calls == [], "nothing may reach Herdr once the capability check fails"
+
+
+def test_cli_rejection_is_not_reported_as_a_possible_draft(
+    herdr_env, tmp_path, monkeypatch
+) -> None:
+    """An unknown subcommand means nothing ran, so nothing was typed.
+
+    Herdr's CLI answers an unknown subcommand with its help text and exit 2.
+    Treating that as draft_inserted_submission_unknown sends the operator to
+    inspect a session that was never touched.
+    """
+
+    async def cli_rejects(self, target, text, **kw):
+        raise RuntimeError(
+            "herdr exited 2 with unparseable output: herdr agent commands:\n  herdr agent list"
+        )
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", cli_rejects)
+
+    preview = _preview()
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submission_rejected"
+    assert result["mutation"].startswith("none")
+    assert "submission_rejected" in [r["event"] for r in _audit(tmp_path)]
 
 
 def test_submission_uses_herdrs_atomic_prompt_verb(herdr_env, monkeypatch) -> None:
