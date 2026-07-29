@@ -147,9 +147,17 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 # Backoff for EADDRINUSE on bind when no live listener owns the port — i.e.
 # lingering TIME_WAIT sockets from the previous gateway's clients. On macOS
-# reuse_address is deliberately off (see connect()), so those linger up to
-# ~60s after the old process is gone. Module-level so tests can shrink it.
-BIND_RETRY_DELAYS = (1, 2, 4, 8, 15, 15, 15)
+# reuse_address is deliberately off (see connect()), so those can linger up to
+# ~60s after the old process is gone.
+#
+# This does NOT try to cover the full ~60s, and must not: gateway.run wraps
+# every platform connect() in _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT (30s), so
+# a longer backoff is simply cancelled mid-sleep — observed 2026-07-29 14:52,
+# where a 60s ladder was killed at "api_server connect timed out after 30s".
+# The long horizon belongs to the reconnect watcher (30s → 60s → … → 300s),
+# not here. This ladder only removes the common short debris window from
+# startup. Module-level so tests can shrink it.
+BIND_RETRY_DELAYS = (1, 2, 4, 8)
 
 
 async def _has_live_listener(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -6097,17 +6105,26 @@ class APIServerAdapter(BasePlatformAdapter):
             # error. With reuse_address off (above), the port stays unbindable
             # while TIME_WAIT sockets from the *previous* instance's clients
             # linger — outliving that process by up to ~60s on macOS. A
-            # one-shot failure there leaves the gateway running with every
+            # one-shot failure there left the gateway running with every
             # other platform up and no API server at all (observed twice on
             # 2026-07-29): alive, but unreachable from the UI. Measured on
             # 2026-07-29 12:21, the old listener closed 8s *before* the
             # replacement started and the bind still failed for 15s more.
             #
+            # That outage was not self-healing, and the reason is subtle: the
+            # old code marked EADDRINUSE non-retryable, and gateway.run's
+            # reconnect watcher drops non-retryable failures from its queue
+            # outright. So nothing ever retried. Classification, not the
+            # retry, is what makes the difference between a 30s blip and a
+            # dead API server — see the two branches after this loop.
+            #
             # So: wait out debris, but never wait on a live conflict. The
-            # probe below tells the two apart.
+            # probe below tells the two apart, and its verdict is reused to
+            # decide retryability.
             # ponytail: fixed backoff, not a config knob — this covers one
             # specific OS behavior with a known duration.
             bind_error: Optional[OSError] = None
+            live_conflict = False
             for delay in (*BIND_RETRY_DELAYS, None):
                 self._site = web.TCPSite(
                     self._runner,
@@ -6122,12 +6139,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 except OSError as exc:
                     bind_error = exc
                     self._site = None
-                    if delay is None or getattr(exc, "errno", None) != errno.EADDRINUSE:
+                    if getattr(exc, "errno", None) != errno.EADDRINUSE:
                         break
-                    # Another process actually serving this port is a real
-                    # conflict — waiting cannot help, so fail now and let the
-                    # non-retryable path below report it (#52132).
-                    if await _has_live_listener(self._host, self._port):
+                    # Probe on EVERY EADDRINUSE, including the last attempt.
+                    # Probing only before a sleep left the final failure
+                    # unclassified, so a genuine conflict lost its
+                    # non-retryable marking whenever the ladder was empty or
+                    # exhausted — the #52132 protection would have silently
+                    # stopped applying.
+                    live_conflict = await _has_live_listener(self._host, self._port)
+                    # A live listener is a real conflict: waiting cannot help.
+                    if live_conflict or delay is None:
                         break
                     logger.warning(
                         "[%s] %s:%d not bindable yet (%s) but nothing is "
@@ -6142,8 +6164,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
-                    # A port conflict is a configuration error, not a
+                if getattr(exc, "errno", None) == errno.EADDRINUSE and live_conflict:
+                    # A LIVE port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
                     # its lifetime. A bare ``return False`` makes the
                     # reconnect watcher in gateway.run treat it as retryable
@@ -6161,10 +6183,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"different value, then `/platform resume api_server`.",
                         retryable=False,
                     )
+                    logger.error(
+                        "[%s] Could not bind %s:%d: %s. Set a different port in "
+                        "config.yaml: platforms.api_server.port",
+                        self.name, self._host, self._port, exc,
+                    )
+                    return False
+
+                # EADDRINUSE with nothing listening is the opposite case:
+                # TIME_WAIT debris that clears on its own. Marking it
+                # non-retryable here is what turned a ~60s wait into a dead
+                # API server until someone restarted the gateway by hand
+                # (2026-07-29, twice) — the watcher drops non-retryable
+                # failures immediately, so nothing ever retried. Leave it
+                # retryable and let the watcher heal it on its next pass.
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc,
+                    "[%s] Could not bind %s:%d after %ds of retries: %s. Nothing "
+                    "is listening, so this is lingering TIME_WAIT debris rather "
+                    "than a port conflict — leaving it retryable for the "
+                    "reconnect watcher.",
+                    self.name, self._host, self._port, sum(BIND_RETRY_DELAYS), exc,
                 )
                 return False
 

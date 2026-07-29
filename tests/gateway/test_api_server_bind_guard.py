@@ -286,6 +286,52 @@ class TestBindMechanics:
             debris.close()
             await adapter.disconnect()
 
+    def test_backoff_fits_inside_the_platform_connect_timeout(self):
+        """The ladder must finish before gateway.run cancels connect().
+
+        gateway.run wraps every platform connect() in a 30s timeout. A longer
+        ladder is not "more patient" — it is silently cancelled mid-sleep, and
+        the adapter never reaches its own failure classification. That is
+        exactly what happened on 2026-07-29 14:52 with a 60s ladder:
+        "api_server connect timed out after 30s".
+        """
+        from gateway.run import _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT
+
+        budget = sum(api_server_module.BIND_RETRY_DELAYS)
+        assert budget < _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT * 0.75, (
+            f"bind backoff {budget}s leaves no room inside the "
+            f"{_PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT}s connect timeout"
+        )
+
+    @pytest.mark.asyncio
+    async def test_exhausted_debris_stays_retryable_so_the_watcher_heals_it(
+        self, monkeypatch
+    ):
+        """Debris that outlasts the ladder must NOT be marked non-retryable.
+
+        gateway.run's reconnect watcher drops non-retryable failures from its
+        queue immediately. Marking TIME_WAIT debris non-retryable therefore
+        converts a self-clearing ~60s condition into an API server that stays
+        dead until a human restarts the gateway — which is what happened twice
+        on 2026-07-29. The port conflict classification (#52132) must apply
+        only when something is actually listening.
+        """
+        monkeypatch.setattr(api_server_module, "BIND_RETRY_DELAYS", (0.01, 0.01))
+        port = self._free_port()
+        debris = socket.socket()
+        debris.bind(("127.0.0.1", port))  # bound, never listen(): nothing accepts
+
+        adapter = self._make_adapter(port)
+        try:
+            assert await adapter.connect() is False
+            assert adapter.has_fatal_error is False, (
+                "debris must stay retryable — a fatal error drops it from the "
+                "reconnect queue forever"
+            )
+        finally:
+            debris.close()
+            await adapter.disconnect()
+
     @pytest.mark.asyncio
     async def test_live_conflict_fails_fast_instead_of_waiting_out_the_backoff(self):
         """Retrying is for debris. A live listener is a real conflict.
