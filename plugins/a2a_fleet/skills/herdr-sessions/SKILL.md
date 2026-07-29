@@ -1,12 +1,15 @@
 ---
 name: herdr-sessions
-description: Discover and inspect running Herdr-managed agent sessions from Hermes — fleet.herdr host/allowlist config, the three read-only tools (herdr_status, herdr_list_sessions, herdr_inspect_session), the terminal_id vs agent-label identifier rule, the cwd vs foreground_cwd trap, and why no pane-mutation tool exists yet. Use when asked to look at, list, inspect, or connect to Herdr sessions / panes / terminals, or to configure fleet.herdr hosts.
+description: Invoke as `a2a_fleet:herdr-sessions` (the bare name does not resolve). Discover and inspect running Herdr-managed agent sessions from Hermes — fleet.herdr host/allowlist config, the three read-only tools (herdr_status, herdr_list_sessions, herdr_inspect_session), the terminal_id vs agent-label identifier rule, the cwd vs foreground_cwd trap, and why no pane-mutation tool exists yet. Use when asked to look at, list, inspect, or connect to Herdr sessions / panes / terminals, or to configure fleet.herdr hosts.
 metadata:
   hermes:
     tags: [a2a_fleet, herdr, sessions, read-only]
 ---
 
 # a2a_fleet: herdr-sessions
+
+Load this skill by its **qualified** name, `a2a_fleet:herdr-sessions`. The bare
+`herdr-sessions` does not resolve.
 
 Herdr is a terminal workspace manager for AI coding agents. It keeps live Claude
 Code / Codex / OpenCode / Antigravity panes running with their terminal context
@@ -105,9 +108,19 @@ herdr_inspect_session(host_alias="mac-mini", terminal_id="term_656fd55fd56381a")
   -> {"status":"ok","session":{...}}
 ```
 
-`agent_status` is `idle | working | blocked | unknown`. `revision` is a monotonic
-counter that advances as the session changes — Phase 2 will use it as an
-optimistic-concurrency guard, so preserve it when you pass records around.
+`agent_status` is `idle | working | blocked | done | unknown`.
+
+`revision` is a **pane-output counter, not a session version.** In the Herdr
+protocol (16) it appears on exactly one event, `pane_output_changed`, and the
+subscription filter that consumes it is `min_revision` on that same event.
+Status transitions ride a separate event, `pane_agent_status_changed`, which
+carries no revision — so an agent can go `done -> working` with `revision`
+unchanged. That is correct behavior, not a stale read.
+
+Read it as "has the visible output advanced since I last looked", which is what
+a Phase 2 send/wait cycle actually needs. Do not read it as "has anything about
+this session changed": as a general optimistic-concurrency guard it silently
+misses every status-only change.
 
 ## Reading the status field
 
@@ -120,6 +133,7 @@ optimistic-concurrency guard, so preserve it when you pass records around.
 | `herdr_protocol_mismatch` | Herdr upgraded past the pinned protocol | Re-pin after re-capturing `herdr api schema --json` |
 | `herdr_verbs_missing` | Required CLI verbs absent | Herdr version too old |
 | `workspace_denied` | Session outside `allowed_workspaces` | Widen the allowlist *deliberately*, or pick another session |
+| `invalid_terminal_id` | Padded with whitespace, or contains control characters | Pass the exact `term_...` handle; the `hint` field shows the trimmed form. Ids are never normalized for you |
 
 ## Why there is no send tool
 
@@ -127,7 +141,9 @@ Wrapping `herdr agent send` would let Hermes type into a pane a human may be
 using. Three things must exist first, and none do yet:
 
 - a confirmation token bound to a preview of the exact action;
-- a `revision` guard so a stale action cannot land on a changed pane;
+- a `revision` guard so a stale action cannot land on a pane whose output moved
+  (output only — pair it with `herdr agent wait --status` for state changes,
+  which `revision` does not track);
 - an audit record that survives a gateway restart.
 
 `herdr agent send` also has **no request ID**, so it can never be made idempotent

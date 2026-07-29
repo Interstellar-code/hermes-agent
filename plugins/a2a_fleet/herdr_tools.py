@@ -27,6 +27,29 @@ from .herdr_client import HerdrClient, HerdrError, HerdrNotFound, normalize_agen
 log = logging.getLogger("a2a_fleet.herdr_tools")
 
 
+def _terminal_id_problem(terminal_id: str) -> Optional[Dict[str, str]]:
+    """Return a structured complaint for a malformed ``terminal_id``, else None.
+
+    Malformed input must not reach the subprocess: a NUL byte made
+    ``create_subprocess_exec`` raise ``ValueError('embedded null byte')``, which
+    surfaced as an opaque ``unexpected error`` instead of a validation status.
+    Whitespace-padded ids are rejected rather than trimmed — silently
+    normalizing an identifier is exactly the loose matching these tools exist to
+    refuse — but the caller is told what to strip.
+    """
+    if terminal_id != terminal_id.strip():
+        return {
+            "reason": "terminal_id has leading or trailing whitespace",
+            "hint": f"pass {terminal_id.strip()!r} — identifiers are never trimmed for you",
+        }
+    if any(ch == "\x00" or (ord(ch) < 32) for ch in terminal_id):
+        return {
+            "reason": "terminal_id contains control characters",
+            "hint": "use the exact term_... handle from herdr_list_sessions",
+        }
+    return None
+
+
 def _herdr_cfg() -> Dict[str, Any]:
     """Return the ``fleet.herdr`` block, or an empty feature-off default.
 
@@ -211,6 +234,15 @@ async def herdr_inspect_session_handler(
 
     if not isinstance(terminal_id, str) or not terminal_id.strip():
         return {"error": "terminal_id is required (the stable term_... handle, not the agent label)"}
+
+    problem = _terminal_id_problem(terminal_id)
+    if problem is not None:
+        return {
+            "status": "invalid_terminal_id",
+            "host_alias": host_alias if isinstance(host_alias, str) else "",
+            "terminal_id": terminal_id,
+            **problem,
+        }
 
     try:
         resolved = await _resolve_host(host_alias)

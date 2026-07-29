@@ -159,6 +159,53 @@ def test_inspect_session_rejects_pane_id_as_identifier(
     assert result["status"] == "ambiguous_identifier"
 
 
+def test_inspect_session_rejects_malformed_terminal_id(
+    fleet_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed ids are a validation status, and never reach the subprocess.
+
+    A NUL byte used to travel all the way to create_subprocess_exec, which
+    raises ValueError("embedded null byte") — surfaced to the caller as an
+    opaque "unexpected error" that reads like an internal fault. Whitespace
+    padding must also be refused rather than trimmed, since silently
+    normalizing an identifier is the loose matching these tools exist to
+    prevent; the caller gets a hint instead.
+    """
+    _add_herdr_host(fleet_home, alias="mac-mini")
+    _patch_capability_ok(monkeypatch)
+
+    async def explode(self, target):  # pragma: no cover - must never run
+        raise AssertionError(f"malformed id reached Herdr: {target!r}")
+
+    monkeypatch.setattr(HerdrClient, "get_agent", explode)
+
+    nul = _run(
+        herdr_tools.herdr_inspect_session_handler(
+            host_alias="mac-mini", terminal_id="term_abc\x00def"
+        )
+    )
+    assert nul["status"] == "invalid_terminal_id"
+    assert "unexpected error" not in str(nul)
+
+    padded = _run(
+        herdr_tools.herdr_inspect_session_handler(
+            host_alias="mac-mini", terminal_id="  term_656fd55fd56381a  "
+        )
+    )
+    assert padded["status"] == "invalid_terminal_id"
+    assert padded["hint"].count("term_656fd55fd56381a") == 1
+    # Refused, not normalized: the padded form is echoed back untouched.
+    assert padded["terminal_id"] == "  term_656fd55fd56381a  "
+
+
+def test_build_argv_rejects_embedded_null() -> None:
+    """The trust boundary itself refuses NUL, for every verb Phase 2 adds."""
+    client = HerdrClient(binary="herdr")
+    with pytest.raises(HerdrError) as excinfo:
+        client._build_argv("agent", "get", "term_x\x00y")
+    assert excinfo.value.code == "invalid_argument"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch shape: dict-first-positional vs kwargs, task_id absorption
 # ---------------------------------------------------------------------------

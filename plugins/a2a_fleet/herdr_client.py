@@ -85,6 +85,17 @@ class HerdrClient:
         if self.ssh_target:
             argv += ["--remote", self.ssh_target]
         argv += list(args)
+        # execve() cannot carry a NUL inside an argument; create_subprocess_exec
+        # raises a bare ValueError("embedded null byte") that reads as an
+        # internal fault rather than bad input. Reject it as a Herdr error so
+        # every verb — including the mutating ones Phase 2 adds — reports it as
+        # what it is.
+        for arg in argv:
+            if "\x00" in arg:
+                raise HerdrError(
+                    "herdr argument contains an embedded null byte",
+                    code="invalid_argument",
+                )
         return argv
 
     async def _read_capped(self, stream: asyncio.StreamReader) -> bytes:
