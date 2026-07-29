@@ -145,10 +145,37 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
-# Backoff for EADDRINUSE on bind, covering the restart race where our own
-# predecessor still holds the port (~15s total). Module-level so tests can
-# shrink it; a genuine port conflict just costs this delay before failing.
-BIND_RETRY_DELAYS = (1, 2, 4, 8)
+# Backoff for EADDRINUSE on bind when no live listener owns the port — i.e.
+# lingering TIME_WAIT sockets from the previous gateway's clients. On macOS
+# reuse_address is deliberately off (see connect()), so those linger up to
+# ~60s after the old process is gone. Module-level so tests can shrink it.
+BIND_RETRY_DELAYS = (1, 2, 4, 8, 15, 15, 15)
+
+
+async def _has_live_listener(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if something is accepting connections on host:port right now.
+
+    Used only to classify an EADDRINUSE that already happened — never to
+    decide whether to bind. That ordering matters: the pre-probe removed in
+    #10297 raced the real bind because it gated it. Here bind stays
+    authoritative and this only answers "was that a live conflict, or debris?"
+    """
+    if host in ("", "0.0.0.0"):
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -6067,15 +6094,19 @@ class APIServerAdapter(BasePlatformAdapter):
             #     keep the default (enabled) for instant restart rebinds.
             #
             # EADDRINUSE also covers a restart race that is NOT a config
-            # error: on `launchctl kickstart -k` the predecessor gateway can
-            # still hold the port when the replacement binds. One-shot
-            # failure there leaves a gateway running with every other
-            # platform up and no API server at all (observed twice on
-            # 2026-07-29), which reads as a hang from the UI side. Retry a
-            # few times first; a real conflict still falls through to the
-            # non-retryable path below.
-            # ponytail: fixed backoff, not a config knob — the only race this
-            # covers is our own predecessor exiting, which takes seconds.
+            # error. With reuse_address off (above), the port stays unbindable
+            # while TIME_WAIT sockets from the *previous* instance's clients
+            # linger — outliving that process by up to ~60s on macOS. A
+            # one-shot failure there leaves the gateway running with every
+            # other platform up and no API server at all (observed twice on
+            # 2026-07-29): alive, but unreachable from the UI. Measured on
+            # 2026-07-29 12:21, the old listener closed 8s *before* the
+            # replacement started and the bind still failed for 15s more.
+            #
+            # So: wait out debris, but never wait on a live conflict. The
+            # probe below tells the two apart.
+            # ponytail: fixed backoff, not a config knob — this covers one
+            # specific OS behavior with a known duration.
             bind_error: Optional[OSError] = None
             for delay in (*BIND_RETRY_DELAYS, None):
                 self._site = web.TCPSite(
@@ -6093,9 +6124,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._site = None
                     if delay is None or getattr(exc, "errno", None) != errno.EADDRINUSE:
                         break
+                    # Another process actually serving this port is a real
+                    # conflict — waiting cannot help, so fail now and let the
+                    # non-retryable path below report it (#52132).
+                    if await _has_live_listener(self._host, self._port):
+                        break
                     logger.warning(
-                        "[%s] Could not bind %s:%d yet (%s); retrying in %ds "
-                        "— a previous gateway may still be shutting down",
+                        "[%s] %s:%d not bindable yet (%s) but nothing is "
+                        "listening — TIME_WAIT debris from the previous "
+                        "gateway; retrying in %ds",
                         self.name, self._host, self._port, exc, delay,
                     )
                     await asyncio.sleep(delay)

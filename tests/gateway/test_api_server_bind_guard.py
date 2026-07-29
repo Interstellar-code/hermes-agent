@@ -6,6 +6,7 @@ that connect() refuses to start without API_SERVER_KEY.
 
 import asyncio
 import socket
+import time
 from unittest.mock import patch
 
 import pytest
@@ -253,28 +254,55 @@ class TestBindMechanics:
             await second.disconnect()
 
     @pytest.mark.asyncio
-    async def test_bind_retries_while_predecessor_releases_port(self, monkeypatch):
+    async def test_bind_retries_while_port_debris_clears(self, monkeypatch):
         """A restart race must not leave the gateway without an API server.
 
-        On `launchctl kickstart -k` the outgoing gateway can still hold the
-        port when its replacement binds. One-shot failure there produced a
-        gateway with every other platform up and no API server (observed
-        twice on 2026-07-29) — alive, but unreachable from the UI.
+        With reuse_address off on macOS, TIME_WAIT sockets from the previous
+        instance's *clients* keep the port unbindable for up to ~60s — well
+        after that process is gone. Measured on 2026-07-29 12:21: the old
+        listener closed 8s before the replacement started and the bind still
+        failed for 15s more, leaving a gateway with every other platform up
+        and no API server at all.
+
+        A socket bound but never listen()ed reproduces that shape: the port
+        is occupied, yet nothing accepts connections.
         """
         monkeypatch.setattr(api_server_module, "BIND_RETRY_DELAYS", (0.05, 0.05, 0.05, 0.05))
         port = self._free_port()
+        debris = socket.socket()
+        debris.bind(("127.0.0.1", port))  # bound, never listen()
+
+        async def clear_debris():
+            await asyncio.sleep(0.12)
+            debris.close()
+
+        clearer = asyncio.create_task(clear_debris())
+        adapter = self._make_adapter(port)
+        try:
+            assert await adapter.connect() is True
+            assert adapter.has_fatal_error is False
+        finally:
+            await clearer
+            debris.close()
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_live_conflict_fails_fast_instead_of_waiting_out_the_backoff(self):
+        """Retrying is for debris. A live listener is a real conflict.
+
+        Without the listener probe, a genuinely occupied port would burn the
+        full backoff before reporting — turning a clear config error into a
+        minute of apparent hang at every startup.
+        """
+        port = self._free_port()
         first = self._make_adapter(port)
         assert await first.connect() is True
-
-        async def release_after_first_retry():
-            await asyncio.sleep(0.12)
-            await first.disconnect()
-
-        releaser = asyncio.create_task(release_after_first_retry())
         second = self._make_adapter(port)
         try:
-            assert await second.connect() is True
-            assert second.has_fatal_error is False
+            started = time.monotonic()
+            assert await second.connect() is False
+            assert time.monotonic() - started < 2.0
+            assert second.fatal_error_code == "api_server_port_in_use"
         finally:
-            await releaser
+            await first.disconnect()
             await second.disconnect()
