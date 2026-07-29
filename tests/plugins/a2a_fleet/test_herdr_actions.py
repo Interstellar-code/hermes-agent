@@ -181,6 +181,56 @@ def test_token_is_single_use(herdr_env, monkeypatch) -> None:
     assert len(calls) == 1, "a replayed token must not produce a second send"
 
 
+def test_takeover_is_checked_before_the_token_is_spent(
+    herdr_env, tmp_path, monkeypatch
+) -> None:
+    """Order matters: the takeover gate runs BEFORE token consumption.
+
+    A request made while a human holds the session must report human_takeover
+    and leave the token unspent — not burn it and report token_already_used on
+    the retry. Consuming a token behind a gate that refused the work would
+    destroy a confirmation the operator still needs once the human is done.
+
+    (Independent verification flagged this ordering as a mismatch against a
+    test script that expected token_already_used under takeover. The ordering
+    is deliberate and the safer one; this test pins it so it stays that way.)
+    """
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "send_agent_text", fake_send)
+
+    preview = _preview()
+    _run(
+        herdr_tools.herdr_claim_human_takeover_handler(
+            host_alias="mac-mini", terminal_id="term_abc123"
+        )
+    )
+    assert _request(preview["confirmation_token"])["status"] == "human_takeover"
+    assert _request(preview["confirmation_token"])["status"] == "human_takeover"
+
+    conn = herdr_binding.connect(tmp_path / "state.db")
+    try:
+        row = conn.execute(
+            "SELECT consumed_at FROM herdr_tokens WHERE token = ?",
+            (preview["confirmation_token"],),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["consumed_at"] is None, "a refused request must not spend the token"
+
+    # And once released, that same confirmation is still good.
+    _run(
+        herdr_tools.herdr_release_human_takeover_handler(
+            host_alias="mac-mini", terminal_id="term_abc123"
+        )
+    )
+    assert _request(preview["confirmation_token"])["status"] == "sent"
+
+
 def test_unknown_token_rejected(herdr_env) -> None:
     assert _request("not-a-real-token")["status"] == "unknown_token"
 
