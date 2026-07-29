@@ -102,6 +102,13 @@ def _expected_registered_tool_names() -> set[str]:
         "herdr_status",
         "herdr_list_sessions",
         "herdr_inspect_session",
+        # Phase 2 action tools register unconditionally and refuse at call time
+        # unless a host sets allow_actions: true. Registration is not the gate —
+        # a tool that explains why it refused is more useful than an absent one.
+        "herdr_preview_action",
+        "herdr_request_action",
+        "herdr_claim_human_takeover",
+        "herdr_release_human_takeover",
     })
     return names
 
