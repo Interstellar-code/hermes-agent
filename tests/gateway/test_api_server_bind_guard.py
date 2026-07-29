@@ -4,14 +4,22 @@ Validates that is_network_accessible() correctly classifies addresses and
 that connect() refuses to start without API_SERVER_KEY.
 """
 
+import asyncio
 import socket
 from unittest.mock import patch
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.base import is_network_accessible
+
+
+@pytest.fixture
+def no_bind_backoff(monkeypatch):
+    """Skip the EADDRINUSE retry backoff so conflict tests stay fast."""
+    monkeypatch.setattr(api_server_module, "BIND_RETRY_DELAYS", ())
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +206,7 @@ class TestBindMechanics:
             await second.disconnect()
 
     @pytest.mark.asyncio
-    async def test_live_listener_conflict_returns_false_and_cleans_up(self):
+    async def test_live_listener_conflict_returns_false_and_cleans_up(self, no_bind_backoff):
         """A second adapter on an occupied port fails cleanly, not with a raise."""
         port = self._free_port()
         first = self._make_adapter(port)
@@ -219,7 +227,7 @@ class TestBindMechanics:
         assert not hasattr(APIServerAdapter, "_port_is_available")
 
     @pytest.mark.asyncio
-    async def test_port_conflict_sets_non_retryable_fatal_error(self):
+    async def test_port_conflict_sets_non_retryable_fatal_error(self, no_bind_backoff):
         """A real port conflict (EADDRINUSE) must set a non-retryable fatal
         error so the reconnect watcher drops the platform from the retry
         queue instead of looping indefinitely.
@@ -242,4 +250,31 @@ class TestBindMechanics:
             assert str(port) in (second.fatal_error_message or "")
         finally:
             await first.disconnect()
+            await second.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_bind_retries_while_predecessor_releases_port(self, monkeypatch):
+        """A restart race must not leave the gateway without an API server.
+
+        On `launchctl kickstart -k` the outgoing gateway can still hold the
+        port when its replacement binds. One-shot failure there produced a
+        gateway with every other platform up and no API server (observed
+        twice on 2026-07-29) — alive, but unreachable from the UI.
+        """
+        monkeypatch.setattr(api_server_module, "BIND_RETRY_DELAYS", (0.05, 0.05, 0.05, 0.05))
+        port = self._free_port()
+        first = self._make_adapter(port)
+        assert await first.connect() is True
+
+        async def release_after_first_retry():
+            await asyncio.sleep(0.12)
+            await first.disconnect()
+
+        releaser = asyncio.create_task(release_after_first_retry())
+        second = self._make_adapter(port)
+        try:
+            assert await second.connect() is True
+            assert second.has_fatal_error is False
+        finally:
+            await releaser
             await second.disconnect()

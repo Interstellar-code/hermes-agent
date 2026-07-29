@@ -145,6 +145,10 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+# Backoff for EADDRINUSE on bind, covering the restart race where our own
+# predecessor still holds the port (~15s total). Module-level so tests can
+# shrink it; a genuine port conflict just costs this delay before failing.
+BIND_RETRY_DELAYS = (1, 2, 4, 8)
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -6061,15 +6065,43 @@ class APIServerAdapter(BasePlatformAdapter):
             #   - Linux: SO_REUSEADDR only permits rebinding past TIME_WAIT
             #     (a second live listener needs SO_REUSEPORT, never set), so
             #     keep the default (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner,
-                self._host,
-                self._port,
-                reuse_address=False if sys.platform == "darwin" else None,
-            )
-            try:
-                await self._site.start()
-            except OSError as exc:
+            #
+            # EADDRINUSE also covers a restart race that is NOT a config
+            # error: on `launchctl kickstart -k` the predecessor gateway can
+            # still hold the port when the replacement binds. One-shot
+            # failure there leaves a gateway running with every other
+            # platform up and no API server at all (observed twice on
+            # 2026-07-29), which reads as a hang from the UI side. Retry a
+            # few times first; a real conflict still falls through to the
+            # non-retryable path below.
+            # ponytail: fixed backoff, not a config knob — the only race this
+            # covers is our own predecessor exiting, which takes seconds.
+            bind_error: Optional[OSError] = None
+            for delay in (*BIND_RETRY_DELAYS, None):
+                self._site = web.TCPSite(
+                    self._runner,
+                    self._host,
+                    self._port,
+                    reuse_address=False if sys.platform == "darwin" else None,
+                )
+                try:
+                    await self._site.start()
+                    bind_error = None
+                    break
+                except OSError as exc:
+                    bind_error = exc
+                    self._site = None
+                    if delay is None or getattr(exc, "errno", None) != errno.EADDRINUSE:
+                        break
+                    logger.warning(
+                        "[%s] Could not bind %s:%d yet (%s); retrying in %ds "
+                        "— a previous gateway may still be shutting down",
+                        self.name, self._host, self._port, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+
+            if bind_error is not None:
+                exc = bind_error
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
