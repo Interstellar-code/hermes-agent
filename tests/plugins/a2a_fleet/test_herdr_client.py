@@ -258,6 +258,12 @@ def test_herdr_client_does_not_import_pane_parsing() -> None:
     import a2a_fleet.herdr_client as herdr_client
 
     source = Path(inspect.getfile(herdr_client)).read_text()
-    banned = ["pane read", "send-keys", "send-text", "screen_state", "pane run"]
+    # "pane send-keys"/"send-text" stay banned: pane-level keystrokes bypass
+    # the agent-session identity boundary. The agent-scoped
+    # `agent send-keys <target> ENTER` IS allowed and deliberately narrow —
+    # the key is hardcoded, there is no parameter, and it only commits text
+    # Herdr has already confirmed is in the composer. Added 2026-07-30 after
+    # Herdr's own scheduled Enter was shown to drop on busy panes.
+    banned = ["pane read", "pane send-keys", "send-text", "screen_state", "pane run"]
     for phrase in banned:
         assert phrase not in source, f"herdr_client.py must not reference {phrase!r}"

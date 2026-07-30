@@ -309,6 +309,29 @@ class HerdrClient:
             argv += ["--timeout", str(int(verify_ms))]
         return await self._call(*argv)
 
+    async def submit_enter(self, target: str) -> Dict[str, Any]:
+        """Press Enter on one agent session. The key is fixed; nothing is passed in.
+
+        This exists because Herdr's own Enter, scheduled by ``agent prompt``
+        after AGENT_PROMPT_SUBMIT_DELAY, does not always land: on a busy pane it
+        can fire before the TUI has taken the pasted text, leaving the prompt in
+        the composer while the agent stays idle. Reproduced live 2026-07-30 —
+        the identical call succeeded on a quiet scratch pane and stalled on
+        busier ones, so it is a race in Herdr's delay, not in this wrapper.
+
+        Verified recovery: a draft sitting in a Claude composer submits on
+        ``agent send-keys <pane> ENTER`` (planted draft -> ENTER -> agent
+        replied, state_change_seq advanced).
+
+        This is NOT a retry of the action. The text is never re-sent — only the
+        keystroke that commits text Herdr has already confirmed is in the
+        composer — so it cannot duplicate a prompt.
+
+        The key is hardcoded. There is no parameter, so no arbitrary-key route
+        exists; pane-level keystroke verbs remain unwrapped.
+        """
+        return await self._call("agent", "send-keys", target, "ENTER")
+
     async def wait_agent_status(
         self, target: str, status: str, timeout_ms: int
     ) -> Dict[str, Any]:
@@ -377,6 +400,10 @@ def normalize_agent_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         "cwd": raw.get("cwd"),
         "workspace_id": raw.get("workspace_id"),
         "revision": raw.get("revision"),
+        # herdr 0.7.5: increments on real agent state changes, unlike
+        # `revision` (title/metadata only). This is the field that can
+        # actually prove a prompt was submitted.
+        "state_change_seq": raw.get("state_change_seq"),
         "terminal_title_stripped": raw.get("terminal_title_stripped"),
         "focused": raw.get("focused"),
     }

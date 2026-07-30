@@ -216,6 +216,65 @@ def test_refuses_before_touching_a_session_when_herdr_cannot_submit(
     assert calls == [], "nothing may reach Herdr once the capability check fails"
 
 
+def test_stalled_submission_is_rescued_by_a_fixed_enter(
+    herdr_env, tmp_path, monkeypatch
+) -> None:
+    """A stalled draft is completed with Enter, and the text is never re-sent.
+
+    Herdr's own Enter (scheduled after AGENT_PROMPT_SUBMIT_DELAY) does not
+    always land on a busy pane. Reproduced live 2026-07-30: identical calls
+    succeeded on a quiet scratch pane and stalled elsewhere. Recovery was
+    verified against a real Claude session — a planted draft submitted on
+    `agent send-keys <pane> ENTER`.
+    """
+    sent, keys = [], []
+    herdr_env["session"]["state_change_seq"] = 10
+
+    async def stalls(self, target, text, **kw):
+        sent.append(text)
+        raise HerdrError("no observed state change within 5000 ms",
+                         code="agent_prompt_stalled")
+
+    async def press_enter(self, target):
+        keys.append(target)
+        herdr_env["session"]["state_change_seq"] = 11  # the agent moved
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", stalls)
+    monkeypatch.setattr(HerdrClient, "submit_enter", press_enter)
+
+    preview = _preview("do the thing")
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submitted"
+    assert keys == ["w1:pH"], "Enter is pressed on the pane, once"
+    assert sent == ["do the thing"], "the prompt text is never re-sent"
+    assert "submitted_after_enter" in [r["event"] for r in _audit(tmp_path)]
+
+
+def test_stall_without_state_change_stays_unsubmitted(
+    herdr_env, tmp_path, monkeypatch
+) -> None:
+    """No evidence, no success. Enter that changes nothing is not a submission."""
+    herdr_env["session"]["state_change_seq"] = 10
+
+    async def stalls(self, target, text, **kw):
+        raise HerdrError("no observed state change within 5000 ms",
+                         code="agent_prompt_stalled")
+
+    async def press_enter(self, target):
+        return {}  # seq deliberately unchanged
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", stalls)
+    monkeypatch.setattr(HerdrClient, "submit_enter", press_enter)
+    real_sleep = asyncio.sleep  # capture before patching, or the lambda recurses
+    monkeypatch.setattr(herdr_tools.asyncio, "sleep", lambda *_a, **_k: real_sleep(0))
+
+    result = _request(_preview()["confirmation_token"])
+    assert result["status"] == "draft_inserted_not_submitted"
+    assert "never" in result["retry"]
+
+
 def test_cli_rejection_is_not_reported_as_a_possible_draft(
     herdr_env, tmp_path, monkeypatch
 ) -> None:

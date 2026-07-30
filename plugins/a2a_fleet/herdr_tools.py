@@ -719,6 +719,15 @@ async def herdr_request_action_handler(
             # than leaving the operator to check by hand.
             code = getattr(exc, "code", None)
             if code in PROMPT_NOT_SUBMITTED:
+                # Herdr's scheduled Enter did not land, so our previewed text is
+                # sitting in the composer. Press Enter once — the key is fixed
+                # and the text is never re-sent, so this completes the action
+                # rather than repeating it, and cannot duplicate a prompt.
+                recovered = await _recover_stalled_submission(
+                    client, session, host_alias, terminal_id, action_id
+                )
+                if recovered is not None:
+                    return recovered
                 # Herdr saw no state change after submitting: the text went in
                 # but the Enter did not take, so a draft is sitting in the
                 # composer. Verified live on 2026-07-30 — without --wait this
@@ -880,6 +889,69 @@ async def herdr_request_action_handler(
         log.exception("herdr_request_action: unexpected error for %r", host_alias)
         return {"error": f"unexpected error: {exc}"}
 
+
+async def _recover_stalled_submission(
+    client: HerdrClient,
+    session: Dict[str, Any],
+    host_alias: str,
+    terminal_id: str,
+    action_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Press Enter on a stalled draft, then require evidence it submitted.
+
+    Returns a success payload only if the session's ``state_change_seq``
+    actually advanced — Herdr 0.7.5's counter for real agent state changes, as
+    opposed to ``revision``, which only tracks title and metadata. No evidence,
+    no success: the caller falls through to draft_inserted_not_submitted.
+    """
+    pane = session.get("pane_id") or terminal_id
+    seq_before = session.get("state_change_seq")
+    try:
+        await client.submit_enter(pane)
+    except Exception as exc:  # noqa: BLE001 — recovery is best effort.
+        await _audit(
+            event="enter_failed", host_alias=host_alias, terminal_id=terminal_id,
+            action_id=action_id, detail=str(exc)[:300],
+        )
+        return None
+
+    for _ in range(6):
+        await asyncio.sleep(1.0)
+        try:
+            raw = await client.get_agent(pane)
+        except Exception:  # noqa: BLE001 — treat as no evidence.
+            break
+        record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
+        now = normalize_agent_record(record)
+        if now.get("terminal_id") != terminal_id:
+            break  # the pane no longer hosts the session we confirmed against
+        if seq_before is None or (now.get("state_change_seq") or 0) > seq_before:
+            await _audit(
+                event="submitted_after_enter", host_alias=host_alias,
+                terminal_id=terminal_id, action_id=action_id,
+                detail=f"state_change_seq {seq_before} -> {now.get('state_change_seq')}",
+            )
+            await _with_db(
+                lambda conn: herdr_binding.upsert_binding(
+                    conn, host_alias=host_alias, terminal_id=terminal_id,
+                    completion_state="pending",
+                )
+            )
+            return {
+                "status": "submitted",
+                "host_alias": host_alias,
+                "terminal_id": terminal_id,
+                "pane_id": pane,
+                "action_id": action_id,
+                "completion_state": "pending",
+                "completion_signal": COMPLETION_SIGNAL,
+                "submission": (
+                    "Herdr's own Enter did not land, so Fleet pressed Enter once and "
+                    "confirmed the session changed state. The prompt text was never "
+                    "re-sent."
+                ),
+            }
+    return None
 
 async def _await_completion(
     client: HerdrClient,

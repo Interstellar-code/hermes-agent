@@ -338,6 +338,9 @@ def test_list_sessions_happy_path_normalizes_and_counts(
             "revision": 1,
             "terminal_title_stripped": "claude",
             "focused": False,
+            # herdr 0.7.5: the counter that actually proves a state change,
+            # unlike `revision` (title/metadata only).
+            "state_change_seq": None,
         }
     ]
 
