@@ -95,7 +95,7 @@ def route_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _configure(fleet_home)
 
     async def _capability_ok(host_alias, herdr_cfg=None, **_kw):
-        return {"status": "ok", "host_alias": host_alias, "protocol": 16}
+        return {"status": "ok", "host_alias": host_alias, "protocol": 17}
 
     monkeypatch.setattr(herdr_tools, "check_herdr_capability", _capability_ok)
     monkeypatch.setattr(herdr_binding, "db_path", lambda: tmp_path / "state.db")
@@ -154,7 +154,7 @@ def test_dispatch_sends_when_confirmation_is_disabled(
 ) -> None:
     _configure(fleet_home, require_confirmation=False)
     result = _send("run the tests")
-    assert route_env["sent"] == [("term_aaa", "run the tests")]
+    assert route_env["sent"] == [("w1:pA", "run the tests")]
     assert "dispatched to term_aaa" in result["reply"]
     # The receipt must not masquerade as the session's answer.
     assert "not the session's answer" in result["reply"]
@@ -189,7 +189,7 @@ def test_context_id_sticks_to_its_session(fleet_home, route_env, tmp_path) -> No
     route_env["agents"].append(dict(SESSION_B))
     second = _send("step two", context_id=context_id)
 
-    assert route_env["sent"] == [("term_aaa", "step one"), ("term_aaa", "step two")]
+    assert route_env["sent"] == [("w1:pA", "step one"), ("w1:pA", "step two")]
     assert second["context_id"] == context_id
 
     conn = herdr_binding.connect(tmp_path / "state.db")
@@ -209,7 +209,7 @@ def test_vanished_bound_session_refuses_to_re_home(fleet_home, route_env) -> Non
     result = _send("step two", context_id=context_id)
 
     assert "no longer available" in result["reply"]
-    assert route_env["sent"] == [("term_aaa", "step one")], "no send to the new pane"
+    assert route_env["sent"] == [("w1:pA", "step one")], "no send to the new pane"
 
 
 def test_takeover_blocks_routed_dispatch(fleet_home, route_env) -> None:

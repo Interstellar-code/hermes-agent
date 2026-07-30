@@ -18,11 +18,22 @@ from .herdr_client import HerdrClient, HerdrError
 # (label, help subcommand args, substring expected in that --help text)
 # Herdr exposes no capability-enumeration endpoint, so verb presence is
 # probed against --help output rather than name-matched against a list.
+# Probed against the BARE subcommand (``herdr agent``), which prints the verb
+# list and exits non-zero without touching a session.
+#
+# Not ``agent --help``: in herdr 0.7.5 that prints the top-level banner
+# instead of the agent verb list, so every verb here read as missing and the
+# whole feature reported herdr_verbs_missing after the upgrade. The bare form
+# has printed the verb list on both 0.7.4 and 0.7.5.
+#
+# ``wait agent-status`` is deliberately absent — 0.7.5 removed the top-level
+# ``wait`` command entirely ("unknown command: wait") in favour of the
+# agent-scoped ``agent wait``, which is what this client now calls.
 _REQUIRED_VERBS = (
-    ("agent list", ("agent", "--help"), "agent list"),
-    ("agent get", ("agent", "--help"), "agent get"),
-    ("agent read", ("agent", "--help"), "agent read"),
-    ("wait agent-status", ("wait", "--help"), "wait agent-status"),
+    ("agent list", ("agent",), "agent list"),
+    ("agent get", ("agent",), "agent get"),
+    ("agent read", ("agent",), "agent read"),
+    ("agent wait", ("agent",), "agent wait"),
 )
 
 

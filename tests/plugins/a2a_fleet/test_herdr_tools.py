@@ -125,11 +125,10 @@ def test_inspect_session_rejects_non_unique_agent_label(
     _add_herdr_host(fleet_home, alias="mac-mini")
     _patch_capability_ok(monkeypatch)
 
-    async def fake_get_agent(self, target):
-        # Herdr happily resolves the label to a real, differently-identified pane.
-        return {"agent": _agent_record(terminal_id="term_realpane")}
+    async def fake_list_agents(self):
+        return {"agents": [_agent_record(terminal_id="term_realpane")]}
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="claude")
@@ -137,7 +136,7 @@ def test_inspect_session_rejects_non_unique_agent_label(
 
     assert result["status"] == "ambiguous_identifier"
     assert result["requested"] == "claude"
-    assert result["resolved_terminal_id"] == "term_realpane"
+    assert result["candidate_terminal_ids"] == ["term_realpane"]
 
 
 def test_inspect_session_rejects_pane_id_as_identifier(
@@ -147,10 +146,10 @@ def test_inspect_session_rejects_pane_id_as_identifier(
     _add_herdr_host(fleet_home, alias="mac-mini")
     _patch_capability_ok(monkeypatch)
 
-    async def fake_get_agent(self, target):
-        return {"agent": _agent_record(terminal_id="term_realpane", pane_id="w1:pH")}
+    async def fake_list_agents(self):
+        return {"agents": [_agent_record(terminal_id="term_realpane", pane_id="w1:pH")]}
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="w1:pH")
@@ -509,10 +508,10 @@ def test_inspect_session_outside_allowlist_returns_workspace_denied(
 
     record = _agent_record(cwd="/srv/workspaces/other-project")
 
-    async def fake_get_agent(self, target):
-        return {"agent": record}
+    async def fake_list_agents(self):
+        return {"agents": [record]}
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="term_1")
@@ -529,11 +528,10 @@ def test_inspect_session_happy_path_returns_normalized_session(
 
     record = _agent_record(cwd="/srv/workspaces/project-a/repo1")
 
-    async def fake_get_agent(self, target):
-        assert target == "term_1"
-        return {"agent": record}
+    async def fake_list_agents(self):
+        return {"agents": [record]}
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="term_1")
@@ -586,10 +584,10 @@ def test_inspect_session_unexpected_exception_returns_error_dict(
     _add_herdr_host(fleet_home, alias="mac-mini")
     _patch_capability_ok(monkeypatch)
 
-    async def fake_get_agent(self, target):
+    async def fake_list_agents(self):
         raise RuntimeError("totally unrelated crash")
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="term_1")

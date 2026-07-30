@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional
 from . import herdr_binding
 from .herdr_capability import check_herdr_capability
 from .herdr_client import (
+    PROMPT_NOT_SUBMITTED,
     PROMPT_REJECTED_BEFORE_SUBMISSION,
     HerdrClient,
     HerdrError,
@@ -47,7 +48,7 @@ log = logging.getLogger("a2a_fleet.herdr_tools")
 # The completion signal Fleet accepts. Named here so the preview payload can
 # state it up front: the operator confirming an action is told exactly what
 # will be treated as "done", and it is never silence or an idle prompt.
-COMPLETION_SIGNAL = "herdr wait agent-status --status done"
+COMPLETION_SIGNAL = "herdr agent wait <terminal_id> --until done"
 
 
 def _revision_guard_state(revision: Any) -> str:
@@ -309,9 +310,48 @@ async def herdr_inspect_session_handler(
         allowed = list(host_cfg.get("allowed_workspaces") or [])
         client = _client_for(host_cfg)
 
+        # EXACT IDENTIFIER ENFORCEMENT, done on OUR side of the boundary.
+        #
+        # Herdr 0.7.5 stopped accepting terminal ids as `agent` targets ("targets
+        # accept unique agent names and pane ids that currently host agents") —
+        # `agent get <terminal_id>` now returns agent_not_found. terminal_id is
+        # still carried in every record; it is simply no longer addressable.
+        #
+        # So resolution happens here: list the sessions and match terminal_id
+        # exactly. That keeps terminal_id as the identity key callers must use —
+        # agent kind labels stay rejected because they are not unique across
+        # panes — while addressing Herdr by the pane_id it now requires. It also
+        # removes the dependency on Herdr's own loose target resolution, which
+        # used to accept labels and pick whichever pane matched.
         try:
-            raw = await client.get_agent(terminal_id)
+            listing = await client.list_agents()
         except HerdrNotFound:
+            listing = {"agents": []}
+
+        records = [normalize_agent_record(r) for r in (listing.get("agents") or [])]
+        matches = [r for r in records if r.get("terminal_id") == terminal_id]
+
+        if not matches:
+            # Distinguish "no such session" from "you passed a label or pane id".
+            # The second is the ambiguous selection this tool exists to prevent,
+            # and the caller needs to be told which mistake they made.
+            by_other_handle = [
+                r for r in records
+                if terminal_id in (r.get("agent_kind"), r.get("pane_id"))
+            ]
+            if by_other_handle:
+                return {
+                    "status": "ambiguous_identifier",
+                    "host_alias": host_alias,
+                    "requested": terminal_id,
+                    "candidate_terminal_ids": [r.get("terminal_id") for r in by_other_handle],
+                    "reason": (
+                        f"{terminal_id!r} is an agent kind label or pane id, not a "
+                        f"terminal_id. Those are not unique across panes and are rejected "
+                        f"as identifiers. Use herdr_list_sessions to get the exact "
+                        f"terminal_id."
+                    ),
+                }
             return {
                 "status": "not_found",
                 "host_alias": host_alias,
@@ -319,30 +359,7 @@ async def herdr_inspect_session_handler(
                 "reason": f"no Herdr session with terminal_id {terminal_id!r}",
             }
 
-        record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
-        normalized = normalize_agent_record(record)
-
-        # EXACT IDENTIFIER ENFORCEMENT. Herdr's `agent get` accepts terminal ids,
-        # unique agent names, AND non-unique kind labels ("claude", "opencode"),
-        # resolving a label to whichever pane happens to match. Verified live:
-        # passing "claude" returned a session successfully. That is the ambiguous
-        # selection this tool exists to prevent, so require the resolved record
-        # to be the exact session asked for and reject anything else — a caller
-        # that wants to search should use herdr_list_sessions.
-        resolved_id = normalized.get("terminal_id")
-        if resolved_id != terminal_id:
-            return {
-                "status": "ambiguous_identifier",
-                "host_alias": host_alias,
-                "requested": terminal_id,
-                "resolved_terminal_id": resolved_id,
-                "reason": (
-                    f"{terminal_id!r} is not a terminal_id — Herdr resolved it to session "
-                    f"{resolved_id!r}. Agent kind labels are not unique across panes and are "
-                    f"rejected as identifiers. Use herdr_list_sessions to get the exact "
-                    f"terminal_id."
-                ),
-            }
+        normalized = matches[0]
 
         if not _workspace_allowed(normalized.get("cwd"), allowed):
             return {
@@ -690,13 +707,43 @@ async def herdr_request_action_handler(
 
         client = _client_for(host_cfg)
         try:
-            await client.submit_prompt(terminal_id, token_row["action"])
+            # Addressed by pane_id: Herdr 0.7.5 no longer accepts terminal ids
+            # as agent targets. The resolver above already proved this pane_id
+            # belongs to the exact terminal_id that was previewed and confirmed.
+            herdr_target = session.get("pane_id") or terminal_id
+            await client.submit_prompt(herdr_target, token_row["action"])
         except HerdrError as exc:
             # Herdr names the failures that happened before it wrote anything
             # (see PROMPT_REJECTED_BEFORE_SUBMISSION). Those are clean
             # rejections: nothing is sitting in the composer, so say so rather
             # than leaving the operator to check by hand.
-            rejected_cleanly = getattr(exc, "code", None) in PROMPT_REJECTED_BEFORE_SUBMISSION
+            code = getattr(exc, "code", None)
+            if code in PROMPT_NOT_SUBMITTED:
+                # Herdr saw no state change after submitting: the text went in
+                # but the Enter did not take, so a draft is sitting in the
+                # composer. Verified live on 2026-07-30 — without --wait this
+                # exact case returned "submitted".
+                await _audit(
+                    event="draft_not_submitted", host_alias=host_alias,
+                    terminal_id=terminal_id, action_id=action_id,
+                    detail=str(exc)[:300],
+                )
+                await _with_db(
+                    lambda conn: herdr_binding.upsert_binding(
+                        conn, host_alias=host_alias, terminal_id=terminal_id,
+                        completion_state="failed",
+                    )
+                )
+                return {
+                    "status": "draft_inserted_not_submitted",
+                    "host_alias": host_alias,
+                    "terminal_id": terminal_id,
+                    "action_id": action_id,
+                    "mutation": "text inserted, NOT submitted — it is in the composer",
+                    "reason": str(exc),
+                    "retry": "never — resubmitting would duplicate the draft",
+                }
+            rejected_cleanly = code in PROMPT_REJECTED_BEFORE_SUBMISSION
             await _audit(
                 event="submission_rejected" if rejected_cleanly else "submission_unknown",
                 host_alias=host_alias,

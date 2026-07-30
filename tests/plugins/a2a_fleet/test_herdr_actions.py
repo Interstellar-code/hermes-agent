@@ -58,7 +58,7 @@ def herdr_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _add_host(fleet_home)
 
     async def _capability_ok(host_alias, herdr_cfg=None, **_kw):
-        return {"status": "ok", "host_alias": host_alias, "protocol": 16}
+        return {"status": "ok", "host_alias": host_alias, "protocol": 17}
 
     monkeypatch.setattr(herdr_tools, "check_herdr_capability", _capability_ok)
     monkeypatch.setattr(herdr_binding, "db_path", lambda: tmp_path / "state.db")
@@ -68,6 +68,11 @@ def herdr_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     async def fake_get_agent(self, target):
         return {"agent": dict(live["session"])}
 
+    async def fake_list_agents(self):
+        # Resolution goes through `agent list` since herdr 0.7.5 stopped
+        # accepting terminal ids as agent targets.
+        return {"agents": [dict(live["session"])]}
+
     async def _supports_submit(self):
         return True
 
@@ -75,6 +80,7 @@ def herdr_env(fleet_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     # this. Without it every test would shell out to the real binary.
     monkeypatch.setattr(HerdrClient, "supports_submit", _supports_submit)
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
     return live
 
 
@@ -122,7 +128,7 @@ def test_actions_refused_until_host_opts_in(fleet_home, tmp_path, monkeypatch) -
     _add_host(fleet_home, allow_actions=False)
 
     async def _capability_ok(host_alias, herdr_cfg=None, **_kw):
-        return {"status": "ok", "host_alias": host_alias, "protocol": 16}
+        return {"status": "ok", "host_alias": host_alias, "protocol": 17}
 
     monkeypatch.setattr(herdr_tools, "check_herdr_capability", _capability_ok)
     monkeypatch.setattr(herdr_binding, "db_path", lambda: tmp_path / "state.db")
@@ -130,7 +136,11 @@ def test_actions_refused_until_host_opts_in(fleet_home, tmp_path, monkeypatch) -
     async def fake_get_agent(self, target):
         return {"agent": dict(SESSION)}
 
+    async def fake_list_agents(self):
+        return {"agents": [dict(SESSION)]}
+
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _preview()
     assert result["status"] == "actions_disabled"
@@ -164,7 +174,9 @@ def test_confirmed_action_sends_once_and_records_it(herdr_env, tmp_path, monkeyp
     result = _request(preview["confirmation_token"])
 
     assert result["status"] == "submitted"
-    assert sent == [("term_abc123", "run the tests")]
+    # Addressed by pane_id: herdr 0.7.5 dropped terminal ids as agent
+    # targets. terminal_id remains the identity key we resolve from.
+    assert sent == [("w1:pH", "run the tests")]
     # Not complete: nothing waited for a done signal.
     assert result["completion_state"] == "pending"
     events = [row["event"] for row in _audit(tmp_path)]
@@ -249,7 +261,11 @@ def test_submission_uses_herdrs_atomic_prompt_verb(herdr_env, monkeypatch) -> No
     preview = _preview("continue the refactor")
     assert _request(preview["confirmation_token"])["status"] == "submitted"
 
-    assert argv == [("agent", "prompt", "term_abc123", "continue the refactor")]
+    # --wait is mandatory, not optional: without it Herdr acks before the
+    # Enter fires and "submitted" means nothing.
+    assert argv == [(
+        "agent", "prompt", "w1:pH", "continue the refactor", "--wait", "--timeout", "15000",
+    )]
 
 
 def test_no_arbitrary_key_injection_route_exists(herdr_env, monkeypatch) -> None:
@@ -273,6 +289,7 @@ def test_no_arbitrary_key_injection_route_exists(herdr_env, monkeypatch) -> None
 
     (call,) = argv
     assert call[:2] == ("agent", "prompt")
+    assert call[2] == "w1:pH", "addressed by pane_id"
     assert call[3] == "ENTER C-c ESC", "key names travel as literal text"
     assert "send-keys" not in call and "pane" not in call
 
@@ -520,11 +537,15 @@ def test_token_bound_to_its_own_session(herdr_env, monkeypatch) -> None:
             return {"agent": second}
         return {"agent": dict(herdr_env["session"])}
 
+    async def fake_list_agents(self):
+        return {"agents": [dict(herdr_env["session"]), dict(second)]}
+
     async def fake_send(self, target, text, **kw):
         sent.append(target)
         return {}
 
     monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
     monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
 
     preview = _preview()  # token is for term_abc123

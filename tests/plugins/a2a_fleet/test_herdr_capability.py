@@ -32,11 +32,11 @@ def _ok_status(self):
 
 
 def _ok_schema(self):
-    return {"protocol": 16, "schema_version": 1}
+    return {"protocol": 17, "schema_version": 1}
 
 
 def _ok_help(self, *_args):
-    return "herdr agent list\nherdr agent get <target>\nherdr agent read <target>\nherdr wait agent-status <pane_id>"
+    return "herdr agent list\nherdr agent get <target>\nherdr agent read <target>\nherdr agent wait <target>"
 
 
 async def _async(fn, *args):
@@ -88,6 +88,7 @@ def test_unreachable_when_server_not_running(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_protocol_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
     from a2a_fleet.herdr_capability import check_herdr_capability
+    from a2a_fleet.herdr_client import HerdrClient
 
     _patch_which(monkeypatch, found=True)
 
@@ -101,7 +102,7 @@ def test_protocol_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = asyncio.run(check_herdr_capability("mac-mini", {}))
     assert result["status"] == "herdr_protocol_mismatch"
-    assert result["expected"] == 16
+    assert result["expected"] == HerdrClient.PROTOCOL_VERSION
     assert result["actual"] == 15
 
 
@@ -117,14 +118,14 @@ def test_verbs_missing(monkeypatch: pytest.MonkeyPatch) -> None:
         return _ok_schema(self)
 
     async def sparse_help(self, *_args):
-        return "herdr agent list\n"  # missing get/read/wait agent-status
+        return "herdr agent list\n"  # missing get/read/agent wait
 
     _patch_client_methods(monkeypatch, status=status, schema=schema, help_text=sparse_help)
 
     result = asyncio.run(check_herdr_capability("mac-mini", {}))
     assert result["status"] == "herdr_verbs_missing"
     assert "agent get" in result["missing"]
-    assert "wait agent-status" in result["missing"]
+    assert "agent wait" in result["missing"]
 
 
 def test_ok(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,7 +146,7 @@ def test_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 
     result = asyncio.run(check_herdr_capability("mac-mini", {}))
     assert result["status"] == "ok"
-    assert result["protocol"] == 16
+    assert result["protocol"] == 17
     assert result["version"] == "0.7.4"
     assert result["transport"] == "local_socket"
     assert result["host_alias"] == "mac-mini"

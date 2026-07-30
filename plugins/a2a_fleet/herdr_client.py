@@ -69,6 +69,11 @@ _ERROR_CODE_MAP: Dict[str, type] = {
 # caller can say so plainly. Anything else — a transport death, a timeout, an
 # unrecognised code — leaves the outcome genuinely unknown, and must be
 # reported as unknown rather than assumed either way.
+# Herdr's --wait verdicts. agent_prompt_stalled means the text went in but no
+# state change followed, i.e. the Enter did not take and a draft is sitting in
+# the composer. That is a DIFFERENT outcome from "we do not know".
+PROMPT_NOT_SUBMITTED = frozenset({"agent_prompt_stalled"})
+
 PROMPT_REJECTED_BEFORE_SUBMISSION = frozenset(
     {
         "empty_agent_prompt",
@@ -82,7 +87,17 @@ PROMPT_REJECTED_BEFORE_SUBMISSION = frozenset(
 class HerdrClient:
     """Shells out to ``herdr`` and parses its JSON envelope."""
 
-    PROTOCOL_VERSION = 16
+    # Pinned against the INSTALLED binary, never against a source checkout.
+    # Re-verified 2026-07-30 on herdr 0.7.5 (protocol 17): PaneInfo fields,
+    # the AgentStatus enum, the error envelope, and revision's placement on
+    # pane_output_changed only are all unchanged from 16, so nothing this
+    # client parses moved.
+    #
+    # Bumping this is a deliberate act, not a version-tracking chore: a pin
+    # that drifts ahead of reality is how a verb got wrapped that the binary
+    # did not have. /tmp/herdr currently reads PROTOCOL_VERSION = 18 — that is
+    # a source checkout ahead of the shipped build, and is NOT evidence.
+    PROTOCOL_VERSION = 17
     DEFAULT_TIMEOUT = 10.0
     # ponytail: generous cap against a runaway/garbled response; raise if a
     # legitimate verb ever needs more.
@@ -236,7 +251,7 @@ class HerdrClient:
         text: str,
         *,
         until: Optional[List[str]] = None,
-        timeout_ms: Optional[int] = None,
+        verify_ms: Optional[int] = 15000,
     ) -> Dict[str, Any]:
         """Submit a prompt to one agent session via ``herdr agent prompt``.
 
@@ -277,26 +292,38 @@ class HerdrClient:
         idempotent and never can be. Callers must not retry an unknown outcome.
         """
         argv = ["agent", "prompt", target, text]
-        if until:
+        if verify_ms:
+            # --wait is not a convenience here, it is the proof. Without it
+            # Herdr acks as soon as the text is queued and schedules the Enter
+            # afterwards, so a success response says nothing about whether the
+            # prompt was actually submitted. Verified live 2026-07-30: the ack
+            # returned success while the text sat unsubmitted at the composer
+            # and the agent stayed idle.
+            #
+            # With --wait, Herdr requires an observed state change after
+            # submission and returns agent_prompt_stalled when none happens —
+            # which is precisely "the Enter did not take".
             argv.append("--wait")
-            for status in until:
+            for status in until or ():
                 argv += ["--until", status]
-            if timeout_ms:
-                argv += ["--timeout", str(int(timeout_ms))]
+            argv += ["--timeout", str(int(verify_ms))]
         return await self._call(*argv)
 
     async def wait_agent_status(
-        self, pane_id: str, status: str, timeout_ms: int
+        self, target: str, status: str, timeout_ms: int
     ) -> Dict[str, Any]:
-        """Block until the pane reaches ``status`` or the timeout expires.
+        """Block until the session reaches ``status`` or the timeout expires.
 
-        ``wait agent-status`` is used rather than ``agent wait`` because only
-        the former accepts ``done`` — the completion state Fleet actually needs.
-        This is the sole admissible completion signal: silence, an idle prompt,
-        or a quiet pane are never completion evidence.
+        Uses the agent-scoped ``agent wait``, addressed by ``terminal_id``.
+        Herdr 0.7.5 removed the top-level ``wait`` command this previously
+        called ("unknown command: wait"); ``agent wait`` now accepts ``done``,
+        which was the only reason the top-level form was preferred.
+
+        A ``done`` signal is the sole admissible completion evidence: silence,
+        an idle prompt, or a quiet pane are never completion.
         """
         return await self._call(
-            "wait", "agent-status", pane_id, "--status", status,
+            "agent", "wait", target, "--until", status,
             "--timeout", str(int(timeout_ms)),
         )
 

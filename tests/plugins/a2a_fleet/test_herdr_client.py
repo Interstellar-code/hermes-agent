@@ -146,14 +146,14 @@ def test_protocol_match_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _client(monkeypatch)
 
     async def fake_schema():
-        return {"protocol": 16, "schema_version": 1}
+        return {"protocol": 17, "schema_version": 1}
 
     monkeypatch.setattr(client, "schema", fake_schema)
     asyncio.run(client.check_protocol())  # must not raise
 
 
 def test_protocol_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    from a2a_fleet.herdr_client import HerdrProtocolMismatch
+    from a2a_fleet.herdr_client import HerdrClient, HerdrProtocolMismatch
 
     client = _client(monkeypatch)
 
@@ -163,7 +163,7 @@ def test_protocol_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(client, "schema", fake_schema)
     with pytest.raises(HerdrProtocolMismatch) as exc:
         asyncio.run(client.check_protocol())
-    assert "16" in str(exc.value)
+    assert str(HerdrClient.PROTOCOL_VERSION) in str(exc.value)
     assert "15" in str(exc.value)
 
 
