@@ -53,6 +53,71 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli import __version__, __release_date__
+
+# --- issue #199: runtime version vs installed version -----------------------
+# ``__version__`` above is bound ONCE, when this module is first imported. On an
+# editable install the code on disk can move underneath a long-running process
+# for days: the reporting installation had a dashboard started at 0.19.0 still
+# serving that string after the checkout had reached 0.19.8, five bumps later.
+#
+# The fix is not to re-read ``version`` — a client asking a remote dashboard
+# what it is running wants the RUNTIME answer, and the process really is running
+# the old code. The fix is to make the answer self-describing, so no client has
+# to guess which of the two it received.
+_VERSION_RE = re.compile(
+    r"^__(version|release_date)__\s*=\s*[\"']([^\"']+)[\"']", re.MULTILINE
+)
+_ON_DISK_CACHE: Dict[str, Any] = {"mtime": None, "value": None}
+
+
+def _on_disk_version() -> Dict[str, Optional[str]]:
+    """Read ``__version__``/``__release_date__` from the package on disk.
+
+    Parsed textually rather than imported or reloaded: re-importing
+    ``hermes_cli`` into a live process would rebind a module other code already
+    holds references to, which is a far worse problem than a stale string.
+
+    Cached on the file's mtime because ``/api/status`` is polled. Any failure
+    yields ``None`` values — an unreadable file must degrade this to "unknown",
+    never break the liveness endpoint that uptime probes depend on.
+    """
+    init_py = Path(__file__).resolve().parent / "__init__.py"
+    try:
+        mtime = init_py.stat().st_mtime
+    except OSError:
+        return {"version": None, "release_date": None}
+
+    if _ON_DISK_CACHE["mtime"] == mtime and _ON_DISK_CACHE["value"] is not None:
+        return _ON_DISK_CACHE["value"]
+
+    found: Dict[str, Optional[str]] = {"version": None, "release_date": None}
+    try:
+        for key, value in _VERSION_RE.findall(init_py.read_text(encoding="utf-8")):
+            found[key] = value
+    except OSError:
+        return {"version": None, "release_date": None}
+
+    _ON_DISK_CACHE["mtime"] = mtime
+    _ON_DISK_CACHE["value"] = found
+    return found
+
+
+def _version_provenance(on_disk: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """Fields that let a caller tell a stale process from a current one.
+
+    ``restart_required`` is only ever True when the on-disk version was read
+    successfully AND differs from the running one. Unknown never means stale:
+    a parse failure must not nag every client into restarting.
+    """
+    installed = on_disk.get("version")
+    return {
+        "runtime_version": __version__,
+        "runtime_release_date": __release_date__,
+        "installed_version": installed,
+        "installed_release_date": on_disk.get("release_date"),
+        "version_source": "process-import",
+        "restart_required": bool(installed) and installed != __version__,
+    }
 from hermes_cli.config import (
     cfg_get,
     DEFAULT_CONFIG,
@@ -2930,13 +2995,22 @@ async def get_status(profile: Optional[str] = None):
         except Exception:
             nous_session_valid = "unknown"
 
+        on_disk = _on_disk_version()
+
         # Always-public liveness + auth-gate shape. Safe for external uptime
         # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
         # bootstrap, and anyone who can curl the host — i.e. exactly the audience
         # ``PUBLIC_API_PATHS`` documents this endpoint as serving.
         status = {
+            # RUNTIME version: what this process actually imported at startup.
+            # Deliberately unchanged, and deliberately not re-read from disk —
+            # clients (Switch UI's /api/agent-version proxy) treat this as the
+            # active runtime version, and for a remote dashboard that is the
+            # only honest answer. The installed_* fields below say what a
+            # restart would pick up. See issue #199.
             "version": __version__,
             "release_date": __release_date__,
+            **_version_provenance(on_disk),
             "config_version": current_ver,
             "latest_config_version": latest_ver,
             "can_update_hermes": not _dashboard_local_update_managed_externally(),
@@ -3841,7 +3915,14 @@ async def check_hermes_update(force: bool = False):
 
     Returns:
         install_method: 'git' | 'pip' | 'docker' | 'nixos' | 'homebrew' | ...
-        current_version: installed Hermes version string
+        current_version: the RUNNING version — what this process imported at
+                 startup. Named "current" before there was a difference to
+                 draw; kept for compatibility. It is not necessarily what is
+                 on disk (issue #199).
+        installed_version: what a restart would pick up, read from disk, or
+                 null if it could not be read
+        restart_required: True when those two disagree — the update you are
+                 about to apply may already be on disk and merely unloaded
         behind: commits behind upstream (>=1), 0 if up to date,
                 -1 if behind by an unknown count (nix/pypi), or null if the
                 check could not run (offline, no remote, etc.)
@@ -3861,6 +3942,7 @@ async def check_hermes_update(force: bool = False):
         return {
             "install_method": "managed-runtime",
             "current_version": __version__,
+            **_version_provenance(_on_disk_version()),
             "behind": None,
             "update_available": False,
             "can_apply": False,
@@ -3877,6 +3959,7 @@ async def check_hermes_update(force: bool = False):
     payload: Dict[str, Any] = {
         "install_method": install_method,
         "current_version": __version__,
+        **_version_provenance(_on_disk_version()),
         "behind": None,
         "update_available": False,
         "can_apply": install_method in ("git", "pip"),
