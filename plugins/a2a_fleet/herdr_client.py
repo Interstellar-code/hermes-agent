@@ -74,6 +74,14 @@ _ERROR_CODE_MAP: Dict[str, type] = {
 # the composer. That is a DIFFERENT outcome from "we do not know".
 PROMPT_NOT_SUBMITTED = frozenset({"agent_prompt_stalled"})
 
+# Herdr's --wait budget expired before the agent reached an observable status.
+# This is NOT agent_prompt_stalled: Herdr is not saying the Enter failed, only
+# that it stopped watching. The prompt may well be in flight, so pressing Enter
+# here could submit a second time — the caller must resolve it with evidence
+# (state_change_seq) instead. Verified live 2026-07-31: opencode exceeded a 15s
+# wait on a submission that had in fact landed.
+PROMPT_WAIT_TIMEOUT = frozenset({"timeout"})
+
 PROMPT_REJECTED_BEFORE_SUBMISSION = frozenset(
     {
         "empty_agent_prompt",
@@ -147,9 +155,10 @@ class HerdrClient:
             chunks.append(chunk)
         return b"".join(chunks)
 
-    async def _exec(self, argv: List[str]) -> tuple:
+    async def _exec(self, argv: List[str], timeout: Optional[float] = None) -> tuple:
         if not argv[0]:
             raise HerdrUnavailable("herdr binary not found on PATH")
+        timeout = self.timeout if timeout is None else timeout
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -162,13 +171,13 @@ class HerdrClient:
         try:
             stdout, stderr = await asyncio.wait_for(
                 asyncio.gather(self._read_capped(proc.stdout), self._read_capped(proc.stderr)),
-                timeout=self.timeout,
+                timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
             proc.kill()
             await proc.wait()
             raise HerdrTimeout(
-                f"herdr call timed out after {self.timeout}s: {' '.join(argv)}"
+                f"herdr call timed out after {timeout}s: {' '.join(argv)}"
             ) from exc
         except HerdrUnavailable:
             proc.kill()
@@ -186,9 +195,11 @@ class HerdrClient:
         exc_cls = _ERROR_CODE_MAP.get(code, HerdrError)
         return exc_cls(message, code=code)
 
-    async def _call(self, *args: str, enveloped: bool = True) -> Any:
+    async def _call(
+        self, *args: str, enveloped: bool = True, timeout: Optional[float] = None
+    ) -> Any:
         argv = self._build_argv(*args)
-        returncode, stdout, stderr = await self._exec(argv)
+        returncode, stdout, stderr = await self._exec(argv, timeout=timeout)
         # herdr routes FAILURE envelopes to stderr and exits non-zero, while
         # success envelopes go to stdout (same split as its --help output).
         # Verified live: `herdr agent get term_doesnotexist` exits 1 and writes
@@ -307,6 +318,15 @@ class HerdrClient:
             for status in until or ():
                 argv += ["--until", status]
             argv += ["--timeout", str(int(verify_ms))]
+            # The subprocess budget MUST outlast the --wait budget we just
+            # asked Herdr for, or this wrapper kills the very call it is
+            # waiting on. Verified live 2026-07-31 against opencode: the
+            # default 10s client timeout fired inside a 15s --wait, and a
+            # submission that had actually landed (state_change_seq 61 -> 72,
+            # reply in the pane) was reported as
+            # draft_inserted_submission_unknown — an unknown outcome is never
+            # retried, so a good submission became an operator investigation.
+            return await self._call(*argv, timeout=verify_ms / 1000.0 + self.timeout)
         return await self._call(*argv)
 
     async def submit_enter(self, target: str) -> Dict[str, Any]:
@@ -406,4 +426,11 @@ def normalize_agent_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         "state_change_seq": raw.get("state_change_seq"),
         "terminal_title_stripped": raw.get("terminal_title_stripped"),
         "focused": raw.get("focused"),
+        # The agent's OWN session id (codex conversation / opencode ses_…),
+        # absent until the agent has actually established a session. This is
+        # the only kind-neutral readiness signal Herdr exposes: a freshly
+        # started agent reports `interactive_ready: true` and `agent_status:
+        # idle` while still swallowing prompts silently, and `agent_session`
+        # is what distinguishes it. See _target_ready in herdr_tools.
+        "agent_session_id": (raw.get("agent_session") or {}).get("value"),
     }

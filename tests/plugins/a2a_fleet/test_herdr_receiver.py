@@ -33,8 +33,16 @@ SESSION_A = {
     "terminal_id": "term_aaa",
     "workspace_id": "w1",
     "revision": 5,
+    # Established session: Fleet refuses to dispatch to an agent that has never
+    # taken a turn, because Herdr accepts prompts for one and drops them.
+    "agent_session": {"agent": "claude", "kind": "id", "value": "sess-aaa"},
 }
-SESSION_B = dict(SESSION_A, terminal_id="term_bbb", pane_id="w1:pB")
+SESSION_B = dict(
+    SESSION_A,
+    terminal_id="term_bbb",
+    pane_id="w1:pB",
+    agent_session={"agent": "claude", "kind": "id", "value": "sess-bbb"},
+)
 
 
 def _run(coro):

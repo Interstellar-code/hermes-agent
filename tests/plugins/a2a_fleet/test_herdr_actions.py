@@ -30,6 +30,11 @@ SESSION = {
     "terminal_id": "term_abc123",
     "workspace_id": "w1",
     "revision": 40,
+    # A session that has taken at least one turn. Herdr only reports
+    # agent_session once the agent has actually established one, and Fleet
+    # refuses to drive a session without it (see _target_ready) because a
+    # freshly started agent silently swallows prompts.
+    "agent_session": {"agent": "claude", "kind": "id", "value": "sess-abc"},
 }
 
 
@@ -49,6 +54,13 @@ def _add_host(fleet_home: Path, *, allow_actions: bool = True) -> None:
         "allowed_workspaces": ["/srv/workspaces/project-a"],
         "allow_actions": allow_actions,
     }
+    _fleet_yaml_path(fleet_home).write_text(yaml.safe_dump(data))
+
+
+def _set_supported_kinds(fleet_home: Path, kinds: List[str]) -> None:
+    """Configure the OPTIONAL per-host agent-kind allowlist."""
+    data = yaml.safe_load(_fleet_yaml_path(fleet_home).read_text())
+    data["fleet"]["herdr"]["hosts"]["mac-mini"]["supported_agent_kinds"] = kinds
     _fleet_yaml_path(fleet_home).write_text(yaml.safe_dump(data))
 
 
@@ -745,3 +757,216 @@ def test_takeover_survives_a_fresh_store_connection(herdr_env, tmp_path) -> None
         assert herdr_binding.automation_blocked(conn, "mac-mini", "term_abc123") is True
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Agent-kind compatibility (codex / opencode), verified live 2026-07-31
+# against herdr 0.7.5 protocol 17.
+#
+# These deliberately do NOT branch on agent kind. Both kinds were driven
+# end-to-end through this exact code path on real panes and behaved
+# identically, so a per-kind table would encode a coincidence rather than a
+# difference. The tests below assert that sameness.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex", "opencode"])
+def test_submission_path_does_not_branch_on_agent_kind(
+    herdr_env, monkeypatch, kind
+) -> None:
+    """One code path for every Herdr agent kind.
+
+    Herdr owns the per-runtime submission encoding inside `agent prompt`, so
+    Fleet has nothing kind-specific to do. Verified live on codex and opencode.
+    """
+    herdr_env["session"]["agent"] = kind
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append((target, text))
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    preview = _preview("kind neutrality")
+    assert preview["agent_kind"] == kind
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submitted"
+    assert sent == [("w1:pH", "kind neutrality")]
+
+
+@pytest.mark.parametrize("kind", ["codex", "opencode"])
+def test_agent_that_never_took_a_turn_is_refused_before_a_token_exists(
+    herdr_env, monkeypatch, kind
+) -> None:
+    """Cold sessions are refused at preview, before a token is minted.
+
+    Reproduced live 2026-07-31 on BOTH codex and opencode: seconds after
+    `herdr agent start`, `agent prompt` returns success and delivers nothing.
+    The pane composer stays untouched and the agent's context is unconsumed.
+    `interactive_ready` is true in that window and `agent_status` reads idle,
+    so the only thing that separates it from a working session is the absence
+    of `agent_session`.
+    """
+    herdr_env["session"]["agent"] = kind
+    herdr_env["session"].pop("agent_session", None)
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    result = _preview("must not be minted")
+    assert result["status"] == "submission_target_not_ready"
+    assert "confirmation_token" not in result
+    assert sent == [], "nothing may be sent to a session that swallows prompts"
+
+
+def test_cold_agent_is_refused_before_the_token_is_spent(
+    herdr_env, monkeypatch
+) -> None:
+    """A token minted while warm is not spendable once the target reads cold.
+
+    Guards the ordering: the readiness check runs BEFORE the single-use token
+    is consumed, so a refused attempt does not burn it.
+    """
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    preview = _preview("minted while warm")
+    herdr_env["session"].pop("agent_session", None)  # target goes cold
+
+    result = _request(preview["confirmation_token"])
+    assert result["status"] == "submission_target_not_ready"
+    assert sent == []
+
+    # The token survived: it was never consumed by the refused attempt.
+    herdr_env["session"]["agent_session"] = {"kind": "id", "value": "sess-abc"}
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+
+
+def test_wait_timeout_with_state_movement_is_submitted_not_unknown(
+    herdr_env, monkeypatch
+) -> None:
+    """Herdr's wait budget expiring is not evidence the prompt failed.
+
+    Verified live 2026-07-31: opencode exceeded a 15s `--wait` on a submission
+    that HAD landed (state_change_seq 76 -> 79, reply in the pane), and the
+    call came back `timeout`. Reporting that as an unknown outcome is the
+    expensive kind of wrong — unknown is never retried, so a good submission
+    turns into an operator investigation.
+    """
+    herdr_env["session"]["state_change_seq"] = 10
+    keys: List[Any] = []
+
+    async def times_out(self, target, text, **kw):
+        # The agent did move; Herdr just stopped watching before it settled.
+        herdr_env["session"]["state_change_seq"] = 11
+        raise HerdrError("timed out waiting for agent status", code="timeout")
+
+    async def press_enter(self, target):
+        keys.append(target)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", times_out)
+    monkeypatch.setattr(HerdrClient, "submit_enter", press_enter)
+
+    preview = _preview("slow agent")
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submitted"
+    assert keys == [], (
+        "a wait timeout must not press Enter: the prompt may already be in "
+        "flight, and Enter would submit a second time"
+    )
+
+
+def test_wait_timeout_without_state_movement_falls_back_to_enter(
+    herdr_env, monkeypatch
+) -> None:
+    """No movement after a wait timeout is treated exactly like a stall."""
+    herdr_env["session"]["state_change_seq"] = 10
+    keys: List[Any] = []
+
+    async def times_out(self, target, text, **kw):
+        raise HerdrError("timed out waiting for agent status", code="timeout")
+
+    async def press_enter(self, target):
+        keys.append(target)
+        herdr_env["session"]["state_change_seq"] = 11  # Enter took
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", times_out)
+    monkeypatch.setattr(HerdrClient, "submit_enter", press_enter)
+
+    preview = _preview("stalled and slow")
+    result = _request(preview["confirmation_token"])
+
+    assert result["status"] == "submitted"
+    assert keys == ["w1:pH"], "Enter is pressed once, on the pane"
+
+
+def test_unlisted_kind_passes_when_no_allowlist_is_configured(
+    herdr_env, monkeypatch
+) -> None:
+    """No allowlist means no restriction — the key is opt-in, not opt-out."""
+    herdr_env["session"]["agent"] = "some-future-kind"
+    async def fake_send(self, target, text, **kw):
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+    assert _preview("unrestricted")["status"] == "preview"
+
+
+def test_configured_allowlist_refuses_an_unlisted_kind(
+    fleet_home, tmp_path, monkeypatch
+) -> None:
+    """An operator can decline to treat every future Herdr kind as proven."""
+    _add_host(fleet_home)
+    _set_supported_kinds(fleet_home, ["claude", "codex"])
+
+    async def _capability_ok(host_alias, herdr_cfg=None, **_kw):
+        return {"status": "ok", "host_alias": host_alias, "protocol": 17}
+
+    monkeypatch.setattr(herdr_tools, "check_herdr_capability", _capability_ok)
+    monkeypatch.setattr(herdr_binding, "db_path", lambda: tmp_path / "state.db")
+
+    session = dict(SESSION, agent="opencode")
+
+    async def fake_get_agent(self, target):
+        return {"agent": dict(session)}
+
+    async def fake_list_agents(self):
+        return {"agents": [dict(session)]}
+
+    async def _supports_submit(self):
+        return True
+
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "supports_submit", _supports_submit)
+    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    result = _preview("blocked by allowlist")
+    assert result["status"] == "agent_kind_not_allowed"
+    assert result["agent_kind"] == "opencode"
+    assert sent == []
+
+
+def test_verified_kinds_are_the_ones_driven_end_to_end() -> None:
+    """Documentation guard: the recorded list is what was actually tested."""
+    assert set(herdr_tools.VERIFIED_AGENT_KINDS) == {"claude", "codex", "opencode"}

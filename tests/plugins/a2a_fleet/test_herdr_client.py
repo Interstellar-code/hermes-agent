@@ -239,7 +239,7 @@ def test_error_envelope_on_stderr_with_nonzero_exit_is_parsed() -> None:
 
     client = HerdrClient(binary="/nonexistent/herdr")
 
-    async def fake_exec(argv):
+    async def fake_exec(argv, timeout=None):
         return (
             1,
             b"",
@@ -267,3 +267,35 @@ def test_herdr_client_does_not_import_pane_parsing() -> None:
     banned = ["pane read", "pane send-keys", "send-text", "screen_state", "pane run"]
     for phrase in banned:
         assert phrase not in source, f"herdr_client.py must not reference {phrase!r}"
+
+
+def test_submit_prompt_subprocess_budget_outlasts_the_wait_budget() -> None:
+    """The wrapper must not kill the call it is waiting on.
+
+    `submit_prompt` asks Herdr to wait `verify_ms` for an observable state
+    change, but the subprocess timeout defaulted to 10s. Verified live
+    2026-07-31: opencode's submission ran past 10s inside a 15s `--wait`, this
+    wrapper killed it, and a prompt that HAD landed was reported as
+    draft_inserted_submission_unknown — an outcome that is never retried.
+    """
+    import asyncio
+
+    from a2a_fleet.herdr_client import HerdrClient
+
+    seen = {}
+
+    async def fake_exec(argv, timeout=None):
+        seen["argv"] = argv
+        seen["timeout"] = timeout
+        return (0, b'{"result": {}}', b"")
+
+    client = HerdrClient(binary="/nonexistent/herdr")
+    client._exec = fake_exec  # type: ignore[method-assign]
+    asyncio.run(client.submit_prompt("w1:pH", "hello", verify_ms=15000))
+
+    wait_budget_s = 15.0
+    assert seen["timeout"] is not None
+    assert seen["timeout"] > wait_budget_s, (
+        f"subprocess budget {seen['timeout']}s must outlast the --wait budget "
+        f"{wait_budget_s}s it just asked Herdr for"
+    )

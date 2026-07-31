@@ -341,6 +341,8 @@ def test_list_sessions_happy_path_normalizes_and_counts(
             # herdr 0.7.5: the counter that actually proves a state change,
             # unlike `revision` (title/metadata only).
             "state_change_seq": None,
+            # The agent's own session id, absent until it has taken a turn.
+            "agent_session_id": None,
         }
     ]
 

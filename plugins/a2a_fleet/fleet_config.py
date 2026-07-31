@@ -134,11 +134,33 @@ def _parse_herdr_hosts(hosts_raw: Any, path: Path) -> Dict[str, Dict[str, Any]]:
                 f"{path}: fleet.herdr.hosts.{alias}.allow_actions must be a boolean, "
                 f"got {type(allow_actions).__name__}"
             )
+        # Optional agent-kind allowlist. Absent = no restriction, which is the
+        # honest default: the submission path is kind-neutral (Herdr owns the
+        # per-runtime encoding inside `agent prompt`). Present = only these
+        # kinds may be driven, for operators who would rather not treat every
+        # future Herdr kind as proven safe.
+        supported_kinds_raw = host_entry.get("supported_agent_kinds")
+        supported_agent_kinds = None
+        if supported_kinds_raw is not None:
+            if not isinstance(supported_kinds_raw, list) or not supported_kinds_raw:
+                raise FleetConfigError(
+                    f"{path}: fleet.herdr.hosts.{alias}.supported_agent_kinds must be a "
+                    "non-empty list of agent kinds (omit the key for no restriction)"
+                )
+            for kind in supported_kinds_raw:
+                if not isinstance(kind, str) or not kind.strip():
+                    raise FleetConfigError(
+                        f"{path}: fleet.herdr.hosts.{alias}.supported_agent_kinds entries "
+                        f"must be non-empty strings, got {kind!r}"
+                    )
+            supported_agent_kinds = [kind.strip() for kind in supported_kinds_raw]
+
         hosts_out[alias] = {
             "transport": transport,
             "ssh_target": ssh_target,
             "allowed_workspaces": allowed_workspaces,
             "allow_actions": allow_actions,
+            "supported_agent_kinds": supported_agent_kinds,
         }
     return hosts_out
 

@@ -15,6 +15,20 @@ revision guard, durable binding, then an audit record written BEFORE the
 submission. Nothing here ever retries: Herdr issues no request ID, so a
 delivered prompt and a lost one are indistinguishable afterwards.
 
+Agent kinds: the path is kind-neutral by construction — Herdr owns the
+per-runtime submission encoding inside ``agent prompt``, so there is nothing
+here to special-case. ``claude``, ``codex`` and ``opencode`` have been driven
+end-to-end against real panes on herdr 0.7.5 / protocol 17 (see
+``VERIFIED_AGENT_KINDS``). A host may set ``supported_agent_kinds`` to refuse
+kinds it has not verified; omitting it restricts nothing.
+
+One trap is NOT kind-specific and bites every kind: for a short window after
+``herdr agent start``, Herdr accepts a prompt, reports success, and delivers
+nothing. ``interactive_ready`` is true and ``agent_status`` is ``idle`` in that
+window, and ``state_change_seq`` advances on its own as detection settles, so
+none of those separate it from a working session. ``_target_ready`` refuses
+sessions with no ``agent_session`` for exactly this reason.
+
 Every handler returns a plain dict and never raises, mirroring
 :mod:`fleet_tools`: the calling agent can surface the string verbatim in chat
 without exception handling.
@@ -37,6 +51,7 @@ from .herdr_capability import check_herdr_capability
 from .herdr_client import (
     PROMPT_NOT_SUBMITTED,
     PROMPT_REJECTED_BEFORE_SUBMISSION,
+    PROMPT_WAIT_TIMEOUT,
     HerdrClient,
     HerdrError,
     HerdrNotFound,
@@ -439,6 +454,87 @@ async def _submit_supported(host_cfg: Dict[str, Any]) -> Optional[Dict[str, str]
     }
 
 
+# Agent kinds driven end-to-end through this code path against a real pane.
+# Everything here was verified on herdr 0.7.5 / protocol 17: discovery, exact-id
+# inspection, preview, confirmed submit, delivery observed in the pane, replay
+# refused, human takeover blocking both verbs, and audit ordering.
+VERIFIED_AGENT_KINDS = ("claude", "codex", "opencode")
+
+
+def _kind_allowed(
+    session: Dict[str, Any], host_cfg: Dict[str, Any]
+) -> Optional[Dict[str, str]]:
+    """Enforce an OPTIONAL per-host ``supported_agent_kinds`` allowlist.
+
+    Herdr 0.7.5 detects 21 agent kinds and will add more. The submission path
+    is genuinely kind-neutral — Herdr owns the per-runtime encoding inside
+    ``agent prompt`` — so this is not needed for correctness, and when the key
+    is absent nothing is restricted. It exists so an operator can decline to
+    treat every future kind as proven safe by default.
+
+    ``VERIFIED_AGENT_KINDS`` records what has actually been driven end-to-end;
+    it is documentation, not the default policy.
+    """
+    allowed = host_cfg.get("supported_agent_kinds")
+    if not allowed:
+        return None
+    kind = session.get("agent_kind") or ""
+    if kind in allowed:
+        return None
+    return {
+        "status": "agent_kind_not_allowed",
+        "reason": (
+            f"agent kind {kind!r} is not in this host's supported_agent_kinds; "
+            "add it there once you have verified it end-to-end"
+        ),
+        "agent_kind": kind,
+        "supported_agent_kinds": ", ".join(allowed),
+        "verified_kinds": ", ".join(VERIFIED_AGENT_KINDS),
+    }
+
+
+def _target_ready(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Refuse a target that has not yet established its own agent session.
+
+    A freshly started agent has a startup window in which ``agent prompt``
+    accepts the call, returns success, and delivers NOTHING. Verified live on
+    2026-07-31 against Herdr 0.7.5 on both ``codex`` and ``opencode``: prompt
+    sent seconds after ``agent start`` returned ok with the pane composer
+    untouched and the agent's context unconsumed.
+
+    None of the obvious signals separate that window from a working session:
+
+    * ``interactive_ready`` is ``true`` in it (that is what ``agent start``
+      waits for, and it is not enough);
+    * ``agent_status`` reads ``idle``, the same as a healthy waiting session;
+    * ``state_change_seq`` ADVANCES during it — the cold codex went 55 -> 58
+      while its startup detection settled — so the post-submit evidence check
+      that guards the recovery path cannot catch this one either.
+
+    ``agent_session`` is the discriminator: absent until the agent actually
+    establishes a session, present on every session that accepts prompts. This
+    is deliberately NOT agent-kind-aware — the window reproduced identically on
+    both kinds, so a per-kind table would encode a coincidence.
+
+    Consequence of refusing here: Fleet will not drive an agent that has never
+    taken a turn. That is the intended scope anyway — fleet peers are
+    long-lived working sessions, and the first turn belongs to the operator.
+    """
+    if session.get("agent_session_id"):
+        return None
+    return {
+        "status": "submission_target_not_ready",
+        "reason": (
+            "this agent has not established a session yet (no agent_session), so "
+            "Herdr accepts a prompt for it and silently drops it — give it its "
+            "first turn interactively, then retry"
+        ),
+        "agent_kind": session.get("agent_kind") or "",
+        "agent_status": str(session.get("agent_status")),
+        "retry": "after the agent has taken at least one turn",
+    }
+
+
 async def _with_db(fn: Any) -> Any:
     """Run one unit of SQLite work on a worker thread, connection and all.
 
@@ -521,6 +617,14 @@ async def herdr_preview_action_handler(
             }
 
         session = inspected["session"]
+        bad_kind = _kind_allowed(session, host_cfg)
+        if bad_kind is not None:
+            return {**bad_kind, "host_alias": host_alias, "terminal_id": terminal_id}
+        not_ready = _target_ready(session)
+        if not_ready is not None:
+            # Refuse before minting a token: a token bound to a session that
+            # silently drops prompts would be spent on nothing.
+            return {**not_ready, "host_alias": host_alias, "terminal_id": terminal_id}
         issued = await _with_db(
             lambda conn: herdr_binding.issue_token(
                 conn,
@@ -626,6 +730,14 @@ async def herdr_request_action_handler(
             }
 
         session = inspected["session"]
+        bad_kind = _kind_allowed(session, host_cfg)
+        if bad_kind is not None:
+            return {**bad_kind, "host_alias": host_alias, "terminal_id": terminal_id}
+        not_ready = _target_ready(session)
+        if not_ready is not None:
+            # Before consuming the token: the single-use token must not be
+            # burned on a session that would swallow the prompt silently.
+            return {**not_ready, "host_alias": host_alias, "terminal_id": terminal_id}
         claim = await _with_db(
             lambda conn: herdr_binding.consume_token(
                 conn,
@@ -718,6 +830,56 @@ async def herdr_request_action_handler(
             # rejections: nothing is sitting in the composer, so say so rather
             # than leaving the operator to check by hand.
             code = getattr(exc, "code", None)
+            if code in PROMPT_WAIT_TIMEOUT:
+                # Herdr stopped watching; it did NOT say the Enter failed.
+                # Resolve with evidence rather than pressing Enter again, which
+                # on an already-submitted prompt would be a second submission.
+                advanced_to = await _seq_advanced(
+                    client,
+                    session.get("pane_id") or terminal_id,
+                    terminal_id,
+                    session.get("state_change_seq"),
+                )
+                if advanced_to is not None:
+                    await _audit(
+                        event="submitted_after_wait_timeout",
+                        host_alias=host_alias,
+                        terminal_id=terminal_id,
+                        action_id=action_id,
+                        detail=(
+                            f"state_change_seq {session.get('state_change_seq')} "
+                            f"-> {advanced_to}"
+                        ),
+                    )
+                    await _with_db(
+                        lambda conn: herdr_binding.upsert_binding(
+                            conn,
+                            host_alias=host_alias,
+                            terminal_id=terminal_id,
+                            completion_state="pending",
+                        )
+                    )
+                    return {
+                        "status": "submitted",
+                        "host_alias": host_alias,
+                        "terminal_id": terminal_id,
+                        "pane_id": session.get("pane_id"),
+                        "action_id": action_id,
+                        "completion_state": "pending",
+                        "completion_signal": COMPLETION_SIGNAL,
+                        "submission": (
+                            "Herdr's wait budget expired before the agent reached an "
+                            "observable status, but the session did change state, so "
+                            "the prompt was submitted. Nothing was re-sent."
+                        ),
+                    }
+                # No movement: treat exactly like a stall — Enter once, then
+                # demand evidence again.
+                recovered = await _recover_stalled_submission(
+                    client, session, host_alias, terminal_id, action_id
+                )
+                if recovered is not None:
+                    return recovered
             if code in PROMPT_NOT_SUBMITTED:
                 # Herdr's scheduled Enter did not land, so our previewed text is
                 # sitting in the composer. Press Enter once — the key is fixed
@@ -890,6 +1052,41 @@ async def herdr_request_action_handler(
         return {"error": f"unexpected error: {exc}"}
 
 
+async def _seq_advanced(
+    client: HerdrClient,
+    pane: str,
+    terminal_id: str,
+    seq_before: Optional[int],
+    tries: int = 6,
+) -> Optional[int]:
+    """Poll for real agent state movement. Returns the new seq, or None.
+
+    ``state_change_seq`` is Herdr 0.7.5's counter for actual agent state
+    changes, as opposed to ``revision``, which only tracks title and metadata.
+    Bails out if the pane stops hosting the session we confirmed against, so
+    evidence is never read off a different agent.
+
+    Only meaningful for a session that has already taken a turn — during an
+    agent's startup window this counter advances on its own as Herdr's
+    detection settles, which is why _target_ready refuses cold sessions before
+    any of this is reached.
+    """
+    for _ in range(tries):
+        await asyncio.sleep(1.0)
+        try:
+            raw = await client.get_agent(pane)
+        except Exception:  # noqa: BLE001 — treat as no evidence.
+            return None
+        record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
+        now = normalize_agent_record(record)
+        if now.get("terminal_id") != terminal_id:
+            return None  # the pane no longer hosts the session we confirmed against
+        seq_now = now.get("state_change_seq")
+        if seq_before is None or (seq_now or 0) > seq_before:
+            return seq_now
+    return None
+
+
 async def _recover_stalled_submission(
     client: HerdrClient,
     session: Dict[str, Any],
@@ -915,43 +1112,35 @@ async def _recover_stalled_submission(
         )
         return None
 
-    for _ in range(6):
-        await asyncio.sleep(1.0)
-        try:
-            raw = await client.get_agent(pane)
-        except Exception:  # noqa: BLE001 — treat as no evidence.
-            break
-        record = raw.get("agent") if isinstance(raw.get("agent"), dict) else raw
-        now = normalize_agent_record(record)
-        if now.get("terminal_id") != terminal_id:
-            break  # the pane no longer hosts the session we confirmed against
-        if seq_before is None or (now.get("state_change_seq") or 0) > seq_before:
-            await _audit(
-                event="submitted_after_enter", host_alias=host_alias,
-                terminal_id=terminal_id, action_id=action_id,
-                detail=f"state_change_seq {seq_before} -> {now.get('state_change_seq')}",
-            )
-            await _with_db(
-                lambda conn: herdr_binding.upsert_binding(
-                    conn, host_alias=host_alias, terminal_id=terminal_id,
-                    completion_state="pending",
-                )
-            )
-            return {
-                "status": "submitted",
-                "host_alias": host_alias,
-                "terminal_id": terminal_id,
-                "pane_id": pane,
-                "action_id": action_id,
-                "completion_state": "pending",
-                "completion_signal": COMPLETION_SIGNAL,
-                "submission": (
-                    "Herdr's own Enter did not land, so Fleet pressed Enter once and "
-                    "confirmed the session changed state. The prompt text was never "
-                    "re-sent."
-                ),
-            }
-    return None
+    advanced_to = await _seq_advanced(client, pane, terminal_id, seq_before)
+    if advanced_to is None:
+        return None
+
+    await _audit(
+        event="submitted_after_enter", host_alias=host_alias,
+        terminal_id=terminal_id, action_id=action_id,
+        detail=f"state_change_seq {seq_before} -> {advanced_to}",
+    )
+    await _with_db(
+        lambda conn: herdr_binding.upsert_binding(
+            conn, host_alias=host_alias, terminal_id=terminal_id,
+            completion_state="pending",
+        )
+    )
+    return {
+        "status": "submitted",
+        "host_alias": host_alias,
+        "terminal_id": terminal_id,
+        "pane_id": pane,
+        "action_id": action_id,
+        "completion_state": "pending",
+        "completion_signal": COMPLETION_SIGNAL,
+        "submission": (
+            "Herdr's own Enter did not land, so Fleet pressed Enter once and "
+            "confirmed the session changed state. The prompt text was never "
+            "re-sent."
+        ),
+    }
 
 async def _await_completion(
     client: HerdrClient,
