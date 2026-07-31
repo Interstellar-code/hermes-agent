@@ -343,6 +343,9 @@ def test_list_sessions_happy_path_normalizes_and_counts(
             "state_change_seq": None,
             # The agent's own session id, absent until it has taken a turn.
             "agent_session_id": None,
+            # Reported only for agents Herdr started itself; a veto when
+            # present, never a requirement (see _agy_ready).
+            "interactive_ready": None,
         }
     ]
 

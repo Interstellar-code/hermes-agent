@@ -27,7 +27,9 @@ One trap is NOT kind-specific and bites every kind: for a short window after
 nothing. ``interactive_ready`` is true and ``agent_status`` is ``idle`` in that
 window, and ``state_change_seq`` advances on its own as detection settles, so
 none of those separate it from a working session. ``_target_ready`` refuses
-sessions with no ``agent_session`` for exactly this reason.
+sessions with no ``agent_session`` for exactly this reason. ``agy`` has the
+same window but never reports an ``agent_session`` at all, so it gets the same
+question answered from its own evidence — see ``_agy_ready``.
 
 Every handler returns a plain dict and never raises, mirroring
 :mod:`fleet_tools`: the calling agent can surface the string verbatim in chat
@@ -43,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -458,7 +461,7 @@ async def _submit_supported(host_cfg: Dict[str, Any]) -> Optional[Dict[str, str]
 # Everything here was verified on herdr 0.7.5 / protocol 17: discovery, exact-id
 # inspection, preview, confirmed submit, delivery observed in the pane, replay
 # refused, human takeover blocking both verbs, and audit ordering.
-VERIFIED_AGENT_KINDS = ("claude", "codex", "opencode")
+VERIFIED_AGENT_KINDS = ("claude", "codex", "opencode", "agy")
 
 
 def _kind_allowed(
@@ -493,7 +496,9 @@ def _kind_allowed(
     }
 
 
-def _target_ready(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
+async def _target_ready(
+    session: Dict[str, Any], host_cfg: Dict[str, Any]
+) -> Optional[Dict[str, str]]:
     """Refuse a target that has not yet established its own agent session.
 
     A freshly started agent has a startup window in which ``agent prompt``
@@ -519,7 +524,12 @@ def _target_ready(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
     Consequence of refusing here: Fleet will not drive an agent that has never
     taken a turn. That is the intended scope anyway — fleet peers are
     long-lived working sessions, and the first turn belongs to the operator.
+
+    Kinds whose runtime never reports a session identity to Herdr at all need
+    their own evidence for the same question — see ``_agy_ready``.
     """
+    if session.get("agent_kind") == "agy":
+        return await _agy_ready(session, host_cfg)
     if session.get("agent_session_id"):
         return None
     return {
@@ -532,6 +542,84 @@ def _target_ready(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
         "agent_kind": session.get("agent_kind") or "",
         "agent_status": str(session.get("agent_status")),
         "retry": "after the agent has taken at least one turn",
+    }
+
+
+# Statuses that mean Herdr is actually tracking this agent. `unknown` (and a
+# missing status) mean detection has not settled, which is precisely the state
+# the cold window lives in.
+LIVE_AGENT_STATUSES = ("idle", "working", "blocked", "done")
+
+# Antigravity prints its conversation id in the pane footer once — and only
+# once — it has established a conversation. Kept deliberately loose on the id
+# body: it is a rendering, and the digest length is not an API.
+AGY_CONVERSATION_MARKER = re.compile(r"\bconv:[0-9a-f]{4,}")
+
+
+async def _agy_ready(
+    session: Dict[str, Any], host_cfg: Dict[str, Any]
+) -> Optional[Dict[str, str]]:
+    """Readiness for ``agy``, which never populates ``agent_session``.
+
+    Antigravity has the SAME silent-drop cold window as codex and opencode —
+    verified live on 2026-07-31 against herdr 0.7.5 / agy 1.1.9 on a scratch
+    pane: ``agent start`` returned ``interactive_ready: true``, a prompt sent
+    ~10s later came back ``agent_prompt_stalled`` with ``state_change_seq``
+    frozen at 131 and an empty composer, and the identical prompt sent later
+    landed (131 -> 133, status ``done``). So agy cannot simply be exempted
+    from the guard; it needs its own evidence for the same question.
+
+    Nothing in Herdr's model supplies it. agy reports no ``agent_session``, no
+    terminal title (hence ``revision`` pinned at 0), and its detection manifest
+    carries no rules — ``agent explain`` reads ``rule: none,
+    fallback_reason: default_known_agent_idle_fallback``, so ``agent_status:
+    idle`` is a default, not an observation. ``state_change_seq`` is a
+    SERVER-GLOBAL counter (a brand-new pane opened at 131 while another agent
+    sat at 130), so it carries no per-agent history to compare against either.
+
+    What agy does expose is its conversation id in the pane footer, and it
+    appears exactly when ``agent_session`` would have: absent on a started but
+    unused session, present from the first completed turn onward. That is the
+    same discriminator, read from the only surface that has it.
+
+    Costs one extra read per submission attempt, on agy only. Fails closed:
+    an unreadable pane is not a ready one.
+    """
+    ready = session.get("interactive_ready")
+    if ready is False:
+        return _agy_not_ready(session, "herdr reports interactive_ready: false")
+
+    status = session.get("agent_status")
+    if status not in LIVE_AGENT_STATUSES:
+        return _agy_not_ready(
+            session, f"agent_status is {status!r}; detection has not settled"
+        )
+
+    target = session.get("pane_id") or session.get("terminal_id") or ""
+    try:
+        pane_text = await _client_for(host_cfg).read_agent_text(target)
+    except HerdrError as exc:
+        return _agy_not_ready(session, f"could not read the pane to check: {exc}")
+    if AGY_CONVERSATION_MARKER.search(pane_text):
+        return None
+    return _agy_not_ready(
+        session,
+        "the pane footer carries no conversation id, so this agy has not "
+        "completed a turn yet and would swallow the prompt",
+    )
+
+
+def _agy_not_ready(session: Dict[str, Any], why: str) -> Dict[str, str]:
+    return {
+        "status": "submission_target_not_ready",
+        "reason": (
+            f"{why} — agy never reports an agent_session, so readiness is read "
+            "from its conversation id in the pane footer; give it its first "
+            "turn interactively, then retry"
+        ),
+        "agent_kind": "agy",
+        "agent_status": str(session.get("agent_status")),
+        "retry": "after the agent has completed at least one turn",
     }
 
 
@@ -620,7 +708,7 @@ async def herdr_preview_action_handler(
         bad_kind = _kind_allowed(session, host_cfg)
         if bad_kind is not None:
             return {**bad_kind, "host_alias": host_alias, "terminal_id": terminal_id}
-        not_ready = _target_ready(session)
+        not_ready = await _target_ready(session, host_cfg)
         if not_ready is not None:
             # Refuse before minting a token: a token bound to a session that
             # silently drops prompts would be spent on nothing.
@@ -733,7 +821,7 @@ async def herdr_request_action_handler(
         bad_kind = _kind_allowed(session, host_cfg)
         if bad_kind is not None:
             return {**bad_kind, "host_alias": host_alias, "terminal_id": terminal_id}
-        not_ready = _target_ready(session)
+        not_ready = await _target_ready(session, host_cfg)
         if not_ready is not None:
             # Before consuming the token: the single-use token must not be
             # burned on a session that would swallow the prompt silently.

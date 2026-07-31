@@ -254,6 +254,24 @@ class HerdrClient:
     async def get_agent(self, target: str) -> Dict[str, Any]:
         return await self._call("agent", "get", target)
 
+    async def read_agent_text(self, target: str, *, lines: int = 4) -> str:
+        """Return the bottom ``lines`` rows of an agent pane as plain text.
+
+        Deliberately NOT routed through ``_call``: ``agent read`` is the one
+        read verb that is not enveloped — it writes terminal text straight to
+        stdout — so JSON parsing would fail on every call.
+
+        Read-only, and used for exactly one thing: recovering readiness state
+        that Herdr does not model (see ``_agy_ready`` in herdr_tools). Never
+        parse agent OUTPUT with this — pane text is a rendering, not an API.
+        """
+        argv = self._build_argv(
+            "agent", "read", target,
+            "--source", "visible", "--lines", str(lines), "--format", "text",
+        )
+        _returncode, stdout, _stderr = await self._exec(argv)
+        return stdout.decode("utf-8", "replace")
+
     # -- action verbs (Phase 2, confirmation-gated at the tool layer) ---------
 
     async def submit_prompt(
@@ -433,4 +451,8 @@ def normalize_agent_record(raw: Dict[str, Any]) -> Dict[str, Any]:
         # idle` while still swallowing prompts silently, and `agent_session`
         # is what distinguishes it. See _target_ready in herdr_tools.
         "agent_session_id": (raw.get("agent_session") or {}).get("value"),
+        # Present only on agents Herdr itself started (`agent start` names
+        # them); absent entirely on operator-started panes, so it can be read
+        # as a veto but never required. See _agy_ready in herdr_tools.
+        "interactive_ready": raw.get("interactive_ready"),
     }

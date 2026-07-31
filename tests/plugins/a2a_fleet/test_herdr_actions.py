@@ -853,6 +853,145 @@ def test_cold_agent_is_refused_before_the_token_is_spent(
     assert _request(preview["confirmation_token"])["status"] == "submitted"
 
 
+# ---------------------------------------------------------------------------
+# agy readiness — same question, different evidence
+# ---------------------------------------------------------------------------
+
+AGY_FOOTER_WARM = "[Gemini 3.6 Flash (High)] repo git:(main) v1.1.9 conv:493d0d6f\n"
+AGY_FOOTER_COLD = "[Gemini 3.6 Flash (High)] repo git:(main) v1.1.9\n"
+
+
+def _agy_env(herdr_env, monkeypatch, footer: str, **overrides):
+    """Point the fixture session at an agy pane and stub the pane read.
+
+    agy reports no ``agent_session`` at any point in its life, so the shared
+    readiness signal is simply absent — readiness comes from the conversation
+    id in its footer instead. Returns the list of read targets so a test can
+    assert the read did NOT happen.
+    """
+    herdr_env["session"]["agent"] = "agy"
+    herdr_env["session"].pop("agent_session", None)
+    herdr_env["session"]["revision"] = 0  # agy sets no terminal title
+    herdr_env["session"].update(overrides)
+    reads: List[Any] = []
+
+    async def fake_read(self, target, **kw):
+        reads.append(target)
+        return footer
+
+    monkeypatch.setattr(HerdrClient, "read_agent_text", fake_read)
+    return reads
+
+
+def test_agy_without_a_conversation_id_is_refused(herdr_env, monkeypatch) -> None:
+    """A started-but-unused agy is cold, exactly like a cold codex.
+
+    Verified live 2026-07-31 on herdr 0.7.5 / agy 1.1.9: a prompt sent ~10s
+    after `agent start` (which had reported interactive_ready: true) came back
+    agent_prompt_stalled with state_change_seq frozen and an empty composer.
+    The same prompt landed later. Herdr never fills agent_session for agy, so
+    the footer's conversation id is what separates the two states.
+    """
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+    _agy_env(herdr_env, monkeypatch, AGY_FOOTER_COLD)
+
+    result = _preview("must not be minted")
+    assert result["status"] == "submission_target_not_ready"
+    assert result["agent_kind"] == "agy"
+    assert "confirmation_token" not in result
+    assert sent == []
+
+
+def test_agy_with_a_conversation_id_submits(herdr_env, monkeypatch) -> None:
+    """The absent agent_session must not block an agy that has taken a turn."""
+    sent: List[Any] = []
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+    _agy_env(herdr_env, monkeypatch, AGY_FOOTER_WARM)
+
+    preview = _preview("run the tests")
+    assert preview["status"] == "preview"
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+    assert sent == ["run the tests"]
+
+
+def test_agy_with_unsettled_detection_is_refused_without_reading(
+    herdr_env, monkeypatch
+) -> None:
+    """`unknown` status means detection has not settled — refuse it first.
+
+    Also pins the ordering: the cheap field check runs before the extra pane
+    read, so a session Herdr cannot even classify costs no subprocess.
+    """
+    reads = _agy_env(
+        herdr_env, monkeypatch, AGY_FOOTER_WARM, agent_status="unknown"
+    )
+    result = _preview()
+    assert result["status"] == "submission_target_not_ready"
+    assert reads == []
+
+
+def test_agy_reported_not_interactive_is_refused(herdr_env, monkeypatch) -> None:
+    """interactive_ready is a veto when present, never a requirement.
+
+    Herdr only reports it for agents it started itself, so requiring it would
+    refuse every operator-started pane — which is every pane Fleet exists for.
+    """
+    _agy_env(herdr_env, monkeypatch, AGY_FOOTER_WARM, interactive_ready=False)
+    assert _preview()["status"] == "submission_target_not_ready"
+
+
+def test_agy_unreadable_pane_fails_closed(herdr_env, monkeypatch) -> None:
+    """No evidence is not the same as good evidence."""
+
+    async def fake_read(self, target, **kw):
+        raise HerdrError("pane is gone", code="pane_not_found")
+
+    _agy_env(herdr_env, monkeypatch, AGY_FOOTER_WARM)
+    monkeypatch.setattr(HerdrClient, "read_agent_text", fake_read)
+    assert _preview()["status"] == "submission_target_not_ready"
+
+
+def test_agy_readiness_is_rechecked_before_the_token_is_spent(
+    herdr_env, monkeypatch
+) -> None:
+    """A token minted against a warm agy is not spendable once it reads cold."""
+    sent: List[Any] = []
+    footer = {"text": AGY_FOOTER_WARM}
+
+    async def fake_send(self, target, text, **kw):
+        sent.append(text)
+        return {}
+
+    async def fake_read(self, target, **kw):
+        return footer["text"]
+
+    _agy_env(herdr_env, monkeypatch, AGY_FOOTER_WARM)
+    monkeypatch.setattr(HerdrClient, "read_agent_text", fake_read)
+    monkeypatch.setattr(HerdrClient, "submit_prompt", fake_send)
+
+    preview = _preview("minted while warm")
+    footer["text"] = AGY_FOOTER_COLD  # e.g. the session was restarted
+
+    result = _request(preview["confirmation_token"])
+    assert result["status"] == "submission_target_not_ready"
+    assert sent == []
+
+    # The token survived the refusal: it was never consumed.
+    footer["text"] = AGY_FOOTER_WARM
+    assert _request(preview["confirmation_token"])["status"] == "submitted"
+
+
 def test_wait_timeout_with_state_movement_is_submitted_not_unknown(
     herdr_env, monkeypatch
 ) -> None:
@@ -969,4 +1108,13 @@ def test_configured_allowlist_refuses_an_unlisted_kind(
 
 def test_verified_kinds_are_the_ones_driven_end_to_end() -> None:
     """Documentation guard: the recorded list is what was actually tested."""
-    assert set(herdr_tools.VERIFIED_AGENT_KINDS) == {"claude", "codex", "opencode"}
+    assert set(herdr_tools.VERIFIED_AGENT_KINDS) == {
+        "claude",
+        "codex",
+        "opencode",
+        # agy joined on 2026-07-31: full gate matrix driven against a scratch
+        # pane (discovery, exact-id inspect, preview, confirmed submit, marker
+        # observed in the pane, replay refused, takeover blocking both verbs,
+        # audit ordering) plus the cold-target refusal on a second pane.
+        "agy",
+    }
