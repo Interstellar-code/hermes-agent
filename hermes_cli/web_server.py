@@ -42,6 +42,7 @@ import urllib.parse
 import zipfile
 
 from hermes_cli._subprocess_compat import windows_detach_flags, windows_hide_flags
+from hermes_cli import strict_update
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -3813,9 +3814,117 @@ async def gateway_drain(request: Request):
     }
 
 
+def _apply_strict_update(payload: "StrictUpdateRequest") -> Dict[str, Any]:
+    """Strict apply, run on a worker thread (git blocks).
+
+    Returns a structured result in every case; the only raised error is the 409
+    for a concurrent attempt, which is a genuine HTTP-level conflict.
+    """
+    if _dashboard_local_update_managed_externally():
+        return {
+            "ok": False,
+            "mode": "strict",
+            "phase": "preflight",
+            "error": "dashboard_update_managed_externally",
+            "reason": "updates are managed outside this dashboard here",
+        }
+
+    install_method = detect_install_method(PROJECT_ROOT)
+    if install_method != "git":
+        # Strict mode is fast-forward of a checkout. There is no such thing for
+        # a pip/docker/nix install, and pretending otherwise would be worse
+        # than refusing.
+        return {
+            "ok": False,
+            "mode": "strict",
+            "phase": "preflight",
+            "error": "strict_unsupported_install",
+            "reason": f"strict mode requires a git checkout, this is {install_method!r}",
+            "install_method": install_method,
+        }
+
+    if _strict_update_in_flight():
+        raise HTTPException(status_code=409, detail="an update is already running")
+
+    result = strict_update.apply_strict(
+        PROJECT_ROOT,
+        expected_current_head=payload.expected_current_head,
+        expected_target_head=payload.expected_target_head,
+        branch=_strict_update_branch(),
+    )
+    result["mode"] = "strict"
+    result["install_method"] = install_method
+
+    if result.get("ok"):
+        # The source moved, so this process is now running code older than the
+        # checkout — exactly the #199 condition, and the reason /api/status
+        # grew restart_required. Strict mode deliberately stops here: the
+        # dependency/build/restart lifecycle lives inline in the CLI updater
+        # and this dashboard cannot restart itself (it is supervisor-managed).
+        result["restart_required"] = True
+        result["post_update"] = (
+            "source updated; dependency install and service restart are not "
+            "performed by strict mode — restart via the supervisor, then "
+            "re-read /api/status"
+        )
+        _record_completed_action(
+            "hermes-update",
+            f"strict update applied: {result.get('current_head', '')[:12]}",
+            exit_code=0,
+        )
+    return result
+
+
+def _strict_update_branch() -> str:
+    """The one branch strict mode will advance. Server-owned, never client input.
+
+    Configurable because a fork may ship from something other than ``main``,
+    but read from server config only: accepting a branch from the caller would
+    hand a browser the choice of what code to install.
+    """
+    try:
+        cfg = load_config() or {}
+        branch = ((cfg.get("update") or {}).get("strict_branch") or "").strip()
+        return branch or strict_update.DEFAULT_BRANCH
+    except Exception:  # noqa: BLE001 — config trouble must not break updates.
+        return strict_update.DEFAULT_BRANCH
+
+
+class StrictUpdateRequest(BaseModel):
+    """Body for ``POST /api/hermes/update``. All fields optional.
+
+    ``expected_*`` are ASSERTIONS about what the client confirmed against, not
+    refs. They are compared as strings and never reach a git command line.
+    """
+
+    mode: Optional[str] = None
+    expected_current_head: Optional[str] = None
+    expected_target_head: Optional[str] = None
+
+
+def _strict_update_in_flight() -> bool:
+    proc = _ACTION_PROCS.get("hermes-update")
+    return proc is not None and proc.poll() is None
+
+
 @app.post("/api/hermes/update")
-async def update_hermes():
-    """Kick off ``hermes update`` in the background."""
+async def update_hermes(payload: Optional[StrictUpdateRequest] = None):
+    """Kick off ``hermes update`` in the background, or apply a strict update.
+
+    Default (no body, or ``mode`` omitted) keeps the historical behaviour
+    exactly: spawn the interactive-equivalent CLI updater, which may stash
+    local changes per ``update.non_interactive_local_changes``.
+
+    ``mode: "strict"`` (#200) takes a different code path entirely — see
+    :mod:`hermes_cli.strict_update`. It advances the checkout only by
+    fast-forward, refuses every other state, and cannot stash, reset, clean,
+    rebase or checkout. The git advance runs inline rather than in the
+    background: it is bounded by git timeouts, and every refusal a client needs
+    to render comes from preflight, so answering immediately with a structured
+    state beats making the client poll to discover it was blocked.
+    """
+    if payload is not None and (payload.mode or "").lower() == "strict":
+        return await run_in_threadpool(_apply_strict_update, payload)
     if _dashboard_local_update_managed_externally():
         message = (
             "Hermes updates are managed outside this dashboard in "
@@ -3966,6 +4075,18 @@ async def check_hermes_update(force: bool = False):
         "update_command": update_command,
         "message": None,
     }
+
+    # #200: strict-mode capability. Advertised as a versioned integer so Switch
+    # UI can feature-detect instead of inferring support from a Hermes version
+    # number — an older agent simply omits the whole block.
+    #
+    # Read-only: no fetch here. A browser polling "is an update available"
+    # must not be able to drive network traffic against the remote on every
+    # poll; the fetch happens once, inside the apply call.
+    if install_method == "git":
+        payload["strict"] = strict_update.preflight(
+            PROJECT_ROOT, branch=_strict_update_branch(), fetch=False
+        )
 
     if install_method == "docker":
         payload["message"] = format_docker_update_message()
