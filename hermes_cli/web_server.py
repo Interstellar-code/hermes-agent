@@ -3919,19 +3919,26 @@ def _apply_strict_update(payload: "StrictUpdateRequest") -> Dict[str, Any]:
         # The source moved, so this process is now running code older than the
         # checkout — exactly the #199 condition, and the reason /api/status
         # grew restart_required. Strict mode deliberately stops here: the
-        # dependency/build/restart lifecycle lives inline in the CLI updater
-        # and this dashboard cannot restart itself (it is supervisor-managed).
+        # Dependency/build/restart runs in a detached fresh interpreter so this
+        # dashboard can safely hand control back to its supervisor.
         result["restart_required"] = True
-        result["post_update"] = (
-            "source updated; dependency install and service restart are not "
-            "performed by strict mode — restart via the supervisor, then "
-            "re-read /api/status"
-        )
-        _record_completed_action(
-            "hermes-update",
-            f"strict update applied: {result.get('current_head', '')[:12]}",
-            exit_code=0,
-        )
+        # Run the existing dependency/build lifecycle in a fresh interpreter.
+        # The dashboard process intentionally stays on the old imported code
+        # until its supervisor reconnects it after the action completes.
+        try:
+            proc = _spawn_hermes_action(
+                ["update", "--refresh-deps", "--restart-after-refresh"],
+                "hermes-update",
+            )
+            result["post_update"] = "refreshing dependencies and restarting gateways"
+            result["action"] = "hermes-update"
+            result["pid"] = proc.pid
+        except Exception as exc:
+            _log.exception("Strict source update applied but refresh could not start")
+            result["post_update"] = (
+                "source updated; dependency install and restart could not start"
+            )
+            result["refresh_error"] = str(exc)
     return result
 
 

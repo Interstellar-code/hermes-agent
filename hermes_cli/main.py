@@ -9809,6 +9809,15 @@ def cmd_update(args):
         managed_error,
     )
 
+    # Strict API post-processing is already gated by the web endpoint to a
+    # local git checkout; run it before the normal managed-install guards.
+    if getattr(args, "refresh_deps", False):
+        raise SystemExit(
+            _run_post_source_refresh(
+                restart_after=bool(getattr(args, "restart_after_refresh", False))
+            )
+        )
+
     # Deprecation notice for pip/Homebrew installs — printed before the
     # managed-mode early-return below so Homebrew users (who are blocked from
     # applying the update here) still see it. Warn, don't block: the update
@@ -9913,6 +9922,49 @@ def _cmd_update_pip(args):
         sys.exit(1)
 
     print("✓ Update complete! Restart hermes to use the new version.")
+
+
+def _run_post_source_refresh(*, restart_after: bool = False) -> int:
+    """Install runtime assets after a strict, already-applied source update.
+
+    This deliberately does not touch Git.  The strict endpoint has already
+    proved and performed the fast-forward; this phase only makes the new
+    checkout runnable and optionally asks the supervisor to restart gateways.
+    """
+    try:
+        _write_update_incomplete_marker()
+        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+
+        update_managed_uv()
+        uv_bin = ensure_uv()
+        if uv_bin:
+            _install_python_dependencies_with_optional_fallback(
+                [uv_bin, "pip"],
+                env={**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")},
+                group="all",
+            )
+        else:
+            _install_python_dependencies_with_optional_fallback(
+                [sys.executable, "-m", "pip"], group="all"
+            )
+        _clear_update_incomplete_marker()
+        _refresh_active_lazy_features()
+        _update_node_dependencies()
+        _build_web_ui(PROJECT_ROOT / "web")
+        if restart_after:
+            restart = subprocess.run(
+                [sys.executable, "-m", "hermes_cli.main", "gateway", "restart", "--all"],
+                cwd=PROJECT_ROOT,
+                check=False,
+            )
+            if restart.returncode != 0:
+                print("⚠ Dependencies installed, but gateway restart failed.")
+                return restart.returncode or 1
+        print("✓ Dependencies and frontend assets refreshed.")
+        return 0
+    except Exception as exc:  # noqa: BLE001 — action status carries the failure.
+        print(f"✗ Post-update refresh failed: {exc}")
+        return 1
 
 
 def _cmd_update_impl(args, gateway_mode: bool):

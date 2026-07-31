@@ -336,8 +336,83 @@ def test_successful_strict_apply_flags_restart_required(monkeypatch, repos) -> N
     monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
     monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
     monkeypatch.setattr(web_server, "_record_completed_action", lambda *a, **k: None)
+    # MUST be stubbed: the real one spawns a detached `hermes update
+    # --refresh-deps --restart-after-refresh`, which installs dependencies
+    # into the live venv and restarts every gateway on the machine running
+    # the suite.
+    monkeypatch.setattr(web_server, "_spawn_hermes_action", _FakeProc.spawn)
 
     result = web_server._apply_strict_update(_FakePayload(mode="strict"))
     assert result["ok"] is True
     assert result["restart_required"] is True
     assert result["mode"] == "strict"
+
+
+class _FakeProc:
+    """Stand-in for the detached action process, plus the call it recorded."""
+
+    calls: list = []
+    pid = 4242
+
+    @classmethod
+    def spawn(cls, subcommand, name):
+        cls.calls.append((list(subcommand), name))
+        return cls()
+
+
+def test_applied_source_hands_off_to_the_refresh_action(monkeypatch, repos) -> None:
+    """The applied source is not runnable until deps and assets catch up.
+
+    Strict apply only fast-forwards git. The dependency/build/restart
+    lifecycle runs in a DETACHED fresh interpreter, because this dashboard is
+    served from the very process that is now stale — it cannot install into
+    its own running venv and then restart itself.
+    """
+    import hermes_cli.web_server as web_server
+
+    upstream, clone = repos
+    _commit(upstream, "shipped.txt")
+    _FakeProc.calls.clear()
+
+    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
+    monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
+    monkeypatch.setattr(web_server, "_spawn_hermes_action", _FakeProc.spawn)
+
+    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+
+    assert _FakeProc.calls == [
+        (["update", "--refresh-deps", "--restart-after-refresh"], "hermes-update")
+    ]
+    assert result["action"] == "hermes-update"
+    assert result["pid"] == _FakeProc.pid
+    assert result["restart_required"] is True
+
+
+def test_refresh_that_cannot_start_is_reported_not_swallowed(monkeypatch, repos) -> None:
+    """A source update whose follow-up never launched is a half-done update.
+
+    The fast-forward already landed, so ok stays true — but the caller is told
+    the refresh did not start, rather than being left to assume it is running.
+    """
+    import hermes_cli.web_server as web_server
+
+    upstream, clone = repos
+    _commit(upstream, "shipped.txt")
+
+    def _boom(subcommand, name):
+        raise OSError("no interpreter")
+
+    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
+    monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
+    monkeypatch.setattr(web_server, "_spawn_hermes_action", _boom)
+
+    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+
+    assert result["ok"] is True
+    assert result["restart_required"] is True
+    assert "no interpreter" in result["refresh_error"]
+    assert "could not start" in result["post_update"]
