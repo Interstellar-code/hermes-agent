@@ -106,3 +106,101 @@ def test_cache_refreshes_when_the_file_changes(tmp_path, monkeypatch):
     os.utime(init_py, (stale_mtime + 10, stale_mtime + 10))
 
     assert web_server._on_disk_version()["version"] == "0.19.8"
+
+
+# ---------------------------------------------------------------------------
+# Commit-level staleness: the version alone is not enough
+# ---------------------------------------------------------------------------
+
+
+def test_code_moving_without_a_version_bump_still_requires_restart(
+    tmp_path, monkeypatch
+):
+    """The hole a version-only check leaves, and the reason #200 needs this.
+
+    Strict-mode updates fast-forward by whatever is upstream. Most commits do
+    not touch __version__, so a version-only comparison would report "nothing
+    to restart" while the process ran code that no longer exists on disk.
+    """
+    fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
+    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(web_server, "__version__", "0.19.8")  # version did NOT move
+    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
+    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "b" * 40)
+    _reset_cache()
+
+    fields = web_server._version_provenance(web_server._on_disk_version())
+    assert fields["restart_required"] is True
+    assert fields["restart_reason"] == "commit"
+    assert fields["runtime_commit"] == "a" * 40
+    assert fields["installed_commit"] == "b" * 40
+
+
+def test_same_commit_and_version_needs_no_restart(tmp_path, monkeypatch):
+    fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
+    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(web_server, "__version__", "0.19.8")
+    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
+    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "a" * 40)
+    _reset_cache()
+
+    fields = web_server._version_provenance(web_server._on_disk_version())
+    assert fields["restart_required"] is False
+    assert fields["restart_reason"] is None
+
+
+def test_non_git_install_is_unknown_not_stale(tmp_path, monkeypatch):
+    """No SHA on either side must not read as "restart" forever."""
+    fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
+    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(web_server, "__version__", "0.19.8")
+    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", None)
+    monkeypatch.setattr(web_server, "_head_sha", lambda _root: None)
+    _reset_cache()
+
+    fields = web_server._version_provenance(web_server._on_disk_version())
+    assert fields["restart_required"] is False
+    assert fields["installed_commit"] is None
+
+
+def test_version_signal_is_reported_even_when_both_moved(tmp_path, monkeypatch):
+    """A real release moves both; name the version, it is the useful one."""
+    fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
+    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(web_server, "__version__", "0.19.0")
+    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
+    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "b" * 40)
+    _reset_cache()
+
+    fields = web_server._version_provenance(web_server._on_disk_version())
+    assert fields["restart_required"] is True
+    assert fields["restart_reason"] == "version"
+
+
+def test_head_sha_reads_a_real_checkout(tmp_path):
+    """Read git's files directly — no subprocess at import time."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "--initial-branch=main"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@e.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"],
+                   check=True, capture_output=True)
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "c"], check=True, capture_output=True)
+
+    expected = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert web_server._head_sha(repo) == expected
+
+
+def test_head_sha_on_a_non_checkout_is_none(tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert web_server._head_sha(plain) is None

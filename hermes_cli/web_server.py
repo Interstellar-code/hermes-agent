@@ -71,6 +71,43 @@ _VERSION_RE = re.compile(
 _ON_DISK_CACHE: Dict[str, Any] = {"mtime": None, "value": None}
 
 
+def _head_sha(repo_root: Path) -> Optional[str]:
+    """Checkout HEAD, by reading git's files directly. None when not a checkout.
+
+    Deliberately no subprocess: this runs at import time, and shelling out
+    during module import is a startup hazard (slow FS, missing git, a hung
+    filesystem) for a field that is only informational.
+    """
+    try:
+        head = (repo_root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not head.startswith("ref:"):
+        return head or None  # detached HEAD holds the SHA directly
+    ref = head[4:].strip()
+    try:
+        return (repo_root / ".git" / ref).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    try:  # packed refs — a freshly cloned checkout has no loose ref file
+        for line in (repo_root / ".git" / "packed-refs").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == ref:
+                return parts[0]
+    except OSError:
+        pass
+    return None
+
+
+# Captured ONCE, at import, so it records the commit this process actually
+# loaded rather than whatever is on disk by the time someone asks.
+_RUNTIME_COMMIT: Optional[str] = _head_sha(PROJECT_ROOT)
+
+
 def _on_disk_version() -> Dict[str, Optional[str]]:
     """Read ``__version__``/``__release_date__` from the package on disk.
 
@@ -106,18 +143,41 @@ def _on_disk_version() -> Dict[str, Optional[str]]:
 def _version_provenance(on_disk: Dict[str, Optional[str]]) -> Dict[str, Any]:
     """Fields that let a caller tell a stale process from a current one.
 
-    ``restart_required`` is only ever True when the on-disk version was read
-    successfully AND differs from the running one. Unknown never means stale:
-    a parse failure must not nag every client into restarting.
+    Staleness is decided on TWO signals, because the version alone is not
+    enough. Most commits do not bump ``__version__``, so a checkout that has
+    moved by several commits can leave the version string identical while the
+    process runs code that no longer exists on disk. That is not hypothetical:
+    the strict updater (#200) fast-forwards by whatever is upstream, and if
+    none of those commits happened to bump the version, a version-only check
+    would report "nothing to restart" to Switch UI while the dashboard ran
+    stale code — the very bug #199 was filed about, through a new door.
+
+    Either signal disagreeing means stale. Neither being readable means
+    unknown, and unknown never means stale: a parse failure or a non-git
+    install must not nag every client into restarting.
     """
     installed = on_disk.get("version")
+    installed_commit = _head_sha(PROJECT_ROOT)
+
+    version_moved = bool(installed) and installed != __version__
+    commit_moved = bool(_RUNTIME_COMMIT and installed_commit) and (
+        installed_commit != _RUNTIME_COMMIT
+    )
+
     return {
         "runtime_version": __version__,
         "runtime_release_date": __release_date__,
+        "runtime_commit": _RUNTIME_COMMIT,
         "installed_version": installed,
         "installed_release_date": on_disk.get("release_date"),
+        "installed_commit": installed_commit,
         "version_source": "process-import",
-        "restart_required": bool(installed) and installed != __version__,
+        "restart_required": version_moved or commit_moved,
+        # Which signal fired, so a client can explain *why* to a human rather
+        # than just showing a restart nag.
+        "restart_reason": (
+            "version" if version_moved else "commit" if commit_moved else None
+        ),
     }
 from hermes_cli.config import (
     cfg_get,
