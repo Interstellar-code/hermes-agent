@@ -514,6 +514,11 @@ _MALFORMED_SCHEMA_MARKERS = (
 _repair_attempted_paths: set[str] = set()
 _repair_attempt_lock = threading.Lock()
 
+# Same one-shot-per-path discipline for the read-only drift reconcile below
+# (a different question from malformed-schema repair, so a separate set).
+_drift_checked_paths: set[str] = set()
+_declared_session_columns_cache: Optional[set] = None
+
 
 def is_malformed_db_error(exc: BaseException) -> bool:
     """True if *exc* is a SQLite 'malformed schema / disk image' error.
@@ -1065,6 +1070,10 @@ class SessionDB:
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                #
+                # One exception, itself lock-free unless the DB is drifted:
+                # see _reconcile_drifted_readonly_schema.
+                self._reconcile_drifted_readonly_schema()
                 self._conn = sqlite3.connect(
                     f"file:{self.db_path}?mode=ro",
                     uri=True,
@@ -1562,6 +1571,97 @@ class SessionDB:
                         logger.debug(
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
+
+    def _reconcile_drifted_readonly_schema(self) -> None:
+        """Bring a *drifted* profile DB current before opening it read-only.
+
+        Cross-profile aggregation (dashboard sidebar, cross-profile session
+        search, the projects panels) opens other profiles' ``state.db`` with
+        ``read_only=True``, which deliberately skips ``_init_schema`` so it can
+        never take a write lock on another profile's live database. But a
+        profile whose gateway last ran on an older version still has that
+        version's ``sessions`` table, and every aggregation query selecting a
+        newer column then fails for the whole profile —
+        ``no such column: s.display_name`` — so e.g. 306 real sessions render as
+        zero rows plus an error string.
+
+        The read-only guarantee is preserved for every DB that isn't drifted:
+        we peek at the live columns over a ``mode=ro`` connection (no lock at
+        all) and, in the normal case where the table is current, return without
+        ever opening the file writable. Only a genuinely drifted DB is opened
+        for writing, at most once per path per process, to run the ordinary
+        declarative ``_reconcile_columns``. Such a DB is by definition one that
+        no current-version writer has opened; if the write lock can't be taken
+        inside the 1s timeout we give up and the caller degrades exactly as it
+        does today.
+
+        ponytail: columns only — that is the whole reported failure. A DB old
+        enough to be missing entire *tables* fails with "no such table" instead
+        and still degrades per-profile; run that profile's gateway once to get
+        the full ``_init_schema``.
+        """
+        global _declared_session_columns_cache
+
+        path_key = str(self.db_path)
+        if path_key in _drift_checked_paths:
+            return
+
+        try:
+            probe = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0
+            )
+        except Exception:
+            return  # Missing/unopenable — caller's own error path handles it.
+        try:
+            live_cols = {row[1] for row in probe.execute('PRAGMA table_info("sessions")')}
+        except Exception:
+            return
+        finally:
+            probe.close()
+
+        if not live_cols:
+            return  # Not an initialised state.db; nothing to reconcile against.
+
+        if _declared_session_columns_cache is None:
+            try:
+                _declared_session_columns_cache = set(
+                    self._parse_schema_columns(SCHEMA_SQL).get("sessions", {})
+                )
+            except Exception:
+                return
+        missing = _declared_session_columns_cache - live_cols
+
+        with _repair_attempt_lock:
+            if path_key in _drift_checked_paths:
+                return
+            # Recorded whether or not the reconcile below succeeds: a current DB
+            # never needs re-probing, and a drifted one we couldn't write must
+            # not be retried on every sidebar poll.
+            _drift_checked_paths.add(path_key)
+
+        if not missing:
+            return
+
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=1.0, isolation_level=None)
+            try:
+                self._reconcile_columns(conn.cursor())
+            finally:
+                conn.close()
+            logger.info(
+                "Reconciled drifted schema for %s (added: %s)",
+                self.db_path,
+                ", ".join(sorted(missing)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not reconcile drifted schema for %s (%s) — aggregation "
+                "over this profile will keep degrading until its own gateway "
+                "runs. Missing: %s",
+                self.db_path,
+                exc,
+                ", ".join(sorted(missing)),
+            )
 
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
