@@ -486,6 +486,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+    # Project Context — the explicit project↔session binding, made visible to
+    # the model. Belongs in the context tier, not the volatile one: it is read
+    # exactly once, when this prompt is first built, and the block contains
+    # only stable project metadata so it stays true for the whole conversation.
+    # Rebinding later does NOT rewrite this prompt — the next turn restores the
+    # stored one verbatim, which is what keeps the provider prefix cache warm.
+    # A new session bound elsewhere builds its own block.
+    _session_id = getattr(agent, "session_id", None)
+    if _session_id:
+        try:
+            from hermes_cli.projects_prompt import project_context_block
+
+            _project_block = project_context_block(_session_id)
+            if _project_block:
+                context_parts.append(_project_block)
+        except Exception as exc:  # noqa: BLE001 — never block agent startup.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Project context block unavailable: %s", exc
+            )
+
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
 
