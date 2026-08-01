@@ -1050,11 +1050,18 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_approval_sessions: Dict[str, str] = {}
         # Approval request metadata for durable receipts.
         self._run_approval_requests: Dict[str, List[Dict[str, Any]]] = {}
-        # Active interactive-clarify streams: session_id -> thread-safe
-        # _enqueue(name, payload) callable for the live chat stream.
-        self._clarify_streams: Dict[str, Any] = {}
-        # Durable session-chat interactions keyed by public interaction id.
-        self._session_interactions: Dict[str, Dict[str, Any]] = {}
+        # Active interactive-clarify streams: (profile, session_id) ->
+        # thread-safe _enqueue(name, payload) callable for the live chat stream.
+        # Keyed by profile as well as session id because this dict is
+        # process-global while the gateway may serve several profiles at once
+        # (``gateway.multiplex_profiles``): two profiles legitimately holding
+        # the same session id would otherwise alias, one overwriting or
+        # cleaning up the other's live stream. ``None`` is the profile for
+        # single-profile gateways and unprefixed requests. Mirrors the
+        # per-profile partitioning ``_open_and_cache_session_db`` already does.
+        self._clarify_streams: Dict[tuple, Any] = {}
+        # Durable session-chat interactions keyed by (profile, interaction id).
+        self._session_interactions: Dict[tuple, Dict[str, Any]] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
@@ -1463,12 +1470,13 @@ class APIServerAdapter(BasePlatformAdapter):
         """Resolve + validate the /p/<profile>/ URL prefix on an API request.
 
         Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored; request handled as the default profile).
+          - ``None`` when no profile prefix is present (request handled as the
+            single-profile gateway, exactly as before multiplexing existed).
           - the profile name (str) when present, multiplexing is on, and the
             profile is one this gateway serves.
           - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler/middleware returns 404).
+            unknown/unconfigured, OR multiplexing is off entirely
+            (handler/middleware returns 404).
         """
         profile = (request.match_info.get("profile") or "").strip()
         if not profile:
@@ -1476,9 +1484,17 @@ class APIServerAdapter(BasePlatformAdapter):
         runner = getattr(self, "gateway_runner", None)
         cfg = getattr(runner, "config", None)
         if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
+            # Prefix supplied but multiplexing is off. Fail closed rather than
+            # ignore it: ``connect()`` registers the /p/<profile>/ mirrors
+            # unconditionally, so an ignored prefix runs the request through the
+            # ordinary handler scoped to the gateway's own HERMES_HOME. For a
+            # write endpoint that silently persists into the WRONG profile's
+            # state.db whenever the session id also exists there, the endpoint
+            # mints its own id (session create, /v1/chat/completions), or
+            # another transport reuses the id. A client cannot close this gap
+            # itself — /api/status gateway_mode is a cache, and the gateway can
+            # restart with multiplexing off between the check and the send.
+            return _PROFILE_REJECTED
         try:
             from hermes_cli.profiles import profiles_to_serve
 
@@ -2310,7 +2326,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        meta = self._session_interactions.get(interaction_id)
+        # Interactive state is process-global but profile-scoped; resolve the
+        # requesting profile (set by the /p/<profile>/ middleware) so a
+        # responder can only reach interactions raised under its own profile.
+        scope = _api_request_profile.get()
+        meta = self._session_interactions.get((scope, interaction_id))
         if not meta or meta.get("session_id") != session_id:
             return web.json_response(
                 _openai_error(
@@ -2347,11 +2367,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
-        self._session_interactions.pop(interaction_id, None)
+        self._session_interactions.pop((scope, interaction_id), None)
         event_payload = self._interaction_event_payload(meta, answer=answer, resolved=True)
         self._persist_interaction_receipt(session_id, meta, answer, True)
 
-        enqueue = self._clarify_streams.get(session_id)
+        enqueue = self._clarify_streams.get((scope, session_id))
         if enqueue is not None:
             try:
                 enqueue("clarify.responded", dict(event_payload))
@@ -2874,6 +2894,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
 
+        # Own the process-global interactive state under (profile, session_id).
+        # Captured once here rather than read from the ContextVar later: the
+        # clarify callback runs on the agent's executor thread, where the
+        # request-scoped ContextVar is not visible.
+        stream_profile = _api_request_profile.get()
+
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -2939,7 +2965,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "question": question,
                 "choices": normalized_choices,
             }
-            self._session_interactions[clarify_id] = interaction_meta
+            self._session_interactions[(stream_profile, clarify_id)] = interaction_meta
             request_payload = self._interaction_event_payload(interaction_meta)
             _enqueue("clarify.request", dict(request_payload))
             _enqueue("interaction.request", dict(request_payload))
@@ -3002,10 +3028,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
-                self._clarify_streams.pop(session_id, None)
-                for _iid, _meta in list(self._session_interactions.items()):
-                    if _meta.get("session_id") == session_id:
-                        self._session_interactions.pop(_iid, None)
+                self._clarify_streams.pop((stream_profile, session_id), None)
+                for _key, _meta in list(self._session_interactions.items()):
+                    if _key[0] == stream_profile and _meta.get("session_id") == session_id:
+                        self._session_interactions.pop(_key, None)
                 try:
                     from tools.clarify_gateway import clear_session as _clear_clarify_session
                     _clear_clarify_session(clarify_session_key or "")
@@ -3014,7 +3040,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
-        self._clarify_streams[session_id] = _enqueue
+        self._clarify_streams[(stream_profile, session_id)] = _enqueue
         task = asyncio.create_task(_run_and_signal())
         try:
             self._background_tasks.add(task)
