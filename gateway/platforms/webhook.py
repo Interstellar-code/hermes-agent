@@ -498,12 +498,13 @@ class WebhookAdapter(BasePlatformAdapter):
         """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
 
         Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored, request handled as the default profile).
+          - ``None`` when no profile prefix is present (request handled as the
+            single-profile gateway, exactly as before multiplexing existed).
           - the profile name (str) when present, multiplexing is on, and the
             profile is one this gateway serves.
           - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler returns 404).
+            unknown/unconfigured, OR multiplexing is off entirely
+            (handler returns 404).
         """
         profile = (request.match_info.get("profile") or "").strip()
         if not profile:
@@ -511,9 +512,11 @@ class WebhookAdapter(BasePlatformAdapter):
         runner = self.gateway_runner
         cfg = getattr(runner, "config", None)
         if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
+            # Prefix supplied but multiplexing is off. Fail closed, same as
+            # api_server: the /p/<profile>/ route is registered unconditionally,
+            # so ignoring the prefix would run the event through the default
+            # profile's home and persist the resulting session there.
+            return _PROFILE_REJECTED
         try:
             from hermes_cli.profiles import profiles_to_serve
             served = {name for name, _ in profiles_to_serve(multiplex=True)}

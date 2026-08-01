@@ -71,9 +71,11 @@ async def test_session_clarify_endpoint_resolves_pending_clarify(adapter):
     session_id = "clarify-session"
     clarify_id = "clarify_1"
     events = []
-    adapter._clarify_streams[session_id] = lambda name, payload: events.append((name, payload))
+    # Interactive state is keyed by (profile, id); None is the profile for an
+    # unprefixed request on a single-profile gateway.
+    adapter._clarify_streams[(None, session_id)] = lambda name, payload: events.append((name, payload))
     register(clarify_id, session_id, "Pick one", ["A", "B"])
-    adapter._session_interactions[clarify_id] = {
+    adapter._session_interactions[(None, clarify_id)] = {
         "interaction_id": clarify_id,
         "clarify_id": clarify_id,
         "kind": "choice",
