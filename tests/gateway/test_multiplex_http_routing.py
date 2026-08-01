@@ -51,10 +51,18 @@ class TestWebhookProfileResolution:
         adapter, Req, _REJ, _ = self._adapter(multiplex=True)
         assert adapter._resolve_request_profile(Req(None)) is None
 
-    def test_prefix_ignored_when_multiplex_off(self):
+    def test_no_prefix_returns_none_when_multiplex_off(self):
+        """Unprefixed webhooks are untouched in both modes."""
         adapter, Req, _REJ, _ = self._adapter(multiplex=False)
-        # Even a bogus profile is ignored (not 404'd) when multiplexing is off.
-        assert adapter._resolve_request_profile(Req("anything")) is None
+        assert adapter._resolve_request_profile(Req(None)) is None
+
+    def test_prefix_rejected_when_multiplex_off(self):
+        """Fail closed, same as api_server: the /p/<profile>/ route is
+        registered unconditionally, so ignoring the prefix would run the event
+        through the default profile's home and persist the session there."""
+        adapter, Req, REJ, _ = self._adapter(multiplex=False)
+        assert adapter._resolve_request_profile(Req("anything")) is REJ
+        assert adapter._resolve_request_profile(Req("coder")) is REJ
 
     def test_known_profile_accepted(self, monkeypatch):
         adapter, Req, _REJ, served = self._adapter(multiplex=True)
