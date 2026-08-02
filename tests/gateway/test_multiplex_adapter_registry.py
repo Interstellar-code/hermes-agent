@@ -393,7 +393,7 @@ class TestSecondaryProfileConfigHandling:
     """Secondary config errors degrade only when the profile is safe to skip."""
 
     @pytest.mark.asyncio
-    async def test_secondary_webhook_uses_degradable_error(self, monkeypatch):
+    async def test_secondary_feishu_webhook_uses_degradable_error(self, monkeypatch):
         from gateway.run import SecondaryPortBindingConfigError
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
@@ -401,10 +401,12 @@ class TestSecondaryProfileConfigHandling:
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner._profile_adapters = {}
 
-        # reviewer profile config enables webhook (a port-binding platform)
+        # reviewer profile config enables feishu in webhook mode (a port-binding platform)
         reviewer_cfg = GatewayConfig(multiplex_profiles=True)
         reviewer_cfg.platforms = {
-            Platform.WEBHOOK: PlatformConfig(enabled=True, extra={"port": 8644}),
+            Platform.FEISHU: PlatformConfig(
+                enabled=True, extra={"connection_mode": "webhook"}
+            ),
         }
         monkeypatch.setattr(
             "gateway.config.load_gateway_config", lambda: reviewer_cfg
@@ -412,7 +414,7 @@ class TestSecondaryProfileConfigHandling:
 
         with pytest.raises(SecondaryPortBindingConfigError) as ei:
             await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
-        assert "webhook" in str(ei.value)
+        assert "feishu" in str(ei.value)
         assert "reviewer" in str(ei.value)
         assert "reviewer" not in runner._profile_adapters
 
@@ -433,7 +435,7 @@ class TestSecondaryProfileConfigHandling:
             Platform.FEISHU: PlatformConfig(
                 enabled=True, extra={"connection_mode": "webhook"}
             ),
-            Platform.WEBHOOK: PlatformConfig(enabled=True, extra={"port": 8644}),
+            Platform.MSGRAPH_WEBHOOK: PlatformConfig(enabled=True),
             Platform.TELEGRAM: PlatformConfig(enabled=True, token="t"),
         }
         monkeypatch.setattr(
@@ -444,9 +446,33 @@ class TestSecondaryProfileConfigHandling:
             await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         message = str(ei.value)
         assert "feishu" in message
-        assert "webhook" in message
+        assert "msgraph_webhook" in message
         assert "telegram" not in message
         assert "reviewer" not in runner._profile_adapters
+
+    @pytest.mark.asyncio
+    async def test_secondary_profile_with_api_server_does_not_raise_port_binding_error(self, monkeypatch):
+        """api_server in secondary profile platforms: must NOT raise
+        SecondaryPortBindingConfigError or skip the secondary profile."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+
+        coder_cfg = GatewayConfig(multiplex_profiles=True)
+        coder_cfg.platforms = {
+            Platform.API_SERVER: PlatformConfig(enabled=True),
+            Platform.WEBHOOK: PlatformConfig(enabled=True),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: coder_cfg
+        )
+
+        # Must not raise SecondaryPortBindingConfigError
+        connected = await runner._start_one_profile_adapters("coder", "/tmp/x", {})
+        assert connected == 0  # api_server and webhook are skipped from secondary standalone creation
+        assert "coder" in runner._profile_adapters
 
     @pytest.mark.asyncio
     async def test_multiplexer_skips_bad_profile_and_continues(self, monkeypatch, caplog):

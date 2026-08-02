@@ -4006,30 +4006,15 @@ def _notify_provider_jobs_changed() -> None:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
 
-def tick(
+def _tick_single_profile(
     verbose: bool = True,
     adapters=None,
     loop=None,
     sync: bool = True,
     *,
     can_dispatch=None,
-):
-    """
-    Check and run all due jobs.
-    
-    Uses a file lock so only one tick runs at a time, even if the gateway's
-    in-process ticker and a standalone daemon or manual tick overlap.
-    
-    Args:
-        verbose: Whether to print status messages
-        adapters: Optional dict mapping Platform → live adapter (from gateway)
-        loop: Optional asyncio event loop (from gateway) for live adapter sends
-        can_dispatch: Optional synchronous gate; false leaves due jobs untouched
-            for the next allowed tick
-
-    Returns:
-        Number of jobs executed (0 if another tick is already running)
-    """
+) -> int:
+    """Check and run all due jobs for the active HERMES_HOME."""
     lock_dir, lock_file = _get_lock_paths()
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4268,6 +4253,65 @@ def tick(
             except (OSError, IOError):
                 pass
         lock_fd.close()
+
+
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    loop=None,
+    sync: bool = True,
+    *,
+    can_dispatch=None,
+) -> int:
+    """Check and run all due jobs across active/served profile(s).
+
+    Uses a file lock per profile so only one tick runs at a time per profile.
+    When multiplexing is active (gateway.multiplex_profiles=True), ticks each
+    served profile under its own HERMES_HOME context.
+    """
+    _multiplex = False
+    try:
+        from agent.secret_scope import is_multiplex_active
+        _multiplex = is_multiplex_active()
+    except Exception:
+        pass
+
+    if _multiplex:
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+            served = profiles_to_serve(multiplex=True)
+        except Exception:
+            served = []
+
+        if served and len(served) > 1:
+            total_executed = 0
+            for pname, phome in served:
+                if not phome:
+                    continue
+                p_adapters = adapters
+                if isinstance(adapters, dict) and pname in adapters:
+                    p_adapters = adapters[pname]
+                token = set_hermes_home_override(str(phome))
+                try:
+                    total_executed += _tick_single_profile(
+                        verbose=verbose,
+                        adapters=p_adapters,
+                        loop=loop,
+                        sync=sync,
+                        can_dispatch=can_dispatch,
+                    )
+                finally:
+                    reset_hermes_home_override(token)
+            return total_executed
+
+    return _tick_single_profile(
+        verbose=verbose,
+        adapters=adapters,
+        loop=loop,
+        sync=sync,
+        can_dispatch=can_dispatch,
+    )
 
 
 if __name__ == "__main__":

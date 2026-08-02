@@ -9498,6 +9498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform.value
             for platform, platform_config in profile_cfg.platforms.items()
             if platform_config.enabled
+            and platform not in (Platform.API_SERVER, Platform.WEBHOOK)
             and _platform_binds_port(platform.value, platform_config.extra)
         )
         if port_binding_platforms:
@@ -9516,12 +9517,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Relay is shared process-level ingress in multiplex mode. The
-            # active profile owns the one connection; connector-stamped
-            # source.profile routes inbound turns to secondary profiles.
+            # Relay, api_server, and webhook are shared process-level ingress
+            # in multiplex mode. The active profile owns the primary listener;
+            # /p/<profile>/ routing dispatches inbound turns to secondary profiles.
             if (
                 getattr(self.config, "multiplex_profiles", False)
-                and platform is Platform.RELAY
+                and platform in (Platform.RELAY, Platform.API_SERVER, Platform.WEBHOOK)
             ):
                 continue
             try:
