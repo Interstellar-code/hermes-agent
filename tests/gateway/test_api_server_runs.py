@@ -419,8 +419,8 @@ class TestRunEvents:
                 victim_run = (await victim_resp.json())["run_id"]
                 attacker_run = (await attacker_resp.json())["run_id"]
 
-                victim_ready.wait(timeout=3.0)
-                attacker_ready.wait(timeout=3.0)
+                await _wait_event_async(victim_ready)
+                await _wait_event_async(attacker_ready)
                 assert auth_adapter._run_approval_sessions[victim_run] == victim_run
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
@@ -719,7 +719,7 @@ class TestStopRun:
                 run_id = data["run_id"]
 
                 # Wait for agent to start running in the thread
-                agent_ready.wait(timeout=3.0)
+                await _wait_event_async(agent_ready)
                 await asyncio.sleep(0.1)
 
                 # Verify agent ref is stored
@@ -811,7 +811,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                await _wait_event_async(agent_ready)
                 await asyncio.sleep(0.1)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
@@ -834,7 +834,7 @@ class TestStopRun:
                 data = await resp.json()
                 run_id = data["run_id"]
 
-                agent_ready.wait(timeout=3.0)
+                await _wait_event_async(agent_ready)
                 await asyncio.sleep(0.1)
 
                 # Subscribe to events in background
