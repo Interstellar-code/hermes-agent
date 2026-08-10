@@ -104,6 +104,24 @@ def _make_slow_agent(**kwargs):
     return mock_agent, ready, interrupted
 
 
+async def _wait_event_async(event: threading.Event, timeout: float = 3.0) -> bool:
+    """Wait for a background ``threading.Event`` without blocking the loop.
+
+    The event is set from inside ``agent.run_conversation``, which the
+    adapter dispatches via ``run_in_executor``/``asyncio.to_thread`` onto
+    *this test's own event loop* (aiohttp's ``TestServer``/``TestClient``
+    run the whole request — including the background run task — on the
+    single loop driving this coroutine, not a separate thread). A plain
+    synchronous ``event.wait(timeout=...)`` call here blocks that shared
+    loop thread for the full timeout, which prevents the background task
+    from ever being scheduled to reach the point where it sets the event:
+    a deterministic deadlock, not a slow-but-eventually-successful wait.
+    Running the blocking wait on a real OS thread via ``asyncio.to_thread``
+    keeps the loop free to advance the background task concurrently.
+    """
+    return await asyncio.to_thread(event.wait, timeout)
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -494,7 +512,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await _wait_event_async(agent_ready)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -551,7 +569,7 @@ class TestRunLifecycleSweep:
 
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await _wait_event_async(agent_ready)
                 expired_queue = adapter._run_streams[run_id]
                 stream_delta = mock_create.call_args.kwargs["stream_delta_callback"]
 
@@ -664,7 +682,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await _wait_event_async(started, timeout=3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
