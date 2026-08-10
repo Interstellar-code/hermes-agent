@@ -1812,7 +1812,11 @@ def list_authenticated_providers(
     # newly added Portal models surface in the /model picker without
     # requiring a Hermes release. Falls back to the in-repo
     # _PROVIDER_MODELS["nous"] snapshot when the manifest is unreachable.
-    curated["nous"] = get_curated_nous_model_ids()
+    # The live fetch is deferred to the "nous" branch in section 2 below —
+    # it only runs once we know a nous row will actually be emitted (i.e.
+    # nous has credentials), so callers listing unrelated providers never
+    # pay for a network round trip. `curated["nous"]` keeps the static
+    # snapshot here as a harmless default for any other (unused) lookup.
     # Ollama Cloud uses dynamic discovery (no static curated list)
     if "ollama-cloud" not in curated:
         from hermes_cli.models import fetch_ollama_cloud_models
@@ -2101,6 +2105,10 @@ def list_authenticated_providers(
             # cached_provider_model_ids, which dumped the full alphabetical
             # catalog; then: curated-only, which dropped the 4 Portal
             # recommendations (e.g. stepfun/step-3.7-flash:free).
+            # Fetched live (with in-repo fallback) here rather than eagerly
+            # up front — has_creds already gated this branch, so we know a
+            # nous row is actually about to be emitted.
+            curated["nous"] = get_curated_nous_model_ids()
             model_ids = curated.get("nous", [])
             try:
                 from hermes_cli.models import (

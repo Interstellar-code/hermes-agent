@@ -271,14 +271,9 @@ def test_current_custom_endpoint_passthrough_marks_current_row(monkeypatch):
     monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
                         lambda *a, **kw: [])
     # This test doesn't mock list_authenticated_providers, so it takes the
-    # real code path — which unconditionally computes curated["nous"] via
-    # get_curated_nous_model_ids() -> hermes_cli.model_catalog, hitting the
-    # live docs-site manifest over the network (see the module docstring's
-    # "no network ... required" claim, which this call would otherwise
-    # violate). Pin it to None so the module falls back to the in-repo
-    # static list instead of live/cached manifest data.
-    monkeypatch.setattr("hermes_cli.model_catalog.get_curated_nous_models",
-                        lambda: None)
+    # real code path. HERMES_OVERLAYS is stubbed empty above, so the "nous"
+    # branch (the only consumer of get_curated_nous_model_ids()) never runs
+    # and no network call happens — no pin needed here.
 
     result = model_switch.list_picker_providers(
         current_provider="custom:ollama",
@@ -358,13 +353,9 @@ def _stub_kimi_discovery(monkeypatch, *, canonical):
     monkeypatch.setattr(hm, "cached_provider_model_ids",
                         lambda *a, **k: ["kimi-k2.6", "kimi-k2.5"])
     monkeypatch.setattr(hm, "clear_provider_models_cache", lambda *a, **k: None)
-    # list_authenticated_providers unconditionally computes curated["nous"]
-    # via get_curated_nous_model_ids() -> hermes_cli.model_catalog, which
-    # hits the live docs-site manifest over the network when unmocked — even
-    # though these tests only care about the Kimi rows. Pin it to None so
-    # discovery stays offline like the rest of this stub's isolation.
-    monkeypatch.setattr("hermes_cli.model_catalog.get_curated_nous_models",
-                        lambda: None)
+    # HERMES_OVERLAYS is stubbed empty above, so the "nous" branch (the only
+    # consumer of get_curated_nous_model_ids()) never runs — discovery stays
+    # offline without needing to pin the manifest fetch here.
 
 
 def test_single_kimi_credential_yields_one_canonical_row(monkeypatch):
