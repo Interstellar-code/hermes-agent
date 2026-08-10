@@ -2430,9 +2430,31 @@ def categorize_commit(subject: str) -> str:
 
 
 def clean_subject(subject: str) -> str:
-    """Clean up a commit subject for display."""
-    # Remove conventional commit prefix
-    cleaned = re.sub(r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests|deps|bump)[\s:(!]+\s*", "", subject, flags=re.IGNORECASE)
+    """Clean up a commit subject for display.
+
+    Strips the whole conventional-commit prefix, including the optional
+    ``(scope)`` and the ``!`` breaking marker. The scope group is not
+    optional decoration: without it, ``feat(api_server): x`` matched only
+    ``feat`` plus a single ``(`` from the separator class, so the prefix was
+    stripped to ``api_server): x`` and then title-cased into
+    ``Api_server): x``. Every scoped commit shipped mangled that way — see
+    the v0.19.10 notes.
+
+    A malformed prefix with an unclosed scope (``feat(oops: x``) now fails to
+    match and is left verbatim, which is preferable to half-stripping it.
+    """
+    # Remove conventional commit prefix: type, optional (scope), optional !
+    cleaned = re.sub(
+        r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update"
+        r"|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests"
+        r"|deps|bump)"
+        r"(\([^)]*\))?"   # optional (scope)
+        r"!?"             # optional breaking-change marker
+        r"[\s:]+\s*",     # separator: colon and/or whitespace
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    )
     # Remove trailing issue refs that are redundant with PR links
     cleaned = cleaned.strip()
     # Capitalize first letter
