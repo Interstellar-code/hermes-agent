@@ -122,10 +122,62 @@ class TestApprovalCommandWiring:
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
+    def _assert_calls_then_uses(self, module, func_name: str, call_name: str, sink_substr: str):
+        """Same shape as ``_assert_redacts_then_uses``, but for a function that
+        delegates redaction to a shared builder: assert `func_name` assigns the
+        result of `call_name` and only then reaches `sink_substr`."""
+        import ast
+        import inspect
+
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+        target_fn = next(
+            (
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == func_name
+            ),
+            None,
+        )
+        assert target_fn is not None, f"function {func_name} not found in {module.__name__}"
+
+        build_line = None
+        for node in ast.walk(target_fn):
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
+                fn = node.value.func
+                if isinstance(fn, ast.Name) and fn.id == call_name:
+                    build_line = node.lineno
+        assert build_line is not None, (
+            f"{func_name} must assign the result of {call_name}(...) — that is "
+            "where the command is redacted before egress"
+        )
+
+        sink_line = None
+        for node in ast.walk(target_fn):
+            seg = ast.get_source_segment(source, node)
+            if seg and sink_substr in seg and getattr(node, "lineno", 0) > build_line:
+                sink_line = node.lineno
+                break
+        assert sink_line is not None, (
+            f"`{sink_substr}` sink not found after the {call_name}(...) call in {func_name}"
+        )
+
     def test_sse_api_path_redacts_before_enqueue(self):
+        """The API server has three approval egress points — the /v1/runs SSE
+        event, the sessions chat-stream event and GET /v1/approvals/pending —
+        and all three are built by ``_build_approval_record``. The redaction
+        lives in that single seam so the three cannot drift apart; each notify
+        path must go through it before reaching its sink."""
         from gateway.platforms import api_server
 
-        self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
+        self._assert_redacts_then_uses(api_server, "_build_approval_record", "record.update")
+        self._assert_calls_then_uses(
+            api_server, "_approval_notify", "_build_approval_record", "put_nowait"
+        )
+        self._assert_calls_then_uses(
+            api_server, "_approval_notify_sync", "_build_approval_record", "_enqueue"
+        )
 
     def test_chat_platform_threads_approval_capabilities_to_adapter(self):
         """The gateway must not drop the backend's one-operation UI contract."""

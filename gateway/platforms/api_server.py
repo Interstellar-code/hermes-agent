@@ -19,6 +19,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/approvals/pending       — approvals still awaiting a human decision
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -54,6 +55,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -72,6 +74,87 @@ def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> lis
     if smart_denied:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
+
+
+def _approval_timeout_seconds() -> float:
+    """Effective ``approvals.timeout`` in seconds (config default 60)."""
+    try:
+        from tools.approval import _get_approval_timeout
+
+        return float(_get_approval_timeout())
+    except Exception:
+        return 60.0
+
+
+def _iso_utc(ts: float) -> str:
+    """Render an epoch timestamp as an absolute ISO 8601 UTC instant."""
+    return (
+        datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _build_approval_record(
+    approval_data: Dict[str, Any],
+    *,
+    approval_id: str,
+    session_id: Optional[str],
+    run_id: str,
+    message_id: Optional[str],
+    profile: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build the canonical pending-approval record.
+
+    One builder for every approval surface — the ``/v1/runs`` SSE event, the
+    sessions chat stream's clarify-shaped event, and ``GET
+    /v1/approvals/pending`` — so the three cannot drift. ``choices`` always
+    comes from :func:`_approval_event_choices`; ``smart_denied`` is carried
+    through from the guard only when it is true.
+
+    Keys prefixed with ``_`` are server-internal bookkeeping and are stripped
+    by :func:`_public_approval_record` before anything goes on the wire.
+    """
+    record = dict(approval_data or {})
+    # Redact credentials from the command before it enters any event stream —
+    # same egress bug as #48456. The raw command is what executes on approval;
+    # redaction is display-only. Reuse the gateway seam.
+    if "command" in record:
+        from gateway.run import _redact_approval_command
+
+        record["command"] = _redact_approval_command(record.get("command"))
+    now = time.time() if now is None else now
+    expires_at_ts = now + _approval_timeout_seconds()
+    record.update({
+        "approval_id": approval_id,
+        # Approvals ride the sessions chat stream through the clarify
+        # interaction transport, whose consumers key off interaction_id/kind.
+        "interaction_id": approval_id,
+        "kind": "approval",
+        "tool_name": "approval",
+        "session_id": session_id,
+        "run_id": run_id,
+        "message_id": message_id,
+        "timestamp": now,
+        "choices": _approval_event_choices(
+            smart_denied=bool(record.get("smart_denied")),
+            allow_permanent=record.get("allow_permanent") is not False,
+        ),
+        # Expiry emits NO event and the agent's queue entry is dropped
+        # silently, so a client cannot detect it passively. Send the real
+        # absolute deadline rather than letting clients assume 60s — the
+        # timeout is configurable.
+        "expires_at": _iso_utc(expires_at_ts),
+    })
+    record["_expires_at_ts"] = expires_at_ts
+    record["_profile"] = profile
+    return record
+
+
+def _public_approval_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip server-internal bookkeeping from an approval record."""
+    return {key: value for key, value in record.items() if not key.startswith("_")}
 
 
 try:
@@ -143,6 +226,9 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+# Idle tick on the /v1/runs event stream. Doubles as the interval at which a
+# reader notices its transport was reaped by the orphan sweep.
+RUN_EVENTS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 # Backoff for EADDRINUSE on bind when no live listener owns the port — i.e.
@@ -1604,6 +1690,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("GET", "/v1/approvals/pending", self._handle_list_pending_approvals),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -2182,6 +2269,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "session_chat_approval_events": True,
+                "approval_pending_list": True,
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -2207,6 +2296,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "approvals_pending": {"method": "GET", "path": "/v1/approvals/pending"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -2990,6 +3080,66 @@ class APIServerAdapter(BasePlatformAdapter):
                 return f"[user did not respond within {int(timeout / 60)}m]"
             return response
 
+        # Approval session key for this stream. Must match what the guard
+        # computes: tools.approval.get_current_session_key() falls through to
+        # HERMES_SESSION_KEY, which _run_agent binds to exactly this value.
+        approval_session_key = gateway_session_key or session_id
+
+        def _approval_notify_sync(approval_data: Dict[str, Any]) -> None:
+            """Publish a blocking command approval on the sessions chat stream.
+
+            Approvals are the same interaction shape as clarify — the agent
+            blocks, a human chooses, the agent continues — so they reuse the
+            clarify transport with ``kind: "approval"`` rather than a parallel
+            mechanism. Runs on the agent's executor thread; ``_enqueue``
+            bridges back to the loop.
+            """
+            approval_id = f"approval_{uuid.uuid4().hex[:10]}"
+            record = _build_approval_record(
+                approval_data,
+                approval_id=approval_id,
+                session_id=session_id,
+                run_id=run_id,
+                message_id=message_id,
+                profile=stream_profile,
+            )
+            # Resolution stays on the existing contract: POST
+            # /v1/runs/{run_id}/approval, keyed by run_id. Register this
+            # stream's run so that endpoint can reach the blocked agent
+            # thread, and record it so GET /v1/approvals/pending can list it.
+            self._run_approval_sessions[run_id] = approval_session_key
+            self._run_approval_requests.setdefault(run_id, []).append(record)
+            try:
+                self._set_run_status(
+                    run_id,
+                    "waiting_for_approval",
+                    last_event="approval.request",
+                    approval_id=approval_id,
+                    session_id=session_id,
+                )
+            except Exception:
+                pass
+            payload = _public_approval_record(record)
+            _enqueue("clarify.request", dict(payload))
+            _enqueue("interaction.request", dict(payload))
+
+        def _clear_run_approval_state() -> None:
+            """Release this run's approval bookkeeping once the agent returns.
+
+            Deliberately NOT wired to the SSE writer's teardown: a client
+            disconnect is not a resolution, and the executor thread can still
+            be blocked on an approval long after the browser went away.
+            """
+            self._run_approval_sessions.pop(run_id, None)
+            self._run_approval_requests.pop(run_id, None)
+            if run_id in self._run_statuses:
+                # Interaction-bearing runs mint a status record; give it a
+                # terminal state so _RUN_STATUS_TTL can reap it.
+                try:
+                    self._set_run_status(run_id, "completed", last_event="run.finished")
+                except Exception:
+                    pass
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -3005,6 +3155,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     interactive_clarify=True,
                     clarify_callback=_clarify_callback_sync,
+                    approval_notify=_approval_notify_sync,
+                    approval_session_key=approval_session_key,
+                    approval_cleanup=_clear_run_approval_state,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
@@ -5184,6 +5337,9 @@ class APIServerAdapter(BasePlatformAdapter):
         interactive_clarify: bool = False,
         clarify_callback=None,
         identity_override: Optional[str] = None,
+        approval_notify=None,
+        approval_session_key: Optional[str] = None,
+        approval_cleanup=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5199,6 +5355,15 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        *approval_notify* registers a blocking command-approval callback for
+        the duration of the agent run (see ``tools.approval``). Registration
+        and teardown live inside the executor thread on purpose: the agent can
+        still be blocked on an approval after the caller's asyncio task has
+        been cancelled (client disconnect), and unregistering early would
+        release that wait as an un-answerable timeout. *approval_cleanup*, if
+        given, runs in the same place — after the notify callback is torn down
+        and the agent has genuinely finished.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -5209,6 +5374,9 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import clear_session_vars
             from contextlib import nullcontext
+
+            approval_key = approval_session_key or gateway_session_key or session_id or ""
+            notify_registered = False
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -5236,6 +5404,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent.clarify_callback = clarify_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if approval_notify is not None and approval_key:
+                        from tools.approval import register_gateway_notify
+
+                        register_gateway_notify(approval_key, approval_notify)
+                        notify_registered = True
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
@@ -5255,6 +5428,37 @@ class APIServerAdapter(BasePlatformAdapter):
                         result["session_id"] = _eff_sid
                     return result, usage
                 finally:
+                    if notify_registered:
+                        # Drop our callback, and ONLY ours — deliberately not
+                        # via unregister_gateway_notify, which also signals
+                        # every queued entry for the key with no result (i.e.
+                        # as an un-answerable timeout). Two things make that
+                        # wrong here: the approval key is the chat session, so
+                        # concurrent streams on one session share it and the
+                        # first to finish would strand the other's live
+                        # approval; and this path must never convert a pending
+                        # approval into a silent auto-deny, which is the whole
+                        # point of surviving a disconnect. Nothing of ours is
+                        # left blocked — _await_gateway_decision always drops
+                        # its own entry before the agent thread returns.
+                        try:
+                            from tools import approval as _approval_mod
+
+                            with _approval_mod._lock:
+                                if (
+                                    _approval_mod._gateway_notify_cbs.get(approval_key)
+                                    is approval_notify
+                                ):
+                                    _approval_mod._gateway_notify_cbs.pop(approval_key, None)
+                        except Exception:
+                            pass
+                    if approval_cleanup is not None:
+                        try:
+                            approval_cleanup()
+                        except Exception:
+                            logger.debug(
+                                "[api_server] approval cleanup failed", exc_info=True
+                            )
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -5493,28 +5697,15 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     approval_id = f"approval_{uuid.uuid4().hex[:10]}"
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "approval_id": approval_id,
-                        "session_id": session_id,
-                        "run_id": run_id,
-                        "message_id": approval_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._run_approval_requests.setdefault(run_id, []).append(dict(event))
+                    record = _build_approval_record(
+                        approval_data,
+                        approval_id=approval_id,
+                        session_id=session_id,
+                        run_id=run_id,
+                        message_id=approval_id,
+                        profile=request_profile,
+                    )
+                    self._run_approval_requests.setdefault(run_id, []).append(record)
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
@@ -5522,6 +5713,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_id=approval_id,
                         session_id=session_id,
                     )
+                    # /v1/runs frames are data-only: the type lives in the JSON
+                    # "event" field. (The sessions chat stream uses SSE
+                    # `event:` lines instead — different framing.)
+                    event = {"event": "approval.request", **_public_approval_record(record)}
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
                     except Exception:
@@ -5741,8 +5936,23 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             while True:
                 try:
-                    event = await asyncio.wait_for(q.get(), timeout=30.0)
+                    event = await asyncio.wait_for(
+                        q.get(), timeout=RUN_EVENTS_SSE_KEEPALIVE_SECONDS
+                    )
                 except asyncio.TimeoutError:
+                    # The queue now outlives a disconnect (see the finally
+                    # below), so a client can reconnect to a run whose
+                    # end-of-stream sentinel an earlier reader already
+                    # consumed. Nothing more will ever arrive for a run that
+                    # has reached a terminal status with an empty queue, and
+                    # nothing at all for a transport the orphan sweep reaped —
+                    # close instead of holding the connection open forever.
+                    finished = (self._run_statuses.get(run_id) or {}).get("status") in {
+                        "completed", "failed", "cancelled",
+                    }
+                    if self._run_streams.get(run_id) is not q or (finished and q.empty()):
+                        await response.write(b": stream closed\n\n")
+                        break
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
@@ -5754,12 +5964,79 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
+            # A disconnect is NOT a resolution. Previously this popped the
+            # run's queue, so a browser refresh 404'd on reconnect and any
+            # approval raised meanwhile was enqueued into an orphaned queue —
+            # the agent then blocked until the approval timeout with no way
+            # for the user to answer. Keep the queue and its creation stamp:
+            # reconnect resumes the same stream, and buffered events (an
+            # approval.request among them) are still delivered.
+            #
+            # Bounded, not leaked: _run_streams_created stays set, so once no
+            # subscriber remains the orphan sweep reaps the transport
+            # _RUN_STREAM_TTL after stream creation whether or not the client
+            # ever returns. Buffering without a reader is already the normal
+            # state for a run nobody subscribed to.
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
 
         return response
 
+
+    def _prune_expired_approval_requests(self, now: Optional[float] = None) -> None:
+        """Drop approval records whose deadline has passed.
+
+        Expiry is silent: ``_await_gateway_decision`` drops its queue entry and
+        the guard returns BLOCKED without emitting anything. Without this the
+        records would outlive the thing they describe — advertising approvals
+        on ``GET /v1/approvals/pending`` that can never be resolved, and
+        mislabelling the FIFO head on resolution. Records without a deadline
+        (older/synthetic entries) are left alone.
+        """
+        if now is None:
+            now = time.time()
+        for run_id, records in list(self._run_approval_requests.items()):
+            live = [
+                record
+                for record in records
+                if not record.get("_expires_at_ts")
+                or float(record["_expires_at_ts"]) > now
+            ]
+            if len(live) == len(records):
+                continue
+            if live:
+                self._run_approval_requests[run_id] = live
+            else:
+                self._run_approval_requests.pop(run_id, None)
+
+    async def _handle_list_pending_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /v1/approvals/pending — approvals still awaiting a human answer.
+
+        Catch-up path for a reloaded client. The request event is emitted
+        exactly once, is never replayed, and dies with the stream it was
+        written to; this endpoint returns the same field set so a client that
+        missed it can rebuild the card and answer through
+        ``POST /v1/runs/{run_id}/approval``.
+
+        Profile-scoped like the interaction registry: a responder only sees
+        approvals raised under its own ``/p/<profile>/`` scope.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        self._prune_expired_approval_requests()
+        scope = _api_request_profile.get()
+        approvals = [
+            _public_approval_record(record)
+            for records in self._run_approval_requests.values()
+            for record in records
+            if record.get("_profile") == scope
+        ]
+        approvals.sort(key=lambda item: item.get("timestamp") or 0)
+        return web.json_response({
+            "object": "hermes.approval.list",
+            "approvals": approvals,
+        })
 
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
@@ -5828,6 +6105,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
 
+        # Keep the record list aligned with the core's queue before taking the
+        # FIFO head: an entry that timed out is already gone from
+        # _gateway_queues, so leaving it here would label this response with a
+        # dead approval.
+        self._prune_expired_approval_requests()
         pending_requests = self._run_approval_requests.get(run_id) or []
         if resolve_all:
             approval_metas = list(pending_requests)
@@ -5969,6 +6251,9 @@ class APIServerAdapter(BasePlatformAdapter):
         """Expire old SSE buffers without treating transport age as run age."""
         if now is None:
             now = time.time()
+        # Reap approvals nobody ever answered, independent of whether any
+        # client calls the pending list.
+        self._prune_expired_approval_requests(now)
         stale = [
             run_id
             for run_id, created_at in list(self._run_streams_created.items())
@@ -5999,12 +6284,24 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stopping_run_ids.discard(run_id)
                 self._run_approval_requests.pop(run_id, None)
 
-        stale_statuses = [
-            run_id
-            for run_id, status in list(self._run_statuses.items())
-            if status.get("status") in {"completed", "failed", "cancelled"}
-            and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
-        ]
+        stale_statuses = []
+        for run_id, status in list(self._run_statuses.items()):
+            if now - float(status.get("updated_at", 0) or 0) <= self._RUN_STATUS_TTL:
+                continue
+            if status.get("status") in {"completed", "failed", "cancelled"}:
+                stale_statuses.append(run_id)
+                continue
+            # Non-terminal but demonstrably dead. Sessions-stream runs mint a
+            # status record when they raise a clarify or an approval, but never
+            # register an executor task, so before this they could sit at
+            # "waiting_for_clarify" / "running" forever. With no task, no
+            # transport and no approval state left there is nothing to wait on.
+            if (
+                run_id not in self._active_run_tasks
+                and run_id not in self._run_streams
+                and run_id not in self._run_approval_sessions
+            ):
+                stale_statuses.append(run_id)
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
 
