@@ -222,10 +222,19 @@ def test_feishu_extra_includes_qrcode_for_qr_login():
     assert any(dep.startswith("qrcode") for dep in feishu_extra)
 
 
-def test_nemo_relay_extra_uses_supported_official_distribution_range():
+def test_nemo_relay_extra_uses_exact_pin():
+    """nemo-relay is deliberately exact-pinned, not a floating range.
+
+    Upstream specifies ``nemo-relay>=0.5,<1.0``, but the fork has always
+    pinned this dependency exactly (see 8712d5b7b): nemo_relay is
+    vendored-risk surface, and a floating range would let a future
+    ``uv sync`` silently resolve a different 0.5.x/0.9.x release with no
+    code change and no diff to review. Bumping the pin is a deliberate,
+    reviewable act (bump here AND regenerate uv.lock).
+    """
     optional_dependencies = _load_optional_dependencies()
 
-    assert optional_dependencies["nemo-relay"] == ["nemo-relay>=0.5,<1.0"]
+    assert optional_dependencies["nemo-relay"] == ["nemo-relay==0.5.0"]
     assert not any(
         spec == "hermes-agent[nemo-relay]"
         for spec in optional_dependencies["all"]
