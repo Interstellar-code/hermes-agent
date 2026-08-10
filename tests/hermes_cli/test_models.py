@@ -70,7 +70,11 @@ class TestFetchOpenRouterModels:
                 return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        # Pin the remote manifest out too — otherwise the curated id order
+        # (and thus which live entries get matched up) silently depends on
+        # whatever the deployed catalog currently contains.
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
         assert models == [
@@ -167,7 +171,11 @@ class TestFetchOpenRouterModels:
                 )
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
-        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
+        # Pin the remote manifest out too — otherwise the curated id list
+        # silently depends on whatever the deployed catalog currently
+        # contains, and this test's fixed live-response ids wouldn't line up.
+        with patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=None), \
+             patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
         ids = [mid for mid, _ in models]
