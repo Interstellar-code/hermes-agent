@@ -47,12 +47,23 @@ def client(monkeypatch, isolated_profiles):
 
     import hermes_state
     from hermes_constants import get_hermes_home
+    from hermes_cli.plugins import discover_plugins
     from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
 
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
     # The dashboard process's os.environ may carry root-install credentials;
     # make sure the scoped path never falls back to them.
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    # The real `hermes dashboard` entrypoint calls discover_plugins() before
+    # starting the server precisely because the dashboard's runtime depends
+    # on plugin-registered providers (see hermes_cli/main.py). Without it,
+    # plugin-registered messaging platforms (e.g. a2a_fleet, registered via
+    # PluginContext.register_platform in plugins/a2a_fleet/__init__.py) never
+    # land in gateway.platform_registry, so this in-process TestClient(app)
+    # would see a messaging catalog missing every plugin-provided platform —
+    # unlike the real dashboard process. discover_plugins() is idempotent, so
+    # this is a safe no-op on repeated calls across tests.
+    discover_plugins()
     c = TestClient(app)
     c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
     return c
@@ -259,6 +270,24 @@ class TestMultiplexPortBindingGuard:
         from gateway.config import PORT_BINDING_PLATFORM_VALUES
 
         _enable_multiplex(isolated_profiles["default"])
+
+        # ``a2a_fleet`` is a `kind: standalone` plugin (see the PluginManifest
+        # kind semantics in hermes_cli/plugins.py) — unlike bundled `platform`
+        # plugins (e.g. "line"), which auto-load, a standalone plugin is
+        # opt-in via `plugins.enabled` and only registers itself with
+        # gateway.platform_registry (and thus appears in the messaging
+        # catalog at all) once enabled. Enable it here so the loop below
+        # exercises the same reachable state a real operator hits after
+        # `hermes plugins enable a2a_fleet`, instead of getting a 404 for
+        # "unknown platform" before the multiplex guard is ever reached.
+        cfg_path = isolated_profiles["default"] / "config.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        cfg.setdefault("plugins", {})["enabled"] = ["a2a_fleet"]
+        cfg_path.write_text(yaml.safe_dump(cfg), encoding="utf-8")
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins(force=True)
+
         assert PORT_BINDING_PLATFORM_VALUES  # guard set must not be empty
         for platform_id in sorted(PORT_BINDING_PLATFORM_VALUES):
             resp = client.put(

@@ -22,7 +22,7 @@ import pytest
 import yaml
 
 import a2a_fleet.herdr_tools as herdr_tools
-from a2a_fleet.herdr_client import HerdrClient, HerdrError, HerdrNotFound
+from a2a_fleet.herdr_client import HerdrClient, HerdrError
 
 
 def _run(coro):
@@ -493,13 +493,23 @@ def test_inspect_session_absent_terminal_id_returns_error_no_client_call(
 
 
 def test_inspect_session_not_found(fleet_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No session anywhere in the listing must resolve to "not_found".
+
+    herdr_inspect_session_handler resolves terminal_id by listing sessions
+    and matching locally (see the block comment above the `list_agents()`
+    call in herdr_tools.py) — it no longer calls `get_agent` at all, since
+    Herdr 0.7.5 stopped accepting terminal ids as `agent` targets. Mocking
+    `get_agent` here would be a no-op: the handler would fall through to a
+    real (un-mocked) `list_agents()` call, which is only hermetic by
+    accident of whether a `herdr` binary happens to be on PATH.
+    """
     _add_herdr_host(fleet_home, alias="mac-mini")
     _patch_capability_ok(monkeypatch)
 
-    async def fake_get_agent(self, target):
-        raise HerdrNotFound(f"no such target: {target}", code="agent_not_found")
+    async def fake_list_agents(self):
+        return {"agents": []}
 
-    monkeypatch.setattr(HerdrClient, "get_agent", fake_get_agent)
+    monkeypatch.setattr(HerdrClient, "list_agents", fake_list_agents)
 
     result = _run(
         herdr_tools.herdr_inspect_session_handler(host_alias="mac-mini", terminal_id="term_ghost")
