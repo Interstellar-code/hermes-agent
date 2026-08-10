@@ -147,6 +147,12 @@ cache/
 # treat it as a local edit and autostash it on every run (#38529).
 .hermes-bootstrap-complete
 
+# Code-scoped install-method stamp written into the checkout root by install.sh
+# (`echo "git" > "$INSTALL_DIR/.install_method"`) and read back by
+# detect_install_method(). Machine-local runtime state, never a code change —
+# same autostash rationale as the bootstrap marker above.
+.install_method
+
 # Persistent dev sandbox dir (scripts/dev-sandbox.sh --persistent)
 .hermes-sandbox/
 
