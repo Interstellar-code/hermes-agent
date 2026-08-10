@@ -2996,6 +2996,20 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = f"run_{uuid.uuid4().hex}"
         seq = 0
 
+        # Publish the run before the first frame carries its id, so a client
+        # that reads run_id off ``run.started`` can immediately poll
+        # ``GET /v1/runs/{run_id}``.  Until this existed a sessions-stream run
+        # had no status record at all unless it happened to raise a clarify or
+        # an approval, so the documented "poll the status after stop" contract
+        # was unreachable from this transport.
+        self._set_run_status(
+            run_id,
+            "running",
+            session_id=session_id,
+            model=self._model_name,
+            last_event="run.started",
+        )
+
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
             seq += 1
@@ -3073,7 +3087,10 @@ class APIServerAdapter(BasePlatformAdapter):
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
             try:
-                self._set_run_status(run_id, "running", last_event="clarify.responded")
+                # Never downgrade an accepted stop back to "running": the
+                # clarify resolving is not the stop being undone.
+                if run_id not in self._stopping_run_ids:
+                    self._set_run_status(run_id, "running", last_event="clarify.responded")
             except Exception:
                 pass
             if response is None or response == "":
@@ -3123,28 +3140,85 @@ class APIServerAdapter(BasePlatformAdapter):
             _enqueue("clarify.request", dict(payload))
             _enqueue("interaction.request", dict(payload))
 
-        def _clear_run_approval_state() -> None:
-            """Release this run's approval bookkeeping once the agent returns.
+        def _finalize_run_status_if_open() -> None:
+            """Close out a run record that no longer has anything to wait on.
+
+            ``_stopping_run_ids`` decides between ``cancelled`` and
+            ``completed``. The ``stopping`` status alone is not enough: a
+            clarify or approval that resolves after the stop writes
+            ``running`` / ``waiting_for_*`` back over it.
+            """
+            current = (self._run_statuses.get(run_id) or {}).get("status")
+            if current is None or current in self._TERMINAL_RUN_STATUSES:
+                return
+            stopped = run_id in self._stopping_run_ids or current == "stopping"
+            try:
+                self._set_run_status(
+                    run_id,
+                    "cancelled" if stopped else "completed",
+                    last_event="run.cancelled" if stopped else "run.finished",
+                )
+            except Exception:
+                pass
+
+        def _register_agent(agent: Any) -> None:
+            """Make this turn reachable from POST /v1/runs/{run_id}/stop.
+
+            Runs on the agent's executor thread, immediately before
+            ``run_conversation``; ``_release_run_control_state`` drops it from
+            the same thread's ``finally``.  Both halves live in the thread that
+            owns the agent because the asyncio wrapper below can be cancelled
+            by a client disconnect while the turn keeps running — unregistering
+            there would make a live agent unstoppable.
+            """
+            self._active_run_agents[run_id] = agent
+
+        def _release_run_control_state() -> None:
+            """Release this run's control state once the agent returns.
 
             Deliberately NOT wired to the SSE writer's teardown: a client
             disconnect is not a resolution, and the executor thread can still
             be blocked on an approval long after the browser went away.
             """
+            self._active_run_agents.pop(run_id, None)
+            self._active_run_tasks.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
             self._run_approval_requests.pop(run_id, None)
-            if run_id in self._run_statuses:
-                # Interaction-bearing runs mint a status record; give it a
-                # terminal state so _RUN_STATUS_TTL can reap it.
-                try:
-                    self._set_run_status(run_id, "completed", last_event="run.finished")
-                except Exception:
-                    pass
+            # Terminal status is normally written by _run_and_signal, which
+            # knows the real result. Only fall back here when that wrapper is
+            # already gone — a disconnect cancels it while this thread keeps
+            # running, and nobody else would ever close the record out.
+            # _stopping_run_ids is dropped by whichever side finalises, never
+            # here unconditionally: on the normal path this callback runs
+            # *inside* _run_agent, before the wrapper has read the flag.
+            if task is not None and task.done():
+                _finalize_run_status_if_open()
+                self._stopping_run_ids.discard(run_id)
 
         async def _run_and_signal() -> None:
+            # True only while the agent's executor thread may still be alive.
+            # A cancellation raised in that window hands terminal-status
+            # ownership to the release callback on that thread.
+            executor_running = False
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
+                # A stop accepted before the agent exists must not start the
+                # turn. Checked here — the last point before the executor takes
+                # over — so it also covers the history load, which is the bulk
+                # of the pre-agent window. Mirrors the guard on POST /v1/runs;
+                # a stop landing *during* _create_agent is caught after the
+                # fact by the same post-executor check both paths use.
+                if run_id in self._stopping_run_ids:
+                    await queue.put(_event_payload("run.cancelled", {
+                        "session_id": session_id,
+                        "message_id": message_id,
+                        "interrupted": True,
+                    }))
+                    self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
+                    return
+                executor_running = True
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -3157,30 +3231,74 @@ class APIServerAdapter(BasePlatformAdapter):
                     clarify_callback=_clarify_callback_sync,
                     approval_notify=_approval_notify_sync,
                     approval_session_key=approval_session_key,
-                    approval_cleanup=_clear_run_approval_state,
+                    approval_cleanup=_release_run_control_state,
+                    agent_register=_register_agent,
+                    # This run is registered in _active_run_tasks below, which
+                    # active_agent_work_count() already sums; counting it as an
+                    # inflight run too would spend two concurrency slots.
+                    count_inflight=False,
                 )
+                executor_running = False
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
                 effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+                interrupted = bool(result.get("interrupted")) if isinstance(result, dict) else False
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "content": final_response,
                     "completed": True,
-                    "partial": False,
-                    "interrupted": False,
+                    "partial": interrupted,
+                    "interrupted": interrupted,
                 }))
                 await queue.put(_event_payload("run.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
+                    "interrupted": interrupted,
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+                # A stop that was accepted still ends the run as "cancelled" —
+                # see _handle_stop_run for why the output rides along instead
+                # of being discarded.
+                if run_id in self._stopping_run_ids:
+                    self._set_run_status(
+                        run_id,
+                        "cancelled",
+                        last_event="run.cancelled",
+                        output=final_response,
+                        usage=usage,
+                        interrupted=interrupted,
+                    )
+                else:
+                    self._set_run_status(
+                        run_id,
+                        "completed",
+                        last_event="run.completed",
+                        output=final_response,
+                        usage=usage,
+                        interrupted=interrupted,
+                    )
             except Exception as exc:
+                executor_running = False
                 logger.exception("[api_server] session chat stream failed")
+                self._set_run_status(
+                    run_id,
+                    "failed",
+                    error=_redact_api_error_text(exc),
+                    last_event="run.failed",
+                )
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
+                if not executor_running:
+                    # The executor thread is done (or never started), so nobody
+                    # else will close this record out. When it *is* still
+                    # running — a disconnect cancelled us mid-turn — the
+                    # release callback on that thread owns the terminal write.
+                    _finalize_run_status_if_open()
+                    self._active_run_tasks.pop(run_id, None)
+                    self._stopping_run_ids.discard(run_id)
                 self._clarify_streams.pop((stream_profile, session_id), None)
                 for _key, _meta in list(self._session_interactions.items()):
                     if _key[0] == stream_profile and _meta.get("session_id") == session_id:
@@ -3194,7 +3312,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 await queue.put(None)
 
         self._clarify_streams[(stream_profile, session_id)] = _enqueue
+        self._activate_admitted_request()
         task = asyncio.create_task(_run_and_signal())
+        # Registered for the same reason POST /v1/runs registers its task: the
+        # agent does not exist until _create_agent returns inside the executor,
+        # and a stop landing in that window must be accepted (200) rather than
+        # 404 while GET /v1/runs/{id} already reports the run as running.
+        self._active_run_tasks[run_id] = task
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -5340,6 +5464,8 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_notify=None,
         approval_session_key: Optional[str] = None,
         approval_cleanup=None,
+        agent_register=None,
+        count_inflight: bool = True,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5364,6 +5490,21 @@ class APIServerAdapter(BasePlatformAdapter):
         release that wait as an un-answerable timeout. *approval_cleanup*, if
         given, runs in the same place — after the notify callback is torn down
         and the agent has genuinely finished.
+
+        *agent_register* is called with the live AIAgent from inside the
+        executor thread, immediately before ``run_conversation``.  It exists so
+        callers can publish the agent into ``_active_run_agents`` and make the
+        turn reachable from ``POST /v1/runs/{run_id}/stop``.  It deliberately
+        shares the executor-thread discipline of *approval_notify*: the
+        matching teardown belongs in *approval_cleanup*, because the caller's
+        asyncio task can be cancelled (client disconnect) while this thread is
+        still running the agent, and dropping the reference there would make a
+        live turn unstoppable.
+
+        *count_inflight* controls the ``_inflight_agent_runs`` accounting used
+        by ``active_agent_work_count``.  Callers that register their own task
+        in ``_active_run_tasks`` are already counted by that path and must pass
+        ``False``, or one turn consumes two concurrency slots.
         """
         loop = asyncio.get_running_loop()
         # Capture before hopping to the executor — ContextVars do not follow
@@ -5404,6 +5545,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         agent.clarify_callback = clarify_callback
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if agent_register is not None:
+                        agent_register(agent)
                     if approval_notify is not None and approval_key:
                         from tools.approval import register_gateway_notify
 
@@ -5462,6 +5605,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
+        if not count_inflight:
+            return await loop.run_in_executor(None, _run)
         self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
@@ -5474,6 +5619,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    # Statuses after which nothing more will ever be reported for a run.
+    _TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+    # How long a run may sit in "stopping" before the status starts telling
+    # clients the agent is not honouring the interrupt.  This is a reporting
+    # threshold, not a deadline: see _handle_stop_run for why the gateway
+    # cannot force a wedged executor thread to stop.
+    _RUN_STOP_WEDGED_SECONDS = 30.0
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -5772,15 +5924,44 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
                 if run_id in self._stopping_run_ids:
+                    # The stop flag can only be read after the executor
+                    # returns, so this branch also catches a stop that lost the
+                    # race against a turn that had already finished — and a
+                    # stop the agent never noticed because it was inside a tool
+                    # that does not poll the interrupt flag. Both produce a
+                    # complete answer the session transcript has already
+                    # persisted, so carry the output and usage onto the
+                    # cancelled record instead of dropping them on the floor.
+                    #
+                    # The status stays "cancelled" rather than flipping to
+                    # "completed": the agent's own `interrupted` flag is the
+                    # only thing that could tell those two cases apart, and it
+                    # is False for both. Reporting "completed" would contradict
+                    # test_stop_keeps_uncooperative_executor_tracked_until_exit,
+                    # which pins that an ignored stop still ends "cancelled".
+                    # `interrupted` is published so a client can tell a turn
+                    # that was genuinely cut short from one that ran to the end.
+                    _interrupted = (
+                        bool(result.get("interrupted")) if isinstance(result, dict) else False
+                    )
+                    _final_response = (
+                        result.get("final_response", "") if isinstance(result, dict) else ""
+                    )
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
+                        "output": _final_response,
+                        "usage": usage,
+                        "interrupted": _interrupted,
                     })
                     self._set_run_status(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
+                        output=_final_response,
+                        usage=usage,
+                        interrupted=_interrupted,
                     )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
@@ -5902,6 +6083,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
+        progress = self._stop_progress_fields(status)
+        if progress:
+            status = {**status, **progress}
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
@@ -6218,7 +6402,25 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
-        """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
+        """POST /v1/runs/{run_id}/stop — interrupt a running agent.
+
+        Stop is cooperative and stays that way, deliberately.  ``stopping`` has
+        no forced deadline because the gateway has no mechanism to impose one:
+        the turn runs on a ``run_in_executor`` thread, and cancelling the
+        asyncio wrapper does not stop a thread that has already started — it
+        only abandons it, which is exactly what
+        ``test_stop_keeps_uncooperative_executor_tracked_until_exit`` forbids.
+        A "forced cancel" would therefore free the bookkeeping while the agent
+        kept writing to the session transcript and holding its real resources
+        (pool worker, subprocesses, LLM quota), turning an honest slow stop into
+        a dishonest fast one plus a leak.
+
+        What is bounded instead is the *reporting*: the stop timestamp is
+        recorded here so ``GET /v1/runs/{run_id}`` can tell a client whether the
+        agent is unwinding normally or is wedged in work that never polls the
+        interrupt flag (``tools/file_tools.py`` and any non-cooperating MCP tool
+        are in that category).  See ``_stop_progress_fields``.
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -6230,7 +6432,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        # Idempotent: a second stop keeps the first request's timestamp so the
+        # wedged-detection clock measures the whole stopping window, not the
+        # time since the most recent button press.
+        existing = self._run_statuses.get(run_id) or {}
+        stop_requested_at = existing.get("stop_requested_at") or time.time()
+        self._set_run_status(
+            run_id,
+            "stopping",
+            last_event="run.stopping",
+            stop_requested_at=stop_requested_at,
+        )
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
@@ -6240,6 +6452,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    def _stop_progress_fields(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        """Derive how long a stop has been pending, and whether it is wedged.
+
+        Computed at read time rather than stored, so no watchdog task is needed
+        and a status record can never disagree with the clock.  ``status`` is
+        never mutated; the caller merges the result into its own copy.
+        """
+        if status.get("status") != "stopping":
+            return {}
+        requested_at = status.get("stop_requested_at")
+        if not isinstance(requested_at, (int, float)):
+            return {}
+        elapsed = max(0.0, time.time() - float(requested_at))
+        return {
+            "stopping_for_seconds": round(elapsed, 3),
+            # False: the agent is between interrupt checks and will unwind.
+            # True: it is inside work that never polls the flag. The run will
+            # still end on its own, but not on any schedule this gateway sets,
+            # and it holds a concurrency slot until it does.
+            "stop_wedged": elapsed >= self._RUN_STOP_WEDGED_SECONDS,
+        }
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically expire transport buffers and terminal status records."""
@@ -6284,11 +6518,30 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._stopping_run_ids.discard(run_id)
                 self._run_approval_requests.pop(run_id, None)
 
+        # Wedged stops are not reaped — nothing here can safely stop a live
+        # executor thread — but they must not be silent either: each one holds
+        # a concurrency slot until its tool returns on its own.
+        for run_id, status in list(self._run_statuses.items()):
+            if status.get("status") != "stopping":
+                continue
+            requested_at = status.get("stop_requested_at")
+            if not isinstance(requested_at, (int, float)):
+                continue
+            elapsed = now - float(requested_at)
+            if elapsed >= self._RUN_STOP_WEDGED_SECONDS:
+                logger.warning(
+                    "[api_server] run %s has been stopping for %.0fs; the agent is "
+                    "not honouring the interrupt (likely inside a tool that never "
+                    "polls it) and still holds a concurrency slot",
+                    run_id,
+                    elapsed,
+                )
+
         stale_statuses = []
         for run_id, status in list(self._run_statuses.items()):
             if now - float(status.get("updated_at", 0) or 0) <= self._RUN_STATUS_TTL:
                 continue
-            if status.get("status") in {"completed", "failed", "cancelled"}:
+            if status.get("status") in self._TERMINAL_RUN_STATUSES:
                 stale_statuses.append(run_id)
                 continue
             # Non-terminal but demonstrably dead. Sessions-stream runs mint a
