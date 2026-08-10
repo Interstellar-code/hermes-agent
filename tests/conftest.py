@@ -467,14 +467,43 @@ def _isolate_hermes_home(_hermetic_environment):
 # the test body — those per-test patches are applied after this fixture has
 # already run and win for the duration of the test, so they are unaffected.
 
+# Captured on first use of the guard fixture, before the real function is
+# swapped out — see the `real_try_gh_cli_token` opt-out fixture below.
+_REAL_TRY_GH_CLI_TOKEN = None
+
+
 def _guarded_try_gh_cli_token():
     raise RuntimeError(
         "tests/conftest.py credential guard: blocked a real `gh auth "
         "token` shell-out from hermes_cli.copilot_auth._try_gh_cli_token(). "
         "Tests must never read a real GitHub/Copilot credential from the "
         "developer's `gh` CLI. Mock `_try_gh_cli_token` (or "
-        "`resolve_copilot_token`) explicitly if this call is intentional."
+        "`resolve_copilot_token`) explicitly if this call is intentional. "
+        "If you need the real function because you have already stubbed "
+        "`copilot_auth.subprocess.run`, request the "
+        "`real_try_gh_cli_token` fixture."
     )
+
+
+@pytest.fixture
+def real_try_gh_cli_token(monkeypatch):
+    """Restore the real ``_try_gh_cli_token`` for tests that stub subprocess.
+
+    A test that has already replaced ``copilot_auth.subprocess.run`` with a
+    fake never shells out and never reads a credential, so the guard above is
+    pure collateral for it — but it still needs the genuine function body to
+    assert on (e.g. that the Windows no-window ``creationflags`` are passed).
+
+    Requesting this fixture is a deliberate, greppable opt-out. Do NOT use it
+    without stubbing ``copilot_auth.subprocess.run`` first, or the real `gh`
+    binary will be invoked.
+    """
+    import hermes_cli.copilot_auth as _copilot_auth
+
+    monkeypatch.setattr(
+        _copilot_auth, "_try_gh_cli_token", _REAL_TRY_GH_CLI_TOKEN
+    )
+    return _REAL_TRY_GH_CLI_TOKEN
 
 
 # Path fragments unique to the Copilot OAuth/token-exchange endpoints. Kept
@@ -498,6 +527,10 @@ def _block_real_copilot_credentials(monkeypatch):
     tests/hermes_cli/test_copilot_token_exchange.py).
     """
     import hermes_cli.copilot_auth as _copilot_auth
+
+    global _REAL_TRY_GH_CLI_TOKEN
+    if _REAL_TRY_GH_CLI_TOKEN is None:
+        _REAL_TRY_GH_CLI_TOKEN = _copilot_auth._try_gh_cli_token
 
     monkeypatch.setattr(_copilot_auth, "_try_gh_cli_token", _guarded_try_gh_cli_token)
 

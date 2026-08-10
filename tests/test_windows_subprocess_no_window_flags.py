@@ -153,7 +153,12 @@ def test_context_reference_git_and_rg_hide_windows(monkeypatch):
     assert rg_calls[0][1].get("creationflags") == _CREATE_NO_WINDOW
 
 
-def test_copilot_gh_cli_probe_hides_gh_windows(monkeypatch):
+def test_copilot_gh_cli_probe_hides_gh_windows(monkeypatch, real_try_gh_cli_token):
+    # The autouse credential guard in tests/conftest.py replaces
+    # _try_gh_cli_token to stop tests reading a real `gh` credential. This
+    # test needs the genuine function body to assert on its creationflags,
+    # and is safe to opt out because it stubs copilot_auth.subprocess.run
+    # below — so no `gh` binary is ever executed.
     from hermes_cli import copilot_auth
 
     captured = []
@@ -167,7 +172,7 @@ def test_copilot_gh_cli_probe_hides_gh_windows(monkeypatch):
     monkeypatch.setattr(copilot_auth, "_gh_cli_candidates", lambda: ["gh"])
     monkeypatch.setattr(copilot_auth.subprocess, "run", fake_run)
 
-    assert copilot_auth._try_gh_cli_token() == "gho_from_cli"
+    assert real_try_gh_cli_token() == "gho_from_cli"
     assert captured[0][0] == ["gh", "auth", "token"]
     assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
 
