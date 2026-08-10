@@ -1516,7 +1516,7 @@ wheels = [
 
 [[package]]
 name = "hermes-agent"
-version = "0.19.9"
+version = "0.19.10"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
