@@ -100,6 +100,9 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     module = _load_release_module(monkeypatch, tmp_path)
     monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
     monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
+    # uv.lock regeneration is covered on its own in test_release_uv_lock.py;
+    # stub it out here so this test stays focused on the manifest bump.
+    monkeypatch.setattr(module, "regenerate_uv_lock", lambda semver: None)
 
     module.update_version_files("0.14.0", "2026-05-21")
 
@@ -111,3 +114,48 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     )
     assert manifest["version"] == "0.14.0"
     assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.14.0"
+
+
+def test_update_version_files_bumps_desktop_package_json_inside_repo_root(
+    monkeypatch, tmp_path
+):
+    """The desktop bump must follow a monkeypatched REPO_ROOT, not import time.
+
+    Regression guard: resolving the desktop package.json into a module-level
+    constant binds it at import, so a test that redirects REPO_ROOT to a tmp
+    tree would silently rewrite the *real* apps/desktop/package.json in the
+    working copy instead. That happened once and was only caught because the
+    stray version showed up in `git status`.
+    """
+    real_desktop_pkg = (
+        Path(__file__).resolve().parents[2] / "apps" / "desktop" / "package.json"
+    )
+    real_before = real_desktop_pkg.read_text(encoding="utf-8")
+
+    _write_manifest(tmp_path, "0.13.0")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "hermes-agent"\nversion = "0.13.0"\n', encoding="utf-8"
+    )
+    version_dir = tmp_path / "hermes_cli"
+    version_dir.mkdir()
+    (version_dir / "__init__.py").write_text(
+        '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
+        encoding="utf-8",
+    )
+    desktop_dir = tmp_path / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text(
+        '{\n  "name": "hermes",\n  "version": "0.13.0"\n}\n', encoding="utf-8"
+    )
+
+    module = _load_release_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
+    monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
+    monkeypatch.setattr(module, "regenerate_uv_lock", lambda semver: None)
+
+    module.update_version_files("0.14.0", "2026-05-21")
+
+    bumped = json.loads((desktop_dir / "package.json").read_text(encoding="utf-8"))
+    assert bumped["version"] == "0.14.0"
+    # The real checkout must be untouched.
+    assert real_desktop_pkg.read_text(encoding="utf-8") == real_before
