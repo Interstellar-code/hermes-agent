@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -38,6 +39,22 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # tests/acp/test_registry_manifest.py enforces this lockstep so the release
 # bump touches both files atomically.
 ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
+
+# uv.lock embeds hermes-agent's own version as a package entry (source =
+# { editable = "." }). It must be regenerated in lockstep with pyproject.toml
+# — see regenerate_uv_lock() for why this is not optional.
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
+
+# The Electron app's package.json tracks pyproject's version (electron-builder
+# reads it for artifact names). update_version_files() bumps it, so it must be
+# staged with the rest — otherwise the bump is left uncommitted in the worktree
+# and the next release diffs against a stale value.
+#
+# Resolved through a function rather than a module-level constant on purpose:
+# the tests monkeypatch REPO_ROOT to a tmp dir, and a constant captured at
+# import time would ignore that and write to the real repo.
+def desktop_package_json() -> Path:
+    return REPO_ROOT / "apps" / "desktop" / "package.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2192,7 +2209,7 @@ def update_version_files(semver: str, calver_date: str):
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
+    desktop_pkg = desktop_package_json()
     if desktop_pkg.exists():
         pkg_text = desktop_pkg.read_text(encoding="utf-8")
         pkg_text = re.sub(
@@ -2206,6 +2223,95 @@ def update_version_files(semver: str, calver_date: str):
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
     _update_acp_registry_versions(semver)
+
+    # Regenerate uv.lock so its embedded hermes-agent version entry matches
+    # the version we just wrote above. Never skip this — see the function's
+    # docstring for the incident that made it mandatory.
+    regenerate_uv_lock(semver)
+
+
+def _managed_uv_path() -> Path:
+    """Where Hermes keeps its own managed uv install.
+
+    Mirrors ``hermes_cli.managed_uv.managed_uv_path()``: ``$HERMES_HOME/bin/uv``
+    (``uv.exe`` on Windows), defaulting to ``~/.hermes/bin/uv`` when
+    ``HERMES_HOME`` is unset. Reimplemented locally (rather than imported)
+    so this script keeps working even when run outside an installed
+    hermes-agent environment.
+    """
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    return home / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
+
+
+def _find_uv_bin():
+    """Locate the ``uv`` binary, or return ``None`` if it can't be found.
+
+    Checks ``PATH`` first (``shutil.which``) since that's correct for anyone
+    with uv installed normally or a venv-activated shell. Falls back to
+    Hermes's own managed uv install, because uv is *not* guaranteed to be on
+    ``PATH`` in every environment that runs a release (e.g. this machine has
+    it only at ``~/.hermes/bin/uv``).
+    """
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        return uv_bin
+
+    managed = _managed_uv_path()
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return str(managed)
+
+    return None
+
+
+def regenerate_uv_lock(semver: str) -> None:
+    """Regenerate uv.lock so it embeds the freshly-bumped project version.
+
+    ``uv.lock`` pins hermes-agent's own version as a package entry
+    (``source = { editable = "." }``). Bumping ``pyproject.toml`` without
+    re-running ``uv lock`` leaves the lockfile stale, and ``uv lock --check``
+    (which ``uv sync --locked`` runs before installing) then fails at the
+    install step — before a single test runs. An install-time abort looks
+    just like a real test failure on the CI dashboard.
+
+    This is not a hypothetical: commit 8712d5b7b introduced exactly this
+    drift and the Python test suite silently did not run for 176 commits,
+    during which 8 real test failures accumulated invisibly. Never let this
+    step fail silently — abort the release rather than ship a stale lock.
+    """
+    uv_bin = _find_uv_bin()
+    if not uv_bin:
+        raise RuntimeError(
+            "Cannot regenerate uv.lock: no `uv` binary found on PATH or at "
+            f"{_managed_uv_path()}. Install uv (https://docs.astral.sh/uv/) "
+            "or set HERMES_HOME to an install that has one, then re-run "
+            "this release."
+        )
+
+    result = subprocess.run(
+        [uv_bin, "lock"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"`uv lock` failed:\n{detail}")
+
+    # Verify the lock actually changed as expected rather than assuming a
+    # zero exit code means the embedded version updated too.
+    if not UV_LOCK_FILE.exists():
+        raise RuntimeError(f"`uv lock` reported success but {UV_LOCK_FILE} is missing.")
+
+    lock_text = UV_LOCK_FILE.read_text(encoding="utf-8")
+    match = re.search(r'^name = "hermes-agent"\nversion = "([^"]+)"', lock_text, re.MULTILINE)
+    if not match or match.group(1) != semver:
+        found = match.group(1) if match else "<no hermes-agent entry found>"
+        raise RuntimeError(
+            f"uv.lock still shows hermes-agent version {found!r} after "
+            f"`uv lock` (expected {semver!r}). Refusing to publish with a "
+            "stale lockfile — investigate before retrying."
+        )
 
 
 def _update_acp_registry_versions(semver: str) -> None:
@@ -2237,7 +2343,7 @@ def build_release_artifacts(semver: str) -> list[Path]:
     shutil.rmtree(dist_dir, ignore_errors=True)
 
     # Prefer uv build (matches CI workflow), fall back to python -m build.
-    uv_bin = shutil.which("uv")
+    uv_bin = _find_uv_bin()
     if uv_bin:
         cmd = [uv_bin, "build", "--sdist", "--wheel"]
     else:
@@ -2612,13 +2718,20 @@ def main():
 
         # Update version files
         if args.bump:
-            update_version_files(new_version, calver_date)
+            try:
+                update_version_files(new_version, calver_date)
+            except RuntimeError as exc:
+                print(f"  ✗ {exc}")
+                return
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
+            print(f"  ✓ Regenerated uv.lock for v{new_version}")
 
             # Commit version bump
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE)]
+            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE), str(UV_LOCK_FILE)]
             if ACP_REGISTRY_MANIFEST.exists():
                 add_files.append(str(ACP_REGISTRY_MANIFEST))
+            if desktop_package_json().exists():
+                add_files.append(str(desktop_package_json()))
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
