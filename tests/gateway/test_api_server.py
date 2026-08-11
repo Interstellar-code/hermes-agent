@@ -4299,9 +4299,15 @@ class TestModelRoutesAgentCreation:
 
         adapter._create_agent(session_id="s1", route=adapter._resolve_route("alias"))
 
-        # The route must NOT be applied — the session override path (global
-        # runtime here, since the gateway applies /model separately) wins.
-        assert captured["model"] == "global/model"
+        # The route must NOT be applied — the session override wins.
+        #
+        # This previously asserted ``global/model``: _create_agent consulted
+        # the override only to veto the route and then never applied it, so a
+        # switched session silently fell back to the global config model. The
+        # override is now applied, which is the whole point of it outranking
+        # the route.
+        assert captured["model"] == "session/override-model"
+        # The route's credentials must not leak in alongside it.
         assert captured["api_key"] == "sk-global"
 
     def test_session_override_lookup_reads_gateway_runner(self, monkeypatch):
