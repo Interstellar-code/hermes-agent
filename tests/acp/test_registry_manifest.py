@@ -54,16 +54,36 @@ def test_agent_json_uses_uvx_distribution_without_local_command_fields():
     assert "command" not in data["distribution"]
 
 
-def test_agent_json_version_matches_pyproject():
-    assert _manifest()["version"] == _pyproject_version()
+def test_agent_json_version_is_decoupled_from_pyproject():
+    """The manifest describes upstream's PyPI release, not this fork's version.
 
+    It used to be bumped in lockstep with pyproject.toml by release.py. That
+    was only correct while this repo could publish ``hermes-agent`` to PyPI —
+    it cannot. The package on PyPI belongs to upstream Nous Research, so a
+    trusted-publishing exchange from this fork fails with ``invalid-publisher``
+    and the PyPI workflow has been removed. Lockstep bumping therefore pinned
+    the manifest to versions that never reached the index (0.19.10, 0.19.11),
+    breaking ``uvx`` for anyone who resolved it.
 
-def test_agent_json_pins_uvx_package_to_pyproject_version():
-    """The registry CI rejects ``@latest`` and floating pins; the manifest must
-    always reference the exact PyPI version listed in pyproject.toml."""
-    assert _manifest()["distribution"]["uvx"]["package"] == (
-        f"hermes-agent[acp]=={_pyproject_version()}"
+    The manifest is now left alone by the release tool. This test asserts the
+    decoupling so a future change cannot silently reintroduce the lockstep.
+    """
+    assert _manifest()["version"] != _pyproject_version(), (
+        "acp_registry/agent.json is tracking pyproject.toml again — release.py "
+        "must not bump it while this fork does not publish to PyPI."
     )
+
+
+def test_agent_json_pins_uvx_package_to_an_exact_published_version():
+    """The registry CI rejects ``@latest`` and floating pins, so the spec must
+    stay an exact ``==`` pin — and it must match the manifest's own version."""
+    manifest = _manifest()
+    package = manifest["distribution"]["uvx"]["package"]
+
+    assert package == f"hermes-agent[acp]=={manifest['version']}"
+    assert "==" in package
+    assert "latest" not in package
+    assert re.fullmatch(r"hermes-agent\[acp\]==\d+\.\d+\.\d+", package)
 
 
 def test_icon_svg_is_16x16_current_color():
