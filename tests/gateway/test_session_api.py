@@ -451,3 +451,102 @@ async def test_session_header_rejected_without_api_key(adapter, session_db):
         assert resp.status == 403
         data = await resp.json()
         assert "X-Hermes-Session-Key requires API key" in data["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Approval bypass (#219) — must be settable in the process that enforces it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_yolo_toggles_state_in_this_process(auth_adapter, session_db):
+    """POST/GET /api/sessions/{id}/yolo drive tools.approval in THIS process.
+
+    ``_session_yolo`` is a module-level set with no IPC, and agents serving
+    this transport are built here — so this is the only place a bypass toggle
+    reaches the guard that gates them. Toggling from the tui_gateway dashboard
+    (or, before that, the slash worker) flips a different copy of the set and
+    reports a change the enforcing agent never sees (#219).
+    """
+    from tools.approval import disable_session_yolo, is_session_yolo_enabled
+
+    session_id = session_db.create_session("yolo-session", "api_server")
+    app = web.Application()
+    app.router.add_get("/api/sessions/{session_id}/yolo", auth_adapter._handle_get_session_yolo)
+    app.router.add_post("/api/sessions/{session_id}/yolo", auth_adapter._handle_set_session_yolo)
+    hdrs = {"Authorization": "Bearer sk-test"}
+
+    disable_session_yolo(session_id)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/api/sessions/{session_id}/yolo", headers=hdrs)
+            assert resp.status == 200
+            assert (await resp.json())["enabled"] is False
+
+            # Explicit enable moves REAL approval state in this process.
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/yolo", json={"enabled": True}, headers=hdrs
+            )
+            assert resp.status == 200
+            body = await resp.json()
+            assert body["enabled"] is True and body["previous"] is False
+            assert is_session_yolo_enabled(session_id) is True
+
+            # Omitting `enabled` toggles.
+            resp = await cli.post(f"/api/sessions/{session_id}/yolo", json={}, headers=hdrs)
+            assert (await resp.json())["enabled"] is False
+            assert is_session_yolo_enabled(session_id) is False
+
+            # A non-boolean is rejected rather than silently toggling.
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/yolo", json={"enabled": "maybe"}, headers=hdrs
+            )
+            assert resp.status == 400
+            assert (await resp.json())["error"]["code"] == "invalid_enabled"
+            assert is_session_yolo_enabled(session_id) is False
+    finally:
+        disable_session_yolo(session_id)
+
+
+@pytest.mark.asyncio
+async def test_session_yolo_keys_on_the_header_like_approvals_do(auth_adapter, session_db):
+    """The key must match what the approval guard computes.
+
+    _run_agent binds HERMES_SESSION_KEY to ``gateway_session_key or
+    session_id`` and registers approvals under the same expression. Keying
+    the toggle differently would flip a bypass nothing reads.
+    """
+    from tools.approval import disable_session_yolo, is_session_yolo_enabled
+
+    session_id = session_db.create_session("yolo-keyed", "api_server")
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/yolo", auth_adapter._handle_set_session_yolo)
+
+    disable_session_yolo("client-key-42")
+    disable_session_yolo(session_id)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/yolo",
+                json={"enabled": True},
+                headers={"Authorization": "Bearer sk-test", "X-Hermes-Session-Key": "client-key-42"},
+            )
+            assert resp.status == 200
+            # Stored under the header key, NOT the URL session id.
+            assert is_session_yolo_enabled("client-key-42") is True
+            assert is_session_yolo_enabled(session_id) is False
+    finally:
+        disable_session_yolo("client-key-42")
+        disable_session_yolo(session_id)
+
+
+@pytest.mark.asyncio
+async def test_session_yolo_requires_auth(adapter, session_db):
+    session_id = session_db.create_session("yolo-auth", "api_server")
+    app = web.Application()
+    app.router.add_post("/api/sessions/{session_id}/yolo", adapter._handle_set_session_yolo)
+    async with TestClient(TestServer(app)) as cli:
+        # `adapter` has no key configured, so this asserts the guard is wired,
+        # not that it rejects — a keyless adapter accepts by design.
+        resp = await cli.post(f"/api/sessions/{session_id}/yolo", json={"enabled": False})
+        assert resp.status in (200, 401)

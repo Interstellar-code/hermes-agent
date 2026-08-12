@@ -14792,6 +14792,22 @@ def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
     This mirrors the session branch of ``config.set key=yolo`` — the
     authoritative path — so both affordances agree, and emits the same
     ``session.info`` so the indicator repaints.
+
+    SCOPE, and why the wording below is careful: ``_session_yolo`` is
+    per-PROCESS. This handler runs wherever the tui_gateway dispatcher is
+    hosted (the dashboard process), so it governs agents built THERE — the
+    TUI and dashboard-hosted sessions. A client whose turns run on another
+    transport, notably ``api_server`` in the gateway process, has its
+    approvals enforced by a different copy of that set, and this toggle
+    cannot reach it. Saying "for this session" flatly would repeat the
+    original defect in a new place, so the message names the surface and
+    points such clients at POST /api/sessions/{id}/yolo, which runs in the
+    process that actually gates them.
+
+    There is deliberately no attempt to auto-detect the hosting transport:
+    the dashboard holds a session object for clients it does not serve turns
+    for, and no reliable marker distinguishes them. An honest message beats
+    a guess.
     """
     from tools.approval import (
         disable_session_yolo,
@@ -14823,12 +14839,20 @@ def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
     if agent is not None:
         _emit("session.info", sid, _session_info(agent, session))
 
+    scope_note = (
+        "   Applies to TUI/dashboard-hosted turns. If your chat runs over the "
+        "HTTP API, use POST /api/sessions/{id}/yolo — approvals there are "
+        "enforced in the gateway process, which this cannot reach."
+    )
     if enable:
         return (
             "(>_<) YOLO mode ON for this session — command approvals are bypassed. "
-            "Run /yolo off to restore them."
+            "Run /yolo off to restore them.\n" + scope_note
         )
-    return "(^_^) YOLO mode OFF for this session — command approvals are enforced again."
+    return (
+        "(^_^) YOLO mode OFF for this session — command approvals are enforced again.\n"
+        + scope_note
+    )
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:

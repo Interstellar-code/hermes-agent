@@ -1680,6 +1680,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/chat/clarify", self._handle_session_clarify),
+            ("GET", "/api/sessions/{session_id}/yolo", self._handle_get_session_yolo),
+            ("POST", "/api/sessions/{session_id}/yolo", self._handle_set_session_yolo),
             (
                 "POST",
                 "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
@@ -6832,6 +6834,101 @@ class APIServerAdapter(BasePlatformAdapter):
             "approved": choice != "deny",
             "resolved": resolved,
         })
+
+    def _yolo_session_key(self, request: "web.Request", session_id: str) -> str:
+        """Approval-bypass key for this session.
+
+        MUST match what the approval guard computes for an agent built by this
+        adapter: ``_run_agent`` binds ``HERMES_SESSION_KEY`` to
+        ``gateway_session_key or session_id`` and registers approvals under the
+        same expression (see ``approval_session_key`` in the chat-stream
+        handler). A different key here would toggle a bypass nothing reads.
+        """
+        gateway_session_key, _ = self._parse_session_key_header(request)
+        return gateway_session_key or session_id
+
+    async def _handle_get_session_yolo(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/yolo — read the approval-bypass state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        from tools.approval import is_session_yolo_enabled
+
+        key = self._yolo_session_key(request, session_id)
+        return web.json_response(
+            {
+                "object": "hermes.session.yolo",
+                "session_id": session_id,
+                "enabled": bool(is_session_yolo_enabled(key)),
+            }
+        )
+
+    async def _handle_set_session_yolo(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/yolo — set the approval bypass.
+
+        This endpoint exists because the approval bypass is per-PROCESS state
+        (``tools.approval._session_yolo`` is a module-level set with no IPC),
+        and agents serving this transport live in THIS process. Toggling it
+        anywhere else — the tui_gateway dashboard, or the slash worker before
+        that — flips a set the enforcing agent never reads, so the client is
+        told the bypass changed when it did not (#219).
+
+        Body: ``{"enabled": true|false}``; omit ``enabled`` to toggle.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            is_session_yolo_enabled,
+        )
+
+        key = self._yolo_session_key(request, session_id)
+        current = bool(is_session_yolo_enabled(key))
+
+        raw = body.get("enabled", None)
+        if raw is None:
+            enabled = not current
+        elif isinstance(raw, bool):
+            enabled = raw
+        elif isinstance(raw, str) and raw.strip().lower() in {"1", "on", "true", "yes"}:
+            enabled = True
+        elif isinstance(raw, str) and raw.strip().lower() in {"0", "off", "false", "no"}:
+            enabled = False
+        else:
+            return web.json_response(
+                _openai_error(
+                    "enabled must be a boolean (omit it to toggle)",
+                    param="enabled",
+                    code="invalid_enabled",
+                ),
+                status=400,
+            )
+
+        if enabled:
+            enable_session_yolo(key)
+        else:
+            disable_session_yolo(key)
+        logger.info(
+            "api_server approval bypass %s for session=%s",
+            "enabled" if enabled else "disabled",
+            key,
+        )
+        return web.json_response(
+            {
+                "object": "hermes.session.yolo",
+                "session_id": session_id,
+                "enabled": bool(is_session_yolo_enabled(key)),
+                "previous": current,
+            }
+        )
 
     async def _handle_session_clarify(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat/clarify — resolve a pending clarify."""
