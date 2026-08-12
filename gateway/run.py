@@ -5174,7 +5174,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        configured = str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        if configured:
+            return configured
+        # Fall back to the configured personality (#223). /personality now
+        # stores a NAME under agent.personality instead of overwriting
+        # agent.system_prompt; without this the gateway would ignore a
+        # personality set with --global, even though the old (destructive)
+        # behaviour did reach messaging and cron sessions. An explicit
+        # system_prompt still wins — same precedence as the CLI.
+        try:
+            from hermes_cli.config import resolve_personality_prompt
+
+            return resolve_personality_prompt(cfg)
+        except Exception:
+            logger.debug("personality prompt resolution failed", exc_info=True)
+            return ""
 
     def _resolve_model_for_channel(
         self,

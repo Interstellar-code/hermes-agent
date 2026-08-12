@@ -334,3 +334,64 @@ class TestPersonalityDictFormat:
         from cli import HermesCLI
         result = HermesCLI._resolve_personality_prompt("You are helpful.")
         assert result == "You are helpful."
+
+
+class TestPersonalityReachesOtherSurfaces:
+    """A --global personality must apply beyond the CLI (#223).
+
+    The old, destructive behaviour wrote the preset text into
+    agent.system_prompt, so a personality reached the messaging gateway and
+    cron runs for free. Storing a NAME under agent.personality fixes the data
+    loss but would silently narrow the feature unless the other surfaces
+    resolve that name too — so these pin the shared resolver and, crucially,
+    the precedence at the call sites.
+    """
+
+    def test_resolves_string_personality(self):
+        from hermes_cli.config import resolve_personality_prompt
+
+        cfg = {"agent": {"personality": "concise", "personalities": {"concise": "Be brief."}}}
+        assert resolve_personality_prompt(cfg) == "Be brief."
+
+    def test_resolves_dict_personality_with_tone_and_style(self):
+        from hermes_cli.config import resolve_personality_prompt
+
+        cfg = {
+            "agent": {
+                "personality": "x",
+                "personalities": {"x": {"system_prompt": "Base.", "tone": "warm", "style": "terse"}},
+            }
+        }
+        assert resolve_personality_prompt(cfg) == "Base.\nTone: warm\nStyle: terse"
+
+    def test_unknown_or_cleared_name_resolves_empty_not_raising(self):
+        from hermes_cli.config import resolve_personality_prompt
+
+        personalities = {"concise": "Be brief."}
+        for name in ("ghost", "none", "default", "neutral", "off", ""):
+            cfg = {"agent": {"personality": name, "personalities": personalities}}
+            assert resolve_personality_prompt(cfg) == "", name
+        assert resolve_personality_prompt({}) == ""
+
+    def test_gateway_prefers_explicit_system_prompt_over_personality(self, monkeypatch):
+        """Precedence lives at the call site, not in the resolver."""
+        from gateway.run import GatewayRunner
+
+        cfg = {
+            "agent": {
+                "system_prompt": "My own prompt.",
+                "personality": "concise",
+                "personalities": {"concise": "Be brief."},
+            }
+        }
+        monkeypatch.delenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", raising=False)
+        monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: cfg)
+        assert GatewayRunner._load_ephemeral_system_prompt() == "My own prompt."
+
+    def test_gateway_falls_back_to_personality_when_no_system_prompt(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        cfg = {"agent": {"personality": "concise", "personalities": {"concise": "Be brief."}}}
+        monkeypatch.delenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", raising=False)
+        monkeypatch.setattr("gateway.run._load_gateway_runtime_config", lambda: cfg)
+        assert GatewayRunner._load_ephemeral_system_prompt() == "Be brief."

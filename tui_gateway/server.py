@@ -5170,6 +5170,17 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    if not system_prompt:
+        # /personality stores a NAME under agent.personality and no longer
+        # overwrites agent.system_prompt (#223), so resolve it here or a
+        # globally-set personality would never reach this surface. An explicit
+        # system_prompt still wins — same precedence as the CLI.
+        try:
+            from hermes_cli.config import resolve_personality_prompt
+
+            system_prompt = _prompt_text(resolve_personality_prompt(cfg))
+        except Exception:
+            pass
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
