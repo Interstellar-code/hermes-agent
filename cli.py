@@ -9697,7 +9697,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off.
+        """Cycle tool progress mode: off → new → all → verbose → log → off.
 
         Tool-progress display (full args / results / think blocks at the
         ``verbose`` step) is INDEPENDENT of global DEBUG logging.  Cycling
@@ -9706,7 +9706,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         explicit ``-v``/``--verbose`` flag and the ``/verbose-logging``
         toggle.  See PR #6a1aa420e for the history that decoupled them.
         """
-        cycle = ["off", "new", "all", "verbose"]
+        # Must cover every value ``display.tool_progress`` accepts (see
+        # gateway/display_config.py::_normalise) — a mode missing from the
+        # cycle can never be selected AND can never be returned to once the
+        # user cycles away from a config-set value (#222).
+        cycle = ["off", "new", "all", "verbose", "log"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -9730,6 +9734,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
             "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
             "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, and think blocks.",
+            # The tool_calls.log writer itself lives in the messaging gateway
+            # (gateway/run.py, "gateway-only by design") — here LOG just means
+            # quiet, but it stays in the cycle so a config-set 'log' survives.
+            "log": f"{_Colors.DIM}Tool progress: LOG{_Colors.RESET} — quiet here; messaging gateways append tool calls to ~/.hermes/logs/tool_calls.log.",
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 

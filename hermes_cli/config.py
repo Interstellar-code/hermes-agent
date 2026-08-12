@@ -1939,7 +1939,9 @@ DEFAULT_CONFIG = {
         # Supported: en, zh, ja, de, es, fr, tr, uk.  Unknown values fall back to en.
         "language": "en",
         # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
-        # spinner), or ascii.  Live-swappable via `/indicator <style>`.
+        # spinner), or ascii.  Live-swappable from the Ink TUI via
+        # `/indicator <style>` (a TUI-only command that rides config.set); the
+        # classic CLI has no equivalent and ignores this key.
         "tui_status_indicator": "kaomoji",
         # Seconds between prompt_toolkit redraws in the classic CLI when idle.
         # Default 1.0 keeps the wall-clock status-bar read-outs (idle-since-

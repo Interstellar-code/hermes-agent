@@ -11668,7 +11668,12 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"key": key, "value": raw})
 
     if key == "verbose":
-        cycle = ["off", "new", "all", "verbose"]
+        # Every value ``display.tool_progress`` accepts (see
+        # gateway/display_config.py::_normalise). This writes the shared
+        # config key, so rejecting "log" here made a valid, gateway-honored
+        # mode unreachable from the TUI/desktop and dropped a config-set
+        # "log" the moment the user cycled (#222).
+        cycle = ["off", "new", "all", "verbose", "log"]
         cur = (
             session.get("tool_progress_mode", _load_tool_progress_mode())
             if session
@@ -13048,8 +13053,17 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
     }
 )
 
+# TUI-surface commands with no classic-CLI handler. They live here rather
+# than in COMMAND_REGISTRY precisely because the registry is the CLI's
+# dispatch contract: listing a command there that cli.py cannot dispatch is
+# how /indicator ended up printing "Unknown command" (#222).
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/compact", "Toggle compact display mode", "TUI"),
+    (
+        "/indicator",
+        "Pick the busy-indicator style [kaomoji|emoji|unicode|ascii]",
+        "TUI",
+    ),
     ("/logs", "Show recent gateway log lines", "TUI"),
     (
         "/mouse",
@@ -13057,6 +13071,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
         "TUI",
     ),
     ("/sessions", "Switch between live TUI sessions", "TUI"),
+    ("/systemprompt", "Show the current system prompt", "TUI"),
 ]
 
 # Commands that queue messages onto _pending_input in the CLI.
@@ -14511,6 +14526,7 @@ def _(rid, params: dict) -> dict:
 _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
+        "compose",
         "compress",
         "effort",
         "history",
@@ -14518,6 +14534,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "prompt",
         "rename",
         "status",
+        "systemprompt",
         "usage",
     }
 )
@@ -14594,7 +14611,14 @@ def _format_live_history_output(session: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_live_prompt_output(session: dict) -> str:
+def _format_live_system_prompt_output(session: dict) -> str:
+    """Render the session's current system prompt (the ``/systemprompt`` read).
+
+    This used to answer ``/prompt``, which the registry defines as "compose
+    your next prompt in $EDITOR" — two unrelated meanings behind one name
+    (#222). The read-only view keeps its own name; ``/prompt`` now reports
+    that composing is a classic-CLI capability.
+    """
     agent = session.get("agent")
     mirror = _metadata_mirror(session)
     if agent is None and "system_prompt" not in mirror:
@@ -14727,10 +14751,19 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if session is None:
             return "No conversation history yet."
         return _format_live_history_output(session)
-    if name == "prompt":
+    if name == "systemprompt":
         if session is None:
             return "No active agent -- send a message first."
-        return _format_live_prompt_output(session)
+        return _format_live_system_prompt_output(session)
+    if name in {"prompt", "compose"}:
+        # /prompt composes the next turn in $EDITOR — it needs a terminal, so
+        # it is cli_only and must not reach the slash worker here. Say so
+        # instead of silently dumping the system prompt (#222).
+        return (
+            "/prompt opens $EDITOR to compose your next message and is only "
+            "available in the classic CLI. Use /systemprompt to see the "
+            "current system prompt."
+        )
     if name == "status":
         response = _methods["session.status"]("status", {"session_id": sid})
         if response.get("error"):
@@ -14774,7 +14807,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # worker thread running agent.run_conversation is using.  Parity
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
-    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
+    _MUTATES_WHILE_RUNNING = {"model", "personality", "compress"}
     if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
         route_name = f"slash.{name}"
         try:
@@ -14800,11 +14833,6 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
             _apply_personality_to_session(sid, session, new_prompt, pname)
-        elif name == "prompt" and agent:
-            cfg = _load_cfg()
-            new_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))
-            agent.ephemeral_system_prompt = new_prompt or None
-            agent._cached_system_prompt = None
         elif name == "compress" and agent:
             # Mirror the session.compress RPC: build a before/after summary so
             # the user gets feedback (#46686). The slash path previously just

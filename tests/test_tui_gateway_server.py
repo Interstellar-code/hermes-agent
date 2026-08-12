@@ -4812,6 +4812,57 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
     assert agent.verbose_logging is True
 
 
+def test_config_set_verbose_cycle_reaches_log_mode(tmp_path, monkeypatch):
+    """`log` is a valid display.tool_progress value the gateway acts on, so the
+    TUI must be able to cycle into it and must not reject it outright (#222).
+    Before the fix the cycle stopped at `verbose` and an explicit `log` was a
+    4002 error, which also meant cycling silently discarded a config-set
+    `log`."""
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    agent = types.SimpleNamespace(verbose_logging=True)
+    server._sessions["sid"] = _session(agent=agent, tool_progress_mode="verbose")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
+            }
+        )
+        assert resp["result"]["value"] == "log"
+        assert server._sessions["sid"]["tool_progress_mode"] == "log"
+        assert agent.verbose_logging is False
+
+        # ...and cycling on from `log` wraps back to `off` rather than sticking.
+        resp = server.handle_request(
+            {
+                "id": "2",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
+            }
+        )
+        assert resp["result"]["value"] == "off"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_config_set_verbose_accepts_explicit_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "log"},
+            }
+        )
+        assert "error" not in resp, resp
+        assert resp["result"]["value"] == "log"
+    finally:
+        server._sessions.pop("sid", None)
+
+
 
 def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
     """A model switch against a lazy-created live session must apply to the
@@ -5881,6 +5932,61 @@ def test_command_dispatch_compress_dry_run_does_not_compress(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_slash_exec_prompt_is_not_the_system_prompt_dump():
+    """/prompt is the CLI's "compose in $EDITOR" command (COMMAND_REGISTRY,
+    cli_only). The gateway used to answer it with the current system prompt —
+    a different capability under the same name (#222). It now says where
+    composing lives and points at /systemprompt."""
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(ephemeral_system_prompt="SECRET SYSTEM PROMPT")
+    )
+    try:
+        for command in ("/prompt", "/compose", "/prompt draft an email"):
+            resp = server.handle_request(
+                {
+                    "id": command,
+                    "method": "slash.exec",
+                    "params": {"command": command, "session_id": "sid"},
+                }
+            )
+            output = resp["result"]["output"]
+            assert "SECRET SYSTEM PROMPT" not in output, (command, output)
+            assert "classic CLI" in output, (command, output)
+            assert "/systemprompt" in output, (command, output)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_systemprompt_shows_the_system_prompt():
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(ephemeral_system_prompt="live system prompt")
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"command": "/systemprompt", "session_id": "sid"},
+            }
+        )
+        assert "live system prompt" in resp["result"]["output"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_tui_catalog_lists_systemprompt_and_indicator():
+    """Both are TUI-surface commands with no cli.py branch, so they ride
+    _TUI_EXTRA instead of COMMAND_REGISTRY — but they must still reach the
+    palette (#222)."""
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    listed = {name for name, _desc in resp["result"]["pairs"]}
+    assert "/systemprompt" in listed
+    assert "/indicator" in listed
+    assert "/prompt" in listed  # still advertised: it works in the classic CLI
+
+
 def test_mirror_slash_compress_preview_does_not_compress(monkeypatch):
     """slash.exec routes /compress through _mirror_slash_side_effects."""
     history = _compress_history()
@@ -5976,7 +6082,9 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     cases = {
         "usage": "Total tokens:                 140",
         "history": "live question from state db",
-        "prompt": "host system prompt",
+        # /systemprompt, not /prompt — /prompt is the CLI's $EDITOR compose
+        # command and no longer dumps the system prompt here (#222).
+        "systemprompt": "host system prompt",
         "status": "Tokens: 140",
         "context": "Context usage: ~80 / 1,000 tokens",
         "tools": "terminal",
@@ -7399,10 +7507,13 @@ def test_config_set_model_allowed_when_idle(monkeypatch):
 
 
 def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monkeypatch):
-    """Slash worker passthrough (e.g. /model, /personality, /prompt,
-    /compress) must reject during an in-flight turn.  Same race as
-    config.set — mutates live agent state while run_conversation is
-    reading it."""
+    """Slash worker passthrough (e.g. /model, /personality, /compress) must
+    reject during an in-flight turn.  Same race as config.set — mutates live
+    agent state while run_conversation is reading it.
+
+    /prompt used to be in this set; its mirror branch was unreachable dead
+    code (slash.exec answers /prompt before ever reaching the mirror) and was
+    removed in #222, so it no longer mutates anything here."""
     import types
 
     applied = {"model": False, "compress": False}
@@ -7424,7 +7535,6 @@ def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monke
     for cmd, expected_name in [
         ("/model new/model", "model"),
         ("/personality default", "personality"),
-        ("/prompt", "prompt"),
         ("/compress", "compress"),
     ]:
         warning = server._mirror_slash_side_effects("sid", session, cmd)
