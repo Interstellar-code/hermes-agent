@@ -141,6 +141,17 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
+    # This process has no interactive terminal: stdin is the JSON-RPC line
+    # protocol below, and no prompt_toolkit app is running (HermesCLI.run() is
+    # never called here).  Without this flag a confirm-prompting command
+    # (/new, /reload-mcp, /update, /model <expensive>, /billing …) would fall
+    # through to a bare input() that reads the protocol pipe — hanging the
+    # worker until the gateway's timeout kills it and consuming the next
+    # request line (issue #220).  Deliberately a dedicated attribute rather
+    # than HERMES_INTERACTIVE, which governs tool-approval fail-closed
+    # behaviour and must keep its current value here.
+    cli._noninteractive_confirm = True
+
     # Spurious stdin-EOF recovery (same O_NONBLOCK shared file-description
     # issue as the gateway entry point — any child inheriting fd 0 can flip
     # the flag and launder EAGAIN into an apparent EOF).
@@ -167,6 +178,25 @@ def main():
             rid = req.get("id")
             out = _run(cli, req.get("command", ""))
             sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
+            sys.stdout.flush()
+        except SystemExit as e:
+            # A stray sys.exit() from deep inside a command handler (argparse
+            # error path, a library forgetting it's being called in-process,
+            # ...) is a BaseException, not an Exception, so it would otherwise
+            # skip the handler below and kill this worker with no response
+            # frame written (issue #224). KeyboardInterrupt is deliberately
+            # left uncaught here so Ctrl-C still unwinds normally instead of
+            # being reported as a command error.
+            code = e.code
+            if code in (None, 0):
+                sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": ""}) + "\n")
+            else:
+                sys.stdout.write(
+                    json.dumps(
+                        {"id": rid, "ok": False, "error": f"command exited with code {code!r}"}
+                    )
+                    + "\n"
+                )
             sys.stdout.flush()
         except Exception as e:
             sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")

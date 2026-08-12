@@ -7595,6 +7595,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         return result[0]
 
+    def _noninteractive_prompt_cancel(self) -> None:
+        """Explain why an interactive prompt was skipped, then cancel it.
+
+        Set ``self._noninteractive_confirm = True`` on a HermesCLI whose stdin
+        is not a terminal the user can answer on — the TUI gateway's
+        ``tui_gateway.slash_worker`` subprocess is the motivating case (issue
+        #220): its stdin carries the framed JSON-RPC line protocol, so a bare
+        ``input()`` there both wedges the worker until the gateway's 45s
+        timeout kills it *and* eats the next protocol line.
+
+        Callers of the prompt helpers already treat ``None`` as "cancelled",
+        so this prints a short explanation (captured by the worker's stdout
+        redirect and returned to the client) and the helper returns ``None``.
+        """
+        print(
+            "🟡 Interactive prompts aren't available on this surface — this command ran "
+            "without a terminal to confirm on."
+        )
+        print(
+            "   Re-run it in the Hermes CLI/TUI, or use the inline confirm token where "
+            "supported (e.g. `/new --yes`, `/reset now`)."
+        )
+        self._invalidate()
+
     def _prompt_text_input(self, prompt_text: str) -> str | None:
         """Prompt for free-text input safely inside or outside prompt_toolkit.
 
@@ -7616,6 +7640,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
 
         in_main_thread = threading.current_thread() is threading.main_thread()
+
+        # Non-interactive-surface guard (#220): the TUI gateway's slash worker
+        # runs handlers on the MAIN thread with no prompt_toolkit app, so the
+        # thread guard below never fires there — yet its stdin is the JSON-RPC
+        # pipe, so input() would hang the worker and swallow a protocol line.
+        # The worker sets this flag explicitly (never keyed off HERMES_INTERACTIVE,
+        # which drives tool-approval fail-closed semantics), and getattr's default
+        # keeps every other construction path on the existing behaviour.
+        if getattr(self, "_noninteractive_confirm", False):
+            self._noninteractive_prompt_cancel()
+            return None
 
         # Slash-worker guard (#23185 / billing auto-reload hang): when a
         # prompt_toolkit app is running but we're on a non-main thread (the
@@ -7686,6 +7721,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         import time as _time
 
         if not choices:
+            return None
+
+        # Non-interactive surface (#220) — no terminal to answer on.  The
+        # ``_app``-less short-circuit below would reach ``_prompt_text_input``
+        # (which carries the same guard), but check here too so the cancel is
+        # correct even if a surface ever has both an app and a dead stdin.
+        if getattr(self, "_noninteractive_confirm", False):
+            self._noninteractive_prompt_cancel()
             return None
 
         # If prompt_toolkit is not running (unit tests / non-interactive calls),
