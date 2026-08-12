@@ -456,6 +456,152 @@ def test_apply_toolset_change_can_enable_default_off_toolset_from_default():
     assert "terminal" in saved
 
 
+def test_apply_toolset_change_disable_keeps_globally_suppressed_entry():
+    """Issue #226: disabling one toolset must not delete a different, globally
+    suppressed one from the user's raw ``platform_toolsets`` list.
+
+    ``_get_platform_tools`` subtracts ``agent.disabled_toolsets`` last, so
+    ``memory`` never appears in the resolved set; feeding that set back into
+    ``_save_platform_tools`` used to leave ``cli: [kanban, terminal]`` —
+    ``memory`` gone for good, so removing it from ``agent.disabled_toolsets``
+    later no longer restored it.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["web"], "disable")
+
+    assert config["platform_toolsets"]["cli"] == ["memory", "terminal"]
+    # The global suppression list is untouched — the user disabled ``web``,
+    # not ``memory``, so ``memory`` stays off at resolve time...
+    assert config["agent"]["disabled_toolsets"] == ["memory"]
+    assert "memory" not in _get_platform_tools(
+        config, "cli", include_default_mcp_servers=False
+    )
+    # ...but lifting the suppression brings the user's entry back.
+    config["agent"]["disabled_toolsets"] = []
+    assert "memory" in _get_platform_tools(
+        config, "cli", include_default_mcp_servers=False
+    )
+
+
+def test_apply_toolset_change_disable_does_not_inject_non_configurable():
+    """Issue #226, injection half: ``_get_platform_tools`` RECOVERS
+    non-configurable platform toolsets (``kanban``) that were never in the
+    user's list. Writing the resolved set back turned them into explicit
+    ``platform_toolsets`` entries the user never asked for. They must stay out
+    of the saved list — recovery re-derives them on every read.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["web"], "disable")
+
+    assert "kanban" not in config["platform_toolsets"]["cli"]
+    # Still resolved at read time, so nothing is lost by not persisting it.
+    assert "kanban" in _get_platform_tools(
+        config, "cli", include_default_mcp_servers=False
+    )
+
+
+def test_apply_toolset_change_disable_removes_suppressed_target():
+    """The preservation above is scoped to toolsets the caller did NOT name.
+    Explicitly disabling a globally suppressed toolset still drops it from the
+    platform list.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["memory"], "disable")
+
+    assert config["platform_toolsets"]["cli"] == ["terminal", "web"]
+    assert config["agent"]["disabled_toolsets"] == ["memory"]
+
+
+def test_apply_toolset_change_enable_still_clears_global_suppression():
+    """Enabling must keep working end-to-end (#49995): the toolset lands in
+    the platform list AND is cleared from ``agent.disabled_toolsets``, which
+    would otherwise veto it at resolve time.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["memory"], "enable")
+
+    assert config["platform_toolsets"]["cli"] == ["memory", "terminal", "web"]
+    assert config["agent"]["disabled_toolsets"] == []
+    assert "memory" in _get_platform_tools(
+        config, "cli", include_default_mcp_servers=False
+    )
+
+
+def test_apply_toolset_change_enable_preserves_unrelated_suppressed_entry():
+    """Enabling an unrelated toolset must not disturb a suppressed entry, in
+    either direction: it stays in the platform list and stays suppressed.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["browser"], "enable")
+
+    assert config["platform_toolsets"]["cli"] == [
+        "browser", "memory", "terminal", "web",
+    ]
+    assert config["agent"]["disabled_toolsets"] == ["memory"]
+
+
+def test_apply_toolset_change_preserves_mcp_server_names_with_suppression():
+    """MCP server names in the raw list survive the #226 fix unchanged."""
+    config = {
+        "platform_toolsets": {"cli": ["web", "terminal", "custom-mcp-server"]},
+        "mcp_servers": {"custom-mcp-server": {"url": "https://example.com/mcp"}},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _apply_toolset_change(config, "cli", ["web"], "disable")
+
+    assert config["platform_toolsets"]["cli"] == ["custom-mcp-server", "terminal"]
+
+
+def test_save_platform_tools_preserves_suppressed_entry_without_targets():
+    """Callers that do their own read-modify-write against the resolved set
+    (e.g. the dashboard's ``PUT /api/tools/toolsets/{name}``) get the #226
+    preservation too — ``explicit_targets`` only narrows it.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["web", "memory", "terminal"]},
+        "agent": {"disabled_toolsets": ["memory"]},
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        enabled = set(
+            _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+        )
+        enabled.discard("web")
+        _save_platform_tools(config, "cli", enabled)
+
+    assert "memory" in config["platform_toolsets"]["cli"]
+    assert "web" not in config["platform_toolsets"]["cli"]
+    # Preserving an entry is not "enabling" it — the suppression must stand.
+    assert config["agent"]["disabled_toolsets"] == ["memory"]
+
+
 def test_get_platform_tools_handles_null_platform_toolsets():
     """YAML `platform_toolsets:` with no value parses as None — the old
     ``config.get("platform_toolsets", {})`` pattern would then crash with
