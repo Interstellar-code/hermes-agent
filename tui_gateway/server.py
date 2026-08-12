@@ -7177,17 +7177,32 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5007)
         key = session["session_key"]
         try:
-            if not db.get_session(key):
-                db.set_session_title(key, f"handoff-{key[:8]}")
-            ok = db.request_handoff(key, platform_name)
+            # Real INSERT OR IGNORE — the set_session_title call that used to
+            # stand here is a plain UPDATE and never created anything (#221).
+            db.ensure_session_row(
+                key, source=_session_source(session), title=f"handoff-{key[:8]}"
+            )
+            # Drop any request an earlier caller abandoned so it neither blocks
+            # this one nor gets executed by the watcher long after the fact.
+            db.expire_stale_handoffs()
+            status = db.request_handoff_status(key, platform_name)
+            in_flight = ""
+            if status == "in_flight":
+                in_flight = (db.get_handoff_state(key) or {}).get("state") or "in flight"
         except Exception as e:
             return _err(rid, 5007, str(e))
 
-    if not ok:
+    if status == "missing":
+        return _err(
+            rid,
+            4028,
+            "session has no state.db record yet — send a message first, then retry the handoff",
+        )
+    if status != "queued":
         return _err(
             rid,
             4027,
-            "session is already in flight for handoff — wait for it to settle, then retry",
+            f"session is already {in_flight} for handoff — wait for it to settle, then retry",
         )
     return _ok(
         rid,
@@ -13097,6 +13112,14 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 
+# Commands whose CLI implementation blocks longer than _SLASH_WORKER_TIMEOUT_S
+# and leaves durable state behind when the worker is killed mid-run. slash.exec
+# serves these from the equivalent non-blocking RPC instead of the worker.
+# ``/handoff`` poll-waits 60s for the gateway watcher, so at the 45s worker
+# timeout its own cleanup never ran and the session stayed handoff_state
+# 'pending' forever — armed for a watcher to execute days later (#221).
+_RPC_ROUTED_COMMANDS: frozenset[str] = frozenset({"handoff"})
+
 
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
@@ -14904,6 +14927,46 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     return ""
 
 
+def _slash_exec_handoff(rid, params: dict, arg: str) -> dict:
+    """Answer ``/handoff`` from the non-blocking ``handoff.request`` RPC.
+
+    The CLI's ``/handoff`` marks the row pending and then poll-blocks for up to
+    60s, longer than the slash worker's own deadline — so over slash.exec the
+    worker was always killed first and the CLI's cleanup never ran. Queueing via
+    the RPC (which the desktop already uses) returns immediately; the caller
+    polls ``handoff.state`` and can release it with ``handoff.fail`` (#221).
+    """
+    platform_name = (arg.strip().split(maxsplit=1)[0] if arg.strip() else "").lower()
+    if not platform_name:
+        return _ok(
+            rid,
+            {
+                "output": (
+                    "Usage: /handoff <platform>\n"
+                    "Hands the current session off to that platform's home channel.\n"
+                    "Poll handoff.state for the result."
+                )
+            },
+        )
+    result = _methods["handoff.request"](
+        rid,
+        {"session_id": params.get("session_id", ""), "platform": platform_name},
+    )
+    if "result" not in result:
+        return result
+    home_name = (result.get("result") or {}).get("home_name") or "home channel"
+    return _ok(
+        rid,
+        {
+            "output": (
+                f"Queued handoff → {platform_name} (home: {home_name}).\n"
+                "The gateway will transfer the session shortly; "
+                "poll handoff.state for the result."
+            )
+        },
+    )
+
+
 @method("slash.exec")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
@@ -14929,6 +14992,10 @@ def _(rid, params: dict) -> dict:
     )
     if live_output is not None:
         return _ok(rid, {"output": live_output or "(no output)"})
+
+    if _cmd_base in _RPC_ROUTED_COMMANDS:
+        # Never let the worker drive this one — see _RPC_ROUTED_COMMANDS.
+        return _slash_exec_handoff(rid, params, _cmd_arg)
 
     if _cmd_base in _PENDING_INPUT_COMMANDS:
         # Route directly to command.dispatch instead of returning an error

@@ -8253,6 +8253,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
+                # Retire requests nobody picked up in time BEFORE listing.
+                # A pending row is a standing instruction to re-bind a session
+                # to a platform; without this sweep, one abandoned when its
+                # requester was killed mid-wait would be executed by whichever
+                # gateway started next — minutes or days later (#221).
+                # Guarded on its own so a sweep failure can never cost the tick
+                # its real work (claiming live handoffs).
+                try:
+                    expired = await self._session_db.expire_stale_handoffs()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    expired = []
+                    logger.debug("Handoff expiry sweep failed", exc_info=True)
+                if expired:
+                    logger.info(
+                        "Expired %d stale handoff request(s): %s",
+                        len(expired), ", ".join(expired[:5]),
+                    )
                 pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")

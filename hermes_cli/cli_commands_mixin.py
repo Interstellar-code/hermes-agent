@@ -598,16 +598,15 @@ class CLICommandsMixin:
         # Make sure the session row exists in state.db. Most CLI sessions
         # are written via _flush_messages_to_session_db on the first turn
         # already, but if the user tries to hand off an empty session we
-        # still want a row to mark.
+        # still want a row to mark. ensure_session_row is a real
+        # INSERT OR IGNORE — the old set_session_title call here was a plain
+        # UPDATE that silently did nothing on a missing row (#221).
         try:
-            row = self._session_db.get_session(self.session_id)
-            if not row:
-                # Nothing has flushed yet. Create a stub so the gateway has
-                # something to switch_session onto. Inserting via title-set
-                # is the simplest path because set_session_title's INSERT OR
-                # IGNORE creates the row.
-                placeholder_title = f"handoff-{self.session_id[:8]}"
-                self._session_db.set_session_title(self.session_id, placeholder_title)
+            self._session_db.ensure_session_row(
+                self.session_id,
+                source="cli",
+                title=f"handoff-{self.session_id[:8]}",
+            )
         except Exception as exc:
             _cprint(f"  Could not ensure session row in state.db: {exc}")
             return True
@@ -623,52 +622,88 @@ class CLICommandsMixin:
         if not session_title:
             session_title = self.session_id[:8]
 
+        # Clear out any request an earlier attempt abandoned (killed mid-wait)
+        # so a stale 'pending' row can neither block this retry nor be executed
+        # by the gateway watcher long after the fact.
+        try:
+            self._session_db.expire_stale_handoffs()
+        except Exception:
+            pass
+
         # Mark pending — gateway watcher will pick this up.
-        ok = self._session_db.request_handoff(self.session_id, platform_name)
-        if not ok:
-            _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
+        status = self._session_db.request_handoff_status(self.session_id, platform_name)
+        if status != "queued":
+            if status == "missing":
+                # No row at all: distinct from "already in flight", which is
+                # what this used to report for both causes (#221).
+                _cprint("  This session has no record in state.db yet — send a message first, then retry /handoff.")
+            else:
+                try:
+                    in_flight = (self._session_db.get_handoff_state(self.session_id) or {}).get("state") or "in flight"
+                except Exception:
+                    in_flight = "in flight"
+                _cprint(f"  Session is already {in_flight} for handoff. Wait for it to settle, then retry.")
             return True
 
         _cprint(f"  Queued handoff of '{session_title}' → {platform_name} (home: {home.name}).")
         _cprint("  Waiting for the gateway to pick it up...")
 
         # Poll-block on terminal state. Tick every 0.5s; bail at ~60s.
+        #
+        # This blocking wait is for the interactive CLI only. Driving it over a
+        # transport with its own (shorter) deadline used to strand the row in
+        # 'pending' when the caller was killed mid-poll, so slash.exec routes
+        # /handoff to the non-blocking handoff.request RPC instead (#221).
         import time as _time
         deadline = _time.time() + 60.0
         last_state = "pending"
-        while _time.time() < deadline:
-            try:
-                state_row = self._session_db.get_handoff_state(self.session_id)
-            except Exception:
-                state_row = None
-            current = (state_row or {}).get("state") or "pending"
-            if current != last_state:
-                if current == "running":
-                    _cprint("  Gateway picked it up; transferring...")
-                last_state = current
-            if current == "completed":
-                _cprint("")
-                _cprint(f"  ↻ Handoff complete. The session is now active on {platform_name}.")
-                _cprint(f"  Resume it on this CLI later with: /resume {session_title}")
-                _cprint("")
-                # End the CLI cleanly — same exit semantics as /quit.
-                self._should_exit = True
-                return False
-            if current == "failed":
-                err = (state_row or {}).get("error") or "unknown error"
-                _cprint(f"  Handoff failed: {err}")
-                _cprint("  Your CLI session is intact. Try /handoff again, or /resume on the platform manually.")
-                return True
-            _time.sleep(0.5)
+        try:
+            while _time.time() < deadline:
+                try:
+                    state_row = self._session_db.get_handoff_state(self.session_id)
+                except Exception:
+                    state_row = None
+                current = (state_row or {}).get("state") or "pending"
+                if current != last_state:
+                    if current == "running":
+                        _cprint("  Gateway picked it up; transferring...")
+                    last_state = current
+                if current == "completed":
+                    _cprint("")
+                    _cprint(f"  ↻ Handoff complete. The session is now active on {platform_name}.")
+                    _cprint(f"  Resume it on this CLI later with: /resume {session_title}")
+                    _cprint("")
+                    # End the CLI cleanly — same exit semantics as /quit.
+                    self._should_exit = True
+                    return False
+                if current == "failed":
+                    err = (state_row or {}).get("error") or "unknown error"
+                    _cprint(f"  Handoff failed: {err}")
+                    _cprint("  Your CLI session is intact. Try /handoff again, or /resume on the platform manually.")
+                    return True
+                _time.sleep(0.5)
+        except BaseException:
+            # Ctrl-C / SystemExit / any teardown that still runs Python: release
+            # the row so the watcher cannot execute a handoff the user walked
+            # away from. A SIGKILL runs nothing here — expire_stale_handoffs is
+            # the backstop for that.
+            self._release_pending_handoff("abandoned before the gateway picked it up")
+            raise
 
         # Timed out. Clear the pending flag so the user can retry.
-        try:
-            self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
-        except Exception:
-            pass
+        self._release_pending_handoff("timed out waiting for gateway")
         _cprint("  Timed out waiting for the gateway. Is `hermes gateway` running?")
         _cprint("  Your CLI session is intact.")
         return True
+
+    def _release_pending_handoff(self, reason: str) -> None:
+        """Fail this session's handoff unless the gateway already finished it."""
+        try:
+            state = (self._session_db.get_handoff_state(self.session_id) or {}).get("state")
+            if state in {"pending", "running"}:
+                self._session_db.fail_handoff(self.session_id, reason)
+        except Exception:
+            pass
 
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""

@@ -47,6 +47,10 @@ class _RecordingSessionDB:
         idents = self.threads.get(name, [])
         return bool(idents) and all(i != self._loop_thread_ident for i in idents)
 
+    def expire_stale_handoffs(self):
+        self._record("expire_stale_handoffs")
+        return []
+
     def list_pending_handoffs(self):
         self._record("list_pending_handoffs")
         return [{"id": "sess-1"}]
@@ -117,6 +121,11 @@ async def test_watcher_offloads_db_calls_to_threads(monkeypatch):
     await _run_one_tick(fake, monkeypatch)
 
     # Sanity: the watcher actually exercised the calls this tick.
+    # The stale-request sweep must run BEFORE the listing, so an abandoned
+    # 'pending' row can never be executed by a later gateway start (#221).
+    assert db.calls.index("expire_stale_handoffs") < db.calls.index(
+        "list_pending_handoffs"
+    )
     assert "list_pending_handoffs" in db.calls
     assert "claim_handoff" in db.calls
     assert "complete_handoff" in db.calls

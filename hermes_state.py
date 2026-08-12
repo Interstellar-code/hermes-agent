@@ -766,6 +766,13 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     return report
 
 
+# How long a ``handoff_state='pending'`` request stays actionable. The gateway
+# watcher polls every 2s (after a 5s startup delay) and every requester bounds
+# its own wait far below this, so 10 minutes covers a gateway restart or a slow
+# platform reconnect while making it impossible for an abandoned request to be
+# executed hours later. See SessionDB.expire_stale_handoffs.
+HANDOFF_PENDING_TTL_S = 600.0
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -812,6 +819,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    handoff_requested_at REAL,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
@@ -2128,6 +2136,46 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def ensure_session_row(
+        self,
+        session_id: str,
+        *,
+        source: str = "cli",
+        title: Optional[str] = None,
+    ) -> bool:
+        """Guarantee a ``sessions`` row exists for *session_id*.
+
+        Returns True if this call inserted the row, False if one already
+        existed. Either way a row is present when this returns normally.
+
+        Callers that need a row for a session which has not flushed any
+        messages yet used to fake this with ``set_session_title``, on the
+        mistaken belief that it upserts — it is a plain UPDATE, so on a missing
+        row it silently did nothing (#221). *title* is applied only to a row
+        this call created, and only when still NULL, so an existing session's
+        user-chosen title is never touched; a title already taken by another
+        session is skipped rather than raising (it is a cosmetic placeholder,
+        never worth failing the caller's real work over).
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, source, started_at) "
+                "VALUES (?, ?, ?)",
+                (session_id, source, time.time()),
+            )
+            created = cur.rowcount > 0
+            if created and title:
+                try:
+                    conn.execute(
+                        "UPDATE sessions SET title = ? "
+                        "WHERE id = ? AND title IS NULL",
+                        (self.sanitize_title(title), session_id),
+                    )
+                except sqlite3.IntegrityError:
+                    pass  # unique-title collision — keep the row, drop the label
+            return created
+        return self._execute_write(_do)
 
     def record_gateway_session_peer(
         self,
@@ -7865,24 +7913,95 @@ class SessionDB:
     # The CLI writes "pending" then poll-waits for terminal state. The gateway
     # watcher transitions pending→running→{completed,failed}.
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session as pending handoff to the given platform.
+    def request_handoff_status(self, session_id: str, platform: str) -> str:
+        """Mark a session as pending handoff; report *why* if that was refused.
 
-        Returns True if the row was found and not already in flight; False if
-        the session is already in a non-terminal handoff state.
+        Returns one of:
+
+        ``"queued"``    — the row was armed with ``handoff_state='pending'``.
+        ``"missing"``   — there is no ``sessions`` row with this id at all
+                          (a session that has never flushed a message).
+        ``"in_flight"`` — the row exists but is already ``pending``/``running``.
+
+        ``request_handoff`` used to collapse the last two into a bare ``False``,
+        so callers reported "already in flight for handoff" for a session that
+        had no handoff record whatsoever (#221). The follow-up SELECT runs
+        inside the same write transaction as the UPDATE, so the answer cannot
+        be raced by a concurrent writer.
         """
         def _do(conn):
             cur = conn.execute(
                 "UPDATE sessions "
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
-                "    handoff_error = NULL "
+                "    handoff_error = NULL, "
+                "    handoff_requested_at = ? "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, session_id),
+                (platform, time.time(), session_id),
             )
-            return cur.rowcount > 0
+            if cur.rowcount > 0:
+                return "queued"
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return "in_flight" if row is not None else "missing"
         return self._execute_write(_do)
+
+    def request_handoff(self, session_id: str, platform: str) -> bool:
+        """Mark a session as pending handoff to the given platform.
+
+        Returns True if the row was found and not already in flight; False if
+        the session is already in a non-terminal handoff state *or* has no row.
+        Use :meth:`request_handoff_status` when those two need distinguishing.
+        """
+        return self.request_handoff_status(session_id, platform) == "queued"
+
+    def expire_stale_handoffs(
+        self, max_age_s: float = HANDOFF_PENDING_TTL_S
+    ) -> List[str]:
+        """Fail handoff requests nobody picked up within *max_age_s*.
+
+        A ``pending`` row is a standing instruction to re-bind the session to a
+        messaging platform, and the gateway's ``_handoff_watcher`` executes any
+        it finds the moment it starts. Without an expiry, a request abandoned
+        because the requester was killed mid-wait (SIGKILL beats every
+        try/finally) would be carried out minutes or days later, long after the
+        user gave up on it — and, because ``request_handoff`` refuses to re-arm
+        a non-terminal row, would block every later ``/handoff`` on that session
+        until state.db was edited by hand.
+
+        Returns the ids that were expired. Rows written before
+        ``handoff_requested_at`` existed fall back to ``started_at``, which is
+        always <= the request time, so legacy orphans expire rather than linger.
+        """
+        cutoff = time.time() - max(0.0, float(max_age_s))
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE handoff_state = 'pending' "
+                "  AND COALESCE(handoff_requested_at, started_at) < ?",
+                (cutoff,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                conn.execute(
+                    "UPDATE sessions SET handoff_state = 'failed', "
+                    "handoff_error = ? "
+                    "WHERE handoff_state = 'pending' "
+                    "  AND COALESCE(handoff_requested_at, started_at) < ?",
+                    (
+                        "handoff expired before the gateway picked it up",
+                        cutoff,
+                    ),
+                )
+            return ids
+
+        try:
+            return self._execute_write(_do)
+        except Exception:
+            return []
 
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Read the current handoff state for a session.
@@ -7907,16 +8026,24 @@ class SessionDB:
         except Exception:
             return None
 
-    def list_pending_handoffs(self) -> List[Dict[str, Any]]:
-        """Return all sessions in handoff_state='pending', oldest first.
+    def list_pending_handoffs(
+        self, max_age_s: float = HANDOFF_PENDING_TTL_S
+    ) -> List[Dict[str, Any]]:
+        """Return actionable sessions in handoff_state='pending', oldest first.
 
-        Used by the gateway's handoff watcher.
+        Used by the gateway's handoff watcher. Requests older than *max_age_s*
+        are withheld even if nothing has swept them yet (see
+        :meth:`expire_stale_handoffs`) so a stale row can never be executed by
+        a watcher that forgot to sweep first.
         """
+        cutoff = time.time() - max(0.0, float(max_age_s))
         try:
             cur = self._conn.execute(
                 "SELECT * FROM sessions "
                 "WHERE handoff_state = 'pending' "
-                "ORDER BY started_at ASC"
+                "  AND COALESCE(handoff_requested_at, started_at) >= ? "
+                "ORDER BY started_at ASC",
+                (cutoff,),
             )
             return [dict(r) for r in cur.fetchall()]
         except Exception:

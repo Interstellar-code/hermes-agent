@@ -150,6 +150,147 @@ def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_slash_exec_handoff_never_drives_the_blocking_cli_loop(monkeypatch):
+    """#221: /handoff must be served by handoff.request, not the slash worker.
+
+    The CLI implementation poll-blocks for 60s, outliving the worker's 45s
+    deadline — the worker was killed mid-poll and its cleanup never ran, so the
+    row stayed handoff_state='pending' forever.
+    """
+    sid = "rt-handoff-slash"
+    server._sessions[sid] = {"session_key": "stored-handoff-slash", "slash_worker": None}
+
+    def _no_worker(*_args, **_kwargs):
+        raise AssertionError("/handoff must not reach the slash worker")
+
+    calls = []
+
+    def _fake_request(rid, params):
+        calls.append(params)
+        return server._ok(
+            rid,
+            {
+                "queued": True,
+                "session_key": "stored-handoff-slash",
+                "platform": params["platform"],
+                "home_name": "Family",
+            },
+        )
+
+    try:
+        monkeypatch.setattr(server, "_SlashWorker", _no_worker)
+        monkeypatch.setitem(server._methods, "handoff.request", _fake_request)
+
+        result = server._methods["slash.exec"](
+            "r1", {"session_id": sid, "command": "/handoff telegram"}
+        )
+
+        assert calls == [{"session_id": sid, "platform": "telegram"}]
+        output = result["result"]["output"]
+        assert "Queued handoff" in output
+        assert "telegram" in output and "Family" in output
+        assert server._sessions[sid]["slash_worker"] is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_slash_exec_handoff_reports_usage_and_passes_errors_through(monkeypatch):
+    sid = "rt-handoff-slash-err"
+    server._sessions[sid] = {"session_key": "stored-handoff-err", "slash_worker": None}
+
+    def _no_worker(*_args, **_kwargs):
+        raise AssertionError("/handoff must not reach the slash worker")
+
+    def _fake_request(rid, params):
+        return server._err(rid, 4028, "session has no state.db record yet")
+
+    try:
+        monkeypatch.setattr(server, "_SlashWorker", _no_worker)
+        monkeypatch.setitem(server._methods, "handoff.request", _fake_request)
+
+        usage = server._methods["slash.exec"]("r1", {"session_id": sid, "command": "/handoff"})
+        assert "Usage: /handoff <platform>" in usage["result"]["output"]
+
+        failed = server._methods["slash.exec"](
+            "r2", {"session_id": sid, "command": "/handoff telegram"}
+        )
+        assert failed["error"]["code"] == 4028
+        assert "no state.db record" in failed["error"]["message"]
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_handoff_request_separates_missing_row_from_in_flight(monkeypatch, tmp_path):
+    """#221: the two rejection causes must produce distinct, accurate errors."""
+    import hermes_state
+
+    class DbContext:
+        def __init__(self, db):
+            self.db = db
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, *_args):
+            return False
+
+    real_db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
+    sid = "rt-handoff-causes"
+    server._sessions[sid] = {"session_key": "handoff-causes-key", "running": False}
+
+    class FakeHome:
+        name = "Family"
+        chat_id = "123"
+
+    class FakePlatformCfg:
+        enabled = True
+
+    class FakeConfig:
+        platforms = {"telegram": FakePlatformCfg()}
+
+        def get_home_channel(self, _platform):
+            return FakeHome()
+
+    import gateway.config as gwconfig
+
+    monkeypatch.setattr(gwconfig, "Platform", lambda name: name)
+    monkeypatch.setattr(gwconfig, "load_gateway_config", lambda: FakeConfig())
+    monkeypatch.setattr(server, "_session_db", lambda _session: DbContext(real_db))
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_session_source", lambda _session: "tui")
+
+    try:
+        # No row yet — handoff.request creates one via ensure_session_row and
+        # queues (the old set_session_title fallback created nothing, so this
+        # answered "already in flight").
+        first = server._methods["handoff.request"](
+            "r1", {"session_id": sid, "platform": "telegram"}
+        )
+        assert first["result"]["queued"] is True
+        assert real_db.get_session("handoff-causes-key") is not None
+
+        # Second request while pending is the genuine in-flight rejection.
+        second = server._methods["handoff.request"](
+            "r2", {"session_id": sid, "platform": "telegram"}
+        )
+        assert second["error"]["code"] == 4027
+        assert "already pending" in second["error"]["message"]
+
+        # A row that cannot be created reports the missing-row cause instead.
+        monkeypatch.setattr(
+            real_db, "ensure_session_row", lambda *a, **k: False
+        )
+        server._sessions[sid]["session_key"] = "never-created-key"
+        third = server._methods["handoff.request"](
+            "r3", {"session_id": sid, "platform": "telegram"}
+        )
+        assert third["error"]["code"] == 4028
+        assert "no state.db record" in third["error"]["message"]
+    finally:
+        server._sessions.pop(sid, None)
+        real_db.close()
+
+
 def test_dashboard_process_isolation_config_defaults_without_default_merge(monkeypatch):
     """tui_gateway.server::_load_cfg is raw YAML, so defaults live at read site."""
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
