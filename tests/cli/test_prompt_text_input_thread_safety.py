@@ -97,3 +97,96 @@ class TestPromptTextInputThreadSafety:
             result = cli._prompt_text_input("Choice: ")
 
         assert result is None
+
+
+class TestNonInteractiveConfirmGuard:
+    """Issue #220 — the TUI gateway's slash worker has no answerable stdin.
+
+    It runs command handlers on the MAIN thread with ``_app is None``, so the
+    #23185 thread guard never fires — but its stdin is the JSON-RPC line
+    protocol, so ``input()`` there hangs the worker until the gateway's 45s
+    timeout kills it and eats the next request line.  The worker sets
+    ``cli._noninteractive_confirm = True``; the prompt helpers must then cancel
+    cleanly (``None``) exactly like the thread guard does.
+    """
+
+    def test_flag_cancels_instead_of_calling_input(self, capsys):
+        cli = _make_cli()
+        cli._app = None
+        cli._noninteractive_confirm = True
+
+        with patch(
+            "builtins.input",
+            side_effect=AssertionError("input() must not be called on a non-interactive surface"),
+        ) as mock_input:
+            result = cli._prompt_text_input("Choice [1/2/3]: ")
+
+        assert result is None
+        assert mock_input.called is False
+        # The user must see why, not a silent no-op.
+        out = capsys.readouterr().out
+        assert "aren't available on this surface" in out
+
+    def test_flag_cancels_even_on_main_thread_with_app(self, capsys):
+        """The flag wins over the app/main-thread path (no run_in_terminal)."""
+        cli = _make_cli()  # _app is a MagicMock
+        cli._last_invalidate = 0.0
+        cli._noninteractive_confirm = True
+
+        with patch("prompt_toolkit.application.run_in_terminal") as mock_rit, \
+             patch("builtins.input", side_effect=AssertionError("input() must not be called")) as mock_input:
+            result = cli._prompt_text_input("Choice: ")
+
+        assert result is None
+        assert mock_rit.called is False
+        assert mock_input.called is False
+
+    def test_modal_cancels_without_input(self, capsys):
+        """``_prompt_text_input_modal`` cancels too — both with and without an app."""
+        choices = [
+            ("once", "Approve Once", "proceed this time only"),
+            ("cancel", "Cancel", "keep current conversation"),
+        ]
+
+        for app in (None, MagicMock()):
+            cli = _make_cli()
+            cli._app = app
+            cli._last_invalidate = 0.0
+            cli._noninteractive_confirm = True
+
+            with patch(
+                "builtins.input",
+                side_effect=AssertionError("input() must not be called on a non-interactive surface"),
+            ) as mock_input:
+                result = cli._prompt_text_input_modal(
+                    title="⚠️  /new — destroys conversation state",
+                    detail="",
+                    choices=choices,
+                )
+
+            assert result is None
+            assert mock_input.called is False
+            assert "aren't available on this surface" in capsys.readouterr().out
+
+    def test_flag_defaults_off_so_existing_paths_are_unchanged(self):
+        """No flag set (the CLI/test construction path) → direct input()."""
+        cli = _make_cli()
+        cli._app = None
+
+        assert getattr(cli, "_noninteractive_confirm", False) is False
+        with patch("builtins.input", return_value="cancel") as mock_input:
+            result = cli._prompt_text_input("Choice: ")
+
+        assert mock_input.called
+        assert result == "cancel"
+
+    def test_flag_explicitly_false_still_prompts(self):
+        cli = _make_cli()
+        cli._app = None
+        cli._noninteractive_confirm = False
+
+        with patch("builtins.input", return_value="1") as mock_input:
+            result = cli._prompt_text_input("Choice: ")
+
+        assert mock_input.called
+        assert result == "1"

@@ -598,16 +598,15 @@ class CLICommandsMixin:
         # Make sure the session row exists in state.db. Most CLI sessions
         # are written via _flush_messages_to_session_db on the first turn
         # already, but if the user tries to hand off an empty session we
-        # still want a row to mark.
+        # still want a row to mark. ensure_session_row is a real
+        # INSERT OR IGNORE — the old set_session_title call here was a plain
+        # UPDATE that silently did nothing on a missing row (#221).
         try:
-            row = self._session_db.get_session(self.session_id)
-            if not row:
-                # Nothing has flushed yet. Create a stub so the gateway has
-                # something to switch_session onto. Inserting via title-set
-                # is the simplest path because set_session_title's INSERT OR
-                # IGNORE creates the row.
-                placeholder_title = f"handoff-{self.session_id[:8]}"
-                self._session_db.set_session_title(self.session_id, placeholder_title)
+            self._session_db.ensure_session_row(
+                self.session_id,
+                source="cli",
+                title=f"handoff-{self.session_id[:8]}",
+            )
         except Exception as exc:
             _cprint(f"  Could not ensure session row in state.db: {exc}")
             return True
@@ -623,52 +622,88 @@ class CLICommandsMixin:
         if not session_title:
             session_title = self.session_id[:8]
 
+        # Clear out any request an earlier attempt abandoned (killed mid-wait)
+        # so a stale 'pending' row can neither block this retry nor be executed
+        # by the gateway watcher long after the fact.
+        try:
+            self._session_db.expire_stale_handoffs()
+        except Exception:
+            pass
+
         # Mark pending — gateway watcher will pick this up.
-        ok = self._session_db.request_handoff(self.session_id, platform_name)
-        if not ok:
-            _cprint("  Session is already in flight for handoff. Wait for it to settle, then retry.")
+        status = self._session_db.request_handoff_status(self.session_id, platform_name)
+        if status != "queued":
+            if status == "missing":
+                # No row at all: distinct from "already in flight", which is
+                # what this used to report for both causes (#221).
+                _cprint("  This session has no record in state.db yet — send a message first, then retry /handoff.")
+            else:
+                try:
+                    in_flight = (self._session_db.get_handoff_state(self.session_id) or {}).get("state") or "in flight"
+                except Exception:
+                    in_flight = "in flight"
+                _cprint(f"  Session is already {in_flight} for handoff. Wait for it to settle, then retry.")
             return True
 
         _cprint(f"  Queued handoff of '{session_title}' → {platform_name} (home: {home.name}).")
         _cprint("  Waiting for the gateway to pick it up...")
 
         # Poll-block on terminal state. Tick every 0.5s; bail at ~60s.
+        #
+        # This blocking wait is for the interactive CLI only. Driving it over a
+        # transport with its own (shorter) deadline used to strand the row in
+        # 'pending' when the caller was killed mid-poll, so slash.exec routes
+        # /handoff to the non-blocking handoff.request RPC instead (#221).
         import time as _time
         deadline = _time.time() + 60.0
         last_state = "pending"
-        while _time.time() < deadline:
-            try:
-                state_row = self._session_db.get_handoff_state(self.session_id)
-            except Exception:
-                state_row = None
-            current = (state_row or {}).get("state") or "pending"
-            if current != last_state:
-                if current == "running":
-                    _cprint("  Gateway picked it up; transferring...")
-                last_state = current
-            if current == "completed":
-                _cprint("")
-                _cprint(f"  ↻ Handoff complete. The session is now active on {platform_name}.")
-                _cprint(f"  Resume it on this CLI later with: /resume {session_title}")
-                _cprint("")
-                # End the CLI cleanly — same exit semantics as /quit.
-                self._should_exit = True
-                return False
-            if current == "failed":
-                err = (state_row or {}).get("error") or "unknown error"
-                _cprint(f"  Handoff failed: {err}")
-                _cprint("  Your CLI session is intact. Try /handoff again, or /resume on the platform manually.")
-                return True
-            _time.sleep(0.5)
+        try:
+            while _time.time() < deadline:
+                try:
+                    state_row = self._session_db.get_handoff_state(self.session_id)
+                except Exception:
+                    state_row = None
+                current = (state_row or {}).get("state") or "pending"
+                if current != last_state:
+                    if current == "running":
+                        _cprint("  Gateway picked it up; transferring...")
+                    last_state = current
+                if current == "completed":
+                    _cprint("")
+                    _cprint(f"  ↻ Handoff complete. The session is now active on {platform_name}.")
+                    _cprint(f"  Resume it on this CLI later with: /resume {session_title}")
+                    _cprint("")
+                    # End the CLI cleanly — same exit semantics as /quit.
+                    self._should_exit = True
+                    return False
+                if current == "failed":
+                    err = (state_row or {}).get("error") or "unknown error"
+                    _cprint(f"  Handoff failed: {err}")
+                    _cprint("  Your CLI session is intact. Try /handoff again, or /resume on the platform manually.")
+                    return True
+                _time.sleep(0.5)
+        except BaseException:
+            # Ctrl-C / SystemExit / any teardown that still runs Python: release
+            # the row so the watcher cannot execute a handoff the user walked
+            # away from. A SIGKILL runs nothing here — expire_stale_handoffs is
+            # the backstop for that.
+            self._release_pending_handoff("abandoned before the gateway picked it up")
+            raise
 
         # Timed out. Clear the pending flag so the user can retry.
-        try:
-            self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
-        except Exception:
-            pass
+        self._release_pending_handoff("timed out waiting for gateway")
         _cprint("  Timed out waiting for the gateway. Is `hermes gateway` running?")
         _cprint("  Your CLI session is intact.")
         return True
+
+    def _release_pending_handoff(self, reason: str) -> None:
+        """Fail this session's handoff unless the gateway already finished it."""
+        try:
+            state = (self._session_db.get_handoff_state(self.session_id) or {}).get("state")
+            if state in {"pending", "running"}:
+                self._session_db.fail_handoff(self.session_id, reason)
+        except Exception:
+            pass
 
     def _handle_resume_command(self, cmd_original: str) -> None:
         """Handle /resume <session_id_or_title> — switch to a previous session mid-conversation."""
@@ -1025,29 +1060,66 @@ class CLICommandsMixin:
         _cprint(f"  Branch session:   {new_session_id}")
 
     def _handle_personality_command(self, cmd: str):
-        """Handle the /personality command to set predefined personalities."""
-        from cli import save_config_value
+        """Handle the /personality command to set predefined personalities.
+
+        Session-scoped by default; ``--global`` persists the personality NAME to
+        ``agent.personality`` in config.yaml (parity with /reasoning and /fast).
+
+        The preset text is NEVER written to ``agent.system_prompt`` — that key
+        holds the user's own hand-written prompt and used to be silently
+        overwritten by this command, with no backup and no undo (#223). The name
+        is resolved to a prompt overlay by ``HermesCLI._compose_system_prompt``.
+        """
+        from cli import _PERSONALITY_CLEAR_WORDS, save_config_value
         parts = cmd.split(maxsplit=1)
-        
+
         if len(parts) > 1:
-            # Set personality
-            personality_name = parts[1].strip().lower()
-            
-            if personality_name in {"none", "default", "neutral"}:
-                self.system_prompt = ""
+            arg_tokens = parts[1].strip().lower().split()
+            explicit_global = "--global" in arg_tokens
+            # --session is accepted as an explicit no-op (it is the default),
+            # matching /reasoning and /model.
+            personality_name = " ".join(
+                token for token in arg_tokens
+                if token not in ("--global", "--session")
+            ).strip()
+        else:
+            explicit_global = False
+            personality_name = ""
+
+        if personality_name:
+            if personality_name in _PERSONALITY_CLEAR_WORDS:
+                self.personality = ""
+                self._personality_session_override = False
+                # Falls back to the user's own agent.system_prompt, if any.
+                self.system_prompt = self._compose_system_prompt()
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                if explicit_global and save_config_value("agent.personality", ""):
                     print("(^_^)b Personality cleared (saved to config)")
+                elif explicit_global:
+                    print("(^_^) Personality cleared (this session; config save failed)")
                 else:
-                    print("(^_^) Personality cleared (session only)")
-                print("  No personality overlay — using base agent behavior.")
+                    print("(^_^) Personality cleared (this session — use --global to persist)")
+                if self.system_prompt:
+                    print("  No personality overlay — using your agent.system_prompt.")
+                else:
+                    print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                self.personality = personality_name
+                # An explicit live command outranks a config-file prompt for
+                # this session — see _compose_system_prompt for the full rule.
+                self._personality_session_override = True
+                self.system_prompt = self._compose_system_prompt()
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                if explicit_global and save_config_value("agent.personality", personality_name):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
+                    if (getattr(self, "base_system_prompt", "") or "").strip():
+                        print("  Note: agent.system_prompt is set in your config and takes")
+                        print("  precedence, so future sessions will keep using it. Clear it")
+                        print("  (or edit config.yaml) for this personality to apply globally.")
+                elif explicit_global:
+                    print(f"(^_^) Personality set to '{personality_name}' (this session; config save failed)")
                 else:
-                    print(f"(^_^) Personality set to '{personality_name}' (session only)")
+                    print(f"(^_^) Personality set to '{personality_name}' (this session — use --global to persist)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
@@ -1065,9 +1137,11 @@ class CLICommandsMixin:
                     preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
                 else:
                     preview = str(prompt)[:50]
-                print(f"  {name:<12} - {preview}")
+                marker = " *" if name == (getattr(self, "personality", "") or "") else ""
+                print(f"  {name:<12} - {preview}{marker}")
             print()
-            print("  Usage: /personality <name>")
+            print("  Usage: /personality <name> [--global]")
+            print("  Session-scoped by default; --global persists agent.personality.")
             print()
 
     def _handle_pet_command(self, cmd: str):
@@ -2553,28 +2627,51 @@ class CLICommandsMixin:
                 if token not in ("--global", "--session")
             )
 
-        # Display toggle
+        # Display toggle. show/hide are genuinely session-scoped —
+        # self.show_reasoning above IS the session state, and the effort
+        # branch below already gates its write on --global. These branches
+        # persisted unconditionally, so `/reasoning show` silently rewrote
+        # config.yaml for every future CLI session, the messaging gateway and
+        # cron, contradicting the usage line's "session-scoped by default,
+        # --global to persist" (#225).
         if arg in {"show", "on"}:
             self.show_reasoning = True
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
+            if explicit_global and save_config_value("display.show_reasoning", True):
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
+            elif explicit_global:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (config save failed){_RST}")
+            else:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (this session){_RST}")
+                _cprint(f"  {_DIM}  Use --global to persist.{_RST}")
             _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
             return
         if arg in {"hide", "off"}:
             self.show_reasoning = False
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}")
+            if explicit_global and save_config_value("display.show_reasoning", False):
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}")
+            elif explicit_global:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (config save failed){_RST}")
+            else:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (this session){_RST}")
+                _cprint(f"  {_DIM}  Use --global to persist.{_RST}")
             return
 
-        # Full / clamped recap toggle
+        # Full / clamped recap toggle.
+        #
+        # These stay GLOBAL deliberately, unlike show/hide above. There is no
+        # session-scoped store for them on either surface, and the gateway
+        # keeps display.reasoning_full consistent across the CLI and TUI on
+        # purpose. Rather than invent a session store for a rarely-toggled
+        # display preference, say plainly that the write is global so the
+        # announcement matches what actually happened (#225).
         if arg in {"full", "all"}:
             self.reasoning_full = True
             save_config_value("display.reasoning_full", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL (saved){_RST}")
+            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL (saved globally){_RST}")
             _cprint(f"  {_DIM}  The post-response recap box will print complete thinking.{_RST}")
             if not self.show_reasoning:
                 _cprint(f"  {_DIM}  Note: reasoning display is OFF — run /reasoning show to see it.{_RST}")
@@ -2582,7 +2679,7 @@ class CLICommandsMixin:
         if arg in {"clamp", "collapse", "short"}:
             self.reasoning_full = False
             save_config_value("display.reasoning_full", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved){_RST}")
+            _cprint(f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved globally){_RST}")
             return
 
         # Effort level change
@@ -2719,7 +2816,7 @@ class CLICommandsMixin:
         ``nous`` and ``local`` are mutually exclusive; if both are given,
         ``local`` wins (it never touches the network).
         """
-        from hermes_cli.debug import run_debug_share
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
         from types import SimpleNamespace
 
         words = {w.lower() for w in cmd_original.split()[1:]}
@@ -2731,7 +2828,16 @@ class CLICommandsMixin:
         args = SimpleNamespace(
             lines=200, expire=7, local=local, nous=nous, yes=True
         )
-        run_debug_share(args)
+        try:
+            run_debug_share(args)
+        except DebugShareFailed:
+            # run_debug_share() already printed "Upload failed: ..." plus the
+            # --local hint. Swallow here — same reasoning as the /journey and
+            # /curator handlers' SystemExit guards above: a library-level
+            # upload failure must not kill the interactive session or (when
+            # this runs inside the TUI slash worker) the worker subprocess
+            # (issue #224).
+            pass
 
     def _handle_update_command(self) -> bool:
         """Handle /update — update Hermes Agent to the latest version.

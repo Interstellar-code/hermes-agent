@@ -88,7 +88,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
-    CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
+    CommandDef("compress", "Compress conversation context; --preview shows what would happen "
+               "('here [N]' keeps the recent N turns — CLI and messaging platforms only, not the desktop/TUI)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
@@ -118,7 +119,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("subgoal", "Add or manage extra criteria on the active goal", "Session",
                args_hint="[text | remove N | clear]"),
     CommandDef("status", "Show session, model, token, and context info", "Session"),
-    CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
+    # Admin/user tiering only exists on messaging platforms (allow_admin_from /
+    # user_allowed_commands), and the only handler is the gateway's
+    # _handle_whoami_command — cli.py has never had a branch for it, so
+    # advertising it outside the gateway printed "Unknown command" (#222).
+    CommandDef("whoami", "Show your slash command access (admin / user)", "Info",
+               gateway_only=True),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
@@ -137,8 +143,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
 
-    CommandDef("personality", "Set a predefined personality", "Configuration",
-               args_hint="[name]"),
+    CommandDef("personality", "Set a predefined personality (this session; --global to persist)",
+               "Configuration", args_hint="[name] [--global]",
+               subcommands=("none", "--global")),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
@@ -160,9 +167,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
-    CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
-               cli_only=True, args_hint="[kaomoji|emoji|unicode|ascii]",
-               subcommands=("kaomoji", "emoji", "unicode", "ascii")),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
     CommandDef("busy", "Control what Enter does while Hermes is working", "Configuration",
@@ -1924,6 +1928,13 @@ class SlashCommandCompleter(Completer):
                     start_position=-len(sub_text),
                     display="none",
                     display_meta="clear personality overlay",
+                )
+            if "--global".startswith(sub_lower) and "--global" != sub_lower:
+                yield Completion(
+                    "--global",
+                    start_position=-len(sub_text),
+                    display="--global",
+                    display_meta="persist to config (default: this session)",
                 )
             for name, prompt in personalities.items():
                 if name.startswith(sub_lower) and name != sub_lower:

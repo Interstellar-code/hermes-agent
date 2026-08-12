@@ -1929,7 +1929,7 @@ def test_dispatch_long_handler_does_not_block_fast_handler(server):
     released.set()
 
 
-def test_dispatch_session_compress_does_not_block_fast_handler(server):
+def test_dispatch_session_compress_does_not_block_fast_handler(server, monkeypatch):
     """Manual TUI compaction can take minutes, so it must not block the RPC loop."""
     released = threading.Event()
 
@@ -1937,8 +1937,18 @@ def test_dispatch_session_compress_does_not_block_fast_handler(server):
         released.wait(timeout=5)
         return server._ok(rid, {"done": True})
 
-    server._methods["session.compress"] = slow_compress
-    server._methods["fast.ping"] = lambda rid, params: server._ok(rid, {"pong": True})
+    # ``_methods`` is a MODULE-level dict (tui_gateway/server.py), and the
+    # ``server`` fixture is function-scoped — it never rebuilds it. Assigning
+    # directly here therefore leaked ``slow_compress`` into every later test in
+    # the process: any subsequent session.compress request returned
+    # ``{"done": True}`` instead of running the real handler, which made the
+    # suite order-dependent (running tests/tui_gateway/ before
+    # tests/test_tui_gateway_server.py produced ~31 phantom failures and masked
+    # genuine ones). monkeypatch.setitem restores both entries at teardown.
+    monkeypatch.setitem(server._methods, "session.compress", slow_compress)
+    monkeypatch.setitem(
+        server._methods, "fast.ping", lambda rid, params: server._ok(rid, {"pong": True})
+    )
 
     t0 = time.monotonic()
     assert server.dispatch({"id": "slow", "method": "session.compress", "params": {}}) is None

@@ -150,6 +150,147 @@ def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_slash_exec_handoff_never_drives_the_blocking_cli_loop(monkeypatch):
+    """#221: /handoff must be served by handoff.request, not the slash worker.
+
+    The CLI implementation poll-blocks for 60s, outliving the worker's 45s
+    deadline — the worker was killed mid-poll and its cleanup never ran, so the
+    row stayed handoff_state='pending' forever.
+    """
+    sid = "rt-handoff-slash"
+    server._sessions[sid] = {"session_key": "stored-handoff-slash", "slash_worker": None}
+
+    def _no_worker(*_args, **_kwargs):
+        raise AssertionError("/handoff must not reach the slash worker")
+
+    calls = []
+
+    def _fake_request(rid, params):
+        calls.append(params)
+        return server._ok(
+            rid,
+            {
+                "queued": True,
+                "session_key": "stored-handoff-slash",
+                "platform": params["platform"],
+                "home_name": "Family",
+            },
+        )
+
+    try:
+        monkeypatch.setattr(server, "_SlashWorker", _no_worker)
+        monkeypatch.setitem(server._methods, "handoff.request", _fake_request)
+
+        result = server._methods["slash.exec"](
+            "r1", {"session_id": sid, "command": "/handoff telegram"}
+        )
+
+        assert calls == [{"session_id": sid, "platform": "telegram"}]
+        output = result["result"]["output"]
+        assert "Queued handoff" in output
+        assert "telegram" in output and "Family" in output
+        assert server._sessions[sid]["slash_worker"] is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_slash_exec_handoff_reports_usage_and_passes_errors_through(monkeypatch):
+    sid = "rt-handoff-slash-err"
+    server._sessions[sid] = {"session_key": "stored-handoff-err", "slash_worker": None}
+
+    def _no_worker(*_args, **_kwargs):
+        raise AssertionError("/handoff must not reach the slash worker")
+
+    def _fake_request(rid, params):
+        return server._err(rid, 4028, "session has no state.db record yet")
+
+    try:
+        monkeypatch.setattr(server, "_SlashWorker", _no_worker)
+        monkeypatch.setitem(server._methods, "handoff.request", _fake_request)
+
+        usage = server._methods["slash.exec"]("r1", {"session_id": sid, "command": "/handoff"})
+        assert "Usage: /handoff <platform>" in usage["result"]["output"]
+
+        failed = server._methods["slash.exec"](
+            "r2", {"session_id": sid, "command": "/handoff telegram"}
+        )
+        assert failed["error"]["code"] == 4028
+        assert "no state.db record" in failed["error"]["message"]
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_handoff_request_separates_missing_row_from_in_flight(monkeypatch, tmp_path):
+    """#221: the two rejection causes must produce distinct, accurate errors."""
+    import hermes_state
+
+    class DbContext:
+        def __init__(self, db):
+            self.db = db
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, *_args):
+            return False
+
+    real_db = hermes_state.SessionDB(db_path=tmp_path / "state.db")
+    sid = "rt-handoff-causes"
+    server._sessions[sid] = {"session_key": "handoff-causes-key", "running": False}
+
+    class FakeHome:
+        name = "Family"
+        chat_id = "123"
+
+    class FakePlatformCfg:
+        enabled = True
+
+    class FakeConfig:
+        platforms = {"telegram": FakePlatformCfg()}
+
+        def get_home_channel(self, _platform):
+            return FakeHome()
+
+    import gateway.config as gwconfig
+
+    monkeypatch.setattr(gwconfig, "Platform", lambda name: name)
+    monkeypatch.setattr(gwconfig, "load_gateway_config", lambda: FakeConfig())
+    monkeypatch.setattr(server, "_session_db", lambda _session: DbContext(real_db))
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_session_source", lambda _session: "tui")
+
+    try:
+        # No row yet — handoff.request creates one via ensure_session_row and
+        # queues (the old set_session_title fallback created nothing, so this
+        # answered "already in flight").
+        first = server._methods["handoff.request"](
+            "r1", {"session_id": sid, "platform": "telegram"}
+        )
+        assert first["result"]["queued"] is True
+        assert real_db.get_session("handoff-causes-key") is not None
+
+        # Second request while pending is the genuine in-flight rejection.
+        second = server._methods["handoff.request"](
+            "r2", {"session_id": sid, "platform": "telegram"}
+        )
+        assert second["error"]["code"] == 4027
+        assert "already pending" in second["error"]["message"]
+
+        # A row that cannot be created reports the missing-row cause instead.
+        monkeypatch.setattr(
+            real_db, "ensure_session_row", lambda *a, **k: False
+        )
+        server._sessions[sid]["session_key"] = "never-created-key"
+        third = server._methods["handoff.request"](
+            "r3", {"session_id": sid, "platform": "telegram"}
+        )
+        assert third["error"]["code"] == 4028
+        assert "no state.db record" in third["error"]["message"]
+    finally:
+        server._sessions.pop(sid, None)
+        real_db.close()
+
+
 def test_dashboard_process_isolation_config_defaults_without_default_merge(monkeypatch):
     """tui_gateway.server::_load_cfg is raw YAML, so defaults live at read site."""
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
@@ -4667,6 +4808,54 @@ def test_complete_slash_reasoning_includes_current_efforts_and_global_scope():
     assert {"max", "ultra", "--global"} <= values
 
 
+def test_slash_yolo_toggles_the_live_session_not_the_worker(monkeypatch):
+    """/yolo must change the gateway's own approval state (#219).
+
+    It used to fall through to the slash worker, which flipped
+    ``tools.approval._session_yolo`` inside its own subprocess — a
+    module-level set with no persistence or IPC — printed "approvals
+    bypassed", and exited. The gateway that actually enforces approvals never
+    saw it, so the banner reported a state change that had not happened.
+    """
+    from tools.approval import (
+        disable_session_yolo,
+        is_session_yolo_enabled,
+    )
+
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    session = _session(agent=types.SimpleNamespace())
+    session["session_key"] = "yolo-key"
+    disable_session_yolo("yolo-key")
+    try:
+        assert "yolo" in server._LIVE_SESSION_DIRECT_COMMANDS
+
+        out_on = server._live_slash_command_output("sid", session, "yolo", "")
+        assert is_session_yolo_enabled("yolo-key") is True
+        assert "ON" in out_on
+
+        out_off = server._live_slash_command_output("sid", session, "yolo", "")
+        assert is_session_yolo_enabled("yolo-key") is False
+        assert "OFF" in out_off
+
+        server._live_slash_command_output("sid", session, "yolo", "on")
+        assert is_session_yolo_enabled("yolo-key") is True
+        server._live_slash_command_output("sid", session, "yolo", "off")
+        assert is_session_yolo_enabled("yolo-key") is False
+
+        # A bad argument must not silently toggle.
+        bad = server._live_slash_command_output("sid", session, "yolo", "bogus")
+        assert "unknown" in bad.lower()
+        assert is_session_yolo_enabled("yolo-key") is False
+    finally:
+        disable_session_yolo("yolo-key")
+
+
+def test_slash_yolo_without_session_reports_no_agent(monkeypatch):
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    out = server._live_slash_command_output("sid", None, "yolo", "")
+    assert "No active agent" in out
+
+
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
@@ -4723,7 +4912,15 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_show["result"]["value"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
+    # Session-scoped: the live session flips, config.yaml is NOT rewritten
+    # (#225). This used to persist unconditionally, so a scope="session"
+    # request silently changed the default for every future CLI session, the
+    # messaging gateway and cron — while the effort branch three assertions
+    # above already honoured the scope. The TUI keeps its own
+    # sections.thinking in client UI state (patchUiState), so nothing
+    # server-side reads the persisted value back for rendering.
+    assert resp_show["result"]["scope"] == "session"
+    assert "display" not in server._load_cfg()
 
     resp_hide = server.handle_request(
         {
@@ -4734,7 +4931,25 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_hide["result"]["value"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
+    assert resp_hide["result"]["scope"] == "session"
+    assert "display" not in server._load_cfg()
+
+    # scope="global" is what persists.
+    resp_show_global = server.handle_request(
+        {
+            "id": "3b",
+            "method": "config.set",
+            "params": {
+                "session_id": "sid",
+                "key": "reasoning",
+                "value": "show",
+                "scope": "global",
+            },
+        }
+    )
+    assert resp_show_global["result"]["scope"] == "global"
+    assert server._load_cfg()["display"]["show_reasoning"] is True
+    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
 
     # /reasoning full | clamp — parity with the classic CLI reasoning_full
     # toggle. In the TUI these map to the thinking section's expand/collapse
@@ -4810,6 +5025,57 @@ def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch
     assert resp["result"]["value"] == "verbose"
     assert server._sessions["sid"]["tool_progress_mode"] == "verbose"
     assert agent.verbose_logging is True
+
+
+def test_config_set_verbose_cycle_reaches_log_mode(tmp_path, monkeypatch):
+    """`log` is a valid display.tool_progress value the gateway acts on, so the
+    TUI must be able to cycle into it and must not reject it outright (#222).
+    Before the fix the cycle stopped at `verbose` and an explicit `log` was a
+    4002 error, which also meant cycling silently discarded a config-set
+    `log`."""
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    agent = types.SimpleNamespace(verbose_logging=True)
+    server._sessions["sid"] = _session(agent=agent, tool_progress_mode="verbose")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
+            }
+        )
+        assert resp["result"]["value"] == "log"
+        assert server._sessions["sid"]["tool_progress_mode"] == "log"
+        assert agent.verbose_logging is False
+
+        # ...and cycling on from `log` wraps back to `off` rather than sticking.
+        resp = server.handle_request(
+            {
+                "id": "2",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
+            }
+        )
+        assert resp["result"]["value"] == "off"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_config_set_verbose_accepts_explicit_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    server._sessions["sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {"session_id": "sid", "key": "verbose", "value": "log"},
+            }
+        )
+        assert "error" not in resp, resp
+        assert resp["result"]["value"] == "log"
+    finally:
+        server._sessions.pop("sid", None)
 
 
 
@@ -5558,7 +5824,7 @@ def test_session_compress_uses_compress_helper(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (2, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
 
@@ -5594,7 +5860,7 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (0, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (0, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
 
@@ -5636,7 +5902,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (2, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
     restart_calls = []
@@ -5659,6 +5925,309 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         assert len(restart_calls) == 1
     finally:
         server._sessions.pop("sid", None)
+
+
+# ── /compress flag parsing (issue #218) ──────────────────────────────
+#
+# The gateway used to hand the whole argument string to the summariser as
+# a focus topic, so `/compress --preview` ran a REAL, irreversible
+# compression (history replaced + SessionDB session rotated) on a command
+# documented as making no changes.
+
+
+class _NoCompressAgent:
+    """Agent whose compression path is a test failure if reached."""
+
+    def __init__(self):
+        self.model = "test-model"
+        self.session_id = "session-key"
+        self._cached_system_prompt = ""
+        self.tools = None
+        self.context_compressor = None
+
+    def _compress_context(self, *args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError(
+            "_compress_context must not run for preview/rejected /compress args"
+        )
+
+
+def _compress_history(n=6):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+        for i in range(n)
+    ]
+
+
+def test_compress_session_history_preview_makes_no_changes():
+    for flag in ("--preview", "--dry-run", "--dryrun", "--PREVIEW"):
+        history = _compress_history()
+        session = _session(agent=_NoCompressAgent(), history=list(history))
+
+        removed, _usage, notice = server._compress_session_history(session, flag)
+
+        assert removed == 0, flag
+        assert notice is not None, flag
+        assert notice.kind == "preview", flag
+        assert "no changes" in notice.text.lower(), flag
+        assert "Would compress 6 of 6" in notice.text, flag
+        # Nothing mutated: same messages, same version (no rotation either,
+        # since _compress_context was never reached).
+        assert session["history"] == history, flag
+        assert session["history_version"] == 0, flag
+
+
+def test_compress_session_history_preview_keeps_focus_topic():
+    session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+    _removed, _usage, notice = server._compress_session_history(
+        session, "--preview auth flow"
+    )
+
+    assert notice.kind == "preview"
+    assert 'Focus topic: "auth flow"' in notice.text
+
+
+def test_compress_session_history_preview_on_short_history():
+    history = _compress_history(2)
+    session = _session(agent=_NoCompressAgent(), history=list(history))
+
+    removed, _usage, notice = server._compress_session_history(session, "--preview")
+
+    assert removed == 0
+    assert notice.kind == "preview"
+    assert "at least 4 messages" in notice.text
+    assert session["history"] == history
+
+
+def test_compress_session_history_rejects_dash_prefixed_topic():
+    cases = [
+        ("--wat", "--wat"),
+        ("-x", "-x"),
+        ("--preview-typo", "--preview-typo"),
+    ]
+    for arg, needle in cases:
+        session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+        removed, _usage, notice = server._compress_session_history(session, arg)
+
+        assert removed == 0, arg
+        assert notice is not None and notice.kind == "error", arg
+        assert needle in notice.text, arg
+        # The rejection names the flags that DO work so a future flag
+        # cannot silently become a focus topic again.
+        assert "--preview" in notice.text, arg
+        assert session["history_version"] == 0, arg
+
+
+def test_compress_session_history_rejects_unsupported_modes():
+    for arg in ("--aggressive", "here 3", "here", "up to here", "--keep 4"):
+        session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+        removed, _usage, notice = server._compress_session_history(session, arg)
+
+        assert removed == 0, arg
+        assert notice is not None and notice.kind == "error", arg
+        assert "not supported" in notice.text, arg
+        assert session["history_version"] == 0, arg
+
+
+def test_compress_session_history_normal_focus_topic_still_compresses():
+    seen = {}
+
+    class _Agent(_NoCompressAgent):
+        def _compress_context(self, history, system_message, **kwargs):
+            seen["focus"] = kwargs.get("focus_topic")
+            seen["count"] = len(history)
+            return [{"role": "user", "content": "summary"}], None
+
+    session = _session(agent=_Agent(), history=_compress_history())
+
+    removed, _usage, notice = server._compress_session_history(session, "auth flow")
+
+    assert notice is None
+    assert seen == {"focus": "auth flow", "count": 6}
+    assert removed == 5
+    assert session["history"] == [{"role": "user", "content": "summary"}]
+    assert session["history_version"] == 1
+
+
+def test_session_compress_rpc_preview_does_not_compress(monkeypatch):
+    history = _compress_history()
+    server._sessions["sid"] = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.compress",
+                    "params": {"session_id": "sid", "focus_topic": "--preview"},
+                }
+            )
+
+        result = resp["result"]
+        assert result["status"] == "preview"
+        assert result["preview"] is True
+        assert result["removed"] == 0
+        assert "no changes" in result["output"].lower()
+        # noop=True keeps the TUI from printing a "✓ compressed" line, and
+        # omitting "messages" keeps the client transcript untouched.
+        assert result["summary"]["noop"] is True
+        assert "messages" not in result
+        assert server._sessions["sid"]["history"] == history
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_compress_rpc_rejects_unknown_flag(monkeypatch):
+    server._sessions["sid"] = _session(
+        agent=_NoCompressAgent(), history=_compress_history()
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.compress",
+                    "params": {"session_id": "sid", "focus_topic": "--bogus"},
+                }
+            )
+
+        assert resp["error"]["code"] == 4004
+        assert "--bogus" in resp["error"]["message"]
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_command_dispatch_compress_dry_run_does_not_compress(monkeypatch):
+    history = _compress_history()
+    server._sessions["sid"] = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_session_info", lambda *a: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "command.dispatch",
+                    "params": {
+                        "session_id": "sid",
+                        "name": "compress",
+                        "arg": "--dry-run",
+                    },
+                }
+            )
+
+        assert "error" not in resp, resp
+        assert "no changes" in resp["result"]["output"].lower()
+        assert server._sessions["sid"]["history"] == history
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_prompt_is_not_the_system_prompt_dump():
+    """/prompt is the CLI's "compose in $EDITOR" command (COMMAND_REGISTRY,
+    cli_only). The gateway used to answer it with the current system prompt —
+    a different capability under the same name (#222). It now says where
+    composing lives and points at /systemprompt."""
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(ephemeral_system_prompt="SECRET SYSTEM PROMPT")
+    )
+    try:
+        for command in ("/prompt", "/compose", "/prompt draft an email"):
+            resp = server.handle_request(
+                {
+                    "id": command,
+                    "method": "slash.exec",
+                    "params": {"command": command, "session_id": "sid"},
+                }
+            )
+            output = resp["result"]["output"]
+            assert "SECRET SYSTEM PROMPT" not in output, (command, output)
+            assert "classic CLI" in output, (command, output)
+            assert "/systemprompt" in output, (command, output)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_systemprompt_shows_the_system_prompt():
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(ephemeral_system_prompt="live system prompt")
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"command": "/systemprompt", "session_id": "sid"},
+            }
+        )
+        assert "live system prompt" in resp["result"]["output"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_tui_catalog_lists_systemprompt_and_indicator():
+    """Both are TUI-surface commands with no cli.py branch, so they ride
+    _TUI_EXTRA instead of COMMAND_REGISTRY — but they must still reach the
+    palette (#222)."""
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    listed = {name for name, _desc in resp["result"]["pairs"]}
+    assert "/systemprompt" in listed
+    assert "/indicator" in listed
+    assert "/prompt" in listed  # still advertised: it works in the classic CLI
+
+
+def test_mirror_slash_compress_preview_does_not_compress(monkeypatch):
+    """slash.exec routes /compress through _mirror_slash_side_effects."""
+    history = _compress_history()
+    session = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *a: {"model": "x"})
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    out = server._live_slash_command_output("sid", session, "compress", "--preview")
+
+    assert "no changes" in out.lower()
+    assert "Would compress 6 of 6" in out
+    assert session["history"] == history
+    assert session["history_version"] == 0
+
+    # A rejected flag reports instead of compressing, too.
+    rejected = server._live_slash_command_output("sid", session, "compress", "--nope")
+    assert "--nope" in rejected
+    assert session["history"] == history
 
 
 def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
@@ -5728,7 +6297,9 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     cases = {
         "usage": "Total tokens:                 140",
         "history": "live question from state db",
-        "prompt": "host system prompt",
+        # /systemprompt, not /prompt — /prompt is the CLI's $EDITOR compose
+        # command and no longer dumps the system prompt here (#222).
+        "systemprompt": "host system prompt",
         "status": "Tokens: 140",
         "context": "Context usage: ~80 / 1,000 tokens",
         "tools": "terminal",
@@ -7151,10 +7722,13 @@ def test_config_set_model_allowed_when_idle(monkeypatch):
 
 
 def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monkeypatch):
-    """Slash worker passthrough (e.g. /model, /personality, /prompt,
-    /compress) must reject during an in-flight turn.  Same race as
-    config.set — mutates live agent state while run_conversation is
-    reading it."""
+    """Slash worker passthrough (e.g. /model, /personality, /compress) must
+    reject during an in-flight turn.  Same race as config.set — mutates live
+    agent state while run_conversation is reading it.
+
+    /prompt used to be in this set; its mirror branch was unreachable dead
+    code (slash.exec answers /prompt before ever reaching the mirror) and was
+    removed in #222, so it no longer mutates anything here."""
     import types
 
     applied = {"model": False, "compress": False}
@@ -7165,7 +7739,7 @@ def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monke
 
     def _fake_compress(session, focus):
         applied["compress"] = True
-        return (0, {})
+        return (0, {}, None)
 
     monkeypatch.setattr(server, "_apply_model_switch", _fake_apply_model)
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
@@ -7176,7 +7750,6 @@ def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monke
     for cmd, expected_name in [
         ("/model new/model", "model"),
         ("/personality default", "personality"),
-        ("/prompt", "prompt"),
         ("/compress", "compress"),
     ]:
         warning = server._mirror_slash_side_effects("sid", session, cmd)
@@ -7226,7 +7799,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
         assert not session["history_lock"].locked()
         # Simulate a real compaction shrinking the transcript.
         session["history"] = [{"role": "user", "content": "summary"}]
-        return (1, {"total": 0})
+        return (1, {"total": 0}, None)
 
     def _fake_sync(_sid, _session):
         seen["sync"] = True

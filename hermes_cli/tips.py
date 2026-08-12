@@ -21,7 +21,7 @@ TIPS = [
     "/queue <prompt> queues a message for the next turn without interrupting the current one.",
     "/undo removes the last user/assistant exchange from the conversation.",
     "/retry resends your last message — useful when the agent's response wasn't quite right.",
-    "/verbose cycles tool progress display: off → new → all → verbose.",
+    "/verbose cycles tool progress display: off → new → all → verbose → log.",
     "/reasoning high increases the model's thinking depth. /reasoning show displays the reasoning.",
     "/fast toggles priority processing for faster API responses (provider-dependent).",
     "/yolo skips all dangerous command approval prompts for the rest of the session.",
@@ -422,7 +422,6 @@ TIPS = [
     '/toolsets lists every available toolset so you know what -t/--toolsets accepts.',
     '/voice tts toggles TTS-only mode — agent replies out loud but you still type your prompts.',
     '/reload-skills re-scans ~/.hermes/skills/ so drop-in skills appear without restarting the session.',
-    '/indicator kaomoji|emoji|unicode|ascii picks the TUI busy-indicator style shown during agent runs.',
     '/debug uploads a support bundle (system info + logs) and returns shareable links — works in chat too.',
 
     # --- CLI Subcommands & Flags ---

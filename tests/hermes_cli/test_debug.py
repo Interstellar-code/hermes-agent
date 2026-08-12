@@ -1,6 +1,7 @@
 """Tests for ``hermes debug`` CLI command and debug utilities."""
 
 import os
+import sys
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -711,8 +712,16 @@ class TestRunDebugShare:
         assert "failed to upload" in out
 
     def test_share_exits_on_report_upload_failure(self, hermes_home, capsys):
-        """If the main report fails to upload, exit with code 1."""
-        from hermes_cli.debug import run_debug_share
+        """If the main report fails to upload, run_debug_share signals failure.
+
+        It must raise DebugShareFailed rather than call sys.exit() directly
+        (issue #224) — a bare SystemExit is a BaseException that escapes the
+        TUI slash worker's ``except Exception`` and kills the whole worker
+        process, silently dropping the error message with it. Only the
+        ``hermes debug share`` shell entry point (run_debug) is expected to
+        translate this into a process exit code; see TestRunDebug below.
+        """
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
 
         args = MagicMock()
         args.lines = 50
@@ -723,12 +732,12 @@ class TestRunDebugShare:
         with patch("hermes_cli.dump.run_dump"), \
              patch("hermes_cli.debug.upload_to_pastebin",
                     side_effect=RuntimeError("all failed")):
-            with pytest.raises(SystemExit) as exc_info:
+            with pytest.raises(DebugShareFailed):
                 run_debug_share(args)
 
-        assert exc_info.value.code == 1
         out = capsys.readouterr()
         assert "all failed" in out.err
+        assert "hermes debug share --local" in out.out
 
 
 # ---------------------------------------------------------------------------
@@ -882,6 +891,33 @@ class TestRunDebug:
 
         with patch("hermes_cli.dump.run_dump"):
             run_debug(args)
+
+    def test_share_subcommand_still_exits_nonzero_on_upload_failure(
+        self, hermes_home, capsys
+    ):
+        """The `hermes debug share` shell entry point must keep its exit(1)
+        contract on upload failure (issue #224) even though run_debug_share
+        itself no longer calls sys.exit() — run_debug is the one place that
+        translates the internal DebugShareFailed signal into a process exit
+        code, so scripts/CI checking $? still see a non-zero status."""
+        from hermes_cli.debug import run_debug
+
+        args = MagicMock()
+        args.debug_command = "share"
+        args.lines = 200
+        args.expire = 7
+        args.local = False
+        args.nous = False
+
+        with patch("hermes_cli.dump.run_dump"), patch(
+            "hermes_cli.debug.upload_to_pastebin",
+            side_effect=RuntimeError("all failed"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                run_debug(args)
+
+        assert exc_info.value.code == 1
+        assert "all failed" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -1549,15 +1585,16 @@ class TestRunDebugShareNous:
         assert isinstance(blob, (bytes, bytearray)) and blob[:2] == b"\x1f\x8b"
 
     def test_nous_failure_suggests_local(self, hermes_home, capsys):
-        from hermes_cli.debug import run_debug_share
+        """Like the paste path, --nous signals failure via DebugShareFailed,
+        not sys.exit() (issue #224) — see test_share_exits_on_report_upload_failure."""
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
 
         with patch("hermes_cli.dump.run_dump"), patch(
             "hermes_cli.diagnostics_upload.share_to_nous",
             side_effect=RuntimeError("service down"),
         ):
-            with pytest.raises(SystemExit) as exc:
+            with pytest.raises(DebugShareFailed):
                 run_debug_share(self._args())
-        assert exc.value.code == 1
         err = capsys.readouterr().err
         assert "Nous upload failed" in err
         assert "--local" in err
@@ -1633,6 +1670,36 @@ class TestDebugSlashCommand:
         # Calling with no cmd_original (legacy callers) must still work.
         c = self._captured("")
         assert c["nous"] is False and c["local"] is False
+
+    def test_upload_failure_does_not_raise_out_of_the_handler(
+        self, hermes_home, capsys
+    ):
+        """A failed upload must not escape /debug's handler as SystemExit.
+
+        Regression for issue #224: /debug is worker-routed (tui_gateway
+        slash_worker.py), and SystemExit is a BaseException that skips the
+        worker's `except Exception`, killing the whole subprocess and
+        dropping the "Upload failed" message with it. The classic CLI's
+        interactive loop only catches KeyboardInterrupt around
+        process_command (cli.py), so an uncaught SystemExit there would also
+        end the whole session. _handle_debug_command must swallow the
+        failure signal itself, the same way it already swallows argparse's
+        SystemExit for /journey and /curator.
+        """
+        from hermes_cli.debug import DebugShareFailed
+
+        def _boom(_args):
+            print("\nUpload failed: offline", file=sys.stderr)
+            print("\nRun `hermes debug share --local` to print the report instead.\n")
+            raise DebugShareFailed("offline")
+
+        with patch("hermes_cli.debug.run_debug_share", _boom):
+            # Must return normally — no SystemExit, no DebugShareFailed.
+            self._handler()("/debug")
+
+        out = capsys.readouterr()
+        assert "Upload failed: offline" in out.err
+        assert "hermes debug share --local" in out.out
 
 
 class TestShareConsentGate:

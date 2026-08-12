@@ -2014,11 +2014,22 @@ def _get_platform_tools(
     return enabled_toolsets
 
 
-def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
+def _save_platform_tools(
+    config: dict,
+    platform: str,
+    enabled_toolset_keys: Set[str],
+    *,
+    explicit_targets: Optional[Set[str]] = None,
+):
     """Save the selected toolset keys for a platform to config.
 
     Preserves any non-configurable toolset entries (like MCP server names)
     that were already in the config for this platform.
+
+    ``explicit_targets`` names the toolsets the caller is actively toggling
+    (see ``_apply_toolset_change``). Anything NOT named there is only ever
+    added back, never removed, by the ``agent.disabled_toolsets`` preservation
+    below — see issue #226.
     """
     config.setdefault("platform_toolsets", {})
 
@@ -2058,8 +2069,39 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     # by hand could never re-enable MCP servers through the UI.
     preserved_entries.discard("no_mcp")
 
+    # Preserve raw entries that the RESOLVER hides but the user still owns
+    # (issue #226). Every caller here arrives with an *effective* set — the
+    # output of _get_platform_tools(), which subtracts agent.disabled_toolsets
+    # LAST and unconditionally (see the block near the end of that function).
+    # A globally suppressed toolset is therefore absent from
+    # ``enabled_toolset_keys`` even when the user wrote it into
+    # platform_toolsets.<platform> by hand, so merging that set back over the
+    # raw list silently DELETED the entry: with
+    # ``cli: [web, memory, terminal]`` and ``agent.disabled_toolsets: [memory]``,
+    # disabling ``web`` used to leave ``cli: [terminal]`` — and dropping the
+    # global suppression later no longer brought ``memory`` back. Blank Slate
+    # installs pre-populate agent.disabled_toolsets with ~27 toolsets (see the
+    # reconcile note below / #49995), so this is the common case, not a corner.
+    #
+    # A suppressed entry is dropped only when the caller explicitly names it as
+    # a target, i.e. the user really did ask to remove it from this platform.
+    _agent_cfg = config.get("agent") or {}
+    _globally_suppressed = {
+        str(ts) for ts in (_agent_cfg.get("disabled_toolsets") or [])
+    }
+    suppressed_existing = {
+        entry for entry in existing_toolsets
+        if entry in _globally_suppressed
+        and entry in configurable_keys
+        and _toolset_allowed_for_platform(entry, platform)
+    }
+    if explicit_targets:
+        suppressed_existing -= {str(ts) for ts in explicit_targets}
+
     # Merge preserved entries with new enabled toolsets
-    config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
+    config["platform_toolsets"][platform] = sorted(
+        enabled_toolset_keys | preserved_entries | suppressed_existing
+    )
 
     # Track which plugin toolsets are "known" for this platform so we can
     # distinguish "new plugin, default enabled" from "user disabled it".
@@ -2087,6 +2129,9 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     if isinstance(agent_cfg, dict):
         disabled_toolsets = agent_cfg.get("disabled_toolsets")
         if isinstance(disabled_toolsets, list) and disabled_toolsets:
+            # NB: ``suppressed_existing`` is deliberately NOT part of this set.
+            # Those entries were merely kept in the raw list (#226); the user
+            # did not re-enable them, so the global suppression must stand.
             newly_enabled = enabled_toolset_keys - preserved_entries
             if newly_enabled:
                 remaining = [
@@ -4670,13 +4715,55 @@ def _configure_mcp_tools_interactive(config: dict):
 
 
 def _apply_toolset_change(config: dict, platform: str, toolset_names: List[str], action: str):
-    """Add or remove built-in toolsets for a platform."""
+    """Add or remove built-in toolsets for a platform.
+
+    The diff is still computed against the RESOLVED set, because that is what
+    materialises the platform default for a config that has never saved a
+    list (``platform_toolsets`` absent → ``hermes tools disable web`` must
+    persist "everything the default gave you, minus web").
+
+    But the resolved set is NOT a faithful picture of the user's raw list, so
+    writing it back verbatim corrupts the config in both directions
+    (issue #226):
+
+    * _get_platform_tools() RECOVERS non-configurable platform toolsets
+      (``kanban`` and friends) that the user never listed. Round-tripping
+      them turned them into explicit ``platform_toolsets`` entries — which is
+      not a no-op: an explicit entry becomes an ``explicit_passthrough`` on
+      the next read and so bypasses the recovery heuristic that produced it.
+      They are re-derived on every read, so leaving them out of the write is
+      lossless; hence the ``writable`` filter below.
+    * _get_platform_tools() subtracts ``agent.disabled_toolsets`` last, so
+      entries the user DID list but that are globally suppressed are missing
+      from the resolved set and used to be deleted by the save. That half is
+      handled inside _save_platform_tools(), which needs to know which names
+      the caller actually meant to touch — that is ``explicit_targets``.
+    """
+    targets = {str(name) for name in toolset_names}
     enabled = _get_platform_tools(config, platform, include_default_mcp_servers=False)
     if action == "disable":
-        updated = enabled - set(toolset_names)
+        updated = enabled - targets
     else:
-        updated = enabled | set(toolset_names)
-    _save_platform_tools(config, platform, updated)
+        updated = enabled | targets
+
+    # Only write back names the user could have chosen: configurable/plugin
+    # toolsets, whatever was already in the raw list (MCP server names, custom
+    # toolsets — _save_platform_tools preserves those anyway), and the caller's
+    # own targets. Everything else in ``updated`` is resolver-injected.
+    raw_entries = (config.get("platform_toolsets") or {}).get(platform)
+    raw_entries = (
+        {str(ts) for ts in raw_entries} if isinstance(raw_entries, list) else set()
+    )
+    writable = (
+        {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+        | _get_plugin_toolset_keys()
+        | raw_entries
+        | targets
+    )
+
+    _save_platform_tools(
+        config, platform, updated & writable, explicit_targets=targets
+    )
 
 
 def _apply_mcp_change(config: dict, targets: List[str], action: str) -> Set[str]:

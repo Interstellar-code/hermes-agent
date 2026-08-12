@@ -1939,7 +1939,9 @@ DEFAULT_CONFIG = {
         # Supported: en, zh, ja, de, es, fr, tr, uk.  Unknown values fall back to en.
         "language": "en",
         # TUI busy indicator style: kaomoji (default), emoji, unicode (braille
-        # spinner), or ascii.  Live-swappable via `/indicator <style>`.
+        # spinner), or ascii.  Live-swappable from the Ink TUI via
+        # `/indicator <style>` (a TUI-only command that rides config.set); the
+        # classic CLI has no equivalent and ignores this key.
         "tui_status_indicator": "kaomoji",
         # Seconds between prompt_toolkit redraws in the classic CLI when idle.
         # Default 1.0 keeps the wall-clock status-bar read-outs (idle-since-
@@ -7194,6 +7196,42 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
 
     require_readable_config_before_write(config_path)
     atomic_yaml_write(config_path, data, **kwargs)
+
+
+def resolve_personality_prompt(cfg: Optional[Dict[str, Any]] = None) -> str:
+    """Return the prompt text for the configured ``agent.personality``, or "".
+
+    ``/personality`` stores a NAME under ``agent.personality`` and never
+    touches ``agent.system_prompt`` (#223). Every surface that builds a system
+    prompt from config therefore has to resolve that name, or a personality
+    set with ``--global`` silently applies to the CLI only — which would make
+    the #223 fix a quiet loss of reach, since the old destructive behaviour
+    did apply everywhere by virtue of overwriting ``system_prompt``.
+
+    A personality value may be a plain string or a dict with
+    ``system_prompt``/``tone``/``style``, matching the classic CLI's
+    ``_resolve_personality_prompt``. An unknown name resolves to "" rather
+    than raising: config is user-editable and a typo must not break startup.
+    """
+    cfg = cfg if isinstance(cfg, dict) else load_config_readonly()
+    agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    name = str(agent_cfg.get("personality") or "").strip()
+    if not name or name.lower() in {"none", "default", "neutral", "off"}:
+        return ""
+    personalities = agent_cfg.get("personalities")
+    if not isinstance(personalities, dict):
+        return ""
+    value = personalities.get(name)
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        parts = [str(value.get("system_prompt", "") or "")]
+        if value.get("tone"):
+            parts.append(f'Tone: {value["tone"]}')
+        if value.get("style"):
+            parts.append(f'Style: {value["style"]}')
+        return "\n".join(p for p in parts if p).strip()
+    return str(value).strip()
 
 
 def load_config() -> Dict[str, Any]:

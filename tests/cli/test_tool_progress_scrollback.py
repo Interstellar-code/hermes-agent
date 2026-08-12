@@ -293,3 +293,44 @@ class TestMoAReferenceBlocks:
         assert "aggregating" in cli._spinner_text
         # aggregating is a spinner-only transition; no committed scrollback line.
         mock_print.assert_not_called()
+
+
+class TestVerboseCycleCoversEveryMode:
+    """/verbose must cycle through every value ``display.tool_progress``
+    accepts, including ``log`` (#222).
+
+    The registry advertises "off -> new -> all -> verbose -> log" but the
+    CLI's cycle listed only four, so ``log`` was unreachable — and a user
+    who had set ``log`` in config.yaml was silently bumped out of it (the
+    ``cycle.index`` lookup raised and fell back to "all") the first time
+    they pressed /verbose, with no way back.
+    """
+
+    def test_cycle_reaches_log_then_wraps_to_off(self):
+        cli = _make_cli(tool_progress="verbose")
+        with patch.object(_cli_mod, "_cprint") as mock_print:
+            cli._toggle_verbose()
+        assert cli.tool_progress_mode == "log"
+        assert "LOG" in mock_print.call_args[0][0]
+
+        with patch.object(_cli_mod, "_cprint"):
+            cli._toggle_verbose()
+        assert cli.tool_progress_mode == "off"
+
+    def test_configured_log_mode_survives_a_full_cycle(self):
+        cli = _make_cli(tool_progress="log")
+        assert cli.tool_progress_mode == "log"
+        for _ in range(5):
+            with patch.object(_cli_mod, "_cprint"):
+                cli._toggle_verbose()
+        assert cli.tool_progress_mode == "log"
+
+    def test_every_mode_in_the_cycle_prints_a_label(self):
+        cli = _make_cli(tool_progress="off")
+        seen = []
+        for _ in range(5):
+            with patch.object(_cli_mod, "_cprint") as mock_print:
+                cli._toggle_verbose()
+            seen.append(cli.tool_progress_mode)
+            assert mock_print.call_args[0][0], f"no label for {cli.tool_progress_mode}"
+        assert seen == ["new", "all", "verbose", "log", "off"]

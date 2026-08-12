@@ -5174,7 +5174,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if prompt:
             return prompt
         cfg = _load_gateway_runtime_config()
-        return str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        configured = str(cfg_get(cfg, "agent", "system_prompt", default="") or "").strip()
+        if configured:
+            return configured
+        # Fall back to the configured personality (#223). /personality now
+        # stores a NAME under agent.personality instead of overwriting
+        # agent.system_prompt; without this the gateway would ignore a
+        # personality set with --global, even though the old (destructive)
+        # behaviour did reach messaging and cron sessions. An explicit
+        # system_prompt still wins — same precedence as the CLI.
+        try:
+            from hermes_cli.config import resolve_personality_prompt
+
+            return resolve_personality_prompt(cfg)
+        except Exception:
+            logger.debug("personality prompt resolution failed", exc_info=True)
+            return ""
 
     def _resolve_model_for_channel(
         self,
@@ -8253,6 +8268,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
+                # Retire requests nobody picked up in time BEFORE listing.
+                # A pending row is a standing instruction to re-bind a session
+                # to a platform; without this sweep, one abandoned when its
+                # requester was killed mid-wait would be executed by whichever
+                # gateway started next — minutes or days later (#221).
+                # Guarded on its own so a sweep failure can never cost the tick
+                # its real work (claiming live handoffs).
+                try:
+                    expired = await self._session_db.expire_stale_handoffs()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    expired = []
+                    logger.debug("Handoff expiry sweep failed", exc_info=True)
+                if expired:
+                    logger.info(
+                        "Expired %d stale handoff request(s): %s",
+                        len(expired), ", ".join(expired[:5]),
+                    )
                 pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")

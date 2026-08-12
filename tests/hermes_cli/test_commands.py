@@ -93,6 +93,97 @@ class TestCommandRegistry:
 
 
 # ---------------------------------------------------------------------------
+# Registry entries must resolve to a real handler
+# ---------------------------------------------------------------------------
+
+def _cli_dispatched_command_names() -> set[str]:
+    """Names cli.py's slash dispatcher actually branches on.
+
+    ``process_command`` is one long ``elif canonical == "..."`` chain (with a
+    few ``canonical in {...}`` groups), so the set of dispatchable names is
+    readable straight off the source.  Static analysis rather than importing
+    cli.py: importing it drags in prompt_toolkit, the agent stack and terminal
+    setup for what is a pure registry invariant.
+    """
+    import pathlib
+    import re
+
+    source = (pathlib.Path(__file__).resolve().parents[2] / "cli.py").read_text(
+        encoding="utf-8"
+    )
+    names = set(re.findall(r'canonical\s*==\s*["\']([\w\-]+)["\']', source))
+    for match in re.finditer(
+        r"canonical\s+in\s+([\(\{\[][^\)\}\]]*[\)\}\]])", source
+    ):
+        names.update(re.findall(r'["\']([\w\-]+)["\']', match.group(1)))
+    return names
+
+
+class TestRegistryCommandsHaveHandlers:
+    """Every advertised command must dispatch somewhere (#222).
+
+    ``/indicator`` sat in the registry as ``cli_only`` with no
+    ``canonical == "indicator"`` branch in cli.py, so typing it printed
+    "Unknown command: /indicator" — and because ``commands.catalog`` filters
+    only ``gateway_only`` and its own hidden list (NOT ``cli_only``), the
+    broken entry was also served to the TUI/desktop/web command palettes.
+    Both of those surfaces bottom out in cli.py's dispatcher (the TUI runs it
+    in the slash-worker subprocess), so "not gateway_only" means "must have a
+    cli.py branch".
+    """
+
+    def test_sanity_dispatcher_scan_finds_the_chain(self):
+        dispatched = _cli_dispatched_command_names()
+        assert len(dispatched) > 50, (
+            "cli.py dispatch scan found almost nothing — the `canonical == ...` "
+            "chain probably moved or changed shape, so this whole test class is "
+            "silently vacuous"
+        )
+        assert "status" in dispatched
+
+    def test_every_non_gateway_only_command_has_a_cli_branch(self):
+        dispatched = _cli_dispatched_command_names()
+        missing = [
+            cmd.name
+            for cmd in COMMAND_REGISTRY
+            if not cmd.gateway_only
+            and cmd.name not in dispatched
+            and not any(alias in dispatched for alias in cmd.aliases)
+        ]
+        assert not missing, (
+            "COMMAND_REGISTRY advertises commands cli.py cannot dispatch "
+            f"(they print 'Unknown command'): {missing}. Either add a "
+            "`canonical == \"<name>\"` branch, mark the entry gateway_only, or "
+            "drop it from the registry (TUI-only commands belong in "
+            "tui_gateway/server.py's _TUI_EXTRA instead)."
+        )
+
+    def test_every_gateway_only_command_has_a_gateway_branch(self):
+        import pathlib
+        import re
+
+        root = pathlib.Path(__file__).resolve().parents[2]
+        slash_src = (root / "gateway" / "slash_commands.py").read_text(encoding="utf-8")
+        run_src = (root / "gateway" / "run.py").read_text(encoding="utf-8")
+
+        handled = set(re.findall(r"async def _handle_([\w]+)_command", slash_src))
+        handled |= set(re.findall(r'\.name\s*==\s*["\']([\w\-]+)["\']', run_src))
+        handled |= set(re.findall(r'canonical\s*==\s*["\']([\w\-]+)["\']', run_src))
+        # Handler method names normalise dashes to underscores.
+        handled |= {name.replace("_", "-") for name in handled}
+
+        missing = [
+            cmd.name
+            for cmd in COMMAND_REGISTRY
+            if cmd.gateway_only
+            and not ({cmd.name, cmd.name.replace("-", "_")} | set(cmd.aliases)) & handled
+        ]
+        assert not missing, (
+            f"gateway_only commands with no gateway handler: {missing}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # resolve_command tests
 # ---------------------------------------------------------------------------
 

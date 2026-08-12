@@ -363,6 +363,11 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
         return []
 
 
+# Words that mean "no personality overlay" wherever a personality name is
+# accepted (/personality <word>, agent.personality in config.yaml).
+_PERSONALITY_CLEAR_WORDS = frozenset({"none", "default", "neutral", "off", ""})
+
+
 def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
     """Resolve the prefill file path from env/config.
 
@@ -473,6 +478,9 @@ def load_cli_config() -> Dict[str, Any]:
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
             "system_prompt": "",
+            # Personality NAME (a key of agent.personalities below), resolved to
+            # a prompt overlay at runtime. Never holds preset text — see #223.
+            "personality": "",
             "prefill_messages_file": "",
             "reasoning_effort": "",
             "service_tier": "",
@@ -3976,12 +3984,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
-        # Ephemeral system prompt: env var takes precedence, then config
-        self.system_prompt = (
+        # Ephemeral system prompt: env var takes precedence, then config.
+        # base_system_prompt holds the user's OWN hand-written prompt. It is
+        # kept separate from self.system_prompt (the effective prompt handed to
+        # the agent) so /personality can never clobber it — see #223.
+        self.base_system_prompt = (
             os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
             or CLI_CONFIG["agent"].get("system_prompt", "")
         )
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
+        # Personalities are stored by NAME under agent.personality and resolved
+        # to a prompt overlay here; the preset text is never written into
+        # agent.system_prompt.
+        self.personality = str(CLI_CONFIG["agent"].get("personality", "") or "").strip().lower()
+        # True once /personality was typed in THIS session (see the precedence
+        # note in _compose_system_prompt).
+        self._personality_session_override = False
+        self.system_prompt = self._compose_system_prompt()
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
         self.prefill_messages = _load_prefill_messages(
@@ -7595,6 +7614,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         return result[0]
 
+    def _noninteractive_prompt_cancel(self) -> None:
+        """Explain why an interactive prompt was skipped, then cancel it.
+
+        Set ``self._noninteractive_confirm = True`` on a HermesCLI whose stdin
+        is not a terminal the user can answer on — the TUI gateway's
+        ``tui_gateway.slash_worker`` subprocess is the motivating case (issue
+        #220): its stdin carries the framed JSON-RPC line protocol, so a bare
+        ``input()`` there both wedges the worker until the gateway's 45s
+        timeout kills it *and* eats the next protocol line.
+
+        Callers of the prompt helpers already treat ``None`` as "cancelled",
+        so this prints a short explanation (captured by the worker's stdout
+        redirect and returned to the client) and the helper returns ``None``.
+        """
+        print(
+            "🟡 Interactive prompts aren't available on this surface — this command ran "
+            "without a terminal to confirm on."
+        )
+        print(
+            "   Re-run it in the Hermes CLI/TUI, or use the inline confirm token where "
+            "supported (e.g. `/new --yes`, `/reset now`)."
+        )
+        self._invalidate()
+
     def _prompt_text_input(self, prompt_text: str) -> str | None:
         """Prompt for free-text input safely inside or outside prompt_toolkit.
 
@@ -7616,6 +7659,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 pass
 
         in_main_thread = threading.current_thread() is threading.main_thread()
+
+        # Non-interactive-surface guard (#220): the TUI gateway's slash worker
+        # runs handlers on the MAIN thread with no prompt_toolkit app, so the
+        # thread guard below never fires there — yet its stdin is the JSON-RPC
+        # pipe, so input() would hang the worker and swallow a protocol line.
+        # The worker sets this flag explicitly (never keyed off HERMES_INTERACTIVE,
+        # which drives tool-approval fail-closed semantics), and getattr's default
+        # keeps every other construction path on the existing behaviour.
+        if getattr(self, "_noninteractive_confirm", False):
+            self._noninteractive_prompt_cancel()
+            return None
 
         # Slash-worker guard (#23185 / billing auto-reload hang): when a
         # prompt_toolkit app is running but we're on a non-main thread (the
@@ -7686,6 +7740,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         import time as _time
 
         if not choices:
+            return None
+
+        # Non-interactive surface (#220) — no terminal to answer on.  The
+        # ``_app``-less short-circuit below would reach ``_prompt_text_input``
+        # (which carries the same guard), but check here too so the cancel is
+        # correct even if a surface ever has both an app and a dead stdin.
+        if getattr(self, "_noninteractive_confirm", False):
+            self._noninteractive_prompt_cancel()
             return None
 
         # If prompt_toolkit is not running (unit tests / non-interactive calls),
@@ -8621,6 +8683,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(f'Style: {value["style"]}' )
             return "\n".join(p for p in parts if p)
         return str(value)
+
+    def _compose_system_prompt(self) -> str:
+        """Resolve the effective ephemeral system prompt from base + personality.
+
+        This is the single place where ``agent.personality`` (a NAME) is turned
+        into prompt text, so the personality preset only ever lives in memory —
+        ``agent.system_prompt`` in config.yaml stays exactly as the user wrote
+        it (#223).
+
+        Precedence when both are set:
+
+        * A hand-written ``agent.system_prompt`` beats a stored
+          ``agent.personality``. The prompt the user typed out themselves is the
+          more specific, more expensive-to-recreate instruction; a personality
+          is a canned preset. Silently shadowing the hand-written prompt is what
+          made #223 destructive, so config-vs-config resolves in its favour.
+        * EXCEPT when /personality was run in this session: an explicit live
+          command is newer and more deliberate than a config file, so it wins
+          for the session. (/personality --global warns when a hand-written
+          prompt would shadow it in future sessions.)
+        """
+        base = (getattr(self, "base_system_prompt", "") or "").strip()
+        name = (getattr(self, "personality", "") or "").strip().lower()
+        overlay = ""
+        if name and name not in _PERSONALITY_CLEAR_WORDS:
+            value = (getattr(self, "personalities", None) or {}).get(name)
+            if value is not None:
+                overlay = self._resolve_personality_prompt(value).strip()
+        if overlay and (not base or getattr(self, "_personality_session_override", False)):
+            return overlay
+        return base
 
 
     
@@ -9604,7 +9697,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
 
     def _toggle_verbose(self):
-        """Cycle tool progress mode: off → new → all → verbose → off.
+        """Cycle tool progress mode: off → new → all → verbose → log → off.
 
         Tool-progress display (full args / results / think blocks at the
         ``verbose`` step) is INDEPENDENT of global DEBUG logging.  Cycling
@@ -9613,7 +9706,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         explicit ``-v``/``--verbose`` flag and the ``/verbose-logging``
         toggle.  See PR #6a1aa420e for the history that decoupled them.
         """
-        cycle = ["off", "new", "all", "verbose"]
+        # Must cover every value ``display.tool_progress`` accepts (see
+        # gateway/display_config.py::_normalise) — a mode missing from the
+        # cycle can never be selected AND can never be returned to once the
+        # user cycles away from a config-set value (#222).
+        cycle = ["off", "new", "all", "verbose", "log"]
         try:
             idx = cycle.index(self.tool_progress_mode)
         except ValueError:
@@ -9637,6 +9734,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
             "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
             "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, and think blocks.",
+            # The tool_calls.log writer itself lives in the messaging gateway
+            # (gateway/run.py, "gateway-only by design") — here LOG just means
+            # quiet, but it stays in the cycle so a config-set 'log' survives.
+            "log": f"{_Colors.DIM}Tool progress: LOG{_Colors.RESET} — quiet here; messaging gateways append tool calls to ~/.hermes/logs/tool_calls.log.",
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 

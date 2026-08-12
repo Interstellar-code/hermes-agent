@@ -276,12 +276,12 @@ hermes uninstall            Uninstall Hermes
 /model [name]        Show or change model
 /personality [name]  Set personality
 /reasoning [level]   Set reasoning (none|minimal|low|medium|high|xhigh|max|ultra|show|hide)
-/verbose             Cycle: off → new → all → verbose
+/verbose             Cycle: off → new → all → verbose → log
 /voice [on|off|tts]  Voice mode
 /yolo                Toggle approval bypass
 /busy [sub]          Control what Enter does while Hermes is working (CLI)
                      (subcommands: queue, steer, interrupt, status)
-/indicator [style]   Pick the TUI busy-indicator style (CLI)
+/indicator [style]   Pick the busy-indicator style (TUI only)
                      (styles: kaomoji, emoji, unicode, ascii)
 /footer [on|off]     Toggle gateway runtime-metadata footer on final replies
 /skin [name]         Change theme (CLI)

@@ -3460,16 +3460,133 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+class CompressNotice(NamedTuple):
+    """A ``/compress`` request that ends WITHOUT touching the transcript.
+
+    ``kind`` is either:
+
+    * ``"preview"`` — ``--preview``/``--dry-run``: a report of what *would*
+      be compressed.  Callers surface it as normal command output.
+    * ``"error"`` — the arguments cannot be honoured on this surface
+      (unknown ``--flag``, ``--aggressive``, ``here [N]``).  Callers
+      surface it as a JSON-RPC error / warning string.
+
+    Either way ``_compress_session_history`` performed no compression, no
+    history replacement and no session rotation, so callers MUST skip the
+    post-compress bookkeeping (``_sync_session_key_after_compress``,
+    before/after summaries, ``session.info`` emits).
+    """
+
+    kind: str
+    text: str
+    lines: tuple[str, ...] = ()
+
+
+#: Flags ``/compress`` understands on the gateway surfaces.  Kept in the
+#: rejection message so an unknown ``--flag`` is never silently reused as
+#: an LLM focus topic again (issue #218).
+_COMPRESS_SUPPORTED_FLAGS = "--preview, --dry-run"
+
+
+def _classify_compress_args(
+    raw_args: str | None,
+) -> tuple[str | None, bool, CompressNotice | None]:
+    """Split the raw ``/compress`` argument string into its parts.
+
+    Returns ``(focus_topic, preview, error_notice)``.  When
+    ``error_notice`` is not None the caller must make no changes.
+
+    Reuses ``hermes_cli.partial_compress`` — the same parser the classic
+    CLI (``cli.py::_manual_compress``) and the messaging gateway
+    (``gateway/slash_commands.py``) use — so the gateway can no longer
+    hand ``--preview`` to the summariser as a focus topic (#218).
+    """
+    from hermes_cli.partial_compress import (
+        extract_compress_flags,
+        parse_partial_compress_args,
+    )
+
+    remaining, preview, aggressive = extract_compress_flags(raw_args or "")
+    partial, _keep_last, focus_topic = parse_partial_compress_args(remaining)
+
+    if aggressive:
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                "--aggressive is not supported here; run /compress without it, "
+                "or use /undo to drop recent turns.",
+            ),
+        )
+    if partial:
+        # `here [N]` / `--keep N` need the CLI's head/tail rejoin, which
+        # this surface's _compress_context rotation path does not do.
+        # Say so instead of silently full-compressing with "here 3" as
+        # the focus topic (#218).
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                "/compress here [N] is not supported here yet — it is available "
+                "in the classic CLI. Run /compress (optionally with a focus "
+                "topic) to compress the whole conversation.",
+            ),
+        )
+    if focus_topic and focus_topic.lstrip().startswith("-"):
+        # A leading dash is never a legitimate focus topic; treating one
+        # as a topic is exactly how --preview became destructive.
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                f"unknown /compress option {focus_topic.split()[0]!r} "
+                f"(supported: {_COMPRESS_SUPPORTED_FLAGS}). "
+                "A focus topic cannot start with '-'.",
+            ),
+        )
+    return focus_topic or None, preview, None
+
+
+def _compress_preview_notice(
+    history: list,
+    focus_topic: str | None,
+    approx_tokens: int,
+) -> CompressNotice:
+    """Build the ``--preview`` report — pure, no side effects."""
+    from hermes_cli.partial_compress import (
+        DEFAULT_KEEP_LAST,
+        summarize_compress_preview,
+    )
+
+    report = summarize_compress_preview(
+        history, False, DEFAULT_KEEP_LAST, focus_topic, approx_tokens
+    )
+    lines = [str(line) for line in report["lines"]]
+    return CompressNotice("preview", "\n".join(lines), tuple(lines))
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
     approx_tokens: int | None = None,
     before_messages: list | None = None,
     history_version: int | None = None,
-) -> tuple[int, dict]:
+) -> tuple[int, dict, CompressNotice | None]:
+    """Compress the live transcript, returning ``(removed, usage, notice)``.
+
+    ``notice`` is None for a real compression.  When it is a
+    :class:`CompressNotice` nothing was mutated — see that class for the
+    caller contract.
+    """
     from agent.model_metadata import estimate_request_tokens_rough
 
     agent = session["agent"]
+    focus_topic, preview, notice = _classify_compress_args(focus_topic)
+    if notice is not None:
+        return 0, _get_usage(agent), notice
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -3479,9 +3596,32 @@ def _compress_session_history(
             before_messages = list(session.get("history", []))
             history_version = int(session.get("history_version", 0))
     history = before_messages
+    if preview:
+        # --preview/--dry-run: report only. Never reach _compress_context
+        # (which ends the SessionDB session and rotates to a continuation
+        # session) and never replace session["history"].
+        usage = _get_usage(agent)
+        if len(history) < 4:
+            return 0, usage, CompressNotice(
+                "preview",
+                "Preview — no changes made. Not enough conversation to "
+                "compress (need at least 4 messages).",
+                (
+                    "Preview — no changes made.",
+                    "Not enough conversation to compress "
+                    "(need at least 4 messages).",
+                ),
+            )
+        if approx_tokens is None:
+            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(agent, "tools", None) or None
+            approx_tokens = estimate_request_tokens_rough(
+                history, system_prompt=_sys_prompt, tools=_tools
+            )
+        return 0, usage, _compress_preview_notice(history, focus_topic, approx_tokens)
     if len(history) < 4:
         usage = _get_usage(agent)
-        return 0, usage
+        return 0, usage, None
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
@@ -3506,11 +3646,11 @@ def _compress_session_history(
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
             usage = _get_usage(agent)
-            return 0, usage
+            return 0, usage, None
         session["history"] = compressed
         session["history_version"] = history_version + 1
     usage = _get_usage(agent)
-    return len(history) - len(compressed), usage
+    return len(history) - len(compressed), usage, None
 
 
 def _sync_session_key_after_compress(
@@ -4513,7 +4653,17 @@ def _available_personalities(cfg: dict | None = None) -> dict:
 
 
 def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str]:
-    raw = str(value or "").strip()
+    # Callers pass raw slash-command arguments (_mirror_slash_side_effects
+    # forwards the text after "/personality" verbatim), so strip the scope
+    # flags before matching. /personality gained --global/--session with #223;
+    # without this, "/personality helpful --global" over slash.exec fails with
+    # "Unknown personality: helpful --global" and the session-scoped mirror
+    # silently never applies.
+    raw = " ".join(
+        token
+        for token in str(value or "").split()
+        if token not in ("--global", "--session")
+    ).strip()
     name = raw.lower()
     if not name or name in {"none", "default", "neutral"}:
         return "", ""
@@ -5020,6 +5170,17 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    if not system_prompt:
+        # /personality stores a NAME under agent.personality and no longer
+        # overwrites agent.system_prompt (#223), so resolve it here or a
+        # globally-set personality would never reach this surface. An explicit
+        # system_prompt still wins — same precedence as the CLI.
+        try:
+            from hermes_cli.config import resolve_personality_prompt
+
+            system_prompt = _prompt_text(resolve_personality_prompt(cfg))
+        except Exception:
+            pass
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -7027,17 +7188,32 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5007)
         key = session["session_key"]
         try:
-            if not db.get_session(key):
-                db.set_session_title(key, f"handoff-{key[:8]}")
-            ok = db.request_handoff(key, platform_name)
+            # Real INSERT OR IGNORE — the set_session_title call that used to
+            # stand here is a plain UPDATE and never created anything (#221).
+            db.ensure_session_row(
+                key, source=_session_source(session), title=f"handoff-{key[:8]}"
+            )
+            # Drop any request an earlier caller abandoned so it neither blocks
+            # this one nor gets executed by the watcher long after the fact.
+            db.expire_stale_handoffs()
+            status = db.request_handoff_status(key, platform_name)
+            in_flight = ""
+            if status == "in_flight":
+                in_flight = (db.get_handoff_state(key) or {}).get("state") or "in flight"
         except Exception as e:
             return _err(rid, 5007, str(e))
 
-    if not ok:
+    if status == "missing":
+        return _err(
+            rid,
+            4028,
+            "session has no state.db record yet — send a message first, then retry the handoff",
+        )
+    if status != "queued":
         return _err(
             rid,
             4027,
-            "session is already in flight for handoff — wait for it to settle, then retry",
+            f"session is already {in_flight} for handoff — wait for it to settle, then retry",
         )
     return _ok(
         rid,
@@ -8851,13 +9027,44 @@ def _(rid, params: dict) -> dict:
             )
 
         try:
-            removed, usage = _compress_session_history(
+            removed, usage, notice = _compress_session_history(
                 session,
                 focus_topic,
                 approx_tokens=before_tokens,
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            if notice is not None:
+                # Nothing was compressed and no session rotation happened,
+                # so skip the whole post-compress bookkeeping below (#218).
+                if notice.kind == "error":
+                    return _err(rid, 4004, notice.text)
+                _lines = list(notice.lines) or [notice.text]
+                return _ok(
+                    rid,
+                    {
+                        "status": "preview",
+                        "preview": True,
+                        "removed": 0,
+                        "before_messages": before_count,
+                        "after_messages": before_count,
+                        "before_tokens": before_tokens,
+                        "after_tokens": before_tokens,
+                        "output": notice.text,
+                        # Shaped like summarize_manual_compression() so the
+                        # TUI/desktop clients render it through their existing
+                        # headline/token_line/note path.
+                        "summary": {
+                            "noop": True,
+                            "aborted": False,
+                            "fallback_used": False,
+                            "headline": _lines[0],
+                            "token_line": _lines[1] if len(_lines) > 1 else "",
+                            "note": "\n".join(_lines[2:]) or None,
+                        },
+                        "usage": usage,
+                    },
+                )
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)
@@ -11487,7 +11694,12 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"key": key, "value": raw})
 
     if key == "verbose":
-        cycle = ["off", "new", "all", "verbose"]
+        # Every value ``display.tool_progress`` accepts (see
+        # gateway/display_config.py::_normalise). This writes the shared
+        # config key, so rejecting "log" here made a valid, gateway-honored
+        # mode unreachable from the TUI/desktop and dropped a config-set
+        # "log" the moment the user cycled (#222).
+        cycle = ["off", "new", "all", "verbose", "log"]
         cur = (
             session.get("tool_progress_mode", _load_tool_progress_mode())
             if session
@@ -11625,10 +11837,20 @@ def _(rid, params: dict) -> dict:
                 sections["thinking"] = "expanded"
                 display["sections"] = sections
                 cfg["display"] = display
-                _save_cfg(cfg)
+                # Honour the requested scope (#225). This used to persist
+                # unconditionally, so scope="session" silently rewrote
+                # config.yaml for every future CLI session, the messaging
+                # gateway and cron — with no "(saved)" disclosure on this
+                # surface at all. The session write below is the whole effect
+                # a session-scoped request asked for.
+                if global_scope or session is None:
+                    _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = True
-                return _ok(rid, {"key": key, "value": "show"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "show", "scope": "global" if global_scope else "session"},
+                )
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
                 display = (
@@ -11643,10 +11865,15 @@ def _(rid, params: dict) -> dict:
                 sections["thinking"] = "hidden"
                 display["sections"] = sections
                 cfg["display"] = display
-                _save_cfg(cfg)
+                # Session-scoped by default — see the show branch above (#225).
+                if global_scope or session is None:
+                    _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = False
-                return _ok(rid, {"key": key, "value": "hide"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "hide", "scope": "global" if global_scope else "session"},
+                )
 
             # /reasoning full | clamp — parity with the classic CLI's
             # reasoning_full toggle. The TUI renders thinking as an
@@ -11872,7 +12099,14 @@ def _(rid, params: dict) -> dict:
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
                 _write_config_key("display.personality", pname)
-                _write_config_key("agent.system_prompt", new_prompt)
+                # Store the personality NAME, never the preset text (#223).
+                # This used to write the resolved prompt into
+                # agent.system_prompt — the one global key holding a user's
+                # hand-written system prompt — silently destroying it with no
+                # backup, for every future CLI session, gateway run and cron
+                # job. The CLI resolves agent.personality into an overlay and
+                # leaves agent.system_prompt alone; this path now matches.
+                _write_config_key("agent.personality", pname)
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
                     sid_key, session, new_prompt, pname
@@ -12860,8 +13094,17 @@ _TUI_HIDDEN: frozenset[str] = frozenset(
     }
 )
 
+# TUI-surface commands with no classic-CLI handler. They live here rather
+# than in COMMAND_REGISTRY precisely because the registry is the CLI's
+# dispatch contract: listing a command there that cli.py cannot dispatch is
+# how /indicator ended up printing "Unknown command" (#222).
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/compact", "Toggle compact display mode", "TUI"),
+    (
+        "/indicator",
+        "Pick the busy-indicator style [kaomoji|emoji|unicode|ascii]",
+        "TUI",
+    ),
     ("/logs", "Show recent gateway log lines", "TUI"),
     (
         "/mouse",
@@ -12869,6 +13112,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
         "TUI",
     ),
     ("/sessions", "Switch between live TUI sessions", "TUI"),
+    ("/systemprompt", "Show the current system prompt", "TUI"),
 ]
 
 # Commands that queue messages onto _pending_input in the CLI.
@@ -12893,6 +13137,14 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
 )
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
+
+# Commands whose CLI implementation blocks longer than _SLASH_WORKER_TIMEOUT_S
+# and leaves durable state behind when the worker is killed mid-run. slash.exec
+# serves these from the equivalent non-blocking RPC instead of the worker.
+# ``/handoff`` poll-waits 60s for the gateway watcher, so at the 45s worker
+# timeout its own cleanup never ran and the session stayed handoff_state
+# 'pending' forever — armed for a watcher to execute days later (#221).
+_RPC_ROUTED_COMMANDS: frozenset[str] = frozenset({"handoff"})
 
 
 @method("commands.catalog")
@@ -13572,13 +13824,19 @@ def _(rid, params: dict) -> dict:
                 if before_count
                 else 0
             )
-            removed, usage = _compress_session_history(
+            removed, usage, notice = _compress_session_history(
                 session,
                 arg.strip() or None,
                 approx_tokens=before_tokens,
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            if notice is not None:
+                # --preview/--dry-run (or a rejected flag): history was not
+                # touched and the session was not rotated (#218).
+                if notice.kind == "error":
+                    return _err(rid, 4004, notice.text)
+                return _ok(rid, {"type": "exec", "output": notice.text})
             with session["history_lock"]:
                 after_messages = list(session.get("history", []))
             after_count = len(after_messages)
@@ -14317,6 +14575,7 @@ def _(rid, params: dict) -> dict:
 _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
+        "compose",
         "compress",
         "effort",
         "history",
@@ -14324,7 +14583,14 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "prompt",
         "rename",
         "status",
+        "systemprompt",
         "usage",
+        # /yolo must be answered here, not by the slash worker (#219). The
+        # worker would toggle tools.approval._session_yolo in ITS OWN process
+        # — a module-level set with no persistence — then exit, so the banner
+        # said the approval bypass had changed while the live agent's
+        # enforcement was untouched.
+        "yolo",
     }
 )
 
@@ -14400,7 +14666,14 @@ def _format_live_history_output(session: dict) -> str:
     return "\n".join(lines)
 
 
-def _format_live_prompt_output(session: dict) -> str:
+def _format_live_system_prompt_output(session: dict) -> str:
+    """Render the session's current system prompt (the ``/systemprompt`` read).
+
+    This used to answer ``/prompt``, which the registry defines as "compose
+    your next prompt in $EDITOR" — two unrelated meanings behind one name
+    (#222). The read-only view keeps its own name; ``/prompt`` now reports
+    that composing is a classic-CLI capability.
+    """
     agent = session.get("agent")
     mirror = _metadata_mirror(session)
     if agent is None and "system_prompt" not in mirror:
@@ -14504,6 +14777,60 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
+def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
+    """Toggle the approval bypass on the LIVE session (#219).
+
+    ``/yolo`` used to fall through to the slash worker, which flipped
+    ``tools.approval._session_yolo`` inside its own subprocess — a
+    module-level set with no persistence or IPC — printed "approvals
+    bypassed", and exited. The gateway process that actually enforces
+    approvals never saw it, so the banner reported a state change that had
+    not happened. Worse in the other direction: after the zap had genuinely
+    enabled bypass via ``config.set``, ``/yolo`` reported OFF while the
+    session was still bypassing.
+
+    This mirrors the session branch of ``config.set key=yolo`` — the
+    authoritative path — so both affordances agree, and emits the same
+    ``session.info`` so the indicator repaints.
+    """
+    from tools.approval import (
+        disable_session_yolo,
+        enable_session_yolo,
+        is_session_yolo_enabled,
+    )
+
+    if session is None:
+        return "(._.) No active agent -- send a message first."
+
+    raw = (arg or "").strip().lower()
+    session_key = session.get("session_key") or ""
+    current = is_session_yolo_enabled(session_key)
+    if raw in {"1", "on", "true", "yes"}:
+        enable = True
+    elif raw in {"0", "off", "false", "no"}:
+        enable = False
+    elif raw:
+        return f"unknown /yolo argument {raw!r} (use on/off, or no argument to toggle)"
+    else:
+        enable = not current
+
+    if enable:
+        enable_session_yolo(session_key)
+    else:
+        disable_session_yolo(session_key)
+
+    agent = session.get("agent")
+    if agent is not None:
+        _emit("session.info", sid, _session_info(agent, session))
+
+    if enable:
+        return (
+            "(>_<) YOLO mode ON for this session — command approvals are bypassed. "
+            "Run /yolo off to restore them."
+        )
+    return "(^_^) YOLO mode OFF for this session — command approvals are enforced again."
+
+
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
@@ -14525,6 +14852,8 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if session is None:
             return "no active session for /compress"
         return _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())
+    if name == "yolo":
+        return _live_yolo_toggle(sid, session, arg)
     if name == "usage":
         if session is None:
             return "(._.) No active agent -- send a message first."
@@ -14533,10 +14862,19 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if session is None:
             return "No conversation history yet."
         return _format_live_history_output(session)
-    if name == "prompt":
+    if name == "systemprompt":
         if session is None:
             return "No active agent -- send a message first."
-        return _format_live_prompt_output(session)
+        return _format_live_system_prompt_output(session)
+    if name in {"prompt", "compose"}:
+        # /prompt composes the next turn in $EDITOR — it needs a terminal, so
+        # it is cli_only and must not reach the slash worker here. Say so
+        # instead of silently dumping the system prompt (#222).
+        return (
+            "/prompt opens $EDITOR to compose your next message and is only "
+            "available in the classic CLI. Use /systemprompt to see the "
+            "current system prompt."
+        )
     if name == "status":
         response = _methods["session.status"]("status", {"session_id": sid})
         if response.get("error"):
@@ -14580,7 +14918,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     # worker thread running agent.run_conversation is using.  Parity
     # with the session.compress / session.undo guards and the gateway
     # runner's running-agent /model guard.
-    _MUTATES_WHILE_RUNNING = {"model", "personality", "prompt", "compress"}
+    _MUTATES_WHILE_RUNNING = {"model", "personality", "compress"}
     if _session_uses_compute_host(session) and name in _MUTATES_WHILE_RUNNING:
         route_name = f"slash.{name}"
         try:
@@ -14606,11 +14944,6 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
             _apply_personality_to_session(sid, session, new_prompt, pname)
-        elif name == "prompt" and agent:
-            cfg = _load_cfg()
-            new_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))
-            agent.ephemeral_system_prompt = new_prompt or None
-            agent._cached_system_prompt = None
         elif name == "compress" and agent:
             # Mirror the session.compress RPC: build a before/after summary so
             # the user gets feedback (#46686). The slash path previously just
@@ -14633,7 +14966,12 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 else 0
             )
 
-            _compress_session_history(session, arg)
+            _, _, _notice = _compress_session_history(session, arg)
+            if _notice is not None:
+                # --preview/--dry-run or a rejected flag: nothing was
+                # compressed and the session was not rotated, so report and
+                # skip the sync/summary below (#218).
+                return _notice.text
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:
@@ -14677,6 +15015,46 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     return ""
 
 
+def _slash_exec_handoff(rid, params: dict, arg: str) -> dict:
+    """Answer ``/handoff`` from the non-blocking ``handoff.request`` RPC.
+
+    The CLI's ``/handoff`` marks the row pending and then poll-blocks for up to
+    60s, longer than the slash worker's own deadline — so over slash.exec the
+    worker was always killed first and the CLI's cleanup never ran. Queueing via
+    the RPC (which the desktop already uses) returns immediately; the caller
+    polls ``handoff.state`` and can release it with ``handoff.fail`` (#221).
+    """
+    platform_name = (arg.strip().split(maxsplit=1)[0] if arg.strip() else "").lower()
+    if not platform_name:
+        return _ok(
+            rid,
+            {
+                "output": (
+                    "Usage: /handoff <platform>\n"
+                    "Hands the current session off to that platform's home channel.\n"
+                    "Poll handoff.state for the result."
+                )
+            },
+        )
+    result = _methods["handoff.request"](
+        rid,
+        {"session_id": params.get("session_id", ""), "platform": platform_name},
+    )
+    if "result" not in result:
+        return result
+    home_name = (result.get("result") or {}).get("home_name") or "home channel"
+    return _ok(
+        rid,
+        {
+            "output": (
+                f"Queued handoff → {platform_name} (home: {home_name}).\n"
+                "The gateway will transfer the session shortly; "
+                "poll handoff.state for the result."
+            )
+        },
+    )
+
+
 @method("slash.exec")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
@@ -14702,6 +15080,10 @@ def _(rid, params: dict) -> dict:
     )
     if live_output is not None:
         return _ok(rid, {"output": live_output or "(no output)"})
+
+    if _cmd_base in _RPC_ROUTED_COMMANDS:
+        # Never let the worker drive this one — see _RPC_ROUTED_COMMANDS.
+        return _slash_exec_handoff(rid, params, _cmd_arg)
 
     if _cmd_base in _PENDING_INPUT_COMMANDS:
         # Route directly to command.dispatch instead of returning an error
