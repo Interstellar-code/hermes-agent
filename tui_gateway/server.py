@@ -4653,7 +4653,17 @@ def _available_personalities(cfg: dict | None = None) -> dict:
 
 
 def _validate_personality(value: str, cfg: dict | None = None) -> tuple[str, str]:
-    raw = str(value or "").strip()
+    # Callers pass raw slash-command arguments (_mirror_slash_side_effects
+    # forwards the text after "/personality" verbatim), so strip the scope
+    # flags before matching. /personality gained --global/--session with #223;
+    # without this, "/personality helpful --global" over slash.exec fails with
+    # "Unknown personality: helpful --global" and the session-scoped mirror
+    # silently never applies.
+    raw = " ".join(
+        token
+        for token in str(value or "").split()
+        if token not in ("--global", "--session")
+    ).strip()
     name = raw.lower()
     if not name or name in {"none", "default", "neutral"}:
         return "", ""
@@ -12043,7 +12053,14 @@ def _(rid, params: dict) -> dict:
                 sid_key = params.get("session_id", "")
                 pname, new_prompt = _validate_personality(str(value or ""), cfg)
                 _write_config_key("display.personality", pname)
-                _write_config_key("agent.system_prompt", new_prompt)
+                # Store the personality NAME, never the preset text (#223).
+                # This used to write the resolved prompt into
+                # agent.system_prompt — the one global key holding a user's
+                # hand-written system prompt — silently destroying it with no
+                # backup, for every future CLI session, gateway run and cron
+                # job. The CLI resolves agent.personality into an overlay and
+                # leaves agent.system_prompt alone; this path now matches.
+                _write_config_key("agent.personality", pname)
                 nv = str(value or "none")
                 history_reset, info = _apply_personality_to_session(
                     sid_key, session, new_prompt, pname

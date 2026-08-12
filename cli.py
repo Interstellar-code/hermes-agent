@@ -363,6 +363,11 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
         return []
 
 
+# Words that mean "no personality overlay" wherever a personality name is
+# accepted (/personality <word>, agent.personality in config.yaml).
+_PERSONALITY_CLEAR_WORDS = frozenset({"none", "default", "neutral", "off", ""})
+
+
 def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
     """Resolve the prefill file path from env/config.
 
@@ -473,6 +478,9 @@ def load_cli_config() -> Dict[str, Any]:
             "max_turns": 90,  # Default max tool-calling iterations (shared with subagents)
             "verbose": False,
             "system_prompt": "",
+            # Personality NAME (a key of agent.personalities below), resolved to
+            # a prompt overlay at runtime. Never holds preset text — see #223.
+            "personality": "",
             "prefill_messages_file": "",
             "reasoning_effort": "",
             "service_tier": "",
@@ -3976,12 +3984,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
-        # Ephemeral system prompt: env var takes precedence, then config
-        self.system_prompt = (
+        # Ephemeral system prompt: env var takes precedence, then config.
+        # base_system_prompt holds the user's OWN hand-written prompt. It is
+        # kept separate from self.system_prompt (the effective prompt handed to
+        # the agent) so /personality can never clobber it — see #223.
+        self.base_system_prompt = (
             os.getenv("HERMES_EPHEMERAL_SYSTEM_PROMPT", "")
             or CLI_CONFIG["agent"].get("system_prompt", "")
         )
         self.personalities = CLI_CONFIG["agent"].get("personalities", {})
+        # Personalities are stored by NAME under agent.personality and resolved
+        # to a prompt overlay here; the preset text is never written into
+        # agent.system_prompt.
+        self.personality = str(CLI_CONFIG["agent"].get("personality", "") or "").strip().lower()
+        # True once /personality was typed in THIS session (see the precedence
+        # note in _compose_system_prompt).
+        self._personality_session_override = False
+        self.system_prompt = self._compose_system_prompt()
         
         # Ephemeral prefill messages (few-shot priming, never persisted)
         self.prefill_messages = _load_prefill_messages(
@@ -8664,6 +8683,37 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(f'Style: {value["style"]}' )
             return "\n".join(p for p in parts if p)
         return str(value)
+
+    def _compose_system_prompt(self) -> str:
+        """Resolve the effective ephemeral system prompt from base + personality.
+
+        This is the single place where ``agent.personality`` (a NAME) is turned
+        into prompt text, so the personality preset only ever lives in memory —
+        ``agent.system_prompt`` in config.yaml stays exactly as the user wrote
+        it (#223).
+
+        Precedence when both are set:
+
+        * A hand-written ``agent.system_prompt`` beats a stored
+          ``agent.personality``. The prompt the user typed out themselves is the
+          more specific, more expensive-to-recreate instruction; a personality
+          is a canned preset. Silently shadowing the hand-written prompt is what
+          made #223 destructive, so config-vs-config resolves in its favour.
+        * EXCEPT when /personality was run in this session: an explicit live
+          command is newer and more deliberate than a config file, so it wins
+          for the session. (/personality --global warns when a hand-written
+          prompt would shadow it in future sessions.)
+        """
+        base = (getattr(self, "base_system_prompt", "") or "").strip()
+        name = (getattr(self, "personality", "") or "").strip().lower()
+        overlay = ""
+        if name and name not in _PERSONALITY_CLEAR_WORDS:
+            value = (getattr(self, "personalities", None) or {}).get(name)
+            if value is not None:
+                overlay = self._resolve_personality_prompt(value).strip()
+        if overlay and (not base or getattr(self, "_personality_session_override", False)):
+            return overlay
+        return base
 
 
     

@@ -1025,29 +1025,66 @@ class CLICommandsMixin:
         _cprint(f"  Branch session:   {new_session_id}")
 
     def _handle_personality_command(self, cmd: str):
-        """Handle the /personality command to set predefined personalities."""
-        from cli import save_config_value
+        """Handle the /personality command to set predefined personalities.
+
+        Session-scoped by default; ``--global`` persists the personality NAME to
+        ``agent.personality`` in config.yaml (parity with /reasoning and /fast).
+
+        The preset text is NEVER written to ``agent.system_prompt`` — that key
+        holds the user's own hand-written prompt and used to be silently
+        overwritten by this command, with no backup and no undo (#223). The name
+        is resolved to a prompt overlay by ``HermesCLI._compose_system_prompt``.
+        """
+        from cli import _PERSONALITY_CLEAR_WORDS, save_config_value
         parts = cmd.split(maxsplit=1)
-        
+
         if len(parts) > 1:
-            # Set personality
-            personality_name = parts[1].strip().lower()
-            
-            if personality_name in {"none", "default", "neutral"}:
-                self.system_prompt = ""
+            arg_tokens = parts[1].strip().lower().split()
+            explicit_global = "--global" in arg_tokens
+            # --session is accepted as an explicit no-op (it is the default),
+            # matching /reasoning and /model.
+            personality_name = " ".join(
+                token for token in arg_tokens
+                if token not in ("--global", "--session")
+            ).strip()
+        else:
+            explicit_global = False
+            personality_name = ""
+
+        if personality_name:
+            if personality_name in _PERSONALITY_CLEAR_WORDS:
+                self.personality = ""
+                self._personality_session_override = False
+                # Falls back to the user's own agent.system_prompt, if any.
+                self.system_prompt = self._compose_system_prompt()
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", ""):
+                if explicit_global and save_config_value("agent.personality", ""):
                     print("(^_^)b Personality cleared (saved to config)")
+                elif explicit_global:
+                    print("(^_^) Personality cleared (this session; config save failed)")
                 else:
-                    print("(^_^) Personality cleared (session only)")
-                print("  No personality overlay — using base agent behavior.")
+                    print("(^_^) Personality cleared (this session — use --global to persist)")
+                if self.system_prompt:
+                    print("  No personality overlay — using your agent.system_prompt.")
+                else:
+                    print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
-                self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
+                self.personality = personality_name
+                # An explicit live command outranks a config-file prompt for
+                # this session — see _compose_system_prompt for the full rule.
+                self._personality_session_override = True
+                self.system_prompt = self._compose_system_prompt()
                 self.agent = None  # Force re-init
-                if save_config_value("agent.system_prompt", self.system_prompt):
+                if explicit_global and save_config_value("agent.personality", personality_name):
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
+                    if (getattr(self, "base_system_prompt", "") or "").strip():
+                        print("  Note: agent.system_prompt is set in your config and takes")
+                        print("  precedence, so future sessions will keep using it. Clear it")
+                        print("  (or edit config.yaml) for this personality to apply globally.")
+                elif explicit_global:
+                    print(f"(^_^) Personality set to '{personality_name}' (this session; config save failed)")
                 else:
-                    print(f"(^_^) Personality set to '{personality_name}' (session only)")
+                    print(f"(^_^) Personality set to '{personality_name}' (this session — use --global to persist)")
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
@@ -1065,9 +1102,11 @@ class CLICommandsMixin:
                     preview = prompt.get("description") or prompt.get("system_prompt", "")[:50]
                 else:
                     preview = str(prompt)[:50]
-                print(f"  {name:<12} - {preview}")
+                marker = " *" if name == (getattr(self, "personality", "") or "") else ""
+                print(f"  {name:<12} - {preview}{marker}")
             print()
-            print("  Usage: /personality <name>")
+            print("  Usage: /personality <name> [--global]")
+            print("  Session-scoped by default; --global persists agent.personality.")
             print()
 
     def _handle_pet_command(self, cmd: str):

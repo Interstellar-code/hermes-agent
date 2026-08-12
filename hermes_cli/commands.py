@@ -137,8 +137,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
 
-    CommandDef("personality", "Set a predefined personality", "Configuration",
-               args_hint="[name]"),
+    CommandDef("personality", "Set a predefined personality (this session; --global to persist)",
+               "Configuration", args_hint="[name] [--global]",
+               subcommands=("none", "--global")),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("timestamps", "Toggle [HH:MM] timestamps on messages and /history", "Configuration",
@@ -1924,6 +1925,13 @@ class SlashCommandCompleter(Completer):
                     start_position=-len(sub_text),
                     display="none",
                     display_meta="clear personality overlay",
+                )
+            if "--global".startswith(sub_lower) and "--global" != sub_lower:
+                yield Completion(
+                    "--global",
+                    start_position=-len(sub_text),
+                    display="--global",
+                    display_meta="persist to config (default: this session)",
                 )
             for name, prompt in personalities.items():
                 if name.startswith(sub_lower) and name != sub_lower:
