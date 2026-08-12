@@ -11723,3 +11723,43 @@ def test_get_usage_clamps_post_compression_sentinel():
     usage = server._get_usage(agent)
     assert "context_used" not in usage
     assert "context_percent" not in usage
+
+
+def test_systemprompt_falls_back_to_configured_when_no_turn_ran(monkeypatch):
+    """/systemprompt must not be structurally empty for other transports (#219 follow-up).
+
+    Its three live sources — _metadata_mirror, agent.ephemeral_system_prompt,
+    agent._cached_system_prompt — are all objects owned by THIS process. A
+    client whose turns run elsewhere (api_server, in the gateway process) has
+    a session object here that never ran a turn, so none of them is ever
+    populated and the read returned nothing useful. The configured prompt is
+    config-derived and resolves identically in any process.
+    """
+    session = {"agent": types.SimpleNamespace(ephemeral_system_prompt=None, _cached_system_prompt=None)}
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"system_prompt": "CONFIGURED PROMPT"}})
+    out = server._format_live_system_prompt_output(session)
+    assert "CONFIGURED PROMPT" in out
+    # Labelled as configured, not live: a per-request system_message on the
+    # serving transport can override it and this process cannot see that.
+    assert "Configured system prompt" in out
+
+    # /personality stores a NAME (#223), so the overlay must resolve too.
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"agent": {"personality": "concise", "personalities": {"concise": "Be brief."}}},
+    )
+    assert "Be brief." in server._format_live_system_prompt_output(session)
+
+    # Nothing configured and nothing built — say so rather than showing blank.
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    assert "No system prompt is configured" in server._format_live_system_prompt_output(session)
+
+
+def test_systemprompt_still_prefers_a_live_prompt(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"system_prompt": "CONFIGURED"}})
+    session = {"agent": types.SimpleNamespace(ephemeral_system_prompt="LIVE", _cached_system_prompt=None)}
+    out = server._format_live_system_prompt_output(session)
+    assert "LIVE" in out and "CONFIGURED" not in out
+    assert out.startswith("Current system prompt:")
