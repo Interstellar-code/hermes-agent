@@ -2627,28 +2627,51 @@ class CLICommandsMixin:
                 if token not in ("--global", "--session")
             )
 
-        # Display toggle
+        # Display toggle. show/hide are genuinely session-scoped —
+        # self.show_reasoning above IS the session state, and the effort
+        # branch below already gates its write on --global. These branches
+        # persisted unconditionally, so `/reasoning show` silently rewrote
+        # config.yaml for every future CLI session, the messaging gateway and
+        # cron, contradicting the usage line's "session-scoped by default,
+        # --global to persist" (#225).
         if arg in {"show", "on"}:
             self.show_reasoning = True
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
+            if explicit_global and save_config_value("display.show_reasoning", True):
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (saved){_RST}")
+            elif explicit_global:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (config save failed){_RST}")
+            else:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: ON (this session){_RST}")
+                _cprint(f"  {_DIM}  Use --global to persist.{_RST}")
             _cprint(f"  {_DIM}  Model thinking will be shown during and after each response.{_RST}")
             return
         if arg in {"hide", "off"}:
             self.show_reasoning = False
             if self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            save_config_value("display.show_reasoning", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}")
+            if explicit_global and save_config_value("display.show_reasoning", False):
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}")
+            elif explicit_global:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (config save failed){_RST}")
+            else:
+                _cprint(f"  {_ACCENT}✓ Reasoning display: OFF (this session){_RST}")
+                _cprint(f"  {_DIM}  Use --global to persist.{_RST}")
             return
 
-        # Full / clamped recap toggle
+        # Full / clamped recap toggle.
+        #
+        # These stay GLOBAL deliberately, unlike show/hide above. There is no
+        # session-scoped store for them on either surface, and the gateway
+        # keeps display.reasoning_full consistent across the CLI and TUI on
+        # purpose. Rather than invent a session store for a rarely-toggled
+        # display preference, say plainly that the write is global so the
+        # announcement matches what actually happened (#225).
         if arg in {"full", "all"}:
             self.reasoning_full = True
             save_config_value("display.reasoning_full", True)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL (saved){_RST}")
+            _cprint(f"  {_ACCENT}✓ Reasoning display: FULL (saved globally){_RST}")
             _cprint(f"  {_DIM}  The post-response recap box will print complete thinking.{_RST}")
             if not self.show_reasoning:
                 _cprint(f"  {_DIM}  Note: reasoning display is OFF — run /reasoning show to see it.{_RST}")
@@ -2656,7 +2679,7 @@ class CLICommandsMixin:
         if arg in {"clamp", "collapse", "short"}:
             self.reasoning_full = False
             save_config_value("display.reasoning_full", False)
-            _cprint(f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved){_RST}")
+            _cprint(f"  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved globally){_RST}")
             return
 
         # Effort level change

@@ -4808,6 +4808,54 @@ def test_complete_slash_reasoning_includes_current_efforts_and_global_scope():
     assert {"max", "ultra", "--global"} <= values
 
 
+def test_slash_yolo_toggles_the_live_session_not_the_worker(monkeypatch):
+    """/yolo must change the gateway's own approval state (#219).
+
+    It used to fall through to the slash worker, which flipped
+    ``tools.approval._session_yolo`` inside its own subprocess — a
+    module-level set with no persistence or IPC — printed "approvals
+    bypassed", and exited. The gateway that actually enforces approvals never
+    saw it, so the banner reported a state change that had not happened.
+    """
+    from tools.approval import (
+        disable_session_yolo,
+        is_session_yolo_enabled,
+    )
+
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    session = _session(agent=types.SimpleNamespace())
+    session["session_key"] = "yolo-key"
+    disable_session_yolo("yolo-key")
+    try:
+        assert "yolo" in server._LIVE_SESSION_DIRECT_COMMANDS
+
+        out_on = server._live_slash_command_output("sid", session, "yolo", "")
+        assert is_session_yolo_enabled("yolo-key") is True
+        assert "ON" in out_on
+
+        out_off = server._live_slash_command_output("sid", session, "yolo", "")
+        assert is_session_yolo_enabled("yolo-key") is False
+        assert "OFF" in out_off
+
+        server._live_slash_command_output("sid", session, "yolo", "on")
+        assert is_session_yolo_enabled("yolo-key") is True
+        server._live_slash_command_output("sid", session, "yolo", "off")
+        assert is_session_yolo_enabled("yolo-key") is False
+
+        # A bad argument must not silently toggle.
+        bad = server._live_slash_command_output("sid", session, "yolo", "bogus")
+        assert "unknown" in bad.lower()
+        assert is_session_yolo_enabled("yolo-key") is False
+    finally:
+        disable_session_yolo("yolo-key")
+
+
+def test_slash_yolo_without_session_reports_no_agent(monkeypatch):
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    out = server._live_slash_command_output("sid", None, "yolo", "")
+    assert "No active agent" in out
+
+
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
@@ -4864,7 +4912,15 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_show["result"]["value"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
+    # Session-scoped: the live session flips, config.yaml is NOT rewritten
+    # (#225). This used to persist unconditionally, so a scope="session"
+    # request silently changed the default for every future CLI session, the
+    # messaging gateway and cron — while the effort branch three assertions
+    # above already honoured the scope. The TUI keeps its own
+    # sections.thinking in client UI state (patchUiState), so nothing
+    # server-side reads the persisted value back for rendering.
+    assert resp_show["result"]["scope"] == "session"
+    assert "display" not in server._load_cfg()
 
     resp_hide = server.handle_request(
         {
@@ -4875,7 +4931,25 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_hide["result"]["value"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
+    assert resp_hide["result"]["scope"] == "session"
+    assert "display" not in server._load_cfg()
+
+    # scope="global" is what persists.
+    resp_show_global = server.handle_request(
+        {
+            "id": "3b",
+            "method": "config.set",
+            "params": {
+                "session_id": "sid",
+                "key": "reasoning",
+                "value": "show",
+                "scope": "global",
+            },
+        }
+    )
+    assert resp_show_global["result"]["scope"] == "global"
+    assert server._load_cfg()["display"]["show_reasoning"] is True
+    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
 
     # /reasoning full | clamp — parity with the classic CLI reasoning_full
     # toggle. In the TUI these map to the thinking section's expand/collapse

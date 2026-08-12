@@ -11826,10 +11826,20 @@ def _(rid, params: dict) -> dict:
                 sections["thinking"] = "expanded"
                 display["sections"] = sections
                 cfg["display"] = display
-                _save_cfg(cfg)
+                # Honour the requested scope (#225). This used to persist
+                # unconditionally, so scope="session" silently rewrote
+                # config.yaml for every future CLI session, the messaging
+                # gateway and cron — with no "(saved)" disclosure on this
+                # surface at all. The session write below is the whole effect
+                # a session-scoped request asked for.
+                if global_scope or session is None:
+                    _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = True
-                return _ok(rid, {"key": key, "value": "show"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "show", "scope": "global" if global_scope else "session"},
+                )
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
                 display = (
@@ -11844,10 +11854,15 @@ def _(rid, params: dict) -> dict:
                 sections["thinking"] = "hidden"
                 display["sections"] = sections
                 cfg["display"] = display
-                _save_cfg(cfg)
+                # Session-scoped by default — see the show branch above (#225).
+                if global_scope or session is None:
+                    _save_cfg(cfg)
                 if session:
                     session["show_reasoning"] = False
-                return _ok(rid, {"key": key, "value": "hide"})
+                return _ok(
+                    rid,
+                    {"key": key, "value": "hide", "scope": "global" if global_scope else "session"},
+                )
 
             # /reasoning full | clamp — parity with the classic CLI's
             # reasoning_full toggle. The TUI renders thinking as an
@@ -14559,6 +14574,12 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "status",
         "systemprompt",
         "usage",
+        # /yolo must be answered here, not by the slash worker (#219). The
+        # worker would toggle tools.approval._session_yolo in ITS OWN process
+        # — a module-level set with no persistence — then exit, so the banner
+        # said the approval bypass had changed while the live agent's
+        # enforcement was untouched.
+        "yolo",
     }
 )
 
@@ -14745,6 +14766,60 @@ def _format_live_model_output(session: dict) -> str:
     return "Current model: (unknown)"
 
 
+def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
+    """Toggle the approval bypass on the LIVE session (#219).
+
+    ``/yolo`` used to fall through to the slash worker, which flipped
+    ``tools.approval._session_yolo`` inside its own subprocess — a
+    module-level set with no persistence or IPC — printed "approvals
+    bypassed", and exited. The gateway process that actually enforces
+    approvals never saw it, so the banner reported a state change that had
+    not happened. Worse in the other direction: after the zap had genuinely
+    enabled bypass via ``config.set``, ``/yolo`` reported OFF while the
+    session was still bypassing.
+
+    This mirrors the session branch of ``config.set key=yolo`` — the
+    authoritative path — so both affordances agree, and emits the same
+    ``session.info`` so the indicator repaints.
+    """
+    from tools.approval import (
+        disable_session_yolo,
+        enable_session_yolo,
+        is_session_yolo_enabled,
+    )
+
+    if session is None:
+        return "(._.) No active agent -- send a message first."
+
+    raw = (arg or "").strip().lower()
+    session_key = session.get("session_key") or ""
+    current = is_session_yolo_enabled(session_key)
+    if raw in {"1", "on", "true", "yes"}:
+        enable = True
+    elif raw in {"0", "off", "false", "no"}:
+        enable = False
+    elif raw:
+        return f"unknown /yolo argument {raw!r} (use on/off, or no argument to toggle)"
+    else:
+        enable = not current
+
+    if enable:
+        enable_session_yolo(session_key)
+    else:
+        disable_session_yolo(session_key)
+
+    agent = session.get("agent")
+    if agent is not None:
+        _emit("session.info", sid, _session_info(agent, session))
+
+    if enable:
+        return (
+            "(>_<) YOLO mode ON for this session — command approvals are bypassed. "
+            "Run /yolo off to restore them."
+        )
+    return "(^_^) YOLO mode OFF for this session — command approvals are enforced again."
+
+
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
     name = (name or "").lstrip("/").lower()
     arg = arg or ""
@@ -14766,6 +14841,8 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if session is None:
             return "no active session for /compress"
         return _mirror_slash_side_effects(sid, session, f"/compress {arg}".strip())
+    if name == "yolo":
+        return _live_yolo_toggle(sid, session, arg)
     if name == "usage":
         if session is None:
             return "(._.) No active agent -- send a message first."
