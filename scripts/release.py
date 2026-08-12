@@ -38,6 +38,8 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # ACP Registry manifest must stay version-locked with pyproject.toml.
 # tests/acp/test_registry_manifest.py enforces this lockstep so the release
 # bump touches both files atomically.
+# Read by tests and kept for reference; the release tool no longer writes it.
+# See the note in update_version_files() for why the manifest is not bumped.
 ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # uv.lock embeds hermes-agent's own version as a package entry (source =
@@ -2220,9 +2222,19 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
-    # Update ACP Registry manifest + npm launcher (must stay version-locked
-    # with pyproject — enforced by tests/acp/test_registry_manifest.py).
-    _update_acp_registry_versions(semver)
+    # The ACP Registry manifest is deliberately NOT bumped here.
+    #
+    # Its uvx spec pins an exact PyPI version (`hermes-agent[acp]==X`), and
+    # this fork does not publish to PyPI — the `hermes-agent` project there
+    # belongs to upstream Nous Research, so a trusted-publishing exchange from
+    # this repo fails with `invalid-publisher` and always will. Bumping the
+    # manifest in lockstep therefore minted a pin to a version that would
+    # never exist on the index, breaking `uvx hermes-agent[acp]==X` for
+    # anyone who resolved the manifest. v0.19.10 and v0.19.11 both shipped
+    # such a pin.
+    #
+    # The manifest now describes upstream's published release and is left
+    # alone by the release tool. See tests/acp/test_registry_manifest.py.
 
     # Regenerate uv.lock so its embedded hermes-agent version entry matches
     # the version we just wrote above. Never skip this — see the function's
@@ -2314,35 +2326,18 @@ def regenerate_uv_lock(semver: str) -> None:
         )
 
 
-def _update_acp_registry_versions(semver: str) -> None:
-    """Bump the ACP Registry manifest's version + uvx package pin in lockstep
-    with pyproject.
-
-    Skips silently if the manifest is missing — older release branches predate
-    the ACP Registry assets.
-    """
-    if ACP_REGISTRY_MANIFEST.exists():
-        manifest = json.loads(ACP_REGISTRY_MANIFEST.read_text(encoding="utf-8"))
-        manifest["version"] = semver
-        uvx = manifest.get("distribution", {}).get("uvx", {})
-        if "package" in uvx:
-            uvx["package"] = f"hermes-agent[acp]=={semver}"
-        # Preserve trailing newline + 2-space indent the file already uses.
-        ACP_REGISTRY_MANIFEST.write_text(
-            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-        )
-
-
 def build_release_artifacts(semver: str) -> list[Path]:
     """Build sdist/wheel artifacts for the current release.
 
-    Tries ``uv build`` first (matching the CI workflow), falls back to
+    Tries ``uv build`` first, falls back to
     ``python -m build`` if uv is unavailable.
     """
     dist_dir = REPO_ROOT / "dist"
     shutil.rmtree(dist_dir, ignore_errors=True)
 
-    # Prefer uv build (matches CI workflow), fall back to python -m build.
+    # Prefer uv build, fall back to python -m build. These artifacts are
+    # attached to the GitHub Release — that is now the only distribution
+    # channel for this fork (no PyPI publish; see update_version_files).
     uv_bin = _find_uv_bin()
     if uv_bin:
         cmd = [uv_bin, "build", "--sdist", "--wheel"]
@@ -2748,10 +2743,9 @@ def main():
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
             print(f"  ✓ Regenerated uv.lock for v{new_version}")
 
-            # Commit version bump
+            # Commit version bump. The ACP Registry manifest is intentionally
+            # absent — update_version_files() no longer touches it.
             add_files = [str(VERSION_FILE), str(PYPROJECT_FILE), str(UV_LOCK_FILE)]
-            if ACP_REGISTRY_MANIFEST.exists():
-                add_files.append(str(ACP_REGISTRY_MANIFEST))
             if desktop_package_json().exists():
                 add_files.append(str(desktop_package_json()))
             add_result = git_result("add", *add_files)

@@ -1,11 +1,15 @@
-"""Tests for the ACP Registry version-lockstep bump in scripts/release.py.
+"""Tests that scripts/release.py leaves the ACP Registry manifest alone.
 
-The official ACP Registry manifest must match ``pyproject.toml`` exactly —
-``tests/acp/test_registry_manifest.py`` enforces this at lint time, and the
-upstream registry CI rejects ``@latest`` / floating pins. The release script
-is the single place that bumps the manifest in lockstep with pyproject; if
-that bump ever silently breaks, weekly releases fail the manifest test
-until someone hand-edits the JSON.
+The release script used to bump ``acp_registry/agent.json`` in lockstep with
+``pyproject.toml``. That was only correct while this repo could publish
+``hermes-agent`` to PyPI — it cannot. The PyPI project belongs to upstream
+Nous Research, so trusted publishing from this fork fails with
+``invalid-publisher``, and the publish workflow has been removed.
+
+Because the manifest's uvx spec is an exact ``==`` pin against PyPI, lockstep
+bumping minted pins to versions that never reached the index (0.19.10,
+0.19.11), which breaks ``uvx`` for anyone resolving the manifest. These tests
+pin the new contract: the release tool must not touch the manifest.
 """
 
 from __future__ import annotations
@@ -56,36 +60,22 @@ def _write_manifest(root: Path, version: str) -> None:
     )
 
 
-def test_update_acp_registry_versions_bumps_manifest_and_pin(monkeypatch, tmp_path):
-    _write_manifest(tmp_path, "0.13.0")
+def test_release_module_has_no_acp_manifest_writer(monkeypatch, tmp_path):
+    """The lockstep bump helper is gone and must not come back.
+
+    ``_update_acp_registry_versions`` was the only writer of the manifest.
+    Reintroducing it would resume minting PyPI pins this fork cannot publish.
+    """
     module = _load_release_module(monkeypatch, tmp_path)
 
-    module._update_acp_registry_versions("0.14.0")
-
-    manifest = json.loads(
-        (tmp_path / "acp_registry" / "agent.json").read_text(encoding="utf-8")
-    )
-    assert manifest["version"] == "0.14.0"
-    assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.14.0"
-    # args stay untouched so we don't accidentally rewrite them.
-    assert manifest["distribution"]["uvx"]["args"] == ["hermes-acp"]
+    assert not hasattr(module, "_update_acp_registry_versions")
 
 
-def test_update_acp_registry_versions_is_silent_when_manifest_missing(
+def test_update_version_files_leaves_manifest_untouched(
     monkeypatch, tmp_path
 ):
-    """Older release branches predate the ACP Registry asset — must no-op."""
-    module = _load_release_module(monkeypatch, tmp_path)
-
-    # No fixture written; function should not raise.
-    module._update_acp_registry_versions("0.14.0")
-
-
-def test_update_version_files_bumps_manifest_alongside_pyproject(
-    monkeypatch, tmp_path
-):
-    """End-to-end: update_version_files() is the function release.py actually
-    calls, so it must drive the manifest bump too."""
+    """End-to-end: update_version_files() is what release.py actually calls,
+    so it is where the manifest must be left alone."""
     _write_manifest(tmp_path, "0.13.0")
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "hermes-agent"\nversion = "0.13.0"\n', encoding="utf-8"
@@ -101,19 +91,24 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
     monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
     # uv.lock regeneration is covered on its own in test_release_uv_lock.py;
-    # stub it out here so this test stays focused on the manifest bump.
+    # stub it out here so this test stays focused on the manifest.
     monkeypatch.setattr(module, "regenerate_uv_lock", lambda semver: None)
+
+    manifest_path = tmp_path / "acp_registry" / "agent.json"
+    before = manifest_path.read_text(encoding="utf-8")
 
     module.update_version_files("0.14.0", "2026-05-21")
 
+    # The rest of the version bump still happens...
     pyproject_text = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
     assert 'version = "0.14.0"' in pyproject_text
 
-    manifest = json.loads(
-        (tmp_path / "acp_registry" / "agent.json").read_text(encoding="utf-8")
-    )
-    assert manifest["version"] == "0.14.0"
-    assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.14.0"
+    # ...but the manifest is byte-for-byte unchanged, still pinned to the
+    # version that is actually published on PyPI.
+    assert manifest_path.read_text(encoding="utf-8") == before
+    manifest = json.loads(before)
+    assert manifest["version"] == "0.13.0"
+    assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.13.0"
 
 
 def test_update_version_files_bumps_desktop_package_json_inside_repo_root(
