@@ -5558,7 +5558,7 @@ def test_session_compress_uses_compress_helper(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (2, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
 
@@ -5594,7 +5594,7 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (0, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (0, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
 
@@ -5636,7 +5636,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_compress_session_history",
-        lambda session, focus_topic=None, **_kw: (2, {"total": 42}),
+        lambda session, focus_topic=None, **_kw: (2, {"total": 42}, None),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
     restart_calls = []
@@ -5659,6 +5659,254 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         assert len(restart_calls) == 1
     finally:
         server._sessions.pop("sid", None)
+
+
+# ── /compress flag parsing (issue #218) ──────────────────────────────
+#
+# The gateway used to hand the whole argument string to the summariser as
+# a focus topic, so `/compress --preview` ran a REAL, irreversible
+# compression (history replaced + SessionDB session rotated) on a command
+# documented as making no changes.
+
+
+class _NoCompressAgent:
+    """Agent whose compression path is a test failure if reached."""
+
+    def __init__(self):
+        self.model = "test-model"
+        self.session_id = "session-key"
+        self._cached_system_prompt = ""
+        self.tools = None
+        self.context_compressor = None
+
+    def _compress_context(self, *args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError(
+            "_compress_context must not run for preview/rejected /compress args"
+        )
+
+
+def _compress_history(n=6):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"}
+        for i in range(n)
+    ]
+
+
+def test_compress_session_history_preview_makes_no_changes():
+    for flag in ("--preview", "--dry-run", "--dryrun", "--PREVIEW"):
+        history = _compress_history()
+        session = _session(agent=_NoCompressAgent(), history=list(history))
+
+        removed, _usage, notice = server._compress_session_history(session, flag)
+
+        assert removed == 0, flag
+        assert notice is not None, flag
+        assert notice.kind == "preview", flag
+        assert "no changes" in notice.text.lower(), flag
+        assert "Would compress 6 of 6" in notice.text, flag
+        # Nothing mutated: same messages, same version (no rotation either,
+        # since _compress_context was never reached).
+        assert session["history"] == history, flag
+        assert session["history_version"] == 0, flag
+
+
+def test_compress_session_history_preview_keeps_focus_topic():
+    session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+    _removed, _usage, notice = server._compress_session_history(
+        session, "--preview auth flow"
+    )
+
+    assert notice.kind == "preview"
+    assert 'Focus topic: "auth flow"' in notice.text
+
+
+def test_compress_session_history_preview_on_short_history():
+    history = _compress_history(2)
+    session = _session(agent=_NoCompressAgent(), history=list(history))
+
+    removed, _usage, notice = server._compress_session_history(session, "--preview")
+
+    assert removed == 0
+    assert notice.kind == "preview"
+    assert "at least 4 messages" in notice.text
+    assert session["history"] == history
+
+
+def test_compress_session_history_rejects_dash_prefixed_topic():
+    cases = [
+        ("--wat", "--wat"),
+        ("-x", "-x"),
+        ("--preview-typo", "--preview-typo"),
+    ]
+    for arg, needle in cases:
+        session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+        removed, _usage, notice = server._compress_session_history(session, arg)
+
+        assert removed == 0, arg
+        assert notice is not None and notice.kind == "error", arg
+        assert needle in notice.text, arg
+        # The rejection names the flags that DO work so a future flag
+        # cannot silently become a focus topic again.
+        assert "--preview" in notice.text, arg
+        assert session["history_version"] == 0, arg
+
+
+def test_compress_session_history_rejects_unsupported_modes():
+    for arg in ("--aggressive", "here 3", "here", "up to here", "--keep 4"):
+        session = _session(agent=_NoCompressAgent(), history=_compress_history())
+
+        removed, _usage, notice = server._compress_session_history(session, arg)
+
+        assert removed == 0, arg
+        assert notice is not None and notice.kind == "error", arg
+        assert "not supported" in notice.text, arg
+        assert session["history_version"] == 0, arg
+
+
+def test_compress_session_history_normal_focus_topic_still_compresses():
+    seen = {}
+
+    class _Agent(_NoCompressAgent):
+        def _compress_context(self, history, system_message, **kwargs):
+            seen["focus"] = kwargs.get("focus_topic")
+            seen["count"] = len(history)
+            return [{"role": "user", "content": "summary"}], None
+
+    session = _session(agent=_Agent(), history=_compress_history())
+
+    removed, _usage, notice = server._compress_session_history(session, "auth flow")
+
+    assert notice is None
+    assert seen == {"focus": "auth flow", "count": 6}
+    assert removed == 5
+    assert session["history"] == [{"role": "user", "content": "summary"}]
+    assert session["history_version"] == 1
+
+
+def test_session_compress_rpc_preview_does_not_compress(monkeypatch):
+    history = _compress_history()
+    server._sessions["sid"] = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.compress",
+                    "params": {"session_id": "sid", "focus_topic": "--preview"},
+                }
+            )
+
+        result = resp["result"]
+        assert result["status"] == "preview"
+        assert result["preview"] is True
+        assert result["removed"] == 0
+        assert "no changes" in result["output"].lower()
+        # noop=True keeps the TUI from printing a "✓ compressed" line, and
+        # omitting "messages" keeps the client transcript untouched.
+        assert result["summary"]["noop"] is True
+        assert "messages" not in result
+        assert server._sessions["sid"]["history"] == history
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_compress_rpc_rejects_unknown_flag(monkeypatch):
+    server._sessions["sid"] = _session(
+        agent=_NoCompressAgent(), history=_compress_history()
+    )
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.compress",
+                    "params": {"session_id": "sid", "focus_topic": "--bogus"},
+                }
+            )
+
+        assert resp["error"]["code"] == 4004
+        assert "--bogus" in resp["error"]["message"]
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_command_dispatch_compress_dry_run_does_not_compress(monkeypatch):
+    history = _compress_history()
+    server._sessions["sid"] = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(server, "_session_info", lambda *a: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+
+    try:
+        with patch("tui_gateway.server._emit"):
+            resp = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "command.dispatch",
+                    "params": {
+                        "session_id": "sid",
+                        "name": "compress",
+                        "arg": "--dry-run",
+                    },
+                }
+            )
+
+        assert "error" not in resp, resp
+        assert "no changes" in resp["result"]["output"].lower()
+        assert server._sessions["sid"]["history"] == history
+        assert server._sessions["sid"]["history_version"] == 0
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_mirror_slash_compress_preview_does_not_compress(monkeypatch):
+    """slash.exec routes /compress through _mirror_slash_side_effects."""
+    history = _compress_history()
+    session = _session(agent=_NoCompressAgent(), history=list(history))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *a, **k: False)
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preview must not rotate the session")
+        ),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *a: {"model": "x"})
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    out = server._live_slash_command_output("sid", session, "compress", "--preview")
+
+    assert "no changes" in out.lower()
+    assert "Would compress 6 of 6" in out
+    assert session["history"] == history
+    assert session["history_version"] == 0
+
+    # A rejected flag reports instead of compressing, too.
+    rejected = server._live_slash_command_output("sid", session, "compress", "--nope")
+    assert "--nope" in rejected
+    assert session["history"] == history
 
 
 def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
@@ -7165,7 +7413,7 @@ def test_mirror_slash_side_effects_rejects_mutating_commands_while_running(monke
 
     def _fake_compress(session, focus):
         applied["compress"] = True
-        return (0, {})
+        return (0, {}, None)
 
     monkeypatch.setattr(server, "_apply_model_switch", _fake_apply_model)
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)
@@ -7226,7 +7474,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
         assert not session["history_lock"].locked()
         # Simulate a real compaction shrinking the transcript.
         session["history"] = [{"role": "user", "content": "summary"}]
-        return (1, {"total": 0})
+        return (1, {"total": 0}, None)
 
     def _fake_sync(_sid, _session):
         seen["sync"] = True

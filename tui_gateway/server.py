@@ -3460,16 +3460,133 @@ def _sync_agent_model_with_config(sid: str, session: dict) -> None:
         )
 
 
+class CompressNotice(NamedTuple):
+    """A ``/compress`` request that ends WITHOUT touching the transcript.
+
+    ``kind`` is either:
+
+    * ``"preview"`` — ``--preview``/``--dry-run``: a report of what *would*
+      be compressed.  Callers surface it as normal command output.
+    * ``"error"`` — the arguments cannot be honoured on this surface
+      (unknown ``--flag``, ``--aggressive``, ``here [N]``).  Callers
+      surface it as a JSON-RPC error / warning string.
+
+    Either way ``_compress_session_history`` performed no compression, no
+    history replacement and no session rotation, so callers MUST skip the
+    post-compress bookkeeping (``_sync_session_key_after_compress``,
+    before/after summaries, ``session.info`` emits).
+    """
+
+    kind: str
+    text: str
+    lines: tuple[str, ...] = ()
+
+
+#: Flags ``/compress`` understands on the gateway surfaces.  Kept in the
+#: rejection message so an unknown ``--flag`` is never silently reused as
+#: an LLM focus topic again (issue #218).
+_COMPRESS_SUPPORTED_FLAGS = "--preview, --dry-run"
+
+
+def _classify_compress_args(
+    raw_args: str | None,
+) -> tuple[str | None, bool, CompressNotice | None]:
+    """Split the raw ``/compress`` argument string into its parts.
+
+    Returns ``(focus_topic, preview, error_notice)``.  When
+    ``error_notice`` is not None the caller must make no changes.
+
+    Reuses ``hermes_cli.partial_compress`` — the same parser the classic
+    CLI (``cli.py::_manual_compress``) and the messaging gateway
+    (``gateway/slash_commands.py``) use — so the gateway can no longer
+    hand ``--preview`` to the summariser as a focus topic (#218).
+    """
+    from hermes_cli.partial_compress import (
+        extract_compress_flags,
+        parse_partial_compress_args,
+    )
+
+    remaining, preview, aggressive = extract_compress_flags(raw_args or "")
+    partial, _keep_last, focus_topic = parse_partial_compress_args(remaining)
+
+    if aggressive:
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                "--aggressive is not supported here; run /compress without it, "
+                "or use /undo to drop recent turns.",
+            ),
+        )
+    if partial:
+        # `here [N]` / `--keep N` need the CLI's head/tail rejoin, which
+        # this surface's _compress_context rotation path does not do.
+        # Say so instead of silently full-compressing with "here 3" as
+        # the focus topic (#218).
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                "/compress here [N] is not supported here yet — it is available "
+                "in the classic CLI. Run /compress (optionally with a focus "
+                "topic) to compress the whole conversation.",
+            ),
+        )
+    if focus_topic and focus_topic.lstrip().startswith("-"):
+        # A leading dash is never a legitimate focus topic; treating one
+        # as a topic is exactly how --preview became destructive.
+        return (
+            None,
+            preview,
+            CompressNotice(
+                "error",
+                f"unknown /compress option {focus_topic.split()[0]!r} "
+                f"(supported: {_COMPRESS_SUPPORTED_FLAGS}). "
+                "A focus topic cannot start with '-'.",
+            ),
+        )
+    return focus_topic or None, preview, None
+
+
+def _compress_preview_notice(
+    history: list,
+    focus_topic: str | None,
+    approx_tokens: int,
+) -> CompressNotice:
+    """Build the ``--preview`` report — pure, no side effects."""
+    from hermes_cli.partial_compress import (
+        DEFAULT_KEEP_LAST,
+        summarize_compress_preview,
+    )
+
+    report = summarize_compress_preview(
+        history, False, DEFAULT_KEEP_LAST, focus_topic, approx_tokens
+    )
+    lines = [str(line) for line in report["lines"]]
+    return CompressNotice("preview", "\n".join(lines), tuple(lines))
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
     approx_tokens: int | None = None,
     before_messages: list | None = None,
     history_version: int | None = None,
-) -> tuple[int, dict]:
+) -> tuple[int, dict, CompressNotice | None]:
+    """Compress the live transcript, returning ``(removed, usage, notice)``.
+
+    ``notice`` is None for a real compression.  When it is a
+    :class:`CompressNotice` nothing was mutated — see that class for the
+    caller contract.
+    """
     from agent.model_metadata import estimate_request_tokens_rough
 
     agent = session["agent"]
+    focus_topic, preview, notice = _classify_compress_args(focus_topic)
+    if notice is not None:
+        return 0, _get_usage(agent), notice
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -3479,9 +3596,32 @@ def _compress_session_history(
             before_messages = list(session.get("history", []))
             history_version = int(session.get("history_version", 0))
     history = before_messages
+    if preview:
+        # --preview/--dry-run: report only. Never reach _compress_context
+        # (which ends the SessionDB session and rotates to a continuation
+        # session) and never replace session["history"].
+        usage = _get_usage(agent)
+        if len(history) < 4:
+            return 0, usage, CompressNotice(
+                "preview",
+                "Preview — no changes made. Not enough conversation to "
+                "compress (need at least 4 messages).",
+                (
+                    "Preview — no changes made.",
+                    "Not enough conversation to compress "
+                    "(need at least 4 messages).",
+                ),
+            )
+        if approx_tokens is None:
+            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(agent, "tools", None) or None
+            approx_tokens = estimate_request_tokens_rough(
+                history, system_prompt=_sys_prompt, tools=_tools
+            )
+        return 0, usage, _compress_preview_notice(history, focus_topic, approx_tokens)
     if len(history) < 4:
         usage = _get_usage(agent)
-        return 0, usage
+        return 0, usage, None
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
@@ -3506,11 +3646,11 @@ def _compress_session_history(
             # External mutation during compaction — drop the compressed
             # result so we don't clobber concurrent edits.
             usage = _get_usage(agent)
-            return 0, usage
+            return 0, usage, None
         session["history"] = compressed
         session["history_version"] = history_version + 1
     usage = _get_usage(agent)
-    return len(history) - len(compressed), usage
+    return len(history) - len(compressed), usage, None
 
 
 def _sync_session_key_after_compress(
@@ -8851,13 +8991,44 @@ def _(rid, params: dict) -> dict:
             )
 
         try:
-            removed, usage = _compress_session_history(
+            removed, usage, notice = _compress_session_history(
                 session,
                 focus_topic,
                 approx_tokens=before_tokens,
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            if notice is not None:
+                # Nothing was compressed and no session rotation happened,
+                # so skip the whole post-compress bookkeeping below (#218).
+                if notice.kind == "error":
+                    return _err(rid, 4004, notice.text)
+                _lines = list(notice.lines) or [notice.text]
+                return _ok(
+                    rid,
+                    {
+                        "status": "preview",
+                        "preview": True,
+                        "removed": 0,
+                        "before_messages": before_count,
+                        "after_messages": before_count,
+                        "before_tokens": before_tokens,
+                        "after_tokens": before_tokens,
+                        "output": notice.text,
+                        # Shaped like summarize_manual_compression() so the
+                        # TUI/desktop clients render it through their existing
+                        # headline/token_line/note path.
+                        "summary": {
+                            "noop": True,
+                            "aborted": False,
+                            "fallback_used": False,
+                            "headline": _lines[0],
+                            "token_line": _lines[1] if len(_lines) > 1 else "",
+                            "note": "\n".join(_lines[2:]) or None,
+                        },
+                        "usage": usage,
+                    },
+                )
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)
@@ -13572,13 +13743,19 @@ def _(rid, params: dict) -> dict:
                 if before_count
                 else 0
             )
-            removed, usage = _compress_session_history(
+            removed, usage, notice = _compress_session_history(
                 session,
                 arg.strip() or None,
                 approx_tokens=before_tokens,
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            if notice is not None:
+                # --preview/--dry-run (or a rejected flag): history was not
+                # touched and the session was not rotated (#218).
+                if notice.kind == "error":
+                    return _err(rid, 4004, notice.text)
+                return _ok(rid, {"type": "exec", "output": notice.text})
             with session["history_lock"]:
                 after_messages = list(session.get("history", []))
             after_count = len(after_messages)
@@ -14633,7 +14810,12 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 else 0
             )
 
-            _compress_session_history(session, arg)
+            _, _, _notice = _compress_session_history(session, arg)
+            if _notice is not None:
+                # --preview/--dry-run or a rejected flag: nothing was
+                # compressed and the session was not rotated, so report and
+                # skip the sync/summary below (#218).
+                return _notice.text
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:

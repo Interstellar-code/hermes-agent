@@ -204,6 +204,7 @@ def test_compute_host_compress_control_runs_identity_guard_in_host(monkeypatch):
         with sess["history_lock"]:
             sess["history"] = [{"role": "summary", "content": "compressed in host"}]
             sess["history_version"] = 3
+        return (0, {}, None)
 
     def _sync(sid, sess):
         assert sess is session
