@@ -14673,20 +14673,53 @@ def _format_live_system_prompt_output(session: dict) -> str:
     your next prompt in $EDITOR" — two unrelated meanings behind one name
     (#222). The read-only view keeps its own name; ``/prompt`` now reports
     that composing is a classic-CLI capability.
+
+    All three live sources below are objects owned by THIS process. A client
+    whose turns run elsewhere — notably ``api_server`` in the gateway process
+    — has a session object here that never ran a turn, so ``_cached_system_prompt``
+    is never set and ``_metadata_mirror`` (written only from compute-host
+    frames) stays empty. The read was therefore structurally empty for those
+    clients: correct code, no data to read (#219 follow-up).
+
+    So when no live value exists we fall back to the CONFIGURED prompt, which
+    is derived from config and resolves identically in any process. It is
+    labelled as configured rather than live, because a per-request
+    ``system_message`` on the serving transport can override it for a given
+    turn and this process cannot see that.
     """
     agent = session.get("agent")
     mirror = _metadata_mirror(session)
-    if agent is None and "system_prompt" not in mirror:
-        return "No active agent -- send a message first."
     prompt = (
         mirror.get("system_prompt")
         or getattr(agent, "ephemeral_system_prompt", None)
         or getattr(agent, "_cached_system_prompt", None)
         or ""
     )
-    if not prompt:
-        return "Current system prompt is not built yet; send a message first."
-    return f"Current system prompt:\n{prompt}"
+    if prompt:
+        return f"Current system prompt:\n{prompt}"
+
+    configured = ""
+    try:
+        cfg = _load_cfg()
+        agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+        configured = _prompt_text(agent_cfg.get("system_prompt", "")) or ""
+        if not configured:
+            # /personality stores a NAME and no longer overwrites
+            # agent.system_prompt (#223), so resolve the overlay too.
+            from hermes_cli.config import resolve_personality_prompt
+
+            configured = _prompt_text(resolve_personality_prompt(cfg)) or ""
+    except Exception:
+        logger.debug("configured system prompt lookup failed", exc_info=True)
+
+    if configured:
+        return (
+            "Configured system prompt (this session has not built a live one "
+            "in this process):\n" + configured
+        )
+    if agent is None and "system_prompt" not in mirror:
+        return "No active agent -- send a message first."
+    return "No system prompt is configured, and none has been built yet."
 
 
 def _format_live_context_output(session: dict) -> str:
@@ -14792,6 +14825,22 @@ def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
     This mirrors the session branch of ``config.set key=yolo`` — the
     authoritative path — so both affordances agree, and emits the same
     ``session.info`` so the indicator repaints.
+
+    SCOPE, and why the wording below is careful: ``_session_yolo`` is
+    per-PROCESS. This handler runs wherever the tui_gateway dispatcher is
+    hosted (the dashboard process), so it governs agents built THERE — the
+    TUI and dashboard-hosted sessions. A client whose turns run on another
+    transport, notably ``api_server`` in the gateway process, has its
+    approvals enforced by a different copy of that set, and this toggle
+    cannot reach it. Saying "for this session" flatly would repeat the
+    original defect in a new place, so the message names the surface and
+    points such clients at POST /api/sessions/{id}/yolo, which runs in the
+    process that actually gates them.
+
+    There is deliberately no attempt to auto-detect the hosting transport:
+    the dashboard holds a session object for clients it does not serve turns
+    for, and no reliable marker distinguishes them. An honest message beats
+    a guess.
     """
     from tools.approval import (
         disable_session_yolo,
@@ -14823,12 +14872,20 @@ def _live_yolo_toggle(sid: str, session: Optional[dict], arg: str) -> str:
     if agent is not None:
         _emit("session.info", sid, _session_info(agent, session))
 
+    scope_note = (
+        "   Applies to TUI/dashboard-hosted turns. If your chat runs over the "
+        "HTTP API, use POST /api/sessions/{id}/yolo — approvals there are "
+        "enforced in the gateway process, which this cannot reach."
+    )
     if enable:
         return (
             "(>_<) YOLO mode ON for this session — command approvals are bypassed. "
-            "Run /yolo off to restore them."
+            "Run /yolo off to restore them.\n" + scope_note
         )
-    return "(^_^) YOLO mode OFF for this session — command approvals are enforced again."
+    return (
+        "(^_^) YOLO mode OFF for this session — command approvals are enforced again.\n"
+        + scope_note
+    )
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
