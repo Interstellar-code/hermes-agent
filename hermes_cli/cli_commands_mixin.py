@@ -2719,7 +2719,7 @@ class CLICommandsMixin:
         ``nous`` and ``local`` are mutually exclusive; if both are given,
         ``local`` wins (it never touches the network).
         """
-        from hermes_cli.debug import run_debug_share
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
         from types import SimpleNamespace
 
         words = {w.lower() for w in cmd_original.split()[1:]}
@@ -2731,7 +2731,16 @@ class CLICommandsMixin:
         args = SimpleNamespace(
             lines=200, expire=7, local=local, nous=nous, yes=True
         )
-        run_debug_share(args)
+        try:
+            run_debug_share(args)
+        except DebugShareFailed:
+            # run_debug_share() already printed "Upload failed: ..." plus the
+            # --local hint. Swallow here — same reasoning as the /journey and
+            # /curator handlers' SystemExit guards above: a library-level
+            # upload failure must not kill the interactive session or (when
+            # this runs inside the TUI slash worker) the worker subprocess
+            # (issue #224).
+            pass
 
     def _handle_update_command(self) -> bool:
         """Handle /update — update Hermes Agent to the latest version.
