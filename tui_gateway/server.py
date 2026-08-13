@@ -132,6 +132,16 @@ _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
 _db = None
 _db_error: str | None = None
+# Home ``_db`` was opened against, so a later HERMES_HOME override can't be
+# served the launch profile's handle by mistake (see _get_db). None when the
+# handle was injected rather than opened here (tests seed ``server._db``).
+_db_home: str | None = None
+# Per-profile-home SessionDB cache (issue #229). Keyed by the RESOLVED home
+# path so two profiles can never share one handle; values are long-lived, like
+# ``_db`` — SessionDB is connect-once/thread-safe and this is a per-request path.
+_profile_dbs: dict[str, Any] = {}
+_profile_db_errors: dict[str, str] = {}
+_db_cache_lock = threading.Lock()
 _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
@@ -665,7 +675,10 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     _tui_owns_lifecycle = True
     if session_id:
         try:
-            db = _get_db()
+            # Profile-scoped (#229): the row we're ending lives in the session's
+            # own state.db, so a machine-wide dashboard must not end/inspect a
+            # same-named row in the launch profile's database instead.
+            db = _db_for(session)
             if db is not None:
                 # Don't end gateway-originated sessions — the gateway owns
                 # their lifecycle.  The TUI is a viewer, not the owner.
@@ -1036,26 +1049,175 @@ _start_idle_reaper()
 # ── Plumbing ──────────────────────────────────────────────────────────
 
 
-def _get_db():
-    global _db, _db_error
-    if _db is None:
-        from hermes_state import SessionDB
+def _resolved_home(home) -> str | None:
+    """Absolute, symlink-resolved string form of a profile home (None if unusable)."""
+    if not home:
+        return None
+    try:
+        return str(Path(home).resolve())
+    except Exception:
+        return str(home) or None
 
-        try:
-            _db = SessionDB()
-            _db_error = None
-        except Exception as exc:
-            _db_error = str(exc)
-            logger.warning(
-                "TUI session store unavailable — continuing without state.db features: %s",
-                exc,
-            )
-            return None
+
+def _current_db_home() -> str | None:
+    """The home ``SessionDB()`` would bind right now (honours HERMES_HOME overrides)."""
+    try:
+        return _resolved_home(get_hermes_home())
+    except Exception:
+        return None
+
+
+def _open_profile_db(home: str):
+    """Return the cached SessionDB for one profile home, opening it on first use.
+
+    Cached (not opened per call) because this sits on the per-request path, and
+    keyed by the resolved home path so a second profile can never be served the
+    first one's handle. Failures are remembered per home and degrade to None,
+    exactly like the process handle — never raised into a request path.
+    """
+    with _db_cache_lock:
+        db = _profile_dbs.get(home)
+    if db is not None:
+        return db
+    # Same file as the process handle → reuse it rather than opening a second
+    # connection to the same state.db (also keeps test-seeded ``_db`` in play).
+    if _db is not None and _db_home is not None and _db_home == home:
+        return _db
+    from hermes_state import SessionDB
+
+    try:
+        db = SessionDB(db_path=Path(home) / "state.db")
+    except Exception as exc:
+        with _db_cache_lock:
+            _profile_db_errors[home] = str(exc)
+        logger.warning(
+            "profile session store unavailable (%s) — continuing without state.db features: %s",
+            home,
+            exc,
+        )
+        return None
+    with _db_cache_lock:
+        # Lost a race? Keep the handle that's already published and drop ours.
+        existing = _profile_dbs.get(home)
+        if existing is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+            return existing
+        _profile_dbs[home] = db
+        _profile_db_errors.pop(home, None)
+    return db
+
+
+def _get_db(profile_home=None):
+    """Return the SessionDB for *profile_home*, or the process one when omitted.
+
+    Approach (a) of issue #229: the profile is an explicit argument rather than
+    something each of the ~20 call sites has to remember to scope for itself.
+    The module-global ``_db`` keeps serving the process/launch profile (so
+    single-profile installs, and every existing monkeypatch of ``_get_db``, are
+    unaffected), while any session that carries a ``profile_home`` gets its own
+    cached handle. Callers with a session in scope should use :func:`_db_for`.
+    """
+    global _db, _db_error, _db_home
+    if profile_home is not None:
+        return _db_for_home(profile_home)
+
+    home = _current_db_home()
+    if _db is not None:
+        # ``_db_home is None`` means the handle was injected (tests) — serve it
+        # verbatim. Otherwise only serve it while the process home still matches
+        # the one it was opened against: a HERMES_HOME override in force here
+        # (the per-turn override a resumed remote profile installs) must not be
+        # answered with the launch profile's database.
+        if _db_home is None or home is None or _db_home == home:
+            return _db
+        return _open_profile_db(home)
+
+    if home is not None and get_hermes_home_override():
+        # First open happens to land inside a per-turn override: bind THAT home
+        # through the per-home cache instead of stamping it onto ``_db``, or the
+        # first profile to touch the process would own ``_db`` for its lifetime
+        # (the "first profile wins" half of #229).
+        return _open_profile_db(home)
+
+    from hermes_state import SessionDB
+
+    try:
+        _db = SessionDB()
+        _db_error = None
+        # Record the home it actually bound (its own db_path, which honours a
+        # monkeypatched DEFAULT_DB_PATH); the drift check above needs to know
+        # which home this handle speaks for.
+        _db_home = _resolved_home(getattr(_db, "db_path", None) and Path(_db.db_path).parent) or _current_db_home()
+    except Exception as exc:
+        _db_error = str(exc)
+        logger.warning(
+            "TUI session store unavailable — continuing without state.db features: %s",
+            exc,
+        )
+        return None
     return _db
 
 
-def _db_unavailable_error(rid, *, code: int):
-    detail = _db_error or "state.db unavailable"
+def _db_for_home(profile_home):
+    """The SessionDB for an optional profile home; the process one when absent.
+
+    Routing helper used by every profile-aware call site. No home → a BARE
+    ``_get_db()``: that is both the single-profile behaviour we must not change
+    and the exact call shape the suite's zero-argument ``_get_db`` doubles
+    expect. A home → the per-home cache directly, so scoping a call site can
+    never be answered by a process-wide stand-in.
+    """
+    if not profile_home:
+        return _get_db()
+    home = _resolved_home(profile_home)
+    return _open_profile_db(home) if home else _get_db()
+
+
+def _db_for(session):
+    """The SessionDB that owns *session*'s rows (profile-aware).
+
+    ``session.resume`` resolves the caller's ``profile`` and stamps the winning
+    home on the session as ``profile_home``; rows for that chat live in THAT
+    profile's state.db. Reading or mutating them through the process handle is
+    issue #229 — stale transcripts and writes that land in a database the chat
+    path never reads. Sessions with no ``profile_home`` (every single-profile
+    install) fall through to a bare ``_get_db()``, i.e. exactly today's
+    behaviour, and keep working with the existing ``_get_db`` test doubles.
+    """
+    home = session.get("profile_home") if isinstance(session, dict) else None
+    return _db_for_home(home)
+
+
+def _reset_db_caches(*, close: bool = False) -> None:
+    """Drop every cached SessionDB handle (test seam / profile teardown).
+
+    Not used on any request path — the caches are process-lifetime by design.
+    """
+    global _db, _db_error, _db_home
+    with _db_cache_lock:
+        stale = list(_profile_dbs.values())
+        _profile_dbs.clear()
+        _profile_db_errors.clear()
+    if close:
+        for handle in stale:
+            with contextlib.suppress(Exception):
+                handle.close()
+    _db, _db_error, _db_home = None, None, None
+
+
+def _db_unavailable_error(rid, *, code: int, session=None, profile_home=None):
+    """Degradation envelope for "no state.db".
+
+    Reports the failure recorded for the profile the caller actually tried
+    (``session``'s home, or an explicit one), falling back to the process-wide
+    ``_db_error`` — so a broken profile db doesn't get explained by the launch
+    profile's (healthy) status, or vice versa.
+    """
+    if profile_home is None and isinstance(session, dict):
+        profile_home = session.get("profile_home")
+    home = _resolved_home(profile_home)
+    detail = (_profile_db_errors.get(home) if home else None) or _db_error or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
 
 
@@ -1944,19 +2106,8 @@ def _ensure_session_db_row(session: dict) -> None:
     # Persist into the session's own profile db (global remote mode), not the
     # launch profile's — otherwise the row lands in the wrong state.db, the
     # unified list mis-tags it, and resume 404s ("session not found").
-    profile_home = session.get("profile_home")
-    if profile_home:
-        from hermes_state import SessionDB
-
-        try:
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
-        except Exception:
-            logger.debug("failed to open profile db for session row", exc_info=True)
-            return
-        close_db = True
-    else:
-        db = _get_db()
-        close_db = False
+    # Handle is cached per profile home now (#229), so nothing to close here.
+    db = _db_for(session)
     if db is None:
         return
     # The session's own model/effort/fast pick — the composer override shipped on
@@ -2028,12 +2179,6 @@ def _ensure_session_db_row(session: dict) -> None:
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
-    finally:
-        if close_db:
-            try:
-                db.close()
-            except Exception:
-                pass
 
 
 def _persist_branch_seed(session: dict) -> None:
@@ -2070,27 +2215,12 @@ def _session_db(session: dict):
     """Yield the SessionDB that owns this session's row (profile-aware).
 
     Mirrors :func:`_ensure_session_db_row`: a remote/profile session persists
-    into its own profile's ``state.db`` (a fresh handle we close on exit);
-    everything else borrows the shared ``_get_db()`` handle (left open). Yields
-    None when the db is unavailable.
+    into its own profile's ``state.db``, everything else into the process one.
+    Both handles are cached and long-lived now (#229), so this no longer opens
+    or closes anything — it stays a context manager because callers (and their
+    test doubles) are written against that shape. Yields None when unavailable.
     """
-    db, close_db = None, False
-    profile_home = session.get("profile_home")
-    if profile_home:
-        from hermes_state import SessionDB
-
-        try:
-            db, close_db = SessionDB(db_path=Path(profile_home) / "state.db"), True
-        except Exception:
-            logger.debug("failed to open profile db for session", exc_info=True)
-    else:
-        db = _get_db()
-    try:
-        yield db
-    finally:
-        if close_db and db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
+    yield _db_for(session)
 
 
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
@@ -2706,7 +2836,7 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     if agent is None or not session_key:
         return
 
-    db = getattr(agent, "_session_db", None) or _get_db()
+    db = getattr(agent, "_session_db", None) or _db_for(session)
     if db is None:
         return
 
@@ -2745,7 +2875,7 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     if agent is None or not session_key or not hasattr(agent, "_build_system_prompt"):
         return
 
-    db = getattr(agent, "_session_db", None) or _get_db()
+    db = getattr(agent, "_session_db", None) or _db_for(session)
     if db is None or not hasattr(db, "update_system_prompt"):
         return
 
@@ -4818,7 +4948,11 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
-        "session_db": _get_db(),
+        # No session dict here, but the parent agent already holds the handle
+        # bound to ITS profile — inherit it so a background task writes where
+        # the conversation that spawned it lives (#229). Only a parent built
+        # without one (no state.db at build time) falls back to the process db.
+        "session_db": getattr(agent, "_session_db", None) or _get_db(),
         "fallback_model": _agent_fallback_model(agent),
     }
 
@@ -5311,6 +5445,10 @@ def _make_agent(
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
+        # No session dict exists yet at build time; profile-scoped callers
+        # (session.resume) pass the profile's handle in as ``session_db``.
+        # Falling back to the process db is right for every other caller —
+        # they are building an agent for the launch profile (#229).
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
@@ -5362,6 +5500,10 @@ def _init_session(
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
+    # The session dict is being built right here, so ``profile_home`` isn't on
+    # it yet (session.resume stamps it after this returns) — the profile handle
+    # arrives as the explicit ``session_db`` argument instead. Everything else
+    # is a launch-profile session, for which the process db is correct (#229).
     db = session_db if session_db is not None else _get_db()
     if db is not None:
         row = db.get_session(key)
@@ -6077,6 +6219,11 @@ def _(rid, params: dict) -> dict:
     )
 
 
+# Session-less by nature: the resume picker asks "what is on THIS backend?".
+# No session (and so no ``profile_home``) is in scope, so the process db is the
+# right and only answer — a machine-wide dashboard lists its own profile's
+# sessions here, and the client resumes a cross-profile row by passing
+# ``profile`` to session.resume, which binds that profile from then on (#229).
 @method("session.list")
 def _(rid, params: dict) -> dict:
     db = _get_db()
@@ -6138,6 +6285,8 @@ def _(rid, params: dict) -> dict:
     null-result shape (and logged) so callers don't have to special-
     case JSON-RPC error envelopes for what is a normal "no answer".
     """
+    # No session in scope (this IS the "which session?" query) — process db,
+    # same contract as session.list above (#229).
     db = _get_db()
     if db is None:
         return _ok(rid, {"session_id": None})
@@ -6330,14 +6479,11 @@ def _(rid, params: dict) -> dict:
 
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
     # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
-    if profile_home is not None:
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=profile_home / "state.db")
-    else:
-        db = _get_db()
+    # Both come from the same cache now (#229), so every later handler that
+    # resolves this session's ``profile_home`` gets back THIS handle.
+    db = _db_for_home(profile_home)
     if db is None:
-        return _db_unavailable_error(rid, code=5000)
+        return _db_unavailable_error(rid, profile_home=profile_home, code=5000)
 
     found = db.get_session(target)
     if not found:
@@ -6747,7 +6893,7 @@ def _message_preview(history: list) -> str:
 
 def _session_live_title(session: dict, key: str) -> str:
     title = str(session.get("pending_title") or "").strip()
-    db = _get_db()
+    db = _db_for(session)
     if db is not None:
         try:
             title = str(db.get_session_title(key) or title or "").strip()
@@ -6930,6 +7076,10 @@ def _(rid, params: dict) -> dict:
     agent corrupts message ordering and trips FK constraints when the
     next message append flushes.
     """
+    # Deliberately the process db: delete must target whatever database
+    # session.list served the picker its rows from, or the "d" key would 404 on
+    # a row it just showed. A cross-profile delete would need its own
+    # ``profile`` parameter and is out of scope for #229.
     target = params.get("session_id", "")
     if not target:
         return _err(rid, 4006, "session_id required")
@@ -6966,9 +7116,9 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    db = _get_db()
+    db = _db_for(session)
     if db is None:
-        return _db_unavailable_error(rid, code=5007)
+        return _db_unavailable_error(rid, session=session, code=5007)
     key = session["session_key"]
     if "title" not in params:
         fallback = session.get("pending_title") or ""
@@ -7185,7 +7335,7 @@ def _(rid, params: dict) -> dict:
 
     with _session_db(session) as db:
         if db is None:
-            return _db_unavailable_error(rid, code=5007)
+            return _db_unavailable_error(rid, session=session, code=5007)
         key = session["session_key"]
         try:
             # Real INSERT OR IGNORE — the set_session_title call that used to
@@ -7239,7 +7389,7 @@ def _(rid, params: dict) -> dict:
         return err
     with _session_db(session) as db:
         if db is None:
-            return _db_unavailable_error(rid, code=5007)
+            return _db_unavailable_error(rid, session=session, code=5007)
         record = db.get_handoff_state(session["session_key"])
 
     record = record or {}
@@ -7266,7 +7416,7 @@ def _(rid, params: dict) -> dict:
     reason = str(params.get("error") or "handoff failed").strip()[:500]
     with _session_db(session) as db:
         if db is None:
-            return _db_unavailable_error(rid, code=5007)
+            return _db_unavailable_error(rid, session=session, code=5007)
         key = session["session_key"]
         record = db.get_handoff_state(key) or {}
         state = record.get("state") or ""
@@ -8866,7 +9016,7 @@ def _(rid, params: dict) -> dict:
     key = session.get("session_key") or params.get("session_id") or ""
     agent = session.get("agent")
     meta = {}
-    db = _get_db()
+    db = _db_for(session)
     if db and key:
         try:
             meta = db.get_session(key) or {}
@@ -8893,11 +9043,18 @@ def _(rid, params: dict) -> dict:
     provider = getattr(agent, "provider", None) or mirror.get("provider") or "unknown"
     model = getattr(agent, "model", None) or mirror.get("model") or "(unknown)"
     project = _project_info_for_cwd(_display_session_cwd(session))
+    # Report the home the row we just read actually lives in, not the process's
+    # — on a machine-wide dashboard those differ, and quoting the process home
+    # next to another profile's numbers is the same lie #229 is about.
+    session_home = str(session.get("profile_home") or "").strip()
+    home_display = (
+        session_home.replace(str(Path.home()), "~", 1) if session_home else display_hermes_home()
+    )
     lines = [
         "Hermes TUI Status",
         "",
         f"Session ID: {key}",
-        f"Path: {display_hermes_home()}",
+        f"Path: {home_display}",
     ]
     if project:
         lines.append(f"Project: {project['name']}")
@@ -8922,7 +9079,7 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     history = list(session.get("history", []))
-    db = _get_db()
+    db = _db_for(session)
     if db is not None and session.get("session_key"):
         try:
             history = db.get_messages_as_conversation(
@@ -9190,9 +9347,9 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    db = _get_db()
+    db = _db_for(session)
     if db is None:
-        return _db_unavailable_error(rid, code=5008)
+        return _db_unavailable_error(rid, session=session, code=5008)
     old_key = session["session_key"]
     with session["history_lock"]:
         history = [dict(msg) for msg in session.get("history", [])]
@@ -9241,6 +9398,13 @@ def _(rid, params: dict) -> dict:
         if lease is not None:
             lease.release()
         return _err(rid, 5008, f"branch failed: {e}")
+    # A branch inherits its parent's profile: the rows above were just written
+    # to the parent's state.db, so the child session must be bound to the SAME
+    # database. Building it against the process db is how #229 produced "5008
+    # FOREIGN KEY constraint failed" — the child appended messages to a db that
+    # has no such session row. Mirrors session.resume's binding.
+    branch_home = session.get("profile_home") or None
+    home_token = set_hermes_home_override(str(branch_home)) if branch_home else None
     try:
         tokens = _set_session_context(new_key)
         try:
@@ -9249,6 +9413,7 @@ def _(rid, params: dict) -> dict:
                 new_key,
                 session_id=new_key,
                 platform_override=source,
+                session_db=db,
             )
         finally:
             _clear_session_context(tokens)
@@ -9258,14 +9423,20 @@ def _(rid, params: dict) -> dict:
             agent,
             list(history),
             cols=session.get("cols", 80),
+            session_db=db,
             source=source,
         )
         if new_sid in _sessions:
+            if branch_home:
+                _sessions[new_sid]["profile_home"] = str(branch_home)
             _sessions[new_sid]["active_session_lease"] = lease
     except Exception as e:
         if lease is not None:
             lease.release()
         return _err(rid, 5000, f"agent init failed on branch: {e}")
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
     return _ok(rid, {"session_id": new_sid, "title": title, "parent": old_key})
 
 
@@ -9657,7 +9828,7 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
+            if (db := _db_for(session)) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
@@ -9755,7 +9926,7 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     # desktop session instead of becoming an orphan that any poller may consume.
     resolved_key = evt_key
     try:
-        db = _get_db()
+        db = _db_for(session)
         if db is not None:
             resolved_key = db.resolve_resume_session_id(evt_key) or evt_key
     except Exception:
@@ -9829,7 +10000,7 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     if evt_key in current_keys:
         return True
     try:
-        db = _get_db()
+        db = _db_for(session)
         resolved_key = (
             db.resolve_resume_session_id(evt_key) if db is not None else evt_key
         ) or evt_key
@@ -10472,7 +10643,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # Apply pending_title now that the DB row exists.
             _pending = session.get("pending_title")
             if _pending and status == "complete":
-                _pdb = _get_db()
+                _pdb = _db_for(session)
                 if _pdb:
                     _session_key = session.get("session_key") or sid
                     try:
@@ -10507,7 +10678,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     _title_model = getattr(agent, "model", None)
                     _title_provider = getattr(agent, "provider", None)
                     maybe_auto_title(
-                        _get_db(),
+                        _db_for(session),
                         _title_key,
                         text,
                         raw,
@@ -12394,6 +12565,12 @@ def _discover_repos_payload(db, *, conn=None, backfill: bool = True) -> list[dic
     return out
 
 
+# The projects.* handlers below are all session-less: they aggregate every row
+# on this backend rather than acting on one chat, so there is no ``profile_home``
+# to resolve and the process db is the correct (and only) source. A cross-profile
+# project tree would be a new feature with its own ``profile`` parameter, not
+# part of #229 — what #229 fixes is per-session handlers silently reading the
+# wrong profile's rows.
 @method("projects.discover_repos")
 def _(rid, params: dict) -> dict:
     """Repos for the desktop overview: scanned-from-disk (cached) ∪ session-derived."""
@@ -13668,9 +13845,9 @@ def _(rid, params: dict) -> dict:
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /undo"
             )
-        db = _get_db()
+        db = _db_for(session)
         if db is None:
-            return _db_unavailable_error(rid, code=5008)
+            return _db_unavailable_error(rid, session=session, code=5008)
         session_key = session.get("session_key", "")
         if not session_key:
             return _err(rid, 4001, "no session key for undo")
@@ -14644,7 +14821,7 @@ def _format_live_usage_output(session: dict) -> str:
 def _format_live_history_output(session: dict) -> str:
     with session["history_lock"]:
         history = list(session.get("history", []))
-    db = _get_db()
+    db = _db_for(session)
     if db is not None and session.get("session_key"):
         try:
             history = db.get_messages_as_conversation(
@@ -14724,7 +14901,7 @@ def _format_live_system_prompt_output(session: dict) -> str:
 
 def _format_live_context_output(session: dict) -> str:
     messages = []
-    db = _get_db()
+    db = _db_for(session)
     if db is not None and session.get("session_key"):
         try:
             messages = _history_to_messages(
@@ -15499,6 +15676,8 @@ def _(rid, params: dict) -> dict:
 
 @method("insights.get")
 def _(rid, params: dict) -> dict:
+    # Aggregate stats for this backend's own profile; no session in scope, so
+    # the process db is the correct source (#229).
     days = params.get("days", 30)
     db = _get_db()
     if db is None:
