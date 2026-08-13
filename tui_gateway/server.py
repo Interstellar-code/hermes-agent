@@ -13323,6 +13323,127 @@ _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 # 'pending' forever — armed for a watcher to execute days later (#221).
 _RPC_ROUTED_COMMANDS: frozenset[str] = frozenset({"handoff"})
 
+# Stateful commands answered by command.dispatch in THIS process rather than by
+# the slash worker. They are not _pending_input commands — they get the same
+# routing for a different reason: they mutate durable goal state through
+# GoalManager, and the worker is a separate long-lived process holding its own
+# GoalManager whose in-memory GoalState was loaded when the worker started.
+# save_goal() rewrites the whole ``goal:{session_id}`` blob, so a worker-side
+# write would clobber the turns_used/status/last_verdict the serving process's
+# post-turn judge (see the /goal continuation hook in _run_prompt_submit) had
+# written in the meantime. Same split as /yolo (#219): the surface that owns the
+# live state answers the command.
+_DISPATCH_ROUTED_COMMANDS: frozenset[str] = frozenset({"subgoal"})
+
+
+def _normalize_skill_ident(identifier: str) -> str:
+    """Slugify a bundle's skill identifier for availability lookups.
+
+    Bundles name their members by skill name ("PDF Processing"), slug, or a
+    path under the skills root; all three resolve through
+    ``_load_skill_payload``. Normalizing to the same slug form
+    ``scan_skill_commands()`` uses lets us answer "is this skill installed?"
+    off the scan we already do, without loading every skill payload.
+    """
+    import re as _re
+
+    raw = (identifier or "").strip().replace("\\", "/").strip("/")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("/") if p]
+    if not parts:
+        return ""
+    tail = parts[-1]
+    # ".../my-skill/SKILL.md" identifies the directory, not the file.
+    if tail.lower() in {"skill.md", "index.md"} and len(parts) > 1:
+        tail = parts[-2]
+    slug = tail.lower().replace(" ", "-").replace("_", "-")
+    slug = _re.sub(r"[^a-z0-9-]", "", slug)
+    return _re.sub(r"-{2,}", "-", slug).strip("-")
+
+
+def _dispatchable_bundle_entries(quick_command_names: set[str]) -> list[dict]:
+    """Return catalog entries for bundles a client can actually run.
+
+    Only slugs that reach the bundle branch of ``slash.exec`` /
+    ``command.dispatch`` are returned — advertising a slug the dispatcher
+    cannot execute is exactly the defect this catalog keeps being blamed for
+    (#222, /indicator). A bundle is dropped when:
+
+    * ``resolve_command()`` claims the slug — both dispatch gates only look
+      up a bundle when the registry has no such command, so the bundle would
+      never be reached (the CLI command wins);
+    * an earlier branch of the same dispatch path claims it: quick commands
+      and plugin handlers (checked before bundles in command.dispatch), or
+      the live/RPC/pending-input/worker-blocked routes and TUI-only names
+      that slash.exec consults before it looks for a bundle;
+    * none of its member skills are installed and enabled —
+      ``build_bundle_invocation_message`` returns ``None`` when no skill
+      block builds, which dispatch reports as 4018 "failed to load bundle".
+
+    The installed check is deliberately conservative: it matches against the
+    skill scan (which already applies the disabled-skills filter that bundle
+    loading re-applies) rather than loading every member payload, because
+    the real builder calls ``bump_use`` and would corrupt skill usage stats
+    just by listing the palette. A bundle whose only members are skills the
+    scan skipped is therefore hidden rather than advertised — the safe
+    direction for a "must be dispatchable" list.
+    """
+    from agent.skill_bundles import scan_bundles
+    from agent.skill_commands import scan_skill_commands
+    from hermes_cli.commands import resolve_command
+
+    available: set[str] = set()
+    for key, info in scan_skill_commands().items():
+        available.add(_normalize_skill_ident(key))
+        available.add(_normalize_skill_ident(str((info or {}).get("name") or "")))
+    available.discard("")
+
+    shadowed = (
+        {n.lstrip("/").lower() for n, _d, _c in _TUI_EXTRA}
+        | {n.lower() for n in _TUI_HIDDEN}
+        | {n.lower() for n in _PENDING_INPUT_COMMANDS}
+        | {n.lower() for n in _DISPATCH_ROUTED_COMMANDS}
+        | {n.lower() for n in _RPC_ROUTED_COMMANDS}
+        | {n.lower() for n in _WORKER_BLOCKED_COMMANDS}
+        | {n.lower() for n in _LIVE_SESSION_DIRECT_COMMANDS}
+        | {n.lower() for n in _ISOLATED_SESSION_READ_COMMANDS}
+        | {"model"}  # answered live by _live_slash_command_output
+        | {n.lower() for n in quick_command_names}
+    )
+
+    try:
+        from hermes_cli.plugins import get_plugin_command_handler
+    except Exception:
+        get_plugin_command_handler = None  # type: ignore[assignment]
+
+    entries: list[dict] = []
+    for cmd_key, info in sorted(scan_bundles().items()):
+        slug = str((info or {}).get("slug") or cmd_key.lstrip("/"))
+        if not slug or slug.lower() in shadowed:
+            continue
+        if resolve_command(slug) is not None:
+            continue
+        if get_plugin_command_handler is not None:
+            try:
+                if get_plugin_command_handler(slug):
+                    continue
+            except Exception:
+                pass
+        skills = [str(s) for s in (info.get("skills") or [])]
+        if not any(_normalize_skill_ident(s) in available for s in skills):
+            continue
+        desc = str(info.get("description") or f"Load {len(skills)} skills as a bundle")
+        entries.append(
+            {
+                "command": f"/{slug}",
+                "name": str(info.get("name") or slug),
+                "description": desc[:120] + ("…" if len(desc) > 120 else ""),
+                "skills": skills,
+            }
+        )
+    return entries
+
 
 @method("commands.catalog")
 def _(rid, params: dict) -> dict:
@@ -13366,9 +13487,11 @@ def _(rid, params: dict) -> dict:
             cat_map[cat].append([name, desc])
 
         warning = ""
+        quick_names: set[str] = set()
         try:
             qcmds = _load_cfg().get("quick_commands", {}) or {}
             if isinstance(qcmds, dict) and qcmds:
+                quick_names = {str(k) for k in qcmds}
                 bucket = "User commands"
                 if bucket not in cat_map:
                     cat_map[bucket] = []
@@ -13404,6 +13527,28 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             warning = f"skill discovery unavailable: {e}"
 
+        # Skill bundles. Clients could not build a palette entry for a bundle
+        # before this (scan_bundles() was never consulted here), so /bundles
+        # was unusable from non-CLI surfaces. Everything below is additive —
+        # existing keys keep their exact shape — and only bundles that really
+        # reach the dispatcher are listed; see _dispatchable_bundle_entries.
+        bundles: list[dict] = []
+        try:
+            bundles = _dispatchable_bundle_entries(quick_names)
+            if bundles:
+                bucket = "Bundles"
+                if bucket not in cat_map:
+                    cat_map[bucket] = []
+                    cat_order.append(bucket)
+                for entry in bundles:
+                    key, bdesc = entry["command"], entry["description"]
+                    canon[key.lower()] = key
+                    all_pairs.append([key, bdesc])
+                    cat_map[bucket].append([key, bdesc])
+        except Exception as e:
+            if not warning:
+                warning = f"bundle discovery unavailable: {e}"
+
         for cat in cat_order:
             categories.append({"name": cat, "pairs": cat_map[cat]})
 
@@ -13416,6 +13561,11 @@ def _(rid, params: dict) -> dict:
                 "canon": canon,
                 "categories": categories,
                 "skill_count": skill_count,
+                # New in this payload: the bundle detail list plus its count.
+                # ``pairs``/``canon``/``categories`` carry the same slugs so a
+                # client that only reads those still gets a palette entry.
+                "bundles": bundles,
+                "bundle_count": len(bundles),
                 "warning": warning,
             },
         )
@@ -13831,6 +13981,116 @@ def _(rid, params: dict) -> dict:
         return _ok(
             rid,
             {"type": "send", "notice": notice, "message": state.goal},
+        )
+
+    if name == "subgoal":
+        # /subgoal was registered in COMMAND_REGISTRY but had no branch here,
+        # so every non-CLI surface got 4018 for a command the palette offered
+        # (#222). Grammar is the CLI's (_handle_subgoal_command):
+        #   /subgoal                 show the goal line + current criteria
+        #   /subgoal <text>          append a criterion
+        #   /subgoal remove <n>      drop criterion n (1-based)
+        #   /subgoal clear           wipe all criteria
+        # Answered in-process rather than by the slash worker — see
+        # _DISPATCH_ROUTED_COMMANDS for why a second process must not write
+        # this state.
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            return _err(rid, 5030, f"goals unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        try:
+            goals_cfg = _load_cfg().get("goals") or {}
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        # Keyed on the Hermes session_key, exactly like the /goal branch above
+        # and api_server's _evaluate_goal_after_turn: the meta key is
+        # ``goal:{session_id}``, so any other key writes subgoals the judge
+        # never reads.
+        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+
+        if not mgr.has_goal():
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "No active goal. Set one with /goal <text>.",
+                },
+            )
+
+        arg_str = (arg or "").strip()
+        if not arg_str:
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": f"{mgr.status_line()}\n{mgr.render_subgoals()}",
+                },
+            )
+
+        tokens = arg_str.split(None, 1)
+        verb = tokens[0].lower()
+        rest = tokens[1].strip() if len(tokens) > 1 else ""
+
+        if verb == "remove":
+            # A malformed index is a user error with a fixable message — never
+            # 4018 ("no dispatch branch"), which tells the client the command
+            # does not exist here.
+            if not rest:
+                return _err(rid, 4004, "usage: /subgoal remove <n>")
+            try:
+                idx = int(rest.split()[0])
+            except (ValueError, IndexError):
+                return _err(
+                    rid,
+                    4004,
+                    "/subgoal remove: <n> must be an integer (1-based index)",
+                )
+            try:
+                removed = mgr.remove_subgoal(idx)
+            except (IndexError, RuntimeError) as exc:
+                return _err(rid, 4004, f"/subgoal remove: {exc}")
+            return _ok(
+                rid,
+                {"type": "exec", "output": f"✓ Removed subgoal {idx}: {removed}"},
+            )
+
+        if verb == "clear":
+            try:
+                prev = mgr.clear_subgoals()
+            except RuntimeError as exc:
+                return _err(rid, 4004, f"/subgoal clear: {exc}")
+            out = (
+                f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}."
+                if prev
+                else "No subgoals to clear."
+            )
+            return _ok(rid, {"type": "exec", "output": out})
+
+        # Anything else is the criterion text itself — same as the CLI, which
+        # has no "unknown subcommand" case by design (a criterion may start
+        # with any word).
+        try:
+            text = mgr.add_subgoal(arg_str)
+        except (ValueError, RuntimeError) as exc:
+            return _err(rid, 4004, f"/subgoal: {exc}")
+        idx = len(mgr.state.subgoals) if mgr.state else 0
+        return _ok(
+            rid,
+            {
+                "type": "exec",
+                "output": (
+                    f"✓ Added subgoal {idx}: {text}\n"
+                    "The judge factors it into the verdict from the next turn on."
+                ),
+            },
         )
 
     if name == "undo":
@@ -15319,10 +15579,12 @@ def _(rid, params: dict) -> dict:
         # Never let the worker drive this one — see _RPC_ROUTED_COMMANDS.
         return _slash_exec_handoff(rid, params, _cmd_arg)
 
-    if _cmd_base in _PENDING_INPUT_COMMANDS:
+    if _cmd_base in _PENDING_INPUT_COMMANDS or _cmd_base in _DISPATCH_ROUTED_COMMANDS:
         # Route directly to command.dispatch instead of returning an error
         # that requires the frontend to retry.  Some TUI clients fail the
         # fallback, leaving the command empty and showing "empty command".
+        # _DISPATCH_ROUTED_COMMANDS joins the same route for a different
+        # reason (goal state must be written by this process, not the worker).
         return _methods["command.dispatch"](
             rid,
             {
