@@ -260,11 +260,18 @@ def _config_overrides(config: dict) -> dict[str, str]:
         if user_val is not None and user_val != default_val:
             overrides[f"{section}.{key}"] = str(user_val)
 
-    # Toolsets (if different from default)
-    default_toolsets = DEFAULT_CONFIG.get("toolsets", [])
-    user_toolsets = config.get("toolsets", [])
+    # Toolsets (if different from default). The raw config value may be a
+    # comma-separated string OR a list depending on how it was written
+    # (`_normalize_toolsets` in hermes_cli/oneshot.py is the house
+    # convention for handling both shapes) — normalize both sides before
+    # comparing so a string "hermes-cli" isn't spuriously reported as an
+    # override of the equivalent list default ["hermes-cli"].
+    from hermes_cli.oneshot import _normalize_toolsets
+
+    default_toolsets = _normalize_toolsets(DEFAULT_CONFIG.get("toolsets")) or []
+    user_toolsets = _normalize_toolsets(config.get("toolsets")) or []
     if user_toolsets != default_toolsets:
-        overrides["toolsets"] = str(user_toolsets)
+        overrides["toolsets"] = ", ".join(user_toolsets) if user_toolsets else "(none)"
 
     # Fallback providers
     fallbacks = config.get("fallback_providers", [])
@@ -421,7 +428,13 @@ def run_dump(args):
     lines.append("")
     lines.append("features:")
 
-    toolsets = config.get("toolsets", ["hermes-cli"])
+    # The config value may be a comma-separated string ("hermes-cli,kanban")
+    # or a list (["hermes-cli", "kanban"]) depending on how it was written.
+    # Normalize with the shared helper before joining — naively `', '.join()`
+    # on a string iterates characters, e.g. "h, e, r, m, e, s, ...".
+    from hermes_cli.oneshot import _normalize_toolsets
+
+    toolsets = _normalize_toolsets(config.get("toolsets", ["hermes-cli"])) or []
     lines.append(f"  toolsets:           {', '.join(toolsets) if toolsets else '(default)'}")
     lines.append(f"  mcp_servers:        {_count_mcp_servers(config)}")
     lines.append(f"  memory_provider:    {_memory_provider(config)}")
