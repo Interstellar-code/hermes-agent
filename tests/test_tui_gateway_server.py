@@ -1861,21 +1861,35 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
             captured["launch_update"] = True
 
     profile_db = ProfileDB()
+    opened = []
+
+    def _fake_session_db(db_path=None):
+        opened.append(db_path)
+        return profile_db
 
     import tools.terminal_tool as terminal_tool
 
-    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
+    monkeypatch.setattr("hermes_state.SessionDB", _fake_session_db)
     monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
     monkeypatch.setattr(terminal_tool, "cleanup_vm", lambda _key: None)
     monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    server._reset_db_caches()
 
-    session = {"session_key": target, "profile_home": str(profile_home)}
-    assert server._set_session_cwd(session, str(new_cwd)) == str(new_cwd)
-    assert session["cwd"] == str(new_cwd)
-    assert session["explicit_cwd"] is True
-    assert captured["profile_update"] == (target, str(new_cwd))
-    assert captured["profile_closed"] is True
-    assert "launch_update" not in captured
+    try:
+        session = {"session_key": target, "profile_home": str(profile_home)}
+        assert server._set_session_cwd(session, str(new_cwd)) == str(new_cwd)
+        assert session["cwd"] == str(new_cwd)
+        assert session["explicit_cwd"] is True
+        assert captured["profile_update"] == (target, str(new_cwd))
+        assert "launch_update" not in captured
+        # The profile handle is CACHED per home now (#229), not opened and closed
+        # per write: a second write reuses it (one open, never closed) so later
+        # handlers resolving the same profile get this very handle back.
+        assert server._set_session_cwd(session, str(new_cwd)) == str(new_cwd)
+        assert len(opened) == 1
+        assert "profile_closed" not in captured
+    finally:
+        server._reset_db_caches()
 
 
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
@@ -11763,3 +11777,228 @@ def test_systemprompt_still_prefers_a_live_prompt(monkeypatch):
     out = server._format_live_system_prompt_output(session)
     assert "LIVE" in out and "CONFIGURED" not in out
     assert out.startswith("Current system prompt:")
+
+
+# ── #229: session handlers must read/write the SESSION's profile db ──────────
+# A machine-wide `hermes dashboard` runs under `-p default` while managing some
+# other profile, so the process db and the session's db are routinely different
+# files. Every handler below used to call the bare process-global `_get_db()`.
+
+
+@pytest.fixture
+def profile_dbs(tmp_path):
+    """Two real state.db files: the process/launch one and one profile's.
+
+    Yields ``(launch_home, profile_home, launch_db, profile_db)`` with the
+    launch db installed as the process handle, and tears the caches down so a
+    cached handle can't leak into another test.
+    """
+    from hermes_state import SessionDB
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "worker"
+    launch_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+
+    launch_db = SessionDB(db_path=launch_home / "state.db")
+    profile_db = SessionDB(db_path=profile_home / "state.db")
+    server._reset_db_caches()
+    server._db = launch_db  # the process handle, as _get_db() would cache it
+    try:
+        yield launch_home, profile_home, launch_db, profile_db
+    finally:
+        server._sessions.clear()
+        server._reset_db_caches()
+        for handle in (launch_db, profile_db):
+            try:
+                handle.close()
+            except Exception:
+                pass
+
+
+def _seed(db, key, turns):
+    db.create_session(key, source="tui")
+    for role, content in turns:
+        db.append_message(session_id=key, role=role, content=content)
+
+
+def _live_session(sid, key, profile_home=None, **extra):
+    session = {
+        "session_key": key,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "cwd": os.getcwd(),
+        "running": False,
+        "agent": types.SimpleNamespace(model="test/model", provider="test"),
+    }
+    if profile_home is not None:
+        session["profile_home"] = str(profile_home)
+    session.update(extra)
+    server._sessions[sid] = session
+    return session
+
+
+def test_session_history_reads_the_profile_db_not_the_process_one(profile_dbs):
+    """The bug's sharpest symptom: `{count: 0}` for a live 3-message chat."""
+    launch_home, profile_home, launch_db, profile_db = profile_dbs
+    key = "shared-session-id"
+    # Same session id in BOTH dbs, different transcripts — exactly the split the
+    # issue reports (launch profile trails the real conversation).
+    _seed(launch_db, key, [("user", "stale")])
+    _seed(profile_db, key, [("user", "one"), ("assistant", "two"), ("user", "three")])
+
+    _live_session("s1", key, profile_home=profile_home)
+    resp = server._methods["session.history"]("r1", {"session_id": "s1"})
+
+    assert "error" not in resp
+    assert resp["result"]["count"] == 3
+    assert [m["text"] for m in resp["result"]["messages"]] == ["one", "two", "three"]
+
+
+def test_session_status_reads_the_profile_db(profile_dbs):
+    launch_home, profile_home, launch_db, profile_db = profile_dbs
+    key = "shared-session-id"
+    _seed(launch_db, key, [("user", "stale")])
+    launch_db.set_session_title(key, "Wrong Profile Title")
+    _seed(profile_db, key, [("user", "real")])
+    profile_db.set_session_title(key, "Right Profile Title")
+
+    _live_session("s1", key, profile_home=profile_home)
+    resp = server._methods["session.status"]("r1", {"session_id": "s1"})
+
+    out = resp["result"]["output"]
+    assert "Right Profile Title" in out
+    assert "Wrong Profile Title" not in out
+    # …and the reported home is the one those numbers came from.
+    assert str(profile_home) in out.replace("~", str(Path.home()))
+
+
+def test_undo_rewinds_the_profile_db_and_leaves_the_process_one_alone(profile_dbs):
+    """Mutations are the worst case: they used to succeed against the wrong db."""
+    launch_home, profile_home, launch_db, profile_db = profile_dbs
+    key = "shared-session-id"
+    _seed(launch_db, key, [("user", "launch-1"), ("assistant", "launch-2")])
+    _seed(
+        profile_db,
+        key,
+        [("user", "p-1"), ("assistant", "p-2"), ("user", "p-3"), ("assistant", "p-4")],
+    )
+
+    _live_session("s1", key, profile_home=profile_home)
+    resp = server._methods["command.dispatch"](
+        "r1", {"session_id": "s1", "name": "undo", "arg": ""}
+    )
+
+    assert "error" not in resp, resp
+    remaining = [
+        m["content"] for m in profile_db.get_messages_as_conversation(key)
+    ]
+    assert remaining == ["p-1", "p-2"]
+    # The launch db is untouched — no silent write into a database the chat
+    # path never reads.
+    assert [m["content"] for m in launch_db.get_messages_as_conversation(key)] == [
+        "launch-1",
+        "launch-2",
+    ]
+
+
+def test_a_session_without_a_profile_still_uses_the_process_db(profile_dbs):
+    """Single-profile installs must be bit-for-bit unaffected."""
+    launch_home, profile_home, launch_db, profile_db = profile_dbs
+    key = "launch-only-session"
+    _seed(launch_db, key, [("user", "hello"), ("assistant", "hi")])
+
+    session = _live_session("s1", key)  # no profile_home
+    assert server._db_for(session) is launch_db
+    assert server._db_for(session) is server._get_db()
+
+    resp = server._methods["session.history"]("r1", {"session_id": "s1"})
+    assert [m["text"] for m in resp["result"]["messages"]] == ["hello", "hi"]
+
+
+def test_two_profiles_do_not_cross_contaminate_through_the_cache(tmp_path):
+    """The single module-global `_db` was first-profile-wins for the whole
+    process. Keyed by resolved home, two profiles get two handles."""
+    from hermes_state import SessionDB
+
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    server._reset_db_caches()
+    try:
+        sessions = [{"session_key": f"k{i}", "profile_home": str(h)} for i, h in enumerate(homes)]
+        db_a, db_b = (server._db_for(s) for s in sessions)
+
+        assert db_a is not db_b
+        assert Path(db_a.db_path).parent == homes[0]
+        assert Path(db_b.db_path).parent == homes[1]
+        # Cached: the same home resolves to the same handle (this is a
+        # per-request path), including via a non-normalised spelling of it.
+        assert server._db_for(sessions[0]) is db_a
+        assert server._db_for({"profile_home": str(homes[0]) + "/./"}) is db_a
+    finally:
+        server._reset_db_caches(close=True)
+
+
+def test_writes_land_in_the_session_profile_db(profile_dbs):
+    """Reads and writes must agree: the row a profile session creates has to be
+    findable in that profile, or resume 404s and /branch trips a FK error."""
+    launch_home, profile_home, launch_db, profile_db = profile_dbs
+    key = "fresh-profile-session"
+    session = _live_session("s1", key, profile_home=profile_home, explicit_cwd=False)
+    server._ensure_session_db_row(session)
+
+    assert (profile_db.get_session(key) or {}).get("id") == key
+    assert launch_db.get_session(key) is None
+
+
+def test_process_handle_is_not_served_under_a_foreign_home_override(tmp_path):
+    """Requirement 1: the module-global cache must never silently answer for a
+    profile it wasn't opened against. A per-turn HERMES_HOME override (the one
+    a resumed remote profile installs for the length of a turn) is exactly that
+    situation — and whichever home happens to open `_db` first must not win the
+    process for good."""
+    launch_home = tmp_path / "launch"
+    other_home = tmp_path / "other"
+    launch_home.mkdir()
+    other_home.mkdir()
+    server._reset_db_caches()
+    launch_token = set_hermes_home_override(launch_home)
+    try:
+        launch_db = server._get_db()  # opened under the launch home
+        assert Path(launch_db.db_path).parent == launch_home
+        assert server._get_db() is launch_db
+
+        other_token = set_hermes_home_override(other_home)
+        try:
+            scoped = server._get_db()
+            assert scoped is not launch_db
+            assert Path(scoped.db_path).parent == other_home
+        finally:
+            reset_hermes_home_override(other_token)
+        assert server._get_db() is launch_db  # back to the launch profile
+    finally:
+        reset_hermes_home_override(launch_token)
+        server._reset_db_caches(close=True)
+
+
+def test_db_unavailable_reports_the_profile_that_failed(monkeypatch, tmp_path):
+    """Degradation survives: an unopenable profile db yields the standard
+    "continuing without state.db" None (never an exception into the request
+    path), and the error envelope quotes THAT profile's failure."""
+    server._reset_db_caches()
+    monkeypatch.setattr(server, "_db_error", "launch profile is fine, actually")
+
+    def _boom(db_path=None):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr("hermes_state.SessionDB", _boom)
+    session = {"session_key": "k", "profile_home": str(tmp_path)}
+    try:
+        assert server._db_for(session) is None
+        env = server._db_unavailable_error("r1", code=5008, session=session)
+        assert "disk on fire" in env["error"]["message"]
+        assert "launch profile is fine" not in env["error"]["message"]
+    finally:
+        server._reset_db_caches()
