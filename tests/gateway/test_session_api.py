@@ -550,3 +550,316 @@ async def test_session_yolo_requires_auth(adapter, session_db):
         # not that it rejects — a keyless adapter accepts by design.
         resp = await cli.post(f"/api/sessions/{session_id}/yolo", json={"enabled": False})
         assert resp.status in (200, 401)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# /goal post-turn continuation on the session chat surfaces (#230)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _goal_manager_stub(decisions, *, turns_used=1, max_turns=20):
+    """Build a fake hermes_cli.goals.GoalManager class yielding *decisions*.
+
+    ``decisions`` is a list consumed one entry per evaluate_after_turn call;
+    the last entry repeats once exhausted so a capped loop keeps continuing.
+    """
+    from types import SimpleNamespace
+
+    calls = {"eval": [], "init": []}
+    state = SimpleNamespace(turns_used=turns_used, max_turns=max_turns)
+    pending = list(decisions)
+
+    class _Stub:
+        def __init__(self, session_id, **kwargs):
+            calls["init"].append(session_id)
+            self.session_id = session_id
+            self.state = state
+
+        def is_active(self):
+            return bool(pending)
+
+        def evaluate_after_turn(self, last_response, **kwargs):
+            calls["eval"].append((last_response, kwargs))
+            return pending.pop(0) if len(pending) > 1 else pending[0]
+
+    return _Stub, calls
+
+
+def _sse_events(body: str):
+    """Parse an SSE body into a list of (event_name, payload dict)."""
+    import json as _json
+
+    events = []
+    for block in body.split("\n\n"):
+        name = None
+        payload = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                name = line[len("event: "):]
+            elif line.startswith("data: "):
+                payload = _json.loads(line[len("data: "):])
+        if name is not None:
+            events.append((name, payload or {}))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_session_chat_omits_goal_block_and_skips_judge_when_no_goal(adapter, session_db):
+    """The no-goal path must cost one state read and change no bytes on the wire."""
+    session_id = session_db.create_session("goal-none", "api_server")
+    stub, calls = _goal_manager_stub([])  # is_active() -> False
+
+    async def fake_run(**kwargs):
+        return {"final_response": "hi", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", stub):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "hello"})
+            assert resp.status == 200
+            data = await resp.json()
+
+    assert "goal" not in data
+    assert calls["eval"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_chat_returns_goal_decision_without_auto_continuing(adapter, session_db):
+    """Non-streaming evaluates and reports; it must not run the continuation
+    itself — that would hold one HTTP request open for another full turn."""
+    session_id = session_db.create_session("goal-json", "api_server")
+    stub, calls = _goal_manager_stub([
+        {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "keep going",
+            "verdict": "continue",
+            "reason": "not done yet",
+            "message": "↻ Continuing toward goal (1/20): not done yet",
+        }
+    ], turns_used=1, max_turns=20)
+    runs = []
+
+    async def fake_run(**kwargs):
+        runs.append(kwargs["user_message"])
+        return {"final_response": "partial answer", "session_id": session_id}, {"total_tokens": 3}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", stub):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "work on it"})
+            assert resp.status == 200
+            data = await resp.json()
+
+    assert data["goal"] == {
+        "status": "active",
+        "verdict": "continue",
+        "message": "↻ Continuing toward goal (1/20): not done yet",
+        "should_continue": True,
+        "continuation_prompt": "keep going",
+        "turns_used": 1,
+        "max_turns": 20,
+    }
+    # Keyed on the session id the goal meta row uses, and exactly one turn ran.
+    assert calls["init"] == [session_id]
+    assert runs == ["work on it"]
+    # The judge sees the turn's visible answer.
+    assert calls["eval"][0][0] == "partial answer"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_survives_a_raising_goal_manager(adapter, session_db):
+    """A broken goal judge must never cost the user their turn."""
+    session_id = session_db.create_session("goal-boom", "api_server")
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("goal state is toast")
+
+    async def fake_run(**kwargs):
+        return {"final_response": "the answer", "session_id": session_id}, {"total_tokens": 2}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", _Boom):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "hello"})
+            assert resp.status == 200
+            data = await resp.json()
+
+    assert data["message"]["content"] == "the answer"
+    assert "goal" not in data
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_runs_goal_continuation_as_a_distinct_turn(adapter, session_db):
+    session_id = session_db.create_session("goal-stream", "api_server")
+    stub, calls = _goal_manager_stub([
+        {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "continue toward the goal",
+            "verdict": "continue",
+            "reason": "still work left",
+            "message": "↻ Continuing toward goal (1/20): still work left",
+        },
+        {
+            "status": "done",
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "done",
+            "reason": "objective met",
+            "message": "✓ Goal achieved: objective met",
+        },
+    ])
+    runs = []
+
+    async def fake_run(**kwargs):
+        runs.append(kwargs["user_message"])
+        kwargs["stream_delta_callback"](f"chunk-{len(runs)}")
+        return {"final_response": f"answer-{len(runs)}", "session_id": session_id}, {"total_tokens": 5}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", stub):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "start"})
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = _sse_events(body)
+    names = [name for name, _ in events]
+    # The continuation actually ran as a second agent turn.
+    assert runs == ["start", "continue toward the goal"]
+    assert names.count("goal.continuation") == 1
+    assert names.count("message.started") == 2
+    assert names.count("assistant.completed") == 2
+    assert names.count("run.completed") == 1
+
+    cont = next(payload for name, payload in events if name == "goal.continuation")
+    assert cont["turn"] == 1
+    assert cont["continuation_prompt"] == "continue toward the goal"
+    assert cont["turns_used"] == 1 and cont["max_turns"] == 20
+
+    started_ids = [p["message"]["id"] for n, p in events if n == "message.started"]
+    assert started_ids[0] != started_ids[1]
+    # The continuation announces the id its own frames will carry.
+    assert cont["message_id"] == started_ids[1]
+    deltas = [p for n, p in events if n == "assistant.delta"]
+    assert deltas[0]["message_id"] == started_ids[0]
+    assert deltas[1]["message_id"] == started_ids[1]
+
+    # Both judge verdicts are surfaced, and the last one closes the goal out.
+    status_msgs = [p["message"] for n, p in events if n == "goal.status"]
+    assert status_msgs == [
+        "↻ Continuing toward goal (1/20): still work left",
+        "✓ Goal achieved: objective met",
+    ]
+    # One usage block for the request, summed across both turns.
+    run_completed = next(p for n, p in events if n == "run.completed")
+    assert run_completed["usage"]["total_tokens"] == 10
+    assert run_completed["goal_continuations"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_goal_loop_is_bounded_by_the_per_request_cap(adapter, session_db):
+    """A goal that never says "done" must not hold the connection forever."""
+    from gateway.platforms.api_server import MAX_GOAL_CONTINUATIONS_PER_REQUEST
+
+    session_id = session_db.create_session("goal-runaway", "api_server")
+    stub, _calls = _goal_manager_stub([
+        {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "again",
+            "verdict": "continue",
+            "reason": "forever",
+            "message": "↻ Continuing",
+        }
+    ])
+    runs = []
+
+    async def fake_run(**kwargs):
+        runs.append(kwargs["user_message"])
+        return {"final_response": "still going", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", stub):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "go"})
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = _sse_events(body)
+    names = [name for name, _ in events]
+    assert len(runs) == 1 + MAX_GOAL_CONTINUATIONS_PER_REQUEST
+    assert names.count("goal.continuation") == MAX_GOAL_CONTINUATIONS_PER_REQUEST
+    assert names.count("run.completed") == 1
+    capped = [p for n, p in events if n == "goal.status" and p.get("capped")]
+    assert len(capped) == 1
+    assert str(MAX_GOAL_CONTINUATIONS_PER_REQUEST) in capped[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_does_not_continue_a_stopped_run(adapter, session_db):
+    """A stop accepted during the turn ends the request; the goal survives for
+    the next one rather than being continued behind the user's back."""
+    session_id = session_db.create_session("goal-stopped", "api_server")
+    stub, calls = _goal_manager_stub([
+        {
+            "status": "active",
+            "should_continue": True,
+            "continuation_prompt": "again",
+            "verdict": "continue",
+            "reason": "more work",
+            "message": "↻ Continuing",
+        }
+    ])
+    runs = []
+
+    async def fake_run(**kwargs):
+        runs.append(kwargs["user_message"])
+        # Stand in for POST /v1/runs/{run_id}/stop landing mid-turn.
+        adapter._stopping_run_ids.update(adapter._run_statuses.keys())
+        return {"final_response": "partial", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", stub):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "go"})
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert runs == ["go"]
+    assert "event: goal.continuation" not in body
+    # Not even the judge runs — a stopped run wants no more model calls.
+    assert calls["eval"] == []
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_survives_a_raising_goal_manager(adapter, session_db):
+    session_id = session_db.create_session("goal-stream-boom", "api_server")
+
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("goal state is toast")
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"]("hello")
+        return {"final_response": "hello", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run), \
+            patch("hermes_cli.goals.GoalManager", _Boom):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "go"})
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "event: assistant.completed" in body
+    assert "event: run.completed" in body
+    assert "event: goal.continuation" not in body
