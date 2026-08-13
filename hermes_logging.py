@@ -34,6 +34,7 @@ import logging
 import os
 import queue
 import sys
+import tempfile
 import threading
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
@@ -300,6 +301,22 @@ def setup_logging(
         The ``logs/`` directory where files are written.
     """
     global _logging_initialized
+
+    # Never attach file handlers to a REAL log directory from inside a test
+    # run. cli.py calls this at module scope, so merely importing it — which
+    # most of the suite does, directly or transitively — used to bind
+    # RotatingFileHandlers to ~/.hermes/logs/ before pytest's fixtures could
+    # redirect HERMES_HOME. Every mocked adapter failure in the suite (Feishu
+    # registration, Telegram, Discord, IMAP/SMTP) was then written to the
+    # user's production errors.log, drowning real incidents in test noise and
+    # making that file useless for triage.
+    #
+    # An explicit hermes_home still wins, so tests that deliberately exercise
+    # logging (tests/test_hermes_logging.py passes a tmp_path) are unaffected.
+    if hermes_home is None and "pytest" in sys.modules:
+        _logging_initialized = True
+        return Path(tempfile.gettempdir()) / "hermes-test-logs-unused"
+
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

@@ -9144,15 +9144,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
 
             if timed_out:
-                logger.warning(
-                    "Gateway drain timed out after %.1fs with %d active agent(s), "
-                    "%d in-flight cron job(s), and %d api_server run(s); "
-                    "interrupting remaining work.",
-                    timeout,
-                    self._running_agent_count(),
-                    self._active_cron_job_count(),
-                    self._active_api_run_count(),
-                )
+                # timeout == 0 is the DEFAULT and is deliberate, not a
+                # misconfiguration: waiting is unbounded (some runs take days)
+                # and a drain shorter than systemd's TimeoutStopSec invites a
+                # SIGKILL-mid-cleanup race that leaves a stale lock and
+                # crash-loops the service (see agent.restart_drain_timeout in
+                # hermes_cli/config.py). Reporting that intended fast path as a
+                # timeout at WARNING reads as an incident during every normal
+                # shutdown — it has already sent two separate investigations
+                # chasing a non-bug. Say what actually happened instead.
+                if timeout <= 0:
+                    logger.info(
+                        "Gateway shutdown: no drain window configured "
+                        "(agent.restart_drain_timeout=0), interrupting %d active "
+                        "agent(s), %d in-flight cron job(s) and %d api_server "
+                        "run(s). Set a positive restart_drain_timeout (well under "
+                        "systemd's TimeoutStopSec) to allow a grace period.",
+                        self._running_agent_count(),
+                        self._active_cron_job_count(),
+                        self._active_api_run_count(),
+                    )
+                else:
+                    logger.warning(
+                        "Gateway drain timed out after %.1fs with %d active agent(s), "
+                        "%d in-flight cron job(s), and %d api_server run(s); "
+                        "interrupting remaining work.",
+                        timeout,
+                        self._running_agent_count(),
+                        self._active_cron_job_count(),
+                        self._active_api_run_count(),
+                    )
                 # Mark forcibly-interrupted sessions as resume_pending BEFORE
                 # interrupting the agents.  This preserves each session's
                 # session_id + transcript so the next message on the same

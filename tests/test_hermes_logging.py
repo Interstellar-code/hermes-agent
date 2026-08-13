@@ -1182,3 +1182,55 @@ class TestAsyncQueueLogging:
         # INFO must not reach the WARNING+ errors.log even through the queue.
         if errors_log.exists():
             assert "info-level line" not in errors_log.read_text()
+
+
+class TestNoProductionLogWritesUnderPytest:
+    """setup_logging() must never bind file handlers to a REAL logs dir in tests.
+
+    cli.py calls setup_logging(mode="cli") at MODULE scope, so merely importing
+    it — which most of the suite does, directly or transitively — used to attach
+    RotatingFileHandlers to ~/.hermes/logs/ before pytest's fixtures could
+    redirect HERMES_HOME. Every mocked adapter failure in the suite (Feishu
+    registration, Telegram, Discord, IMAP/SMTP) was then appended to the user's
+    production errors.log, drowning genuine incidents in test noise and making
+    that file useless for triage.
+
+    The guard keys on ``"pytest" in sys.modules`` and is bypassed by an explicit
+    ``hermes_home``, so the tests above — which pass tmp_path — still exercise
+    the real handler setup.
+    """
+
+    def test_no_explicit_home_does_not_touch_the_resolved_logs_dir(self, tmp_path):
+        """With HERMES_HOME pointing somewhere real, nothing may be written."""
+        fake_home = tmp_path / "pretend_hermes_home"
+        (fake_home / "logs").mkdir(parents=True)
+        sentinel = fake_home / "logs" / "errors.log"
+        assert not sentinel.exists()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(fake_home)}):
+            hermes_logging.setup_logging()  # no hermes_home= → guarded path
+
+        # Neither errors.log nor agent.log may have been created.
+        assert not sentinel.exists(), "setup_logging() wrote to a real logs dir under pytest"
+        assert not (fake_home / "logs" / "agent.log").exists()
+
+    def test_emitting_a_warning_afterwards_still_writes_nothing(self, tmp_path):
+        """The regression was WARNINGs from mocked adapters reaching errors.log."""
+        fake_home = tmp_path / "pretend_hermes_home2"
+        (fake_home / "logs").mkdir(parents=True)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(fake_home)}):
+            hermes_logging.setup_logging()
+            logging.getLogger("plugins.platforms.feishu.adapter").warning(
+                "[Feishu onboard] Registration failed: bad json"
+            )
+
+        assert list((fake_home / "logs").iterdir()) == [], (
+            "a WARNING emitted after setup_logging() landed in a real logs dir"
+        )
+
+    def test_explicit_hermes_home_still_creates_handlers(self, tmp_path):
+        """The guard must not disable logging for tests that opt in."""
+        log_dir = hermes_logging.setup_logging(hermes_home=tmp_path)
+        assert (tmp_path / "logs" / "errors.log").exists()
+        assert log_dir == tmp_path / "logs"
