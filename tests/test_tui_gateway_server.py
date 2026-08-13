@@ -12002,3 +12002,305 @@ def test_db_unavailable_reports_the_profile_that_failed(monkeypatch, tmp_path):
         assert "launch profile is fine" not in env["error"]["message"]
     finally:
         server._reset_db_caches()
+
+
+# ── /subgoal + bundle slugs in the catalog ───────────────────────────
+# /subgoal was in COMMAND_REGISTRY with no dispatch branch, so every
+# non-CLI surface answered a palette-advertised command with 4018; the
+# catalog never consulted scan_bundles(), so clients could not build a
+# palette entry for a bundle they *can* dispatch. Both are the #222
+# "advertised but not dispatchable" family.
+
+
+@pytest.fixture
+def goal_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME so GoalManager writes land in a throwaway db."""
+    from hermes_cli import goals
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    goals._DB_CACHE.clear()
+    try:
+        yield home
+    finally:
+        goals._DB_CACHE.clear()
+        reset_hermes_home_override(token)
+
+
+def _goal_session(sid="sid", key="goal-session-key"):
+    server._sessions[sid] = _session(session_key=key)
+    return server._sessions[sid]
+
+
+def test_subgoal_dispatch_persists_a_criterion_goalmanager_reads_back(goal_home):
+    """The whole point: a subgoal set from this surface must be visible to the
+    judge, which reads goal:{session_key} through GoalManager."""
+    from hermes_cli.goals import GoalManager
+
+    _goal_session()
+    GoalManager(session_id="goal-session-key").set("ship the release")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {
+                    "session_id": "sid",
+                    "name": "subgoal",
+                    "arg": "every test passes on CI",
+                },
+            }
+        )
+
+        assert "error" not in resp, resp
+        assert "every test passes on CI" in resp["result"]["output"]
+
+        # Fresh manager on the SAME key the judge uses — the read-back proves
+        # the write landed where evaluate_after_turn looks.
+        assert GoalManager(session_id="goal-session-key").state.subgoals == [
+            "every test passes on CI"
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_subgoal_over_slash_exec_is_dispatched_not_4018(goal_home):
+    """slash.exec is the surface that returned 4018 — it must reach the same
+    in-process branch (never the slash worker, which holds its own stale
+    GoalState and would clobber judge-written fields on save)."""
+    from hermes_cli.goals import GoalManager
+
+    session = _goal_session()
+    session["slash_worker"] = _WorkerMustNotRun()
+    GoalManager(session_id="goal-session-key").set("ship the release")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"session_id": "sid", "command": "/subgoal no new lint errors"},
+            }
+        )
+
+        assert "error" not in resp, resp
+        assert GoalManager(session_id="goal-session-key").state.subgoals == [
+            "no new lint errors"
+        ]
+
+        # …and the list/remove/clear verbs round-trip through the same route.
+        listed = server.handle_request(
+            {
+                "id": "2",
+                "method": "slash.exec",
+                "params": {"session_id": "sid", "command": "/subgoal"},
+            }
+        )
+        assert "no new lint errors" in listed["result"]["output"]
+
+        cleared = server.handle_request(
+            {
+                "id": "3",
+                "method": "slash.exec",
+                "params": {"session_id": "sid", "command": "/subgoal clear"},
+            }
+        )
+        assert "error" not in cleared, cleared
+        assert GoalManager(session_id="goal-session-key").state.subgoals == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+class _WorkerMustNotRun:
+    def run(self, command):  # pragma: no cover - failure path
+        raise AssertionError(f"/subgoal must not reach the slash worker: {command}")
+
+    def close(self):
+        pass
+
+
+def test_subgoal_bad_index_errors_clearly_instead_of_4018(goal_home):
+    """A malformed argument is a user error with a fixable message. 4018 means
+    "this surface has no such command" — the wrong story for a typo."""
+    from hermes_cli.goals import GoalManager
+
+    _goal_session()
+    GoalManager(session_id="goal-session-key").set("ship the release")
+    try:
+        for arg, needle in (
+            ("remove abc", "integer"),
+            ("remove", "usage"),
+            ("remove 7", "out of range"),
+        ):
+            resp = server.handle_request(
+                {
+                    "id": arg,
+                    "method": "command.dispatch",
+                    "params": {"session_id": "sid", "name": "subgoal", "arg": arg},
+                }
+            )
+            assert resp["error"]["code"] == 4004, (arg, resp)
+            assert resp["error"]["code"] != 4018
+            assert needle in resp["error"]["message"].lower(), (arg, resp)
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_subgoal_without_a_goal_explains_instead_of_failing(goal_home):
+    _goal_session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "command.dispatch",
+                "params": {"session_id": "sid", "name": "subgoal", "arg": "be fast"},
+            }
+        )
+        assert "error" not in resp, resp
+        assert "/goal" in resp["result"]["output"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def _patch_bundle_catalog(monkeypatch, bundles, skills):
+    """Point the catalog's bundle/skill discovery at fixture data."""
+    import agent.skill_bundles as skill_bundles
+    import agent.skill_commands as skill_commands
+
+    monkeypatch.setattr(skill_bundles, "scan_bundles", lambda: bundles)
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", lambda: skills)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+
+def test_commands_catalog_emits_dispatchable_bundle_slugs(monkeypatch):
+    _patch_bundle_catalog(
+        monkeypatch,
+        {
+            "/deep-research": {
+                "name": "Deep Research",
+                "slug": "deep-research",
+                "description": "Research stack",
+                "skills": ["web-research", "note-taking"],
+            }
+        },
+        {
+            "/web-research": {"name": "web-research", "description": "search"},
+            "/note-taking": {"name": "Note Taking", "description": "notes"},
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    result = resp["result"]
+
+    pairs = dict(result["pairs"])
+    assert pairs["/deep-research"] == "Research stack"
+    assert result["canon"]["/deep-research"] == "/deep-research"
+    assert result["bundle_count"] == 1
+    assert result["bundles"][0]["command"] == "/deep-research"
+    assert result["bundles"][0]["name"] == "Deep Research"
+    bundle_cat = next(c for c in result["categories"] if c["name"] == "Bundles")
+    assert ["/deep-research", "Research stack"] in bundle_cat["pairs"]
+
+    # Backward compatible: every key SwitchUI parses today is still there.
+    for key in ("pairs", "sub", "canon", "categories", "skill_count", "warning"):
+        assert key in result
+
+
+def test_commands_catalog_hides_bundles_the_dispatcher_cannot_run(monkeypatch):
+    """Only advertise what slash.exec/command.dispatch actually reach: a
+    bundle with no installed skills fails 4018 in build_bundle_invocation_message,
+    and a slug the registry owns never reaches the bundle branch at all."""
+    _patch_bundle_catalog(
+        monkeypatch,
+        {
+            "/orphan-bundle": {
+                "name": "Orphan Bundle",
+                "slug": "orphan-bundle",
+                "description": "references nothing installed",
+                "skills": ["not-installed", "also-missing"],
+            },
+            # Slug collides with a COMMAND_REGISTRY command → resolve_command()
+            # wins in both dispatch gates, the bundle is unreachable.
+            "/status": {
+                "name": "status",
+                "slug": "status",
+                "description": "shadowed by the core command",
+                "skills": ["web-research"],
+            },
+            "/usable": {
+                "name": "usable",
+                "slug": "usable",
+                "description": "one installed skill is enough",
+                "skills": ["missing-one", "web-research"],
+            },
+        },
+        {"/web-research": {"name": "web-research", "description": "search"}},
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    result = resp["result"]
+    listed = {name for name, _desc in result["pairs"]}
+
+    assert "/orphan-bundle" not in listed
+    assert "/orphan-bundle" not in result["canon"]
+    assert [b["command"] for b in result["bundles"]] == ["/usable"]
+    # /status stays in the catalog as the core command, with ITS description.
+    assert dict(result["pairs"])["/status"] != "shadowed by the core command"
+
+
+def test_catalog_bundles_never_shadow_a_live_or_quick_command(monkeypatch):
+    """Names claimed earlier in slash.exec (live-answered, pending-input) or by
+    a quick command are dispatched by those branches, so the bundle behind them
+    is not runnable and must not be listed as one."""
+    _patch_bundle_catalog(
+        monkeypatch,
+        {
+            "/yolo": {
+                "name": "yolo",
+                "slug": "yolo",
+                "description": "b",
+                "skills": ["web-research"],
+            },
+            "/build": {
+                "name": "build",
+                "slug": "build",
+                "description": "b",
+                "skills": ["web-research"],
+            },
+        },
+        {"/web-research": {"name": "web-research", "description": "search"}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"quick_commands": {"build": {"type": "exec", "command": "make"}}},
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    assert resp["result"]["bundles"] == []
+    assert resp["result"]["bundle_count"] == 0
+
+
+def test_commands_catalog_survives_bundle_discovery_failure(monkeypatch):
+    """Never raise into a request path: a broken bundles dir degrades to a
+    warning with the rest of the catalog intact."""
+    import agent.skill_bundles as skill_bundles
+
+    def _boom():
+        raise RuntimeError("bundles dir on fire")
+
+    monkeypatch.setattr(skill_bundles, "scan_bundles", _boom)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+    assert "error" not in resp, resp
+    assert resp["result"]["bundles"] == []
+    assert "bundles dir on fire" in resp["result"]["warning"]
+    assert "/status" in dict(resp["result"]["pairs"])
