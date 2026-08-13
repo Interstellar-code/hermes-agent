@@ -584,6 +584,54 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return None, _multimodal_validation_error(exc, param=param)
 
 
+def _requested_reasoning_effort(
+    body: Dict[str, Any],
+) -> tuple[Optional[str], Optional["web.Response"]]:
+    """Parse a per-request ``reasoning_effort`` field.
+
+    Returns ``(effort, None)`` when the field is absent (``effort`` is None,
+    meaning "use the configured default") or valid, and ``(None, response)``
+    with a 400 when it is present but unusable.
+
+    Rejecting loudly is the point: a picker that sends ``reasoning_effort``
+    and gets a silently-ignored default back is indistinguishable from one
+    that works, which is how this endpoint shipped with the field unwired at
+    all.  The level list is taken from ``hermes_constants`` rather than
+    duplicated here so the HTTP surface cannot drift from the CLI/config
+    parser (``parse_reasoning_effort``), and the disable aliases it accepts
+    (``none``/``false``/``disabled``) are advertised alongside the levels.
+    """
+    if "reasoning_effort" not in body:
+        return None, None
+    raw = body.get("reasoning_effort")
+    if raw is None:
+        # Explicit null == "no preference", same as omitting the field.
+        return None, None
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+    valid = ", ".join((*VALID_REASONING_EFFORTS, "none"))
+    if not isinstance(raw, str) or not raw.strip():
+        return None, web.json_response(
+            _openai_error(
+                f"reasoning_effort must be a non-empty string; expected one of: {valid}",
+                param="reasoning_effort",
+                code="invalid_reasoning_effort",
+            ),
+            status=400,
+        )
+    cleaned = raw.strip().lower()
+    if parse_reasoning_effort(cleaned) is None:
+        return None, web.json_response(
+            _openai_error(
+                f"Invalid reasoning_effort '{raw}'; expected one of: {valid}",
+                param="reasoning_effort",
+                code="invalid_reasoning_effort",
+            ),
+            status=400,
+        )
+    return cleaned, None
+
+
 def check_api_server_requirements() -> bool:
     """Check if API server dependencies are available."""
     return AIOHTTP_AVAILABLE
@@ -1741,6 +1789,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("GET", "/v1/approvals/pending", self._handle_list_pending_approvals),
         ]
         if _CRON_AVAILABLE:
@@ -2400,6 +2449,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         route: Optional[Dict[str, Any]] = None,
         interactive_clarify: bool = False,
+        reasoning_effort: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2420,6 +2470,17 @@ class APIServerAdapter(BasePlatformAdapter):
         routing).  When set — and no session ``/model`` override exists for
         this session — its model/provider/api_key/base_url override the
         global defaults for this agent instance only.
+
+        ``reasoning_effort`` is a validated level (see
+        ``_requested_reasoning_effort``) that replaces the config-resolved
+        reasoning config for **this agent instance only**.  Unlike the model
+        override it is deliberately NOT sticky per session: a reasoning picker
+        sends the level with every turn, so persisting it would add a second,
+        invisible source of truth that a client could never clear, and a turn
+        with no field would silently inherit the last one.  Per-request also
+        keeps the "cheap turn now, deep turn next" pattern available without a
+        reset call.  Clients that want it to persist re-send it, which they
+        already do.
         """
         from run_agent import AIAgent
         from gateway.run import (
@@ -2433,6 +2494,22 @@ class APIServerAdapter(BasePlatformAdapter):
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
+        if reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            requested_reasoning = parse_reasoning_effort(reasoning_effort)
+            if requested_reasoning is not None:
+                reasoning_config = requested_reasoning
+            else:
+                # Unreachable through the HTTP handlers, which 400 on an
+                # invalid level before ever getting here. Degrade to the
+                # configured default rather than raising: this runs on the
+                # agent's executor thread, where an exception would fail the
+                # whole turn over a display-level preference.
+                logger.warning(
+                    "api_server ignoring unrecognized reasoning_effort %r",
+                    reasoning_effort,
+                )
         model = _resolve_gateway_model()
 
         # When the primary provider's auth fails (expired token / 429 quota
@@ -2758,6 +2835,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                # Mid-run guidance without cancelling (POST /v1/runs/{id}/steer).
+                "run_steer": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -2788,6 +2867,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "approvals_pending": {"method": "GET", "path": "/v1/approvals/pending"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -3120,13 +3200,36 @@ class APIServerAdapter(BasePlatformAdapter):
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        """Load the agent-facing history for *session_id*, following compression.
+
+        Auto-compression **ends** the session and forks a continuation child
+        (``parent_session_id``); new messages land on the child, so reading
+        ``session_id`` verbatim strands the chat on the dead parent and every
+        turn after the first compression is answered with a truncated (often
+        empty) transcript.  ``resolve_resume_session_id`` walks that chain to
+        the live tip — the same primitive ``GET /api/sessions/{id}/messages``
+        already uses, so the read-only listing and the agent's own view of the
+        conversation can no longer disagree.  See hermes_state.py:4950 / #15000.
+
+        Resolution is best-effort by design: this runs on the hot path of every
+        chat turn, so a failure to resolve degrades to the unresolved id (and,
+        ultimately, to an empty history) rather than failing the turn.
+        """
         db = await self._ensure_session_db_async()
         if db is None:
             return []
+        resolved_id = session_id
         try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
         except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            logger.warning(
+                "Failed to resolve continuation session for %s: %s", session_id, exc
+            )
+            resolved_id = session_id
+        try:
+            return await asyncio.to_thread(db.get_messages_as_conversation, resolved_id)
+        except Exception as exc:
+            logger.warning("Failed to load session history for %s: %s", resolved_id, exc)
             return []
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
@@ -3565,6 +3668,12 @@ class APIServerAdapter(BasePlatformAdapter):
         model_err = await self._apply_requested_model(body, session_id, gateway_session_key)
         if model_err is not None:
             return model_err
+        # Per-request only, unlike ``model`` above which is sticky on the
+        # session — see _create_agent for why. Validated before the turn
+        # starts so a bad level is a plain 400, never a silently-default turn.
+        reasoning_effort, reasoning_err = _requested_reasoning_effort(body)
+        if reasoning_err is not None:
+            return reasoning_err
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -3572,6 +3681,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ephemeral_system_prompt=system_prompt,
             session_id=session_id,
             gateway_session_key=gateway_session_key,
+            reasoning_effort=reasoning_effort,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
         final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -3630,6 +3740,14 @@ class APIServerAdapter(BasePlatformAdapter):
         model_err = await self._apply_requested_model(body, session_id, gateway_session_key)
         if model_err is not None:
             return model_err
+
+        # Per-request thinking level for this turn (and its /goal
+        # continuations, which are the same client request). Validated up here
+        # for the same reason ``model`` is: an invalid value must be a 400
+        # before the SSE response is committed, not an error frame mid-stream.
+        reasoning_effort, reasoning_err = _requested_reasoning_effort(body)
+        if reasoning_err is not None:
+            return reasoning_err
 
         # Own the process-global interactive state under (profile, session_id).
         # Captured once here rather than read from the ContextVar later: the
@@ -3928,6 +4046,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_session_key=approval_session_key,
                         approval_cleanup=_release_run_control_state,
                         agent_register=_register_agent,
+                        reasoning_effort=reasoning_effort,
                         # This run is registered in _active_run_tasks below, which
                         # active_agent_work_count() already sums; counting it as an
                         # inflight run too would spend two concurrency slots.
@@ -4261,13 +4380,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
+            # Same helper the session-chat endpoints use, so a client that
+            # pins X-Hermes-Session-Id across a compression keeps reading the
+            # continuation session instead of the ended parent. It swallows its
+            # own failures and returns [] — this path must never fail a turn
+            # over history loading. The db probe stays here so an unavailable
+            # session store still falls back to the request-body history rather
+            # than silently emptying it.
+            if await self._ensure_session_db_async() is not None:
+                history = await self._conversation_history_for_session(session_id)
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -6224,6 +6345,7 @@ class APIServerAdapter(BasePlatformAdapter):
         approval_cleanup=None,
         agent_register=None,
         count_inflight: bool = True,
+        reasoning_effort: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6258,6 +6380,9 @@ class APIServerAdapter(BasePlatformAdapter):
         asyncio task can be cancelled (client disconnect) while this thread is
         still running the agent, and dropping the reference there would make a
         live turn unstoppable.
+
+        *reasoning_effort* is a per-request thinking level for this turn only
+        (see ``_create_agent``); ``None`` uses the configured default.
 
         *count_inflight* controls the ``_inflight_agent_runs`` accounting used
         by ``active_agent_work_count``.  Callers that register their own task
@@ -6294,6 +6419,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         route=route,
                         interactive_clarify=interactive_clarify,
+                        reasoning_effort=reasoning_effort,
                     )
                     # Karpathy offline-eval harness: the consumer half reads this
                     # in agent/system_prompt.py. Auth-gated and validated at the
@@ -7305,6 +7431,129 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
+
+    async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/steer — add guidance to a run without stopping it.
+
+        Body: ``{"text": "..."}``.  The text is handed to ``AIAgent.steer``
+        (run_agent.py:2899), which stashes it and appends it to the last tool
+        result once the current tool batch finishes — the model reads it as
+        part of that tool output on its next iteration.  Nothing is
+        interrupted, so this is the complement of ``/stop``: mid-course
+        correction instead of abandonment.  Repeated steers before the agent
+        drains them concatenate, which is the core's behaviour, not ours.
+
+        Failure modes are deliberately distinguishable, because "the agent
+        never saw it" is indistinguishable from success at the UI otherwise:
+
+        * unknown run -> 404 ``run_not_found`` (same shape as /approval, /stop)
+        * known run with no live agent (finished, or still queued before the
+          executor built one) -> 409 ``run_not_steerable``
+        * a run already stopping -> 409 ``run_not_steerable``.  ``interrupt()``
+          drops any pending steer on purpose (see ``AIAgent.clear_interrupt``),
+          so accepting one here would report success for text the agent is
+          guaranteed to discard.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        status = self._run_statuses.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+        if agent is None and status is None and task is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object"), status=400
+            )
+
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                _openai_error(
+                    "text must be a non-empty string",
+                    param="text",
+                    code="invalid_steer_text",
+                ),
+                status=400,
+            )
+
+        if run_id in self._stopping_run_ids:
+            return web.json_response(
+                _openai_error(
+                    f"Run is stopping and cannot be steered: {run_id}",
+                    code="run_not_steerable",
+                ),
+                status=409,
+            )
+        if agent is None:
+            return web.json_response(
+                _openai_error(
+                    f"Run has no live agent to steer: {run_id}",
+                    code="run_not_steerable",
+                ),
+                status=409,
+            )
+
+        try:
+            accepted = bool(agent.steer(text))
+        except Exception as exc:
+            # A steer is advisory; never let it take the run down with it.
+            logger.exception("[api_server] steer failed for run %s", run_id)
+            return web.json_response(
+                _openai_error(f"Failed to steer run: {exc}", code="steer_failed"),
+                status=500,
+            )
+        if not accepted:
+            # steer() only refuses empty text, which the guard above already
+            # rejects — but report the refusal instead of claiming success.
+            return web.json_response(
+                _openai_error(
+                    f"Steer was not accepted by the agent: {run_id}",
+                    code="steer_rejected",
+                ),
+                status=409,
+            )
+
+        cleaned = text.strip()
+        # Keep the polled status honest without changing the run's state: the
+        # agent is still running, this is only the most recent thing that
+        # happened to it.
+        self._set_run_status(
+            run_id,
+            (status or {}).get("status") or "running",
+            last_event="run.steered",
+        )
+        event = {
+            "event": "run.steered",
+            "run_id": run_id,
+            "session_id": (status or {}).get("session_id") or run_id,
+            "timestamp": time.time(),
+            "text": cleaned,
+        }
+        q = self._run_streams.get(run_id)
+        if q is not None:
+            try:
+                q.put_nowait(event)
+            except Exception:
+                pass
+
+        return web.json_response({
+            "object": "hermes.run.steer",
+            "run_id": run_id,
+            "steered": True,
+            "text": cleaned,
+        })
 
     def _stop_progress_fields(self, status: Dict[str, Any]) -> Dict[str, Any]:
         """Derive how long a stop has been pending, and whether it is wedged.

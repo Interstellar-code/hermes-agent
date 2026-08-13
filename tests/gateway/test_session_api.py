@@ -863,3 +863,187 @@ async def test_session_chat_stream_survives_a_raising_goal_manager(adapter, sess
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: goal.continuation" not in body
+
+
+# ---------------------------------------------------------------------------
+# Per-request reasoning_effort (SwitchUI reasoning picker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/chat", "/chat/stream"])
+async def test_session_chat_rejects_invalid_reasoning_effort(adapter, session_db, path):
+    """An unusable level is a 400 that names the valid ones — never a silent default."""
+    session_id = session_db.create_session("reasoning-bad", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}{path}",
+                json={"message": "hello", "reasoning_effort": "turbo"},
+            )
+            assert resp.status == 400
+            payload = await resp.json()
+
+    message = payload["error"]["message"]
+    assert payload["error"]["code"] == "invalid_reasoning_effort"
+    assert "turbo" in message
+    for level in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra", "none"):
+        assert level in message
+    # The turn must not have started on the default level behind the 400.
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_non_string_reasoning_effort(adapter, session_db):
+    session_id = session_db.create_session("reasoning-type", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "hello", "reasoning_effort": 3},
+            )
+            assert resp.status == 400
+    mock_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/chat", "/chat/stream"])
+async def test_session_chat_forwards_reasoning_effort_to_the_turn(adapter, session_db, path):
+    session_id = session_db.create_session("reasoning-good", "api_server")
+    captured = {}
+
+    async def fake_run(**kwargs):
+        captured.update(kwargs)
+        cb = kwargs.get("stream_delta_callback")
+        if cb is not None:
+            cb("ok")
+        return {"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}{path}",
+                json={"message": "hello", "reasoning_effort": "HIGH "},
+            )
+            assert resp.status == 200, await resp.text()
+            await resp.text()
+
+    assert captured["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_without_reasoning_effort_leaves_it_unset(adapter, session_db):
+    """Absent field == no preference; the agent falls back to configured default."""
+    session_id = session_db.create_session("reasoning-absent", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "hello"})
+            assert resp.status == 200
+
+    _, kwargs = mock_run.call_args
+    assert kwargs["reasoning_effort"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_chat_reasoning_effort_is_per_request_not_sticky(adapter, session_db):
+    """A level sent on one turn must not leak into the next one."""
+    session_id = session_db.create_session("reasoning-sticky", "api_server")
+    seen = []
+
+    async def fake_run(**kwargs):
+        seen.append(kwargs["reasoning_effort"])
+        return {"final_response": "ok", "session_id": session_id}, {}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "one", "reasoning_effort": "ultra"},
+            )
+            await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two"})
+
+    assert seen == ["ultra", None]
+
+
+def test_create_agent_maps_reasoning_effort_onto_reasoning_config(adapter):
+    """The validated level reaches AIAgent as a reasoning_config for this turn."""
+    runtime = {"api_key": "k", "base_url": "https://x/v1", "provider": "p"}
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value=dict(runtime)),
+        patch("gateway.run._resolve_gateway_model", return_value="config/default-model"),
+        patch("gateway.run._load_gateway_config", return_value={}),
+        patch("gateway.run.GatewayRunner._load_reasoning_config", return_value={"enabled": True, "effort": "medium"}),
+        patch("run_agent.AIAgent") as mock_agent_cls,
+    ):
+        adapter._create_agent(session_id="s1", reasoning_effort="xhigh")
+        assert mock_agent_cls.call_args.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "xhigh",
+        }
+
+        mock_agent_cls.reset_mock()
+        adapter._create_agent(session_id="s1", reasoning_effort="none")
+        assert mock_agent_cls.call_args.kwargs["reasoning_config"] == {"enabled": False}
+
+        # No per-request level: the configured default is untouched.
+        mock_agent_cls.reset_mock()
+        adapter._create_agent(session_id="s1")
+        assert mock_agent_cls.call_args.kwargs["reasoning_config"] == {
+            "enabled": True,
+            "effort": "medium",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Chat history follows a compression continuation (#15000)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_chat_history_follows_compression_continuation(adapter, session_db):
+    """Chatting the compressed parent must load the continuation's transcript."""
+    parent_id = session_db.create_session("compressed-parent", "api_server")
+    session_db.append_message(parent_id, "user", "before compression")
+    session_db.end_session(parent_id, "compression")
+    child_id = session_db.create_session(
+        "continuation-child", "api_server", parent_session_id=parent_id
+    )
+    session_db.append_message(child_id, "user", "after compression")
+    session_db.append_message(child_id, "assistant", "continued answer")
+
+    mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": child_id}, {}))
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{parent_id}/chat", json={"message": "next"})
+            assert resp.status == 200
+
+    _, kwargs = mock_run.call_args
+    contents = [m["content"] for m in kwargs["conversation_history"]]
+    assert contents == ["after compression", "continued answer"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_degrades_when_resolution_fails(adapter, session_db):
+    """A broken resolver must not fail the turn — fall back to the raw id."""
+    session_id = session_db.create_session("resolve-boom", "api_server")
+    session_db.append_message(session_id, "user", "still here")
+
+    def _boom(_sid):
+        raise RuntimeError("resolver exploded")
+
+    with patch.object(adapter._session_db, "resolve_resume_session_id", _boom):
+        history = await adapter._conversation_history_for_session(session_id)
+
+    assert [m["content"] for m in history] == ["still here"]
