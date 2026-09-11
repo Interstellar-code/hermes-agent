@@ -13551,24 +13551,48 @@ class BackupRequest(BaseModel):
     output: Optional[str] = None
 
 
-def _dashboard_backup_dir() -> Path:
-    return get_hermes_home() / "backups"
+def _dashboard_backup_profile(profile: Optional[str]) -> Tuple[Optional[str], Path]:
+    """Resolve dashboard backup operations to one profile's HERMES_HOME."""
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        return None, get_hermes_home()
+
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+
+    try:
+        name = normalize_profile_name(requested)
+        validate_profile_name(name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not profile_exists(name):
+        raise HTTPException(status_code=404, detail=f"Profile '{name}' does not exist.")
+    return name, get_profile_dir(name)
 
 
-def _new_dashboard_backup_path() -> Path:
+def _dashboard_backup_dir(profile: Optional[str] = None) -> Path:
+    return _dashboard_backup_profile(profile)[1] / "backups"
+
+
+def _new_dashboard_backup_path(profile: Optional[str] = None) -> Path:
     stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-    return _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
+    return _dashboard_backup_dir(profile) / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
 
 
 @app.post("/api/ops/backup")
-async def run_backup(body: BackupRequest):
-    args = ["backup"]
+async def run_backup(body: BackupRequest, profile: Optional[str] = Query(None)):
+    profile_name, _ = _dashboard_backup_profile(profile)
+    args = ["backup"] if profile_name is None else ["--profile", profile_name, "backup"]
     archive: Optional[Path] = None
     output = (body.output or "").strip()
     if output:
         args.extend(["-o", output])
     else:
-        archive = _new_dashboard_backup_path()
+        archive = _new_dashboard_backup_path(profile)
         try:
             archive.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -13589,9 +13613,12 @@ async def run_backup(body: BackupRequest):
 
 
 @app.get("/api/ops/backup/download")
-async def download_dashboard_backup(archive: str):
+async def download_dashboard_backup(
+    archive: str,
+    profile: Optional[str] = Query(None),
+):
     try:
-        backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+        backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
         target = Path(archive).expanduser().resolve(strict=True)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Backup not found")
@@ -13612,7 +13639,7 @@ async def download_dashboard_backup(archive: str):
 
 
 @app.get("/api/ops/backup/list")
-async def list_dashboard_backups():
+async def list_dashboard_backups(profile: Optional[str] = Query(None)):
     """Enumerate downloadable backups in the dashboard backup directory.
 
     Returns newest-first. Missing directory → empty list (not an error), so a
@@ -13620,7 +13647,7 @@ async def list_dashboard_backups():
     anything resolving outside the backup dir are skipped, mirroring the
     download route's containment guard.
     """
-    backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+    backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
     backups: list[dict] = []
     try:
         entries = list(backup_dir.iterdir())
@@ -13670,13 +13697,14 @@ class ImportRequest(BaseModel):
 
 
 @app.post("/api/ops/import")
-async def run_import(body: ImportRequest):
+async def run_import(body: ImportRequest, profile: Optional[str] = Query(None)):
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
     if not os.path.isfile(archive):
         raise HTTPException(status_code=404, detail=f"Archive not found: {archive}")
-    args = ["import", archive]
+    profile_name, _ = _dashboard_backup_profile(profile)
+    args = ["import", archive] if profile_name is None else ["--profile", profile_name, "import", archive]
     if body.force:
         args.append("--force")
     try:
@@ -13701,8 +13729,10 @@ def _safe_backup_upload_name(filename: str | None) -> str:
 async def run_import_upload(
     file: UploadFile = File(...),
     force: bool = Form(False),
+    profile: Optional[str] = Query(None),
 ):
-    staging_dir = _dashboard_backup_dir()
+    profile_name, _ = _dashboard_backup_profile(profile)
+    staging_dir = _dashboard_backup_dir(profile)
     try:
         staging_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -13758,7 +13788,9 @@ async def run_import_upload(
             detail="Uploaded archive is not a valid zip file",
         )
 
-    args = ["import", str(target)]
+    args = ["import", str(target)] if profile_name is None else [
+        "--profile", profile_name, "import", str(target)
+    ]
     if force:
         args.append("--force")
     try:
