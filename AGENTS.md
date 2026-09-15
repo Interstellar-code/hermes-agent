@@ -26,6 +26,21 @@ reviewing any change:
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
 
+## Fork divergence — read before changing shared surface
+
+This checkout is the **Interstellar-code fork**. It carries divergence upstream
+does not have, and an upstream merge is a routine event here.
+
+`FORK-REGISTRY.md` (repo root) is the durable record of what the fork owns:
+fork-only plugins, core-file patches, contract routes, and diverged decisions —
+each with the SHAs that implement it and its status against the current upstream
+tag. **Any change that touches fork-owned surface updates the relevant registry
+row in the same commit.** A divergence-touching change with no registry delta is
+incomplete.
+
+If you are about to edit a file and are unsure whether it is fork-owned, check
+the registry first — it is cheaper than discovering it during a merge.
+
 ## Contribution Rubric — What We Want / What We Don't
 
 This is the project's intent layer. Use it two ways:
