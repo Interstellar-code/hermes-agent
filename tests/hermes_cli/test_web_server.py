@@ -3085,6 +3085,31 @@ class TestWebServerEndpoints:
         assert captured["args"] == ["backup", "-o", str(archive)]
         assert archive.parent.is_dir()
 
+    def test_ops_backup_endpoints_honor_profile(self, tmp_path, monkeypatch):
+        import hermes_cli.web_server as ws
+        from hermes_cli import profiles as profiles_mod
+
+        profile_home = tmp_path / "profiles" / "work"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: name == "work")
+        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda name: profile_home)
+
+        backup_dir = profile_home / "backups"
+        backup_dir.mkdir()
+        archive = backup_dir / "hermes-backup-work.zip"
+        archive.write_bytes(b"zip bytes")
+
+        listed = self.client.get("/api/ops/backup/list", params={"profile": "work"})
+        assert listed.status_code == 200
+        assert [item["name"] for item in listed.json()["backups"]] == [archive.name]
+
+        downloaded = self.client.get(
+            "/api/ops/backup/download",
+            params={"profile": "work", "archive": str(archive)},
+        )
+        assert downloaded.status_code == 200
+        assert downloaded.content == b"zip bytes"
+
     def test_ops_backup_download_streams_dashboard_backup(self, tmp_path):
         import hermes_cli.web_server as ws
 
