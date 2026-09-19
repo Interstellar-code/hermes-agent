@@ -232,6 +232,13 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 
 SCHEMA_VERSION = 30
 
+# FORK-ONLY (#221). How long a ``handoff_state='pending'`` request stays actionable. The gateway
+# watcher polls every 2s (after a 5s startup delay) and every requester bounds its own wait far
+# below this, so 10 minutes covers a gateway restart or a slow platform reconnect while making it
+# impossible for an abandoned request to be executed hours later.
+# See SessionDB.expire_stale_handoffs in hermes_state_gateway.py.
+HANDOFF_PENDING_TTL_S = 600.0
+
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
 # freelist_count / PRAGMA page_count``). Below it a full rewrite costs more I/O than it returns — pruning a
@@ -372,6 +379,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     handoff_state TEXT,
     handoff_platform TEXT,
     handoff_error TEXT,
+    handoff_requested_at REAL,
     compression_failure_cooldown_until REAL,
     compression_failure_error TEXT,
     compression_fallback_streak INTEGER NOT NULL DEFAULT 0,

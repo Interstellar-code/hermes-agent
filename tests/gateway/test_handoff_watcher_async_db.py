@@ -47,6 +47,10 @@ class _RecordingSessionDB:
         idents = self.threads.get(name, [])
         return bool(idents) and all(i != self._loop_thread_ident for i in idents)
 
+    def expire_stale_handoffs(self):
+        self._record("expire_stale_handoffs")
+        return []
+
     def list_pending_handoffs(self):
         self._record("list_pending_handoffs")
         return [{"id": "sess-1"}]
@@ -132,3 +136,6 @@ async def test_watcher_wraps_calls_via_asyncio_to_thread(monkeypatch):
     assert "list_pending_handoffs" in wrapped
     assert "claim_handoff" in wrapped
     assert "complete_handoff" in wrapped
+    # FORK-ONLY (#221): the stale-request sweep must run BEFORE the listing, so an abandoned
+    # 'pending' row can never be executed by a later gateway start.
+    assert wrapped.index("expire_stale_handoffs") < wrapped.index("list_pending_handoffs")

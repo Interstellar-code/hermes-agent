@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_state_common import (
-    _RECOVERABLE_END_REASONS_SQL, _RESET_END_REASONS_SQL, _sql_json_extract, _sql_session_last_active)
+    _RECOVERABLE_END_REASONS_SQL, _RESET_END_REASONS_SQL, _sql_json_extract, _sql_session_last_active,
+    HANDOFF_PENDING_TTL_S)
 
 # Log-record parity with the origin module (caplog tests pin "hermes_state").
 logger = logging.getLogger("hermes_state")
@@ -613,14 +614,87 @@ class SessionGatewayMixin:
             " ORDER BY last_heartbeat DESC")
         return [dict(r) for r in rows]
 
+    def request_handoff_status(self, session_id: str, platform: str) -> str:
+        """FORK-ONLY (#221). Arm a handoff and say precisely what happened.
+
+        ``"queued"``    — the row was armed with ``handoff_state='pending'``.
+        ``"missing"``   — there is no ``sessions`` row with this id at all
+                          (a session that has never flushed a message).
+        ``"in_flight"`` — the row exists but is already ``pending``/``running``.
+
+        ``request_handoff`` used to collapse the last two into a bare ``False``, so callers
+        reported "already in flight for handoff" for a session that had no handoff record
+        whatsoever. The follow-up SELECT runs inside the same write transaction as the UPDATE,
+        so the answer cannot be raced by a concurrent writer.
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions "
+                "SET handoff_state = 'pending', "
+                "    handoff_platform = ?, "
+                "    handoff_error = NULL, "
+                "    handoff_requested_at = ? "
+                "WHERE id = ? AND (handoff_state IS NULL "
+                "                  OR handoff_state IN ('completed', 'failed'))",
+                (platform, time.time(), session_id),
+            )
+            if cur.rowcount > 0:
+                return "queued"
+            row = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return "in_flight" if row is not None else "missing"
+        return self._execute_write(_do)
+
     def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session pending handoff to *platform*; False if a handoff is already in flight."""
-        return self._write_rowcount(
-            "UPDATE sessions SET handoff_state = 'pending',     handoff_platform = ?, "
-            "    handoff_error = NULL WHERE id = ? AND (handoff_state IS NULL "
-            "                  OR handoff_state IN ('completed', 'failed'))",
-            (platform, session_id),
-        ) > 0
+        """Mark a session pending handoff to *platform*; False if a handoff is already in flight.
+
+        Use :meth:`request_handoff_status` when "already in flight" and "no such session" need
+        distinguishing.
+        """
+        return self.request_handoff_status(session_id, platform) == "queued"
+
+    def expire_stale_handoffs(
+        self, max_age_s: float = HANDOFF_PENDING_TTL_S
+    ) -> List[str]:
+        """FORK-ONLY (#221). Fail handoff requests nobody picked up within *max_age_s*.
+
+        A ``pending`` row is a standing instruction to re-bind the session to a messaging
+        platform, and the gateway's ``_handoff_watcher`` executes any it finds the moment it
+        starts. Without an expiry, a request abandoned because the requester was killed
+        mid-wait (SIGKILL beats every try/finally) would be carried out minutes or days later,
+        long after the user gave up on it — and, because ``request_handoff`` refuses to re-arm
+        a non-terminal row, would block every later ``/handoff`` on that session until state.db
+        was edited by hand.
+
+        Returns the ids that were expired. Rows written before ``handoff_requested_at`` existed
+        fall back to ``started_at``, which is always <= the request time, so legacy orphans
+        expire rather than linger.
+        """
+        cutoff = time.time() - max(0.0, float(max_age_s))
+
+        def _do(conn):
+            rows = conn.execute(
+                "SELECT id FROM sessions "
+                "WHERE handoff_state = 'pending' "
+                "  AND COALESCE(handoff_requested_at, started_at) < ?",
+                (cutoff,),
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                conn.execute(
+                    "UPDATE sessions SET handoff_state = 'failed', "
+                    "handoff_error = ? "
+                    "WHERE handoff_state = 'pending' "
+                    "  AND COALESCE(handoff_requested_at, started_at) < ?",
+                    ("handoff expired before the gateway picked it up", cutoff),
+                )
+            return ids
+
+        try:
+            return self._execute_write(_do)
+        except Exception:
+            return []
 
     def get_handoff_state(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return ``{"state", "platform", "error"}`` or None if the session has no handoff record."""
@@ -635,14 +709,25 @@ class SessionGatewayMixin:
         except Exception:
             return None
 
-    def list_pending_handoffs(self) -> List[Dict[str, Any]]:
-        """All sessions in handoff_state='pending', oldest first (gateway handoff watcher)."""
+    def list_pending_handoffs(
+        self, max_age_s: float = HANDOFF_PENDING_TTL_S
+    ) -> List[Dict[str, Any]]:
+        """All sessions in handoff_state='pending', oldest first (gateway handoff watcher).
+
+        FORK-ONLY (#221): rows older than *max_age_s* are skipped here as well as swept by
+        :meth:`expire_stale_handoffs`, so a stale row can never be executed by a watcher that
+        forgot to sweep first. ``COALESCE`` onto ``started_at`` keeps rows written before
+        ``handoff_requested_at`` existed from lingering forever.
+        """
+        cutoff = time.time() - max(0.0, float(max_age_s))
         try:
             rows = self._read_all(
                 "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved FROM sessions s "
                 "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
                 "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC")
+                "  AND COALESCE(s.handoff_requested_at, s.started_at) >= ? "
+                "ORDER BY s.started_at ASC",
+                (cutoff,))
             return [self._session_row_dict(r) for r in rows]
         except Exception:
             return []
