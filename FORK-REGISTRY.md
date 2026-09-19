@@ -161,6 +161,41 @@ committed to** since the fork point require a decision — those are here. Every
 > = `git rev-list --count <MB>..main -- <path>`. Zero means the fork is carrying a stale upstream
 > file it never edited.
 
+## §2c Class B-symbol — fork symbols living inside SHARED files (the gap §0 misses)
+
+**Why this section exists.** §0's class B counts fork-added **paths** — a file that exists only on the
+fork, which a tree adopt visibly drops. It has no slot for a fork-added **symbol inside a file that
+exists on both sides**. That file merges cleanly, produces no conflict marker, and the symbol
+silently disappears. `hermes_cli/kanban_templates.py` has already been broken this way once (#161).
+
+**Swept 2026-09-19** (method at the bottom). 664 fork-only `.py` paths scanned against
+`345cd2b057`: **147 imports of names absent at the tag, across 71 distinct symbols.**
+
+- **142 of the 147 have TEST consumers.** Those fail **loudly** at collection, so Phase G catches
+  them. They are not silent — but the underlying symbol loss is the same class, so a Phase-G test
+  error here means *a fork symbol was dropped*, not *a test needs updating*. Do not "fix" them by
+  editing the test.
+- **6 symbols have NON-TEST consumers.** These are the silent ones:
+
+| Symbol | Defined (fork) | Consumed by | Status at tag | Action on adopt |
+|---|---|---|---|---|
+| `cron.jobs.upsert_kanban_template_job` | `cron/jobs.py:1492` | `hermes_cli/kanban_templates.py:1172` | **absent** (0 at tag, 0 at merge-base) — genuinely fork-added | Re-apply. **Already dropped once (#161)**, restored `c5e9bd592`. |
+| `hermes_cli.kanban_db.connect` | `hermes_cli/kanban_db.py` | `hermes_cli/kanban_templates.py` (via `import … as _kdb`, attribute access) | absent | Re-apply. Invisible to `from X import` scans — found only by attribute-resolution. |
+| `hermes_cli.kanban_db.write_txn` | `hermes_cli/kanban_db.py` | `hermes_cli/kanban_templates.py` (via `_kdb.`) | absent | Re-apply. Same. |
+| `agent.usage_pricing.register_usage_observer` | `agent/usage_pricing.py:22` | `plugins/mcp_lazy/baseline_patch.py:76` | absent | Re-apply (S-2; also its own §2 row). |
+| `tools.browser_tool._run_browser_command` | `tools/browser_tool.py:2300` | `scripts/benchmark_browser_eval.py:97` | **moved**, not lost → `tools/browser_tool_session.py` | Mechanical repoint. Private name, so the compat layer does **not** cover it. |
+| `hermes_cli.web_server._is_authenticated` | *nowhere* | `hermes-switch-ui` + `personas` `plugin_api.py` | never existed on either side | Dead import — delete it (S-1, §4). |
+
+> **`hermes_cli/kanban_templates.py` is the single highest-risk non-test file**: three of the six
+> land in it, and it is the file #161 already broke. Assert its imports resolve after adopt —
+> `python -c "import hermes_cli.kanban_templates"` — do not settle for the file existing.
+
+**Method, and its limits.** Pass 1 resolved every `from X import n` in fork-only `.py` files against
+the tag's real module tree. That misses `import X` + `X.attr`: 250 such statements exist in fork-only
+files, but only **1** is non-test (`kanban_templates.py:45`), and resolving its attributes by hand is
+what produced the two `_kdb` rows above. **Not swept:** fork symbols in shared files consumed by
+*other shared files* — lower risk, since a correct §2/§3 replay carries both sides, but unmeasured.
+
 ## §3 Contract surface (SwitchUI-facing features of the 36-commit wave, `86480a4c6758f..main`)
 
 Status values: **OURS** (no upstream equivalent — replay) · **UPSTREAM-EQUIVALENT@version** ·
