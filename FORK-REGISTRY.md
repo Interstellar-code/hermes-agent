@@ -6,30 +6,47 @@ same commit** as any divergence-touching change. Git history remains the source 
 is a **claims ledger with provenance** — every entry carries implementing SHAs and a last-verified
 stamp. An entry without a SHA is a rumor, not a claim.
 
-**Verification anchors** (all stamps below verified 2026-09-11 against these refs, read-only):
+**Verification anchors** — re-stamped **2026-09-19** against **v0.21.3**, the current integration target. Read-only.
 
 | Anchor | Value |
 |---|---|
-| fork `main` HEAD | `72cc7bbd4e` (v0.19.17, 2026.8.14) |
-| upstream v0.20.6 tag | `5fc308a707` |
-| upstream v0.21.1 tag (= `v2026.9.7`) | `2237be3559` |
-| `upstream/main` (local ref, fetched 2026-09-11) | `0dcadf6f41` |
+| fork `main` HEAD | `422c26e928` (v0.19.17 line, 2026.8.14 tag + post-tag fork work) |
+| **TARGET — upstream v0.21.3** (= `v2026.9.14`) | **`345cd2b057`** ← pin everything here |
+| upstream v0.21.1 tag (= `v2026.9.7`) | `2237be3559` (superseded target; clean ancestor of v0.21.3) |
+| upstream v0.20.6 tag (= `v2026.8.27`) | `5fc308a707` (historical; the 0.20 doc's target) |
+| `upstream/main` (local ref, fetched 2026-09-19) | `228022ef5b` — **moving; never a target.** Was `0dcadf6f41` |
 | merge-base fork↔upstream | `3ef6bbd201` (upstream v0.19.0 release) |
-| fork∩upstream-changed files at v0.20.6 | **125 files / 171 fork commits** |
-| fork∩upstream-changed files at v0.21.1 | **126 files** |
-| fork-only paths vs v0.21.1 (`ls-tree` fork − tag) | **695** = **333 fork-added** + **362 upstream-removed** |
-| Last-verified stamp for all entries | **2026-09-11** (coverage audit + §0/§5 corrections: 2026-09-13) |
+| **replay surface at v0.21.3** | **126 files / 173 fork commits** (51 of the 126 are tests) |
+| replay surface at v0.21.1 | 126 files / 171 fork commits — **identical file set, zero new collisions** |
+| replay surface at v0.20.6 | 125 files / 171 fork commits |
+| fork-only paths vs v0.21.3 | **1090** = **334 class B** + **756 class C** |
+| fork-only paths vs v0.21.1 | 695 = 333 class B + 362 class C |
+| class C needing a decision at v0.21.3 | **11 of 756** — the other **745 are inherit-the-deletion** (0 fork commits) |
+| Last-verified stamp for all entries | **2026-09-19** (re-stamped to v0.21.3) |
+
+> **Reading the 0.21.1 → 0.21.3 delta.** The window is large — 2,025 commits, 3,695 files,
+> +233,118/−49,072 — but it costs the fork almost nothing. The colliding file set is **byte-identical
+> at 126** with **zero new collisions**; the replay grows by **2 commits** (171 → 173). Class C
+> doubling (362 → 756) is upstream housekeeping: only **11** of the 756 are paths the fork ever
+> committed to, and 9 of those 11 are test files that follow their subject — the two substantive
+> ones (`acp_registry/agent.json`, `plugins/observability/nemo_relay/__init__.py`) are already
+> decided in §2b. Class B is **unchanged**: the set delta vs v0.21.1 is empty; the count moved
+> 333 → 334 only because this registry file was itself added to the fork.
+>
+> **Therefore: target v0.21.3 directly.** Skipping v0.21.1 adds no conflict surface and avoids a
+> second integration. Pin late — if a newer tag lands before execution, re-run §5 rather than
+> trusting this table.
 
 ## §0 The three divergence classes (read this before §1)
 
 A registry organized only around *collision* misses two-thirds of the divergence. Every fork/upstream
 difference falls into exactly one class, and each fails differently at adopt time:
 
-| Class | Size at v0.21.1 | How it fails | Covered by |
+| Class | Size at **v0.21.3** | How it fails | Covered by |
 |---|---|---|---|
-| **A — SHARED-MODIFIED** (both sides changed the same existing file) | **125–126** | textual/semantic conflict | §2, §3 |
-| **B — FORK-ADDED** (exists on fork, never existed upstream) | **333** | **silently dropped** by a tree-level adopt — never appears in a conflict list | §1, §2 |
-| **C — UPSTREAM-REMOVED** (existed at merge-base; upstream deleted it since; fork still carries it) | **362** | **silently deleted** by adopt — usually correct, occasionally not | §2b |
+| **A — SHARED-MODIFIED** (both sides changed the same existing file) | **126** (173 fork commits) | textual/semantic conflict | §2, §3 |
+| **B — FORK-ADDED** (exists on fork, never existed upstream) | **334** | **silently dropped** by a tree-level adopt — never appears in a conflict list | §1, §2 |
+| **C — UPSTREAM-REMOVED** (existed at merge-base; upstream deleted it since; fork still carries it) | **756**, of which **only 11 need a decision** | **silently deleted** by adopt — usually correct, occasionally not | §2b |
 
 Class B is the one the intersection cannot see: a `read-tree`/checkout from upstream drops fork-added
 paths without a conflict marker. The `_matrix-memory-mnemosyne` gitlink hazard (§1) is one instance of
