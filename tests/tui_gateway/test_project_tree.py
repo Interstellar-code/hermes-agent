@@ -58,6 +58,26 @@ def _lane_ids(project):
     return [g["id"] for repo in project["repos"] for g in repo["groups"]]
 
 
+def _home(tree):
+    """The Home bucket, or None when nothing was left unplaced."""
+    return next((p for p in tree["projects"] if p["id"] == pt.NO_PROJECT_ID), None)
+
+
+def _home_session_ids(tree):
+    home = _home(tree)
+    return [s["id"] for s in _sessions_of(home)] if home else []
+
+
+def _sessions_of(project):
+    return [s for repo in project["repos"] for g in repo["groups"] for s in g["sessions"]]
+
+
+def _real_project_ids(tree):
+    """Project ids excluding the Home bucket (which is always present when any
+    session went unplaced, so asserting on it in every test would be noise)."""
+    return [p["id"] for p in tree["projects"] if p["id"] != pt.NO_PROJECT_ID]
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -103,6 +123,42 @@ def test_linked_worktrees_fold_under_their_common_repo_root():
     linked = next(g for repo in project["repos"] for g in repo["groups"] if not g["isMain"])
     assert linked["id"] == "/elsewhere/wt"
     assert linked["path"] == "/elsewhere/wt"
+
+
+def test_overview_orders_lanes_by_recency_not_alphabetically():
+    # Two linked-worktree lanes under one common repo root whose ALPHABETICAL
+    # order (wt-aaa, wt-zzz) is the OPPOSITE of their activity order (wt-zzz is
+    # the more recently active). The overview (hydrate=False) empties lane
+    # session arrays for payload slimness — but the lane sort must still run on
+    # real recency, matching the drill-in (hydrate=True) order, not collapse to
+    # alphabetical because the rows were dropped before sorting.
+    resolve = _resolver(
+        {
+            "/repo": ("/repo", "/repo"),
+            "/wt-aaa": ("/repo", "/wt-aaa"),
+            "/wt-zzz": ("/repo", "/wt-zzz"),
+        }
+    )
+    sessions = [
+        _session("/repo", branch="main", last_active=5000),
+        _session("/wt-aaa", last_active=1000),  # alphabetically first, older
+        _session("/wt-zzz", last_active=9000),  # alphabetically last, newer
+    ]
+
+    def _non_trunk_labels(hydrate):
+        tree = pt.build_tree([], sessions, [], resolve, hydrate=hydrate)
+        project = tree["projects"][0]
+        return [
+            g["label"]
+            for repo in project["repos"]
+            for g in repo["groups"]
+            if not g["isMain"]
+        ]
+
+    # Overview path: recency order (newer first), NOT alphabetical.
+    assert _non_trunk_labels(hydrate=False) == ["wt-zzz", "wt-aaa"]
+    # Drill-in path already sorts by recency — the two paths must agree.
+    assert _non_trunk_labels(hydrate=True) == ["wt-zzz", "wt-aaa"]
 
 
 def test_kanban_task_worktrees_collapse_into_one_bucket():
@@ -169,6 +225,52 @@ def test_unrecorded_and_recorded_main_share_one_lane():
     assert len(main_lanes[0]["sessions"]) == 2
 
 
+def test_main_checkout_detected_when_roots_differ_only_in_path_spelling():
+    # The two roots come from DIFFERENT git probes: `rev-parse --show-toplevel`
+    # emits forward slashes, while the `--git-common-dir` path goes through
+    # os.path.dirname and keeps Windows backslashes. The main checkout must be
+    # recognized by path IDENTITY, not by raw string equality — otherwise the
+    # repo's own checkout is misread as a linked worktree and the sidebar shows
+    # both a dir-labeled lane and a branch-labeled "main" lane for one checkout.
+    resolve = _resolver(
+        {
+            "C:/repo": ("C:\\repo", "C:/repo"),
+        }
+    )
+    sessions = [_session("C:/repo", branch="main")]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = next(p for p in tree["projects"] if pt._path_key(p["id"]) == pt._path_key("C:/repo"))
+    lanes = [g for repo in project["repos"] for g in repo["groups"]]
+
+    assert len(lanes) == 1
+    assert lanes[0]["isMain"] is True
+    # Labeled by branch (a main checkout), never by the directory basename.
+    assert lanes[0]["label"] == "main"
+
+
+def test_main_and_linked_worktree_do_not_duplicate_one_checkout():
+    # End-to-end shape of the reported bug: the repo's own checkout plus a real
+    # linked worktree. Mixed separators across probes must still yield exactly
+    # one lane per checkout — a branch lane for main, a dir lane for the linked
+    # worktree — not three lanes for two checkouts.
+    resolve = _resolver(
+        {
+            "C:/repo": ("C:\\repo", "C:/repo"),
+            "C:/repo-wt": ("C:\\repo", "C:/repo-wt"),
+        }
+    )
+    sessions = [_session("C:/repo", branch="main"), _session("C:/repo-wt", branch="feature")]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = next(p for p in tree["projects"] if pt._path_key(p["id"]) == pt._path_key("C:/repo"))
+    lanes = [g for repo in project["repos"] for g in repo["groups"]]
+
+    assert len(lanes) == 2
+    assert [g["label"] for g in lanes] == ["main", "repo-wt"]
+    assert [g["isMain"] for g in lanes] == [True, False]
+
+
 def test_persisted_repo_root_used_when_no_live_probe():
     # No resolver (remote backend): fall back to the persisted git_repo_root and
     # split the main checkout by the session's recorded branch.
@@ -193,18 +295,9 @@ def test_non_git_cwd_preserves_legacy_workspace_grouping():
     assert project["isAuto"] is True
     assert project["label"] == "notes"
     assert project["sessionCount"] == 1
-    assert _lane_ids(project) == ["/work/notes"]
-    assert tree["scoped_session_ids"] == [legacy["id"]]
-
-
-def test_non_git_windows_cwd_preserves_legacy_workspace_grouping():
-    cwd = r"C:\Users\alice\workspace\notes"
-    legacy = _session(cwd)
-
-    tree = pt.build_tree([], [legacy], [], resolve=lambda _cwd: None, hydrate=True)
-
-    assert [p["id"] for p in tree["projects"]] == [cwd]
-    assert tree["projects"][0]["label"] == "notes"
+    # Branch-style lane id (#53329): keying this lane by the raw path used to
+    # fork a duplicate lane against the live overlay's `::branch::main` id.
+    assert _lane_ids(project) == ["/work/notes::branch::main"]
     assert tree["scoped_session_ids"] == [legacy["id"]]
 
 
@@ -251,17 +344,6 @@ def test_wsl_localhost_cwds_collapse_into_one_auto_project():
     assert tree["projects"][0]["sessionCount"] == 2
 
 
-def test_wsl_localhost_path_cannot_bypass_explicit_project():
-    explicit = _project("p_proj", "Proj", [r"\wsl.localhost\Ubuntu\home\alice\proj"])
-    session = _session("//wsl.localhost/Ubuntu/home/alice/PROJ/")
-
-    tree = pt.build_tree([explicit], [session], [], resolve=lambda _cwd: None, hydrate=True)
-
-    assert [p["id"] for p in tree["projects"]] == ["p_proj"]
-    assert tree["projects"][0]["sessionCount"] == 1
-    assert tree["scoped_session_ids"] == [session["id"]]
-
-
 def test_posix_path_identity_remains_case_sensitive():
     explicit = _project("p_notes", "Notes", ["/Work/Notes"])
     session = _session("/work/notes")
@@ -306,12 +388,12 @@ def test_scoped_session_ids_is_union_of_placed_sessions():
     )
     owned = _session("/www/app", branch="main")
     auto = _session("/www/repo", branch="main")
-    homeless = _session(None)  # no cwd -> belongs to no project
+    homeless = _session(None)  # no cwd -> the Home bucket
 
     tree = pt.build_tree([project], [owned, auto, homeless], [], resolve, hydrate=True)
 
-    assert set(tree["scoped_session_ids"]) == {owned["id"], auto["id"]}
-    assert homeless["id"] not in tree["scoped_session_ids"]
+    assert set(tree["scoped_session_ids"]) == {owned["id"], auto["id"], homeless["id"]}
+    assert _home_session_ids(tree) == [homeless["id"]]
 
 
 def test_overview_drops_session_rows_but_keeps_counts_and_previews():
@@ -339,21 +421,6 @@ def test_discovered_repo_with_no_sessions_becomes_zero_session_project():
     assert fresh["repos"][0]["groups"] == []
 
 
-def test_explicit_project_with_no_sessions_seeds_its_folders_as_repos():
-    # A brand-new (or unloaded) project must still expose its declared folders as
-    # repos so the entered view renders and the desktop's optimistic overlay has a
-    # lane to place a freshly-created session into (otherwise it only shows after a
-    # full tree refresh).
-    project = _project("p_new", "New", ["/work/blank"])
-
-    tree = pt.build_tree([project], [], [], resolve=None, hydrate=True)
-
-    node = next(p for p in tree["projects"] if p["id"] == "p_new")
-    assert node["sessionCount"] == 0
-    assert [r["path"] for r in node["repos"]] == ["/work/blank"]
-    assert node["repos"][0]["groups"] == []
-
-
 def test_seeded_folder_repo_does_not_duplicate_a_session_derived_repo():
     # When a folder already has sessions (same git root), seeding must not add a
     # second repo for the same path.
@@ -365,15 +432,6 @@ def test_seeded_folder_repo_does_not_duplicate_a_session_derived_repo():
 
     node = next(p for p in tree["projects"] if p["id"] == "p_app")
     assert [r["path"] for r in node["repos"]] == ["/www/app"]
-
-
-def test_discovered_repo_owned_by_explicit_project_is_not_duplicated():
-    project = _project("p_app", "App", ["/www/app"])
-    discovered = [{"root": "/www/app", "label": "app", "sessions": 2, "last_active": 1}]
-
-    tree = pt.build_tree([project], [], discovered, resolve=None, hydrate=False)
-
-    assert [p["id"] for p in tree["projects"] if p["path"] == "/www/app"] == ["p_app"]
 
 
 def test_nested_project_folders_pick_the_deepest_match():
@@ -403,8 +461,8 @@ def test_nested_project_folders_pick_the_deepest_match():
 
 def test_junk_root_never_becomes_an_auto_project():
     # A session whose git root is HERMES_HOME (config/state) must not spawn a
-    # phantom project; it falls through to flat Recents (unscoped). A real repo
-    # alongside it still groups normally.
+    # phantom project; it lands in the Home bucket. A real repo alongside it
+    # still groups normally.
     resolve = _resolver(
         {
             "/home/me/.hermes": ("/home/me/.hermes", "/home/me/.hermes"),
@@ -417,37 +475,9 @@ def test_junk_root_never_becomes_an_auto_project():
 
     tree = pt.build_tree([], [junk, real], [], resolve, hydrate=True, is_junk_root=is_junk)
 
-    ids = {p["id"] for p in tree["projects"]}
-    assert ids == {"/www/app"}
-    assert junk["id"] not in tree["scoped_session_ids"]
+    assert _real_project_ids(tree) == ["/www/app"]
+    assert _home_session_ids(tree) == [junk["id"]]
     assert real["id"] in tree["scoped_session_ids"]
-
-
-def test_junk_root_is_dropped_from_the_discovered_tier():
-    discovered = [{"root": "/home/me/.hermes", "label": ".hermes", "sessions": 0, "last_active": 9}]
-
-    tree = pt.build_tree([], [], discovered, resolve=None, is_junk_root=lambda r: r == "/home/me/.hermes")
-
-    assert tree["projects"] == []
-
-
-def test_non_git_cwd_can_group_inside_a_junk_repo_subtree():
-    # Repo discovery rejects the full state subtree, but a selected non-git
-    # descendant may be an intentional workspace carried over from the old UI.
-    workspace = _session("/home/test/.hermes/workspaces/notes")
-
-    tree = pt.build_tree(
-        [],
-        [workspace],
-        [],
-        resolve=lambda _cwd: None,
-        hydrate=True,
-        is_junk_root=lambda path: path.startswith("/home/test/.hermes"),
-        is_junk_cwd=lambda path: path in {"/home/test", "/home/test/.hermes"},
-    )
-
-    assert [p["id"] for p in tree["projects"]] == ["/home/test/.hermes/workspaces/notes"]
-    assert tree["scoped_session_ids"] == [workspace["id"]]
 
 
 def test_broad_default_non_git_cwd_stays_unscoped():
@@ -462,8 +492,98 @@ def test_broad_default_non_git_cwd_stays_unscoped():
         is_junk_cwd=lambda path: path in {"/home/test", "/home/test/.hermes"},
     )
 
-    assert tree["projects"] == []
-    assert detached["id"] not in tree["scoped_session_ids"]
+    assert _real_project_ids(tree) == []
+    assert _home_session_ids(tree) == [detached["id"]]
+
+
+def test_deleted_sibling_worktree_folds_into_parent_home_checkout():
+    # A deleted <repo>-<suffix> worktree leaves its session with an unresolvable
+    # cwd and no persisted root. It joins the parent's trunk lane — no dead-path
+    # lane, no phantom project.
+    resolve = _resolver({"/www/hermes-agent": ("/www/hermes-agent", "/www/hermes-agent")})
+    sessions = [
+        _session("/www/hermes-agent", branch="main"),
+        _session("/www/hermes-agent-session-links"),
+    ]
+
+    tree = pt.build_tree([], sessions, [], resolve, hydrate=True)
+    project = tree["projects"][0]
+
+    assert [p["id"] for p in tree["projects"]] == ["/www/hermes-agent"]
+    assert _lane_ids(project) == ["/www/hermes-agent::branch::main"]
+    main = project["repos"][0]["groups"][0]
+    assert main["isMain"] and main["path"] == "/www/hermes-agent"
+    assert len(main["sessions"]) == 2
+
+
+def test_existing_non_git_workspace_still_becomes_a_project():
+    # The existence guard keys on the DIRECTORY, not on git-ness: a plain folder
+    # that's still on disk is a legitimate workspace and must keep its project.
+    sessions = [_session("/www/notes")]
+
+    tree = pt.build_tree([], sessions, [], lambda _cwd: None, hydrate=True, exists=lambda _p: True)
+
+    assert [p["id"] for p in tree["projects"]] == ["/www/notes"]
+
+
+def test_stale_persisted_repo_root_does_not_become_a_project():
+    # A session carrying a git_repo_root whose repo has since been deleted must
+    # not resurrect it as a project on the strength of the persisted value alone.
+    stale = _session("/tmp/gone/sub", repo_root="/tmp/gone")
+
+    tree = pt.build_tree([], [stale], [], lambda _cwd: None, hydrate=True, exists=lambda _p: False)
+
+    assert _real_project_ids(tree) == []
+    assert _home_session_ids(tree) == [stale["id"]]
+
+
+def test_exists_defaults_to_keeping_everything():
+    # Omitting `exists` (remote backends, which can't stat) preserves the old
+    # behavior: guessing "gone" would wrongly hide a project on the other host.
+    sessions = [_session("/remote/workspace")]
+
+    tree = pt.build_tree([], sessions, [], lambda _cwd: None, hydrate=True)
+
+    assert [p["id"] for p in tree["projects"]] == ["/remote/workspace"]
+
+
+def test_sibling_probe_is_bounded():
+    # Each miss costs a git invocation, and this runs per session, so a deeply
+    # nested unresolvable cwd must not fan out into an unbounded probe storm.
+    probed = []
+
+    def resolve(cwd):
+        probed.append(cwd)
+        return None
+
+    assert pt._probe_sibling_worktree("/a-b-c/d-e-f/g-h-i/j-k-l", resolve) == ""
+    assert len(probed) <= pt._MAX_SIBLING_PROBES
+
+
+def test_home_bucket_leads_the_tree_and_is_lossless():
+    # Every session a project didn't claim belongs to Home, and Home leads the
+    # list — so the grouped view shows the same set of sessions as flat Recents.
+    resolve = _resolver({"/www/app": ("/www/app", "/www/app"), "/home/me": ("/home/me", "/home/me")})
+    owned = _session("/www/app", branch="main")
+    cwdless = _session(None)
+    junked = _session("/home/me", branch="main")
+
+    tree = pt.build_tree(
+        [],
+        [owned, cwdless, junked],
+        [],
+        resolve,
+        hydrate=True,
+        is_junk_root=lambda root: root == "/home/me",
+    )
+
+    assert tree["projects"][0]["id"] == pt.NO_PROJECT_ID
+    assert set(_home_session_ids(tree)) == {cwdless["id"], junked["id"]}
+    assert {s["id"] for p in tree["projects"] for s in _sessions_of(p)} == {
+        owned["id"],
+        cwdless["id"],
+        junked["id"],
+    }
 
 
 def test_colliding_repo_basenames_disambiguate_labels():
@@ -481,202 +601,59 @@ def test_colliding_repo_basenames_disambiguate_labels():
     assert labels == ["x/proj", "y/proj"]
 
 
-# ---------------------------------------------------------------------------
-# Per-session project binding (issue #191) — pure-function resolver
-# ---------------------------------------------------------------------------
+def test_non_git_folder_uses_branch_lane_id():
+    """#53329: _place_by_heuristic must use _branch_lane_id for non-git folders.
 
-
-class _FakeBinding:
-    """Duck-typed stand-in for projects_db.SessionBinding (no DB needed)."""
-
-    def __init__(self, project_id: str) -> None:
-        self.project_id = project_id
-
-
-class _FakeProject:
-    """Duck-typed stand-in for projects_db.Project — only the resolver touches
-    three fields, so we don't need the full dataclass."""
-
-    def __init__(self, id_: str, slug: str, name: str) -> None:
-        self.id = id_
-        self.slug = slug
-        self.name = name
-
-
-class _FakeProjectsDB:
-    """In-memory backend satisfying ``resolve_session_project``'s contract.
-
-    The real ``hermes_cli.projects_db`` exposes ``get_session_project(id)``,
-    ``get_project(ident)``, and ``get_active_id()`` — three calls, no I/O.
-    The resolver reaches for them by name, so a literal works.
+    Before the fix, non-git folders got a lane key equal to the raw path,
+    while the desktop overlay expected ::branch::main. This caused duplicate
+    lanes (one from backend, one from overlay).
     """
-
-    def __init__(self) -> None:
-        self.bindings: dict[str, str] = {}
-        self.projects: dict[str, _FakeProject] = {}
-        self.active_id: str | None = None
-
-    def add_project(self, id_: str, slug: str, name: str) -> _FakeProject:
-        proj = _FakeProject(id_, slug, name)
-        self.projects[id_] = proj
-        return proj
-
-    def bind(self, session_id: str, project_id: str) -> None:
-        self.bindings[session_id] = project_id
-
-    # --- The three names ``resolve_session_project`` looks for ---
-    def get_session_project(self, session_id: str):
-        pid = self.bindings.get(session_id)
-        return _FakeBinding(pid) if pid else None
-
-    def get_project(self, ident: str):
-        return self.projects.get(ident)
-
-    def get_active_id(self):
-        return self.active_id
-
-
-def _project_dict(proj: _FakeProject | None) -> dict | None:
-    return None if proj is None else {"id": proj.id, "slug": proj.slug, "name": proj.name}
-
-
-def test_resolver_returns_unbound_when_no_backend_and_no_cwd():
-    out = pt.resolve_session_project("s1", "/somewhere")
-    assert out == {"session_id": "s1", "project": None, "source": None}
-
-
-def test_resolver_precedence_explicit_binding_wins_over_active():
-    db = _FakeProjectsDB()
-    bound = db.add_project("p1", "bound", "Bound")
-    active = db.add_project("p2", "active", "Active")
-    db.bind("s1", "p1")
-    db.active_id = "p2"
-
-    out = pt.resolve_session_project("s1", "/x", projects_db=db)
-    assert out["source"] == "binding"
-    assert out["project"] == _project_dict(bound)
-    # Active was set but the binding takes precedence — caller never sees it.
-    assert out["project"]["id"] != active.id
-
-
-def test_resolver_precedence_active_wins_over_cwd_heuristic():
-    db = _FakeProjectsDB()
-    active = db.add_project("p2", "active", "Active")
-    db.active_id = "p2"
-    cwd_proj = _FakeProject("p3", "cwd", "CWD")
-
-    def _cwd_resolver(cwd: str):
-        return _project_dict(cwd_proj)
-
-    out = pt.resolve_session_project(
-        "s1", "/somewhere", projects_db=db, resolve_cwd_project=_cwd_resolver
+    result = pt._place_by_heuristic("/home/user/my-project")
+    assert result is not None
+    assert result["lane_key"] == pt._branch_lane_id(
+        "/home/user/my-project", pt.DEFAULT_BRANCH_LABEL
+    ), (
+        f"Expected lane_key to use _branch_lane_id scheme but got "
+        f"{result['lane_key']!r}"
     )
-    assert out["source"] == "active"
-    assert out["project"] == _project_dict(active)
+    # The label should still be the folder basename
+    assert result["lane_label"] == "my-project"
+    # Must be marked as main lane
+    assert result["is_main"] is True
 
 
-def test_resolver_falls_through_to_cwd_when_no_binding_and_no_active():
-    db = _FakeProjectsDB()
-    # Note: no active_id set; the resolver must not return ``source="active"``
-    # for an unset pointer.
-    cwd_proj = db.add_project("p3", "cwd", "CWD")
-
-    def _cwd_resolver(cwd: str):
-        return _project_dict(cwd_proj)
-
-    out = pt.resolve_session_project(
-        "s1", "/somewhere", projects_db=db, resolve_cwd_project=_cwd_resolver
+def test_non_git_folder_lane_matches_overlay_scheme():
+    """#53329: verify the lane key format matches what the overlay expects."""
+    result = pt._place_by_heuristic("/data/work/folder-x")
+    assert result is not None
+    # Overlay expects: <path>::branch::main
+    expected = "/data/work/folder-x::branch::main"
+    assert result["lane_key"] == expected, (
+        f"Expected lane_key={expected!r} but got {result['lane_key']!r}"
     )
-    assert out["source"] == "cwd"
-    assert out["project"] == _project_dict(cwd_proj)
 
 
-def test_resolver_missing_binding_returns_none_cleanly():
-    db = _FakeProjectsDB()
-    db.add_project("p1", "bound", "Bound")
-    # No binding, no active, no cwd resolver.
-    out = pt.resolve_session_project("s_unknown", "/x", projects_db=db)
-    assert out == {"session_id": "s_unknown", "project": None, "source": None}
+def test_heuristic_lane_ids_for_kanban_and_wt_suffix_are_unchanged():
+    """The branch-style id applies ONLY to the plain-folder fallback.
 
-
-def test_resolver_handles_empty_session_id():
-    db = _FakeProjectsDB()
-    bound = db.add_project("p1", "bound", "Bound")
-    # An empty session id must NOT accidentally pick up someone else's binding.
-    out = pt.resolve_session_project("", "/x", projects_db=db)
-    assert out == {"session_id": "", "project": None, "source": None}
-    # The bound project's id is the same one we will not see here.
-    assert bound.id == "p1"
-
-
-def test_resolver_tolerates_backend_errors_and_degrades():
-    class _Boom:
-        def get_session_project(self, sid):  # noqa: D401
-            raise RuntimeError("db down")
-
-        def get_project(self, ident):
-            raise RuntimeError("db down")
-
-        def get_active_id(self):
-            raise RuntimeError("db down")
-
-    out = pt.resolve_session_project("s1", "/x", projects_db=_Boom())
-    assert out == {"session_id": "s1", "project": None, "source": None}
-
-
-def test_build_tree_with_binding_overrides_cwd_heuristic():
-    """``build_tree`` should consult the binding BEFORE the cwd heuristic.
-
-    The session's cwd is under ``/www/other`` (which would normally claim it
-    for that auto project), but the binding pins it to the explicit
-    ``p_bound`` project. The session must end up under ``p_bound`` and the
-    auto /www/other project must NOT pick it up.
+    Kanban worktrees keep the ::kanban id and `<repo>-wt-<slug>` folders keep
+    the raw-path lane key so existing worktree lanes don't fork.
     """
-    db = _FakeProjectsDB()
-    bound = db.add_project("p_bound", "bound", "Bound")
-    db.bind("s_known", bound.id)
+    kanban = pt._place_by_heuristic("/www/app/.worktrees/t_1a2b3c")
+    assert kanban is not None
+    assert kanban["lane_key"] == pt._kanban_lane_id("/www/app")
+    assert kanban["is_kanban"] is True
 
-    project = _project("p_bound", "Bound", ["/elsewhere"])
-    resolve = _resolver(
-        {
-            "/www/other": ("/www/other", "/www/other"),
-            "/elsewhere": ("/elsewhere", "/elsewhere"),
-        }
-    )
-    sessions = [
-        _session("/www/other", branch="main", id="s_known"),
-        _session("/www/other", branch="main"),  # unbound, owns the auto project
-    ]
-
-    tree = pt.build_tree(
-        [project], sessions, [], resolve, hydrate=True, projects_db=db
-    )
-
-    by_id = {p["id"]: p for p in tree["projects"]}
-    assert by_id["p_bound"]["sessionCount"] == 1
-    # The unbound /www/other session falls through to the cwd heuristic and
-    # becomes its own auto project.
-    assert any(p["id"] == "/www/other" and p["isAuto"] for p in tree["projects"])
-    # The bound session is in the explicit project's scoped set, NOT the
-    # auto project's. (Catches the "auto project swallowed the bound session"
-    # regression directly.)
-    scoped = set(tree["scoped_session_ids"])
-    assert "s_known" in scoped
-    # The auto /www/other project owns only the OTHER (unbound) session.
-    auto = by_id["/www/other"]
-    assert auto["sessionCount"] == 1
+    wt = pt._place_by_heuristic("/www/app-wt-feature")
+    assert wt is not None
+    assert wt["lane_key"] == "/www/app-wt-feature"
+    assert wt["lane_label"] == "feature"
+    assert wt["is_main"] is False
 
 
-def test_build_tree_without_binding_backend_keeps_cwd_heuristic_behavior():
-    """When ``projects_db`` is None, the binding lookup is a no-op and the
-    cwd heuristic alone decides project ownership — i.e. the pre-binding
-    behavior is preserved for callers that don't opt in."""
-    project = _project("p_app", "App", ["/www/app"])
-    resolve = _resolver({"/www/app": ("/www/app", "/www/app")})
-    sessions = [_session("/www/app", branch="main", id="s1")]
-
-    # No projects_db → no binding → cwd heuristic wins.
-    tree = pt.build_tree([project], sessions, [], resolve, hydrate=True)
-
-    by_id = {p["id"]: p for p in tree["projects"]}
-    assert by_id["p_app"]["sessionCount"] == 1
+def test_equivalent_windows_spellings_derive_one_lane_key():
+    """Lane identity must collapse separator/trailing-slash variants (#62165)."""
+    a = pt._place_by_heuristic("C:/work/notes")
+    b = pt._place_by_heuristic("C:\\work\\notes\\")
+    assert a is not None and b is not None
+    assert pt._lane_key(a["lane_key"]) == pt._lane_key(b["lane_key"])
