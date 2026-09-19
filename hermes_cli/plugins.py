@@ -106,6 +106,10 @@ def _install_plugin_debug_handler(force: bool = False) -> None:
 _install_plugin_debug_handler()
 
 VALID_HOOKS: Set[str] = {
+    # transform_tools (FORK-ONLY): transform the tool list before it is sent to the API
+    # (mcp_lazy lazy-load). Plugins return a replacement tools list, or None to leave it
+    # unchanged; the first non-empty list wins. Fired from agent/turn_api_request.py.
+    "transform_tools",
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",

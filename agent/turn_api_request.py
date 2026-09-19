@@ -108,6 +108,22 @@ def build_api_request(
     # require reasoning_content — re-apply the echo-back pad (idempotent) and re-render
     # the prompt-cache decoration for the current provider.
     agent._reapply_reasoning_echo_for_provider(api_messages)
+    # transform_tools (FORK-ONLY hook, mcp_lazy): let a plugin swap the tool list before it
+    # is sent. Fired HERE, not inside build_api_kwargs where the pre-decomposition fork had
+    # it: upstream now decorates the tool list for the prompt cache in
+    # _redecorate_prompt_cache_for_provider BEFORE kwargs are built, so a later swap would
+    # plan cache markers over one tool list and ship a different one.
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        for _result in invoke_hook(
+            "transform_tools", tools=tools_for_api, agent=agent, api_messages=api_messages,
+        ) or []:
+            if isinstance(_result, list) and _result:
+                tools_for_api = _result
+                break
+    except Exception as _exc:  # a broken plugin must never block the request
+        logger.debug("transform_tools hook error: %s", _exc)
     api_messages, _moa_prepared_request, tools_for_api = (
         _redecorate_prompt_cache_for_provider(
             agent, api_messages, system_message=system_message, moa_prepared=_moa_prepared_request,

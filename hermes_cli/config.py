@@ -1220,6 +1220,33 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+
+    # ── mcp lazy-loading config (FORK-ONLY, mcp_lazy plugin) ──────────────
+    mcp_cfg = config.get("mcp")
+    if mcp_cfg is not None:
+        if not isinstance(mcp_cfg, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"mcp should be a dict, got {type(mcp_cfg).__name__}",
+                "Use:\n  mcp:\n    lazy_loading: true\n    discovery_mode: tool",
+            ))
+        else:
+            mode = mcp_cfg.get("discovery_mode")
+            if mode is not None and mode not in {"tool", "server", "both"}:
+                issues.append(ConfigIssue(
+                    "error",
+                    "mcp.discovery_mode must be one of: tool, server, both",
+                    "Set discovery_mode to 'tool', 'server', or 'both'",
+                ))
+            for key in ("lazy_stub_max_desc", "server_stub_max_desc"):
+                value = mcp_cfg.get(key)
+                if value is not None and (not isinstance(value, int) or value < 0):
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"mcp.{key} must be a non-negative integer",
+                        f"Set {key} to a non-negative integer, or remove it",
+                    ))
+
     return issues
 
 
