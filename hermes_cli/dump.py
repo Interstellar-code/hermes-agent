@@ -148,9 +148,14 @@ def _config_overrides(config: dict) -> dict[str, str]:
         user_val = user_section.get(key)
         if user_val is not None and user_val != default_section.get(key):
             overrides[f"{section}.{key}"] = str(user_val)
-    user_toolsets = config.get("toolsets", [])
-    if user_toolsets != DEFAULT_CONFIG.get("toolsets", []):
-        overrides["toolsets"] = str(user_toolsets)
+    # The raw value may be a comma-separated string OR a list depending on how
+    # it was written. Normalize BOTH sides before comparing, or the string
+    # "hermes-cli" is reported as an override of the equivalent list default
+    # ["hermes-cli"]. _normalize_toolsets is the house convention for this.
+    from hermes_cli.oneshot import _normalize_toolsets
+    user_toolsets = _normalize_toolsets(config.get("toolsets")) or []
+    if user_toolsets != (_normalize_toolsets(DEFAULT_CONFIG.get("toolsets")) or []):
+        overrides["toolsets"] = ", ".join(user_toolsets) if user_toolsets else "(none)"
     fallbacks = config.get("fallback_providers", [])
     if fallbacks:
         overrides["fallback_providers"] = str(fallbacks)
@@ -244,7 +249,11 @@ def run_dump(args):
         profile = get_active_profile_name() or "(default)"
     except Exception:
         profile = "(default)"
-    toolsets = config.get("toolsets", ["hermes-cli"])
+    # Same string-or-list shape as above: a naive ', '.join() on the string form
+    # iterates CHARACTERS -- "hermes-cli,kanban" renders as
+    # "h, e, r, m, e, s, -, c, l, i, ,, k, a, n, b, a, n" in the dump.
+    from hermes_cli.oneshot import _normalize_toolsets
+    toolsets = _normalize_toolsets(config.get("toolsets", ["hermes-cli"])) or []
     platforms = [name for name, env in _PLATFORM_ENV_VARS.items() if os.getenv(env)]
     lines = [
         "--- hermes dump ---",
