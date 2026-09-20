@@ -196,6 +196,49 @@ files, but only **1** is non-test (`kanban_templates.py:45`), and resolving its 
 what produced the two `_kdb` rows above. **Not swept:** fork symbols in shared files consumed by
 *other shared files* — lower risk, since a correct §2/§3 replay carries both sides, but unmeasured.
 
+### §2c sweep 2 — module-attribute consumption (the blind spot above, now closed) — 2026-09-20
+
+Sweep 1's `from X import n` limitation was not academic. It missed the ENTIRE per-session
+project-binding layer, because the consumers bind the module and go through attributes:
+
+```python
+from hermes_cli import projects_db     # a MODULE, not a symbol -> invisible to sweep 1
+projects_db.bind_session(...)          # the actual loss
+```
+
+Three adopted modules were calling `projects_db.bind_session` / `get_session_project` /
+`get_session_projects` into thin air — latent `AttributeError`s. Ported as Phase D unit 15
+(`f6dd6ec51a`).
+
+Sweep 2 resolves module aliases and checks `alias.attr` against the tag. **850 fork-owned files,
+545 findings, 513 with test consumers (loud), 32 non-test across 21 distinct symbols.** Of those 21:
+
+| | count | |
+|---|---|---|
+| already fixed | 5 | the `projects_db` session-binding layer, unit 15 |
+| **false positives** | **11** | resolve at runtime via PEP 562 lazy `__getattr__` re-export |
+| genuinely missing | **5** | all **private** names — see below |
+
+> ⚠ **A static scan over-reports here by 2:1.** Upstream re-exports lazily through module-level
+> `__getattr__`, which no AST pass can see. **Confirm every candidate with a runtime `hasattr`
+> before calling it a loss.** Two of the false positives additionally resolved through a
+> `PLUGIN-COMPAT` block and emitted `HermesPluginCompatWarning` — live, warning, not disabling,
+> exactly as the G1 note concludes.
+
+**The 5 real gaps — all private, so the compat layer explicitly does NOT restore them:**
+
+| symbol | consumer |
+|---|---|
+| `hermes_cli.kanban_db._git_toplevel` | `plugins/kanban/dashboard/plugin_api.py:2025` |
+| `hermes_cli.web_server._ws_auth_ok` | `plugins/kanban/dashboard/plugin_api.py:95` |
+| `hermes_cli.setup._setup_telegram` | `plugins/platforms/telegram/adapter.py:9292` |
+| `tools.web_tools._peek_nous_access_token` | `plugins/web/firecrawl/provider.py:161` |
+| `tools.web_tools._read_nous_access_token` | `plugins/web/firecrawl/provider.py` |
+
+All five are fork modifications to **upstream-bundled** plugins (not the §1 fork-seven) reaching
+into private core names. Each needs the same decision as S-1: use a public equivalent, vendor the
+logic, or change the approach. None is a silent-data risk; each fails loudly at call time.
+
 ## §3 Contract surface (SwitchUI-facing features of the 36-commit wave, `86480a4c6758f..main`)
 
 Status values: **OURS** (no upstream equivalent — replay) · **UPSTREAM-EQUIVALENT@version** ·
