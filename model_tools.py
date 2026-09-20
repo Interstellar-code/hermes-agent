@@ -526,7 +526,7 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
                       f"{_TOOL_SEARCH_LISTING_FORMS.get(assembly.listing_form, assembly.listing_form)}.")
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
-        logger.warning("Tool search assembly skipped: %s", e)
+        logger.warning("Tool search assembly skipped: %s", e, exc_info=True)
 
     return filtered_tools
 
@@ -554,6 +554,7 @@ def _resolve_active_context_length() -> int:
     try:
         model_id, model_cfg = _active_model_config()
         if not model_id:
+            logger.debug("Could not resolve active context length: no model ID or default in config")
             return 0
         from agent.model_metadata import get_cached_context_length, get_model_context_length
         # Honor explicit `model.context_length` in config.yaml — short-circuits the OpenRouter /models probe
@@ -582,8 +583,13 @@ def _resolve_active_context_length() -> int:
                     return cached_ctx
             except Exception:
                 pass
-        return int(get_model_context_length(model_id, base_url=base_url, api_key=api_key,
-                                            config_context_length=config_ctx, provider=provider) or 0)
+        ctx = int(get_model_context_length(model_id, base_url=base_url, api_key=api_key,
+                                           config_context_length=config_ctx, provider=provider) or 0)
+        if ctx <= 0:
+            logger.debug("Could not resolve active context length for model_id='%s' (lookup returned 0)", model_id)
+        else:
+            logger.debug("Resolved active context length for model_id='%s': %d tokens", model_id, ctx)
+        return ctx
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

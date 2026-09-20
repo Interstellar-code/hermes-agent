@@ -34,6 +34,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    "kanban_template_list", "kanban_template_instantiate",
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
@@ -189,9 +190,21 @@ TOOLSETS = {
         "messaging, audio, or clarify UI",
         [t for t in _CODING_TOOLS if t != "clarify"],
     ),
+    # NOTE on `clarify`: the interactive `clarify` tool is intentionally
+    # excluded above (via _core_without). `clarify` blocks the agent thread
+    # for up to ~10 minutes waiting for a human answer, which would hang
+    # headless OpenAI-compat clients (/v1/chat/completions, /v1/responses).
+    # The fork additionally re-injects it dynamically in
+    # gateway/platforms/api_server.py::_create_agent, but ONLY on the interactive
+    # SSE chat-stream path and ONLY when `api_server.interactive_clarify` is set.
+    # NOT PORTED YET at v0.21.3: that half lives in api_server.py (9 fork refs,
+    # 0 at the tag) and is still to do; its test
+    # tests/gateway/test_api_server_clarify_core.py is present but the production
+    # code is not. Until that lands, clarify is simply absent here — do not
+    # describe the dynamic injection as working.
     "hermes-api-server": _ts(
-        "OpenAI-compatible API server — full agent tools accessible via HTTP (no "
-        "interactive UI tools like clarify or send_message)",
+        "OpenAI-compatible API server — full agent tools accessible via HTTP "
+        "(clarify excluded: it blocks on human input)",
         _core_without("text_to_speech", "clarify", "computer_use", kanban=False),
     ),
     "hermes-cli": _bundle("Full interactive CLI toolset - all default tools plus cronjob management"),
