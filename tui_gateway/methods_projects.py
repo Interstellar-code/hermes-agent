@@ -388,10 +388,31 @@ def _build_project_tree(
     git_probe.warm_roots(
         [str(f.get("path") or "") for p in projects for f in (p.get("folders") or [])]
         + [str(r.get("root") or "") for r in discovered])
+    # Explicit per-session project bindings outrank cwd inference (#projects).
+    # Bulk-fetched in one query: build_tree is pure, so it cannot go to the DB
+    # itself, and a per-session lookup here would be N round-trips on a tree
+    # that already renders hundreds of sessions. A projects-DB failure must not
+    # take down the tree -- it degrades to cwd inference, which is what every
+    # caller got before bindings existed.
+    session_bindings = None
+    try:
+        from hermes_cli import projects_db as pdb
+        with pdb.connect_closing() as _pconn:
+            session_bindings = pdb.get_session_projects(
+                _pconn, [str(s.get("id") or "") for s in sessions if s.get("id")])
+    except Exception as _bexc:  # noqa: BLE001
+        # Explicit logger, not this module's bare `logger`: that name is injected
+        # by bind_module onto the SERVER's globals, and `_`-prefixed helpers are
+        # skipped by it -- so a bare `logger` here would AttributeError exactly
+        # when the projects DB is already failing.
+        import logging as _logging
+        _logging.getLogger(__name__).debug(
+            "project bindings unavailable, falling back to cwd inference: %s", _bexc)
+
     tree = project_tree.build_tree(
         projects, sessions, discovered, git_probe.resolve, preview_limit=preview_limit,
         hydrate=hydrate, is_junk_root=_is_repo_junk, is_junk_cwd=_is_session_cwd_junk,
-        exists=_dir_exists_cached)
+        exists=_dir_exists_cached, session_bindings=session_bindings)
     return tree, active_id
 
 
