@@ -92,7 +92,12 @@ def finish_text_response(
                 len(_promoted),
             )
             assistant_message.content = _promoted
-    final_response = assistant_message.content or ""
+    # Scrub echoed <memory-context> spans before the reply reaches the user (#150).
+    # Defense in depth: the streaming path has StreamingContextScrubber, but a
+    # non-streamed final response never passes through it, and a model that echoes
+    # its injected context back would leak the whole block verbatim.
+    from agent.memory_manager import sanitize_context
+    final_response = sanitize_context(assistant_message.content or "")
     # Unmute: _mute_post_response from a housekeeping tool turn must not silence
     # empty-response warnings on the final response path.
     agent._mute_post_response = False

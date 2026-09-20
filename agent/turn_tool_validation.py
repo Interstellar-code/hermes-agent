@@ -76,6 +76,7 @@ def validate_tool_calls(
     3; args cut off mid-stream (routers rewrite ``length`` → ``tool_calls``) are refused
     outright rather than retried."""
     from agent.conversation_loop import _invalid_tool_name_error_content
+    from agent.tool_executor import deferred_tool_recovery_message
 
     tool_calls = assistant_message.tool_calls
     valid_names = agent.valid_tool_names
@@ -128,7 +129,15 @@ def validate_tool_calls(
         _append_tool_error_results(
             messages, tool_calls,
             lambda tc: (
-                _invalid_tool_name_error_content(tc.function.name, valid_names)
+                # A deferred tool called by bare name is NOT a hallucination: under Tool
+                # Search the name is absent from the visible tools array, but the model
+                # may legitimately have seen it in the system prompt, transcript or
+                # memory. Hand back its schema so the turn recovers, instead of a
+                # generic unknown-tool error it can only escape by thinking to call
+                # tool_search. Returns None when Tool Search is inactive or the name is
+                # not a deferrable tool, and then the normal error applies.
+                (deferred_tool_recovery_message(agent, tc.function.name)
+                 or _invalid_tool_name_error_content(tc.function.name, valid_names))
                 if tc.function.name not in valid_names
                 else "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
             ),
