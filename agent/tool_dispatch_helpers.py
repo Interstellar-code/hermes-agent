@@ -397,6 +397,30 @@ def _normalize_tool_call_id(tool_call_id: Any) -> Any:
     return tool_call_id
 
 
+def _coerce_tool_content(content: Any) -> Any:
+    """Coerce a tool result to a provider-safe wire shape.
+
+    str and list (multimodal parts) are already legal and pass through by
+    identity. Anything else -- notably a dict returned by a tool -- is JSON
+    serialized, because a dict reaching a chat-completions provider 400s EVERY
+    subsequent turn in that session, not just the turn that produced it, so the
+    history can never drain itself back to a valid state.
+
+    Runs before _maybe_append_elision_notice/_maybe_wrap_untrusted so both
+    operate on a legal type.
+
+    This is the BUILD half of the fix; agent/transports/chat_completions.py
+    carries the wire half. Both are needed: this stops new poisoning, that
+    heals a session whose history already carries a dict.
+    """
+    if isinstance(content, (str, list)):
+        return content
+    try:
+        return json.dumps(content, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
 def make_tool_result_message(
     name: str,
     content: Any,
@@ -412,7 +436,8 @@ def make_tool_result_message(
     tool_call_id = _normalize_tool_call_id(tool_call_id)
     # Elision notice is appended to the RAW content first, THEN wrapped, so it sits inside
     # the untrusted block next to the data it describes — once, at construction (cache-safe).
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    wrapped = _maybe_wrap_untrusted(
+        name, _maybe_append_elision_notice(name, _coerce_tool_content(content)))
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,

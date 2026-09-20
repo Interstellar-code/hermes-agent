@@ -322,6 +322,18 @@ def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:
     if msg.get("role") == "tool" and "name" in msg:
         strip_keys.append("name")
     out_msg = {k: v for k, v in msg.items() if k not in strip_keys}
+    # A dict-typed tool result poisons the session permanently: the provider 400s
+    # on EVERY subsequent turn once it is in history, so the conversation can
+    # never drain itself back to a valid state. Coerce on the way out so an
+    # already-poisoned session heals rather than staying dead.
+    coerced_tool_content = False
+    if msg.get("role") == "tool" and not isinstance(msg.get("content"), (str, list)):
+        raw_content = msg.get("content")
+        try:
+            out_msg["content"] = json.dumps(raw_content, default=str, ensure_ascii=False)
+        except (TypeError, ValueError):
+            out_msg["content"] = str(raw_content)
+        coerced_tool_content = True
     tool_calls = msg.get("tool_calls")
     copied_tool_calls = None
     if msg.get("role") == "assistant" and "tool_calls" in msg and (tool_calls is None or (isinstance(tool_calls, list) and not tool_calls)):
@@ -340,7 +352,7 @@ def _sanitize_message(msg: Any, strip_extra_content: bool) -> dict | None:
                 copied_tool_calls[tc_idx] = {k: v for k, v in tc.items() if k not in keys}
         if copied_tool_calls is not None:
             out_msg["tool_calls"] = copied_tool_calls
-    return out_msg if strip_keys or copied_tool_calls is not None else None
+    return out_msg if strip_keys or copied_tool_calls is not None or coerced_tool_content else None
 
 
 class ChatCompletionsTransport(ProviderTransport):
