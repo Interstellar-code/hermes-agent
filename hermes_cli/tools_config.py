@@ -677,22 +677,60 @@ def _warn_all_invalid_platform_toolsets(platform: str, explicit: list) -> None:
             platform, ", ".join(named))
 
 
-def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
-    """Save the selected toolset keys for a platform to config."""
+def _save_platform_tools(
+    config: dict,
+    platform: str,
+    enabled_toolset_keys: Set[str],
+    *,
+    explicit_targets: Optional[Set[str]] = None,
+):
+    """Save the selected toolset keys for a platform to config.
+
+    ``explicit_targets`` names the toolsets the caller is actively toggling right
+    now (e.g. the checklist universe, or the names passed to ``hermes tools
+    enable/disable``). Anything NOT named there is only ever added back, never
+    removed, by the ``agent.disabled_toolsets`` preservation below — see issue
+    #226.
+    """
     config.setdefault("platform_toolsets", {})
     # Drop platform-scoped toolsets that don't apply here, so the "Configure all platforms" checklist (or a
     # hand-edited config.yaml) can't turn on `discord` for Telegram.
     enabled_toolset_keys = {ts for ts in enabled_toolset_keys if _toolset_allowed_for_platform(ts, platform)}
     plugin_keys = _get_plugin_toolset_keys()
+    configurable_keys = _configurable_keys()
     # Preserve only existing entries that are neither configurable nor platform defaults (i.e. MCP server
     # names): platform defaults (hermes-cli, ...) resolve to ALL tools and would silently override the user's
     # unchecked selections on the next read. Saving from the picker is consent to clear the "no_mcp" sentinel
     # (no checkbox for it; users who once set it by hand could otherwise never re-enable MCP via the UI).
-    drop = _configurable_keys() | plugin_keys | _platform_default_keys() | {"no_mcp"}
+    drop = configurable_keys | plugin_keys | _platform_default_keys() | {"no_mcp"}
     existing_toolsets = cfg_get(config, "platform_toolsets", platform, default=[])
-    preserved_entries = {str(e) for e in (existing_toolsets if isinstance(existing_toolsets, list) else [])
-                         if str(e) not in drop}
-    config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries)
+    existing_toolsets = [str(e) for e in existing_toolsets] if isinstance(existing_toolsets, list) else []
+    preserved_entries = {e for e in existing_toolsets if e not in drop}
+
+    # Preserve raw entries that the RESOLVER hides but the user still owns (issue #226). ``enabled_toolset_keys``
+    # is an *effective* set — the output of _get_platform_tools(), which subtracts agent.disabled_toolsets LAST
+    # and unconditionally. A globally suppressed toolset is therefore absent from ``enabled_toolset_keys`` even
+    # when the user wrote it into platform_toolsets.<platform> by hand, so merging that set back over the raw
+    # list silently deleted the entry: with ``cli: [web, memory, terminal]`` and
+    # ``agent.disabled_toolsets: [memory]``, disabling ``web`` used to leave ``cli: [terminal]`` — and dropping
+    # the global suppression later no longer brought ``memory`` back.
+    #
+    # A suppressed entry is dropped only when the caller explicitly names it as a target, i.e. the user really
+    # did ask to remove it from this platform.
+    agent_cfg = config.get("agent")
+    disabled_raw = agent_cfg.get("disabled_toolsets") if isinstance(agent_cfg, dict) else None
+    globally_suppressed: Set[str] = set()
+    if disabled_raw:
+        from agent.skill_utils import parse_config_string_list
+        globally_suppressed = {name.strip() for name in parse_config_string_list(disabled_raw) if name.strip()}
+    suppressed_existing = {
+        e for e in existing_toolsets
+        if e in globally_suppressed and e in configurable_keys and _toolset_allowed_for_platform(e, platform)
+    }
+    if explicit_targets:
+        suppressed_existing -= {str(ts) for ts in explicit_targets}
+
+    config["platform_toolsets"][platform] = sorted(enabled_toolset_keys | preserved_entries | suppressed_existing)
     # Record which plugin toolsets this platform "knows" (distinguishes "new plugin, default enabled" from
     # "user disabled it"). _cfg_section normalizes a present-but-null key that setdefault alone would not replace.
     if plugin_keys:
@@ -705,7 +743,8 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     # the desktop Toolsets UI unable to re-enable anything). Only toolsets just explicitly enabled FOR THIS
     # PLATFORM are cleared, so the list keeps working as a cross-platform suppression list for everything else.
     # See #49995.
-    agent_cfg = config.get("agent")
+    # NB: ``suppressed_existing`` is deliberately NOT part of this set. Those entries were merely kept in the
+    # raw list (#226); the user did not re-enable them, so the global suppression must stand.
     newly_enabled = enabled_toolset_keys - preserved_entries
     if isinstance(agent_cfg, dict) and agent_cfg.get("disabled_toolsets") and newly_enabled:
         from agent.skill_utils import parse_config_string_list

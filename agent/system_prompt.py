@@ -489,6 +489,13 @@ def _identity_parts(agent: Any, ctx_len: Optional[int]) -> Tuple[List[str], bool
     """SOUL.md (primary identity; cron keeps the persona while skipping cwd
     instructions, scoped to the agent's OWN home) or the default identity.
     Returns ``(parts, soul_loaded)``."""
+    # An authenticated evaluator may supply an in-memory replacement for the
+    # profile identity. It occupies the same primary slot as SOUL.md so an
+    # offline self-improvement run measures the candidate rather than an
+    # appended, lower-priority instruction. The gateway never persists it.
+    _identity_override = getattr(agent, "_eval_identity_override", None)
+    if isinstance(_identity_override, str) and _identity_override.strip():
+        return [_identity_override.strip()], True
     wants_soul = agent.load_soul_identity or not agent.skip_context_files
     _soul_content = _pb.load_soul_md(ctx_len, home_override=_agent_home(agent)) if wants_soul else None
     return ([_soul_content], True) if _soul_content else ([DEFAULT_AGENT_IDENTITY], False)
@@ -597,6 +604,26 @@ def _context_files_part(agent: Any, ctx_len: Optional[int], soul_loaded: bool) -
         allow_install_tree_fallback=agent.platform in ("cli", "tui"), home_override=_agent_home(agent))]
 
 
+def _project_context_part(agent: Any) -> List[str]:
+    """Project Context block: the explicit project<->session binding, made
+    visible to the model. Belongs in the context tier, not the volatile one:
+    it is read exactly once, when this prompt is first built, and the block
+    contains only stable project metadata so it stays true for the whole
+    conversation. Rebinding later does NOT rewrite this prompt -- the next
+    turn restores the stored one verbatim, which is what keeps the provider
+    prefix cache warm. A new session bound elsewhere builds its own block."""
+    session_id = getattr(agent, "session_id", None)
+    if not session_id:
+        return []
+    try:
+        from hermes_cli.projects_prompt import project_context_block
+        block = project_context_block(session_id)
+    except Exception as exc:  # noqa: BLE001 -- never block agent startup.
+        logging.getLogger(__name__).warning("Project context block unavailable: %s", exc)
+        return []
+    return [block] if block else []
+
+
 def _join_tier(parts: List[Optional[str]]) -> str:
     """Join non-empty parts; None/blank entries are dropped."""
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
@@ -640,6 +667,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if system_message is not None:
         context_parts.append(system_message)
     context_parts.extend(_context_files_part(agent, _ctx_len, _soul_loaded))
+    context_parts.extend(_project_context_part(agent))
     if coding_workspace_parts:
         context_parts.extend([*coding_workspace_parts, *coding_trailing_parts, *post_workspace_parts])
     else:
