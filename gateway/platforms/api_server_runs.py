@@ -820,10 +820,27 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         return _json_error(
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
     request_id_field = {"request_id": request_id} if request_id else {}
+    # Prune FIRST: the core drops a timed-out entry from its own queue, so an expired
+    # head left in our list would label this receipt with an approval that is already
+    # dead. Only then take the head as the record this call resolved.
+    self._prune_expired_approval_requests()
+    _records = self._run_approval_requests.get(run_id) or []
+    if resolve_all:
+        _resolved_records, _records = _records, []
+    else:
+        _resolved_records = [_records.pop(0)] if _records else []
+    if _records:
+        self._run_approval_requests[run_id] = _records
+    else:
+        self._run_approval_requests.pop(run_id, None)
+    # Answered approvals must stop appearing in GET /v1/approvals/pending, or a
+    # reloaded client is invited to answer something already resolved.
+    approval_id_field = (
+        {"approval_id": _resolved_records[0].get("approval_id")} if _resolved_records else {})
     _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
-        "resolved": resolved})
+        **approval_id_field, "resolved": resolved})
 
 
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":

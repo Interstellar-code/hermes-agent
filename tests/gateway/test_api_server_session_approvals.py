@@ -41,6 +41,16 @@ from tools import approval as approval_mod
 AUTH = {"Authorization": "Bearer test-key"}
 
 
+class _DefaultScopeRequest:
+    """Minimal stand-in for an unprefixed request, for _run_idempotency_scope()."""
+    match_info: dict = {}
+    headers: dict = {}
+    query: dict = {}
+
+
+_DEFAULT_SCOPE_REQUEST = _DefaultScopeRequest()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -615,6 +625,13 @@ def _seed(adapter, run_id, *, approval_id, profile=None, expires_in=60.0, now=No
             now=now,
         )
     adapter._run_approval_requests.setdefault(run_id, []).append(record)
+    # Upstream added per-run ownership AFTER this file was written (#93689): a run with
+    # no _run_owners stamp is "an unanswered authorization question, not a run anyone may
+    # control", so /v1/runs/{id}/approval 404s before reaching the handler. Production
+    # stamps it in _handle_session_chat_stream; a hand-seeded run must do the same or it
+    # is not testing the resolution path at all. Stamped with the default (unprefixed)
+    # scope, matching what these tests' requests carry.
+    adapter._run_owners.setdefault(run_id, adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST))
     return record
 
 

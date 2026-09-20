@@ -2258,6 +2258,46 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
 
+    def _persist_approval_receipt(
+        self, session_id: str, meta: Dict[str, Any], choice: str, resolved: int) -> None:
+        """Write a transcript-visible receipt for a resolved approval.
+
+        Without this an approval leaves no trace in the session: the SSE event is
+        transport-only, so on reload the transcript shows the agent pausing and
+        resuming with nothing explaining what was asked or what the user answered.
+
+        Best-effort by design -- a failed receipt must never fail the resolution
+        that already happened.
+        """
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        receipt = {
+            "type": "interaction_receipt",
+            "kind": "approval",
+            "tool_name": "approval",
+            "approval_id": meta.get("approval_id"),
+            "session_id": session_id,
+            "run_id": meta.get("run_id"),
+            "message_id": meta.get("message_id"),
+            "action": meta.get("command"),
+            "context": meta.get("description"),
+            "pattern_key": meta.get("pattern_key"),
+            "pattern_keys": meta.get("pattern_keys"),
+            "choices": meta.get("choices") or ["once", "session", "always", "deny"],
+            "selected_answer": choice,
+            "approved": choice != "deny",
+            "resolved": int(resolved),
+        }
+        try:
+            db.append_message(
+                session_id=session_id, role="tool",
+                content=json.dumps(receipt, ensure_ascii=False),
+                tool_name="approval", tool_call_id=receipt["approval_id"], observed=True,
+            )
+        except Exception:
+            logger.warning("[api_server] failed to persist approval receipt", exc_info=True)
+
     def _prune_expired_approval_requests(self, now: Optional[float] = None) -> None:
         """Drop approval records past their deadline, and any run left with none.
 
@@ -3286,6 +3326,46 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 events.enqueue(event_type, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        _approval_profile = _api_request_profile.get()
+
+        def _approval_notify(approval_data: Dict[str, Any]) -> None:
+            """Publish a blocking command approval onto THIS session's SSE stream.
+
+            Before this existed the sessions transport carried clarify interactions
+            but registered no approval callback, so a guard on this surface blocked
+            the agent for the full approval timeout with no prompt and no way to
+            answer. Runs on the agent thread; ``events.enqueue`` hops to the loop.
+            """
+            record = _build_approval_record(
+                dict(approval_data or {}),
+                approval_id=f"approval_{uuid.uuid4().hex}",
+                session_id=session_id, run_id=run_id, message_id=message_id,
+                profile=_approval_profile,
+            )
+            self._run_approval_requests.setdefault(run_id, []).append(record)
+            # Marks the approval genuinely outstanding, so the sweep leaves this run's
+            # waiting_for_approval status alone until the turn releases it.
+            self._run_approval_sessions[run_id] = session_id
+            wire = _public_approval_record(record)
+            self._set_run_status(
+                run_id, "waiting_for_approval", last_event="clarify.request", approval=wire)
+            # Same payload under both names: clarify.request is the historical name this
+            # transport already carried, interaction.request the generic one. A fresh copy
+            # per emission because payload() stamps seq/ts via setdefault and would leave
+            # the second event wearing the first's stamps.
+            for _name in ("clarify.request", "interaction.request"):
+                events.enqueue(_name, dict(wire))
+
+        def _approval_cleanup() -> None:
+            """Release run-scoped approval state once the turn returns (any outcome).
+
+            Without this the run stays pinned at waiting_for_approval and its record
+            keeps appearing in GET /v1/approvals/pending as an approval no client can
+            answer, because the agent that was waiting has already gone.
+            """
+            self._run_approval_requests.pop(run_id, None)
+            self._run_approval_sessions.pop(run_id, None)
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {
@@ -3296,7 +3376,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 history = await self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     conversation_history=history, stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress, active_run_id=run_id, **ctx["run_kwargs"])
+                    tool_progress_callback=_tool_progress, active_run_id=run_id,
+                    approval_notify=_approval_notify, approval_session_key=session_id,
+                    approval_cleanup=_approval_cleanup, **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
