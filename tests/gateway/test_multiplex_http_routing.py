@@ -41,6 +41,27 @@ class TestWebhookProfileResolution:
         adapter, Req, _REJ, _ = self._adapter(multiplex=True)
         assert adapter._resolve_request_profile(Req(None)) is None
 
+    def test_no_prefix_returns_none_when_multiplex_off(self):
+        """Unprefixed webhooks are untouched in both modes."""
+        adapter, Req, _REJ, _ = self._adapter(multiplex=False)
+        assert adapter._resolve_request_profile(Req(None)) is None
+
+    def test_foreign_prefix_rejected_when_multiplex_off(self, monkeypatch):
+        """Fail closed: the /p/<profile>/ route is registered unconditionally, so silently
+        ignoring the prefix would run the event through the default profile's home and persist
+        the session there — serving one profile's routes under another profile's URL."""
+        adapter, Req, rejected, _ = self._adapter(multiplex=False)
+        monkeypatch.setattr("hermes_cli.profiles.profile_matches_home", lambda name: False)
+        assert adapter._resolve_request_profile(Req("anything")) is rejected
+        assert adapter._resolve_request_profile(Req("coder")) is rejected
+
+    def test_self_referential_prefix_allowed_when_multiplex_off(self, monkeypatch):
+        """A prefix naming this gateway's OWN profile falls through to the bare route."""
+        adapter, Req, _REJ, _ = self._adapter(multiplex=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_matches_home", lambda name: name == "mine")
+        assert adapter._resolve_request_profile(Req("mine")) is None
+
     def test_unserved_prefix_is_rejected(self, monkeypatch):
         adapter, Req, rejected, served = self._adapter(
             multiplex=True, served=("default", "worker"),
