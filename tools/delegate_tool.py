@@ -36,7 +36,8 @@ from tools.delegate_tool_config import (  # noqa: F401
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
-    DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix, _build_child_progress_callback,
+    DelegateEvent, SUBAGENT_FAILURE_STATUSES, _batch_prefix,
+    _build_child_progress_callback as _build_child_progress_callback_base,
     _build_child_system_prompt, _clean_error_text, _emit_parent_console, _quiet, _resolve_workspace_hint,
     _safe_progress, format_batch_tag, format_subagent_failure_line,
 )
@@ -67,6 +68,36 @@ def _normalize_role(r: Optional[str]) -> str:
         logger.warning("Unknown delegate_task role=%r, coercing to 'leaf'", r)
         return "leaf"
     return r_norm
+
+
+def _normalize_agent_id(v: Any) -> Optional[str]:
+    """Caller-owned identity string (#194): stripped verbatim, never validated against a registry.
+    None for anything that isn't a non-empty string once stripped."""
+    if not isinstance(v, str):
+        return None
+    v = v.strip()
+    return v or None
+
+
+def _build_child_progress_callback(
+    task_index: int, goal: str, parent_agent, task_count: int = 1, *, subagent_id: Optional[str] = None,
+    agent_id: Optional[str] = None, **kwargs,
+) -> Optional[callable]:
+    """Thin wrapper over ``delegate_tool_progress``'s relay builder that also threads the child's explicit
+    ``agent_id`` (#194) into every relayed event, alongside subagent_id/parent_id/depth/model/toolsets.
+    No-op passthrough when agent_id is absent/blank -- zero behavior change for existing callers."""
+    cb = _build_child_progress_callback_base(task_index, goal, parent_agent, task_count, subagent_id=subagent_id, **kwargs)
+    normalized = _normalize_agent_id(agent_id)
+    if cb is None or normalized is None:
+        return cb
+
+    def _with_agent_id(event_type, *cb_args, **event_kwargs):
+        event_kwargs.setdefault("agent_id", normalized)
+        return cb(event_type, *cb_args, **event_kwargs)
+
+    if hasattr(cb, "_flush"):
+        _with_agent_id._flush = cb._flush  # preserve the batched-flush contract _run_single_child relies on
+    return _with_agent_id
 
 DEFAULT_MAX_ITERATIONS = 250
 _HEARTBEAT_INTERVAL = 30  # seconds between parent activity heartbeats during delegation
@@ -178,6 +209,8 @@ def _build_child_agent(
     routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
+    # Explicit caller identity (#194): threaded into progress events and persisted session config.
+    agent_id: Optional[str] = None,
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair."""
@@ -194,6 +227,7 @@ def _build_child_agent(
     # the live registry; parent_id is set when THIS parent is itself a subagent.
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
+    normalized_agent_id = _normalize_agent_id(agent_id)
 
     # General delegation behavior (reasoning, compression, capabilities) stays
     # global. Only fallback policy follows the owner of a per-call route such
@@ -215,6 +249,7 @@ def _build_child_agent(
         task_index, goal, parent_agent, task_count, subagent_id=subagent_id, parent_id=parent_subagent_id,
         depth=max(0, child_depth - 1),  # 0 = first-level child for the UI
         model=model or getattr(parent_agent, "model", None), toolsets=child_toolsets, session_ref=child_session_ref,
+        agent_id=normalized_agent_id,
     )
     rt = _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
@@ -263,6 +298,7 @@ def _build_child_agent(
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
     child._subagent_id, child._parent_subagent_id = subagent_id, parent_subagent_id
+    child._agent_id = normalized_agent_id
     _apply_child_compression_cap(child, delegation_cfg)
     # Ownership chain for action=list/steer/stop; weakref so a finished parent
     # can be collected while a detached child record lingers in the registry.
@@ -274,6 +310,8 @@ def _build_child_agent(
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
         child._session_init_model_config["_delegate_from"] = parent_sid
+    if normalized_agent_id and getattr(child, "_session_init_model_config", None) is not None:
+        child._session_init_model_config["_agent_id"] = normalized_agent_id
     # Shared pool lets children rotate credentials on rate limits.
     child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
     if child_pool is not None:
@@ -363,6 +401,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    agent_id: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -382,12 +421,16 @@ def _build_children(
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        # Per-task agent_id (#194) wins over the top-level default; falls back when unset/blank.
+        _task_agent_id = t.get("agent_id") if isinstance(t, dict) else None
+        _effective_agent_id = _task_agent_id if _normalize_agent_id(_task_agent_id) else agent_id
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                agent_id=_effective_agent_id, **overrides,
             )
         except ValueError as exc:
             return [], str(exc)
@@ -419,7 +462,7 @@ def delegate_task(
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
-    credentials_cfg: Optional[Dict[str, Any]] = None,
+    credentials_cfg: Optional[Dict[str, Any]] = None, agent_id: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -496,6 +539,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        agent_id=agent_id,
     )
     if err:
         return tool_error(err)
@@ -659,11 +703,21 @@ DELEGATE_TASK_SCHEMA = {
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
                         ),
+                        "agent_id": _p(
+                            "string",
+                            "Optional identity string for this child, overriding the top-level agent_id. Caller-owned "
+                            "and preserved verbatim; never validated against a registry.",
+                        ),
                     },
                     "required": ["goal"],
                 },
                 "description": "(rebuilt at get_definitions() time)",
             },
+            "agent_id": _p(
+                "string",
+                "Optional identity string applied to every task in this call that has no per-task agent_id "
+                "override. Caller-owned and preserved verbatim; never validated against a registry.",
+            ),
             # `background` (bool) is also accepted — DEPRECATED, ignored: top-level
             # delegations always run in the background. Unadvertised; do not re-add.
             "action": _p(
@@ -717,6 +771,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        agent_id=args.get("agent_id"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
