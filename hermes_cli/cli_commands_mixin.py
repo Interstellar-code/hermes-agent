@@ -1128,12 +1128,29 @@ class CLICommandsMixin:
         session_title = self._handoff_prepare_session()
         if session_title is None:
             return True
-        if not self._session_db.request_handoff(self.session_id, platform_name):
+        try:
+            status = self._session_db.request_handoff_status(self.session_id, platform_name)
+        except AttributeError:
+            # Older SessionDB mixed install without request_handoff_status: fall back to the
+            # boolean API, which cannot distinguish "missing" from "in_flight".
+            status = "queued" if self._session_db.request_handoff(self.session_id, platform_name) else "in_flight"
+        if status == "missing":
+            return self._handoff_keep(
+                "  Could not find this session's row in state.db. Try again.")
+        if status != "queued":
             return self._handoff_keep(
                 "  Session is already in flight for handoff. Wait for it to settle, then retry.")
         _cp(f"  Queued handoff of '{session_title}' → {platform_name} (home: {home.name}).",
             "  Waiting for the gateway to pick it up...")
-        return self._handoff_wait(platform_name, session_title)
+        try:
+            return self._handoff_wait(platform_name, session_title)
+        except BaseException:
+            # Ctrl-C / SystemExit / any teardown that still runs Python: release the row so the
+            # watcher cannot execute a handoff the user walked away from. A SIGKILL runs nothing
+            # here, and expire_stale_handoffs only runs inside a live gateway watcher -- so
+            # without this a CLI abort leaves a pending row until some gateway next ticks. #221
+            self._release_pending_handoff("abandoned before the gateway picked it up")
+            raise
 
     def _handoff_validate_target(self, platform_name: str):
         """Resolve the destination home channel via the live gateway config; None (after printing
@@ -1182,9 +1199,11 @@ class CLICommandsMixin:
         if not self._session_db:
             return _cp(_db_unavailable_line())
         # Ensure the session row exists (an empty session has flushed nothing yet): the gateway
-        # needs a row to switch_session onto; set_session_title's INSERT OR IGNORE creates it.
+        # needs a row to switch_session onto. set_session_title is a CAS UPDATE only (a no-op on
+        # a missing row) — create_session (an upsert) must run first to actually create it. #221
         try:
             if not self._session_db.get_session(self.session_id):
+                self._session_db.create_session(self.session_id, source="cli")
                 self._session_db.set_session_title(self.session_id, f"handoff-{self.session_id[:8]}")
         except Exception as exc:
             return _cp(f"  Could not ensure session row in state.db: {exc}")
@@ -1192,6 +1211,21 @@ class CLICommandsMixin:
         with suppress(Exception):
             session_title = (self._session_db.get_session(self.session_id) or {}).get("title") or ""
         return session_title or self.session_id[:8]
+
+    def _release_pending_handoff(self, reason: str) -> None:
+        """CAS-clear this session's handoff, but ONLY while still ``pending``.
+
+        Scoped to ``pending`` deliberately: once the gateway has claimed the row (``running``)
+        it owns the transfer, and failing it from here is the split-brain bug the two-phase
+        poll exists to avoid."""
+        try:
+            self._session_db.fail_handoff(self.session_id, reason, only_states=("pending",))
+        except TypeError:
+            # Older SessionDB without only_states (mixed installs): legacy unconditional fail.
+            with suppress(Exception):
+                self._session_db.fail_handoff(self.session_id, reason)
+        except Exception:
+            pass
 
     def _handoff_wait(self, platform_name: str, session_title: str) -> bool:
         """Two-phase 0.5s poll. PENDING (unclaimed): 60s, then CAS-fail the row so the user can
@@ -1245,15 +1279,7 @@ class CLICommandsMixin:
                         "  This CLI is no longer waiting. Avoid continuing this session here;",
                         "  if nothing arrives, retry /handoff once the state settles.")
             time.sleep(0.5)
-        try:  # pending timed out: CAS-clear so the user can retry
-            self._session_db.fail_handoff(
-                self.session_id, "timed out waiting for gateway", only_states=("pending",))
-        except TypeError:
-            # Older SessionDB without only_states (mixed installs): legacy unconditional fail.
-            with suppress(Exception):
-                self._session_db.fail_handoff(self.session_id, "timed out waiting for gateway")
-        except Exception:
-            pass
+        self._release_pending_handoff("timed out waiting for gateway")
         return self._handoff_keep(
             "  Timed out waiting for the gateway. Is `hermes gateway` running?",
             "  Your CLI session is intact.")
