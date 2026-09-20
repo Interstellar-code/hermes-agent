@@ -60,9 +60,16 @@ def register(ctx) -> None:
     with a ctx exposing ``register_memory_provider`` (and optionally
     ``register_skill`` / ``register_cli_command``).
     """
-    if not _FORK_ROOT.exists():
+    # Check for the package we actually import, NOT _FORK_ROOT.exists(): an
+    # UNINITIALIZED submodule is an EMPTY DIRECTORY, and Path.exists() is True for
+    # one. The guard therefore never fired in the case it was written for -- control
+    # fell through to `from hermes_memory_provider import ...` and the operator got
+    # `ModuleNotFoundError: No module named 'hermes_memory_provider'` from inside a
+    # third-party import instead of the one-line fix below. A fresh `git worktree`
+    # does not inherit initialized submodules, so this is the DEFAULT state there.
+    if not (_FORK_ROOT / "hermes_memory_provider").is_dir():
         raise RuntimeError(
-            "matrix-memory: submodule missing at %s — run "
+            "matrix-memory: Mnemosyne submodule not checked out at %s — run "
             "`git submodule update --init plugins/memory/_matrix-memory-mnemosyne`"
             % _FORK_ROOT
         )
