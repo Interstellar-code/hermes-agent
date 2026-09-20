@@ -14,6 +14,41 @@ from pathlib import Path
 
 _profile_fallback_warned: bool = False
 _UNSET = object()
+
+
+# =========================================================================
+# Source repository (fork-aware `hermes update`, update-check, release links)
+# =========================================================================
+# FORK-ONLY. Upstream hardcodes NousResearch/hermes-agent at every one of these
+# sites, which would point this fork's updater and release links at upstream —
+# i.e. `hermes update` would pull upstream over the fork. Single source of truth,
+# overridable per-deployment via the HERMES_REPO_URL env var.
+HERMES_REPO_URL = os.environ.get(
+    "HERMES_REPO_URL", "https://github.com/Interstellar-code/hermes-agent.git"
+).strip()
+
+
+def hermes_repo_web_url() -> str:
+    """Repo URL without the .git suffix."""
+    url = HERMES_REPO_URL
+    return url[:-4] if url.endswith(".git") else url
+
+
+def hermes_repo_url_variants() -> set[str]:
+    """Equivalent forms of the configured repo URL (https/ssh, with/without .git).
+
+    Remote-matching must not depend on which form the user cloned with.
+    """
+    web = hermes_repo_web_url()
+    variants = {web, web + ".git"}
+    prefix = "https://github.com/"
+    if web.startswith(prefix):
+        path = web[len(prefix):]
+        variants.add(f"git@github.com:{path}")
+        variants.add(f"git@github.com:{path}.git")
+    return variants
+
+
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar("_HERMES_HOME_OVERRIDE", default=_UNSET)
 
 # TUI busy-indicator styles (CLI /indicator, TUI gateway config, /help registry).

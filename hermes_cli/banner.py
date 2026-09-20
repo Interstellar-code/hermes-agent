@@ -143,8 +143,13 @@ _last_target_rev: Optional[str] = None
 # Returned when an update is known to exist but commits can't be counted (e.g. nix builds).
 UPDATE_AVAILABLE_NO_COUNT = -1
 
-_UPSTREAM_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
-_OFFICIAL_REPO_CANONICAL = "github.com/nousresearch/hermes-agent"
+# FORK-ONLY: derive from the configured source repo rather than hardcoding
+# NousResearch — otherwise this fork's update check compares against upstream and
+# `hermes update` offers to pull upstream over the fork. Override via HERMES_REPO_URL.
+from hermes_constants import HERMES_REPO_URL as _UPSTREAM_REPO_URL  # noqa: E402
+
+# _OFFICIAL_REPO_CANONICAL is derived just below _canonical_github_remote's definition
+# (it cannot be computed here — the helper is defined further down this module).
 
 
 def _canonical_github_remote(url: str | None) -> str:
@@ -161,6 +166,11 @@ def _canonical_github_remote(url: str | None) -> str:
         if parsed.netloc and parsed.path:
             value = f"{parsed.netloc}{parsed.path}"
     return value.strip().rstrip("/").removesuffix(".git").lower()
+
+
+# FORK-ONLY: derived from the configured source repo (see _UPSTREAM_REPO_URL above),
+# not hardcoded to nousresearch/hermes-agent.
+_OFFICIAL_REPO_CANONICAL = _canonical_github_remote(_UPSTREAM_REPO_URL)
 
 
 def _is_official_ssh_remote(url: str | None) -> bool:
@@ -467,7 +477,10 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
 
 
-_RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
+# FORK-ONLY: release links must point at the configured source repo, not upstream.
+from hermes_constants import hermes_repo_web_url as _hermes_repo_web_url  # noqa: E402
+
+_RELEASE_URL_BASE = f"{_hermes_repo_web_url()}/releases/tag"
 
 
 def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
