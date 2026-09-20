@@ -628,6 +628,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if not text or _gateway_surface_passes_raw_text(platform):
         return text
 
+    # Defense-in-depth: strip any <memory-context> spans the model echoed into
+    # its reply. See Interstellar-code/hermes-agent#150.
+    try:
+        from agent.memory_manager import sanitize_context
+        text = sanitize_context(text)
+    except Exception:
+        pass
+
     # Lone UTF-16 surrogates make Telegram/Signal ``.encode()`` raise; last defense for legacy/plugin paths.
     # Lone UTF-16 surrogates (U+D800–U+DFFF) in model output crash chat surfaces downstream: Telegram's
     # ``utf16_len`` length check and Signal formatting both ``.encode()`` the reply and raise
@@ -2522,6 +2530,74 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         pass
 
     return None
+
+
+async def _ollama_context_preflight() -> None:
+    """Warn at gateway startup if Ollama is configured with an insufficient context window.
+
+    Loads the raw config via ``load_config()`` (the ``cfg_get`` convention
+    used elsewhere in this module, e.g. the approvals.mode startup check),
+    probes the Ollama server's ``/api/show`` endpoint (via the existing
+    ``query_ollama_num_ctx`` helper) and emits a single WARNING when the
+    runtime context is below ``MINIMUM_CONTEXT_LENGTH``.
+
+    Fail-open: any network error, import error, or unexpected exception is
+    caught and logged at DEBUG level — the gateway startup always proceeds.
+
+    NOTE: the natural call site for this (right before the startup-restore
+    serialization) now lives in ``gateway/run_startup.py``'s
+    ``GatewayStartupMixin.start()``, which is out of this port's assigned
+    scope; this function is defined but not yet wired to a caller.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_full_config
+
+        cfg = _load_full_config()
+
+        base_url = str(cfg_get(cfg, "model", "base_url", default="") or "")
+        model = str(
+            cfg_get(cfg, "model", "default", default="")
+            or cfg_get(cfg, "model", "model", default="")
+            or ""
+        )
+
+        if not base_url:
+            return
+        if "11434" not in base_url and "ollama" not in base_url.lower():
+            return
+        if not model:
+            logger.debug("ollama preflight skipped (no model configured)")
+            return
+
+        if cfg_get(cfg, "agent", "quiet_mode", default=False):
+            logger.debug("ollama preflight skipped (quiet_mode)")
+            return
+
+        from agent.model_metadata import query_ollama_num_ctx, MINIMUM_CONTEXT_LENGTH  # noqa: PLC0415
+        import functools
+
+        api_key = str(cfg_get(cfg, "model", "api_key", default="") or "")
+        loop = asyncio.get_event_loop()
+        runtime_ctx = await loop.run_in_executor(
+            None, functools.partial(query_ollama_num_ctx, model, base_url, api_key)
+        )
+
+        if runtime_ctx is None:
+            logger.debug("ollama preflight skipped (probe returned None for %s @ %s)", model, base_url)
+            return
+        if runtime_ctx >= MINIMUM_CONTEXT_LENGTH:
+            return
+
+        logger.warning(
+            "Ollama context window too small for tool use: "
+            "model=%s base_url=%s runtime_context=%d minimum=%d. "
+            "Increase context before the first request: set "
+            "`model.ollama_num_ctx: 65536` in config.yaml, or add "
+            "`PARAMETER num_ctx 65536` to the Ollama Modelfile.",
+            model, base_url, runtime_ctx, MINIMUM_CONTEXT_LENGTH,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("ollama preflight skipped (%s)", exc)
 
 
 def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:

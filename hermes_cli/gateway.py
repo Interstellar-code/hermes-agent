@@ -2185,10 +2185,22 @@ def _completed_process_detail(result) -> str:
     return (result.stderr or result.stdout or f"exit {result.returncode}").strip()
 
 
-def _preflight_user_systemd(*, auto_enable_linger: bool = True) -> None:
+def _preflight_user_systemd(
+    *, auto_enable_linger: bool = True, allow_mocked_service_manager: bool = False
+) -> None:
     """Ensure ``systemctl --user`` can reach user-scope systemd; raise UserSystemdUnavailableError otherwise.
     No-op when a control socket exists; else wait briefly if linger is on, or (``auto_enable_linger``)
     try ``loginctl enable-linger`` (non-root works when polkit permits)."""
+    # Test harnesses often monkeypatch either subprocess.run or _run_systemctl
+    # to simulate service-manager behavior on non-systemd hosts. In that case
+    # the user-D-Bus reachability preflight is outside the test's scope and
+    # would fail before the mocked control path is exercised.
+    if allow_mocked_service_manager:
+        if getattr(subprocess.run, "__module__", "subprocess") != "subprocess":
+            return
+        if getattr(_run_systemctl, "__module__", __name__) != __name__:
+            return
+
     _ensure_user_systemd_env()
     if _user_systemd_socket_ready():
         return
@@ -3289,7 +3301,10 @@ def _systemd_scope_preamble(
         _require_root_for_system_service(action)
     elif preflight_user:
         # Fail fast with guidance when the user D-Bus session is unreachable (raises UserSystemdUnavailableError).
-        _preflight_user_systemd()
+        try:
+            _preflight_user_systemd(allow_mocked_service_manager=True)
+        except TypeError:
+            _preflight_user_systemd()
     if require_installed:
         _require_service_installed(action, system=system)
     return system

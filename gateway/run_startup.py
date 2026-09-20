@@ -973,6 +973,14 @@ class GatewayStartupMixin:
             if stuck:
                 logger.warning("Auto-suspended %d stuck-loop session(s)", stuck)
 
+        # Warn once at startup when an Ollama model's server-side context window is
+        # smaller than the configured one -- Ollama silently truncates instead of
+        # erroring, so an oversized history is dropped mid-conversation with no
+        # signal. Deferred import matches the rest of this module (gateway.run
+        # imports run_startup, so a module-level import would cycle).
+        from gateway.run import _ollama_context_preflight
+        await _ollama_context_preflight()
+
     async def _start_prefilter_platforms(self) -> Tuple[bool, int, list, list]:
         """Create + wire an adapter per enabled platform (no connects). Returns
         (aborted, enabled_platform_count, multiplex_skipped_platforms, pending_connects)."""
