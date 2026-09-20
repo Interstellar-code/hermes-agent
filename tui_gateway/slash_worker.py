@@ -109,6 +109,16 @@ def main():
     _prepare_slash_worker_runtime()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
+
+    # This process has no interactive terminal: stdin is the JSON-RPC line protocol
+    # below, and no prompt_toolkit app is running (HermesCLI.run() is never called
+    # here). Without this flag a confirm-prompting command (/new, /reload-mcp,
+    # /update, /model <expensive>, /billing ...) falls through to a bare input()
+    # that reads the protocol pipe -- hanging the worker until the gateway's
+    # timeout kills it, AND consuming the next request line (#220). Deliberately a
+    # dedicated attribute rather than HERMES_INTERACTIVE, which governs
+    # tool-approval fail-closed behaviour and must keep its value here.
+    cli._noninteractive_confirm = True
     # Spurious stdin-EOF recovery (same shared-file-description O_NONBLOCK issue as the gateway entry
     # point — any child inheriting fd 0 can flip the flag).
     _sw_recovery_times: list[float] = []
@@ -127,6 +137,19 @@ def main():
             req = json.loads(line)
             rid = req.get("id")
             _reply(id=rid, ok=True, output=_run(cli, req.get("command", "")))
+        except SystemExit as e:
+            # A stray sys.exit() from inside a command handler (an argparse error
+            # path, a library forgetting it is running in-process) is a
+            # BaseException, not an Exception, so it would skip the handler below
+            # and kill this worker with NO response frame written -- the client
+            # then waits out the full timeout on a request that is already dead
+            # (#224). KeyboardInterrupt is deliberately left uncaught so Ctrl-C
+            # still unwinds normally instead of being reported as a command error.
+            code = e.code
+            if code in (None, 0):
+                _reply(id=rid, ok=True, output="")
+            else:
+                _reply(id=rid, ok=False, error=f"command exited with code {code!r}")
         except Exception as e:
             _reply(id=rid, ok=False, error=str(e))
         finally:
