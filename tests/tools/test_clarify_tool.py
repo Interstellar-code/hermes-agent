@@ -110,6 +110,9 @@ class TestClarifyDictChoices:
     def test_flatten_unwraps_label_first(self):
         assert _flatten_choice({"label": "Short", "description": "Long"}) == "Short"
 
+    def test_flatten_unwraps_content_when_no_label(self):
+        assert _flatten_choice({"content": "Use the existing catalog"}) == "Use the existing catalog"
+
 
     def test_dict_choices_reach_callback_as_clean_text(self):
         """The whole point: the UI callback never sees a dict repr."""

@@ -20,12 +20,12 @@ _UNAVAILABLE = "Clarify tool is not available in this execution context."
 def _flatten_choice(c) -> str:
     """Coerce one choice to display text. LLMs sometimes emit dict-shaped choices and ``str(c)``
     would leak the repr onto every surface and back as the answer; unwrap order ``label`` >
-    ``description`` > ``text`` > ``title`` (``name``/``value`` excluded: raw component enums,
-    not labels). No match -> "" and dropped: no choice beats a garbage label."""
+    ``content`` > ``description`` > ``text`` > ``title`` (``name``/``value`` excluded: raw
+    component enums, not labels). No match -> "" and dropped: no choice beats a garbage label."""
     if isinstance(c, str):
         return c.strip()
     if isinstance(c, dict):
-        return next((v.strip() for k in ("label", "description", "text", "title")
+        return next((v.strip() for k in ("label", "content", "description", "text", "title")
                      if isinstance(v := c.get(k), str) and v.strip()), "")
     if isinstance(c, (list, tuple)):
         return " ".join(_flatten_choice(x) for x in c).strip()
