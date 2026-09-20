@@ -27,7 +27,11 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, mkdir_under_hermes_home
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
-from hermes_state_common import escape_like as _escape_like, stat_db_file_identity as _stat_db_file_identity
+from hermes_state_common import (
+    SCHEMA_SQL,
+    escape_like as _escape_like,
+    stat_db_file_identity as _stat_db_file_identity,
+)
 from hermes_state_errors import (
     _DELETED_WAL_GENERATION_MSG, _DISK_IO_ERROR_MARKER, _STATE_DB_CORRUPT_MSG, _STATE_DB_GENERATION_KEY,
     _STATE_DB_REPLACED_MSG, DeletedWalGenerationError, SessionCompressionInProgressError, StateDbCorruptError,
@@ -348,6 +352,12 @@ def format_session_db_unavailable(prefix: str = "Session database not available"
 # web_server / gateway opens on the same malformed file).
 _repair_attempted_paths: set[str] = set()
 _repair_attempt_lock = threading.Lock()
+
+# Same one-shot-per-path discipline for the read-only drift reconcile below
+# (a different question from malformed-schema repair, so a separate set).
+_drift_checked_paths: set[str] = set()
+_declared_session_columns_cache: Optional[set] = None
+
 # Cross-process schema-surgery lock timeout (``_repair_attempt_lock`` covers one interpreter
 # only); sized for the slowest legitimate holder (VACUUM, multi-GB DB).
 _REPAIR_LOCK_TIMEOUT_SECONDS = 120.0
@@ -613,6 +623,9 @@ class SessionDB(
         must exist. FTS flags are probed with SELECTs only, and the connection is
         closed on ANY probe failure (malformed schema raises DatabaseError) so a
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
+        # One exception to "no write lock", itself lock-free unless the DB is
+        # drifted: see _reconcile_drifted_readonly_schema.
+        self._reconcile_drifted_readonly_schema()
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
                 self._conn = conn = self._connect_read_only(timeout=1.0)
@@ -638,6 +651,97 @@ class SessionDB(
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or not transient:
                     raise
                 time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
+
+    def _reconcile_drifted_readonly_schema(self) -> None:
+        """Bring a *drifted* profile DB current before opening it read-only.
+
+        Cross-profile aggregation (dashboard sidebar, cross-profile session
+        search, the projects panels) opens other profiles' ``state.db`` with
+        ``read_only=True``, which deliberately skips schema init so it can
+        never take a write lock on another profile's live database. But a
+        profile whose gateway last ran on an older version still has that
+        version's ``sessions`` table, and every aggregation query selecting a
+        newer column then fails for the whole profile —
+        ``no such column: s.display_name`` — so e.g. 306 real sessions render as
+        zero rows plus an error string.
+
+        The read-only guarantee is preserved for every DB that isn't drifted:
+        we peek at the live columns over a ``mode=ro`` connection (no lock at
+        all) and, in the normal case where the table is current, return without
+        ever opening the file writable. Only a genuinely drifted DB is opened
+        for writing, at most once per path per process, to run the ordinary
+        declarative ``_reconcile_columns``. Such a DB is by definition one that
+        no current-version writer has opened; if the write lock can't be taken
+        inside the 1s timeout we give up and the caller degrades exactly as it
+        does today.
+
+        ponytail: columns only — that is the whole reported failure. A DB old
+        enough to be missing entire *tables* fails with "no such table" instead
+        and still degrades per-profile; run that profile's gateway once to get
+        the full schema init.
+        """
+        global _declared_session_columns_cache
+
+        path_key = str(self.db_path)
+        if path_key in _drift_checked_paths:
+            return
+
+        try:
+            probe = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, timeout=1.0
+            )
+        except Exception:
+            return  # Missing/unopenable — caller's own error path handles it.
+        try:
+            live_cols = {row[1] for row in probe.execute('PRAGMA table_info("sessions")')}
+        except Exception:
+            return
+        finally:
+            probe.close()
+
+        if not live_cols:
+            return  # Not an initialised state.db; nothing to reconcile against.
+
+        if _declared_session_columns_cache is None:
+            try:
+                _declared_session_columns_cache = set(
+                    self._parse_schema_columns(SCHEMA_SQL).get("sessions", {})
+                )
+            except Exception:
+                return
+        missing = _declared_session_columns_cache - live_cols
+
+        with _repair_attempt_lock:
+            if path_key in _drift_checked_paths:
+                return
+            # Recorded whether or not the reconcile below succeeds: a current DB
+            # never needs re-probing, and a drifted one we couldn't write must
+            # not be retried on every sidebar poll.
+            _drift_checked_paths.add(path_key)
+
+        if not missing:
+            return
+
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=1.0, isolation_level=None)
+            try:
+                self._reconcile_columns(conn.cursor())
+            finally:
+                conn.close()
+            logger.info(
+                "Reconciled drifted schema for %s (added: %s)",
+                self.db_path,
+                ", ".join(sorted(missing)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not reconcile drifted schema for %s (%s) — aggregation "
+                "over this profile will keep degrading until its own gateway "
+                "runs. Missing: %s",
+                self.db_path,
+                exc,
+                ", ".join(sorted(missing)),
+            )
 
     def _connect_read_only(self, timeout: float) -> sqlite3.Connection:
         """``mode=ro`` tracked connection with Row factory. check_same_thread=False: pooled connections
