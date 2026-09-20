@@ -23,7 +23,11 @@ from hermes_cli.colors import Colors as _Colors
 
 CONFIG_WATCH_INTERVAL = 5.0  # seconds between config.yaml stat() calls
 
-_TOOL_PROGRESS_CYCLE = ["off", "new", "all", "verbose"]
+# Must cover every value display.tool_progress accepts (gateway/display_config.py
+# _NORMALISERS allows {off,new,all,verbose,log}). A mode missing here can never be
+# selected AND can never be returned to once the user cycles away from a
+# config-set value -- "log" was unreachable that way (#222).
+_TOOL_PROGRESS_CYCLE = ["off", "new", "all", "verbose", "log"]
 # Raw ANSI (not Rich markup): _cprint routes through prompt_toolkit's renderer, while Rich markup
 # written to stdout gets mangled by patch_stdout's StdoutProxy ('?[33mTool progress: NEW?[0m').
 _TOOL_PROGRESS_LABELS = {
@@ -34,6 +38,10 @@ _TOOL_PROGRESS_LABELS = {
     "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
     "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
     "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, and think blocks.",
+    # The tool_calls.log writer lives in the messaging gateway (gateway/run.py),
+    # so in the CLI "log" just means quiet -- but it stays in the cycle so a
+    # config-set 'log' survives a round trip.
+    "log": f"{_Colors.DIM}Tool progress: LOG{_Colors.RESET} — quiet here; messaging gateways append tool calls to ~/.hermes/logs/tool_calls.log.",
 }
 
 _RELOAD_MCP_CHOICES = [
