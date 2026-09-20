@@ -871,6 +871,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
+    # FORK-ONLY: per-task scheduling. Partial index — the overwhelming majority of tasks
+    # carry no constraint, so indexing only the scheduled ones keeps it tiny.
+    if "scheduled_at" not in _column_names(conn, "tasks"):
+        _add_column_if_missing(conn, "tasks", "scheduled_at", "scheduled_at INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_scheduled_at "
+        "ON tasks(scheduled_at) WHERE scheduled_at IS NOT NULL"
+    )
 
     # task_events.run_id back-fills as NULL for historical events (they predate
     # runs and can't be attributed).

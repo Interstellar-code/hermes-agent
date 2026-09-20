@@ -714,6 +714,8 @@ class Task:
     # VALID_BLOCK_KINDS or None (legacy); kept across unblock so a same-kind re-block reads as a loop.
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
+    # Earliest dispatch time (unix epoch seconds). NULL = no constraint.
+    scheduled_at: Optional[int] = None
     completion_contract: Optional[str] = None
 
     @classmethod
@@ -732,6 +734,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            scheduled_at=(int(g("scheduled_at")) if g("scheduled_at") else None),
         )
 
 
@@ -941,7 +944,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Earliest time (unix epoch seconds) at which this task may be dispatched.
+    -- NULL = no scheduling constraint (dispatch immediately when ready).
+    -- The dispatcher skips tasks where scheduled_at > now().
+    scheduled_at         INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1231,6 +1238,7 @@ def create_task(
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
+    scheduled_at: Optional[int] = None,
     completion_contract: Optional[str] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
@@ -1331,8 +1339,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        scheduled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1351,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        _opt_int(scheduled_at),
                     ),
                 )
                 for pid in parents:
@@ -2103,8 +2113,9 @@ def _claim_and_open_run(
          WHERE id = ?
            AND status = '{source_status}'
            AND claim_lock IS NULL
+           AND (scheduled_at IS NULL OR scheduled_at <= ?)
         """,
-        (lock, expires, now, task_id),
+        (lock, expires, now, task_id, now),
     )
     if cur.rowcount != 1:
         return None

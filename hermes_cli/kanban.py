@@ -28,6 +28,7 @@ from hermes_cli.kanban_output import (
     _task_to_dict,
 )
 from hermes_cli.kanban_boards import _dispatch_boards
+from hermes_cli.kanban_templates import _dispatch_templates
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
@@ -156,6 +157,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
         return _dispatch_boards(args)
+
+    # `template …` manages the filesystem-based template store, independent of any
+    # particular board, so it also bypasses the `--board` routing override.
+    if action == "template":
+        return _dispatch_templates(args)
 
     # `--board <slug>` pins HERMES_KANBAN_BOARD for the duration of this call so it inherits the
     # exact resolution the dispatcher uses for workers.
@@ -1248,7 +1254,7 @@ _HANDLERS = {
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
-    "gc": _cmd_gc,
+    "gc": _cmd_gc, "template": _dispatch_templates,
 }
 
 

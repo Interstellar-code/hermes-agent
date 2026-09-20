@@ -134,6 +134,40 @@ _BOARD_SPECS = [
     )),
 ]
 
+_TEMPLATE_SPECS = [
+    _cmd("list", aliases=["ls"], help="List all saved templates"),
+    _cmd("show", [_arg("slug", help="Template slug")],
+         help="Print the raw YAML of a template"),
+    _cmd("create", [
+        _arg("file", help="Path to the template YAML file"),
+        _arg("--slug", default=None, metavar="SLUG",
+             help="Override the slug (default: use the 'slug' field inside the file)"),
+    ], help="Save a template from a YAML file (slug taken from file content)"),
+    _cmd("delete", [
+        _arg("slug", help="Template slug to delete"),
+        _arg("--yes", "-y", action="store_true", help="Skip the confirmation prompt"),
+    ], aliases=["rm"], help="Delete a saved template"),
+    _cmd("instantiate", [
+        _arg("slug", help="Template slug to instantiate"),
+        _arg("--var", dest="vars", action="append", default=[], metavar="KEY=VALUE",
+             help="Set a template variable (repeatable). Split on first '=' only."),
+        _arg("--board", dest="template_board", default=None, metavar="SLUG",
+             help="Target board slug (overrides board.slug in template)"),
+        _arg("--dispatch", action="store_true",
+             help="Set auto_dispatch=True so ready tasks are picked up by the dispatcher"),
+    ], aliases=["apply"], help="Create board tasks from a template"),
+    _cmd("save-board", [
+        _arg("board_slug", help="Source board slug to snapshot"),
+        _arg("--as", dest="template_slug", required=True, metavar="TEMPLATE_SLUG",
+             help="Slug for the new template"),
+        _arg("--name", default=None, help="Human-readable display name for the template"),
+        _arg("--keep-status", action="store_true",
+             help=("Preserve 'ready' task status in the saved template. All other statuses "
+                   "(running, blocked, done, etc.) are always reset to 'todo'; only 'ready' "
+                   "is preserved when this flag is set.")),
+    ], help="Snapshot a live board as a reusable template"),
+]
+
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
@@ -423,6 +457,13 @@ _SPECS = [
              "the same narrow auto-repair the connect-time guard applies. Any other corruption "
              "class is reported and left untouched (fail-closed). Exits 0 when the DB is healthy "
              "or was repaired, non-zero when it is still corrupt."
+         )),
+    _cmd("template", children=("template_action", _TEMPLATE_SPECS),
+         help="Manage board templates (save once, instantiate repeatedly)",
+         description=(
+             "Board templates store a set of tasks, dependencies, variables, and "
+             "optional recurrence rules so you can seed a board in one command. "
+             "Templates live under <HERMES_HOME>/kanban/templates/<slug>/template.yaml."
          )),
 ]
 
