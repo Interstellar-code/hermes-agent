@@ -14,6 +14,7 @@ from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
 )
 from hermes_state_common import (
+    _agent_id_json,
     _LISTABLE_CHILD_SQL, _PREVIEW_ELIGIBLE_SQL, _PREVIEW_RAW_SELECT, _RECOVERABLE_END_REASONS,
     _RECOVERABLE_END_REASONS_SQL, _RESET_END_REASONS, _legacy_reset_child_sql, _shape_preview,
     _sql_json_extract, _sql_session_last_active, _sql_session_last_active_by_id, escape_like as _escape_like,
@@ -32,12 +33,6 @@ def workspace_key(row: Dict[str, Any]) -> Optional[str]:
 
 def _delegate_from_json(col: str = "model_config") -> str:
     return _sql_json_extract(col, "$._delegate_from")
-
-
-def _agent_id_json(col: str = "model_config") -> str:
-    """Owning agent identity marker written by delegate_task (#194).
-    Same JSON-blob pattern as ``_delegate_from``/``_branched_from`` — no new column."""
-    return _sql_json_extract(col, "$._agent_id")
 
 
 # _merge_model_config_json's "no such row" result — distinct from the legal None

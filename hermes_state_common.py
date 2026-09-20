@@ -68,6 +68,18 @@ def _sql_json_extract(expression: str, path: str) -> str:
     return f"json_extract({safe_json}, {_sql_literal(path)})"
 
 
+def _agent_id_json(col: str = "model_config") -> str:
+    """Owning agent identity marker written by delegate_task (#194).
+
+    Same JSON-blob pattern as ``_delegate_from``/``_branched_from`` -- no new column.
+    Lives here, not in a sibling, because BOTH hermes_state_sessions
+    (list_sessions_rich) and hermes_state_portability (_get_session_rich_rows_batch)
+    project it, and the two queries must agree on the JSON path exactly -- a silent
+    mismatch would make agent_id null on one read path only.
+    """
+    return _sql_json_extract(col, "$._agent_id")
+
+
 def _sql_ltrim_whitespace(expression: str) -> str:
     return f"LTRIM({expression}, {_SQL_WHITESPACE})"
 
