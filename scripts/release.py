@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -33,6 +34,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
+# uv.lock embeds hermes-agent's own version as a package entry
+# (source = { editable = "." }). It must be regenerated in lockstep with
+# pyproject.toml -- see regenerate_uv_lock() for why this is not optional.
+UV_LOCK_FILE = REPO_ROOT / "uv.lock"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -2272,11 +2277,98 @@ def update_version_files(semver: str, calver_date: str):
         installer_cargo.write_text(cargo_text, encoding="utf-8")
 
 
+def _managed_uv_path() -> Path:
+    """Where Hermes keeps its own managed uv install.
+
+    Mirrors ``hermes_cli.managed_uv.managed_uv_path()``: ``$HERMES_HOME/bin/uv``
+    (``uv.exe`` on Windows), defaulting to ``~/.hermes/bin/uv`` when
+    ``HERMES_HOME`` is unset. Reimplemented locally rather than imported so
+    this script keeps working outside an installed hermes-agent environment.
+    """
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    home = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
+    return home / "bin" / ("uv.exe" if sys.platform == "win32" else "uv")
+
+
+def _find_uv_bin():
+    """Locate the ``uv`` binary, or None. PATH first, then Hermes's managed install.
+
+    uv is not guaranteed to be on ``PATH`` in every environment that cuts a
+    release -- on the maintainer's machine it exists only at ``~/.hermes/bin/uv``.
+    """
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        return uv_bin
+    managed = _managed_uv_path()
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return str(managed)
+    return None
+
+
+def regenerate_uv_lock(semver: str) -> None:
+    """Regenerate uv.lock so it embeds the freshly-bumped project version.
+
+    ``uv.lock`` pins hermes-agent's own version as a package entry
+    (``source = { editable = "." }``). Bumping ``pyproject.toml`` without
+    re-running ``uv lock`` leaves the lockfile stale, and ``uv lock --check``
+    (which ``uv sync --locked`` runs before installing) then fails at the
+    install step -- before a single test runs. An install-time abort looks just
+    like a real test failure on the CI dashboard.
+
+    Not hypothetical: commit 8712d5b7b introduced exactly this drift and the
+    Python suite silently did not run for 176 commits, during which 8 real test
+    failures accumulated invisibly. Abort the release rather than ship a stale
+    lock.
+    """
+    uv_bin = _find_uv_bin()
+    if not uv_bin:
+        raise RuntimeError(
+            "Cannot regenerate uv.lock: no `uv` binary found on PATH or at "
+            f"{_managed_uv_path()}. Install uv (https://docs.astral.sh/uv/) "
+            "or set HERMES_HOME to an install that has one, then re-run."
+        )
+    result = subprocess.run([uv_bin, "lock"], cwd=str(REPO_ROOT),
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"`uv lock` failed:\n{detail}")
+    if not UV_LOCK_FILE.exists():
+        raise RuntimeError(f"`uv lock` reported success but {UV_LOCK_FILE} is missing.")
+    lock_text = UV_LOCK_FILE.read_text(encoding="utf-8")
+    match = re.search(r'^name = "hermes-agent"\nversion = "([^"]+)"', lock_text, re.MULTILINE)
+    if not match or match.group(1) != semver:
+        found = match.group(1) if match else "<no hermes-agent entry found>"
+        raise RuntimeError(
+            f"uv.lock still shows hermes-agent version {found!r} after `uv lock` "
+            f"(expected {semver!r}). Refusing to publish with a stale lockfile."
+        )
+
+
+def origin_repo_slug() -> str:
+    """Return 'owner/repo' parsed from the origin remote URL.
+
+    The fork must not publish releases to upstream's repo. Every `gh` call that
+    can target a repo passes this.
+    """
+    fallback = "NousResearch/hermes-agent"
+    url = git("remote", "get-url", "origin")
+    if not url:
+        return fallback
+    m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    return fallback
+
+
 def version_files_to_stage() -> list[str]:
     """Return version-bearing files that exist and should be `git add`ed after a bump."""
     candidates = [
         VERSION_FILE,
         PYPROJECT_FILE,
+        UV_LOCK_FILE,
         REPO_ROOT / "apps" / "desktop" / "package.json",
         REPO_ROOT / "apps" / "bootstrap-installer" / "package.json",
         REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri" / "tauri.conf.json",
@@ -2343,7 +2435,24 @@ def categorize_commit(subject: str) -> str:
 def clean_subject(subject: str) -> str:
     """Clean up a commit subject for display."""
     # Remove conventional commit prefix
-    cleaned = re.sub(r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests|deps|bump)[\s:(!]+\s*", "", subject, flags=re.IGNORECASE)
+    # The (scope) group is not optional decoration: without it,
+    # ``feat(api_server): x`` matched only ``feat`` plus a single ``(`` from the
+    # separator class, stripping the prefix to ``api_server): x`` which then
+    # title-cased into ``Api_server): x``. Every scoped commit shipped mangled
+    # that way -- see the v0.19.10 notes. A malformed prefix with an unclosed
+    # scope (``feat(oops: x``) now fails to match and is left verbatim, which
+    # beats half-stripping it.
+    cleaned = re.sub(
+        r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update"
+        r"|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests"
+        r"|deps|bump)"
+        r"(\([^)]*\))?"   # optional (scope)
+        r"!?"             # optional breaking-change marker
+        r"[\s:]+\s*",     # separator: colon and/or whitespace
+        "",
+        subject,
+        flags=re.IGNORECASE,
+    )
     # Remove trailing issue refs that are redundant with PR links
     cleaned = cleaned.strip()
     # Capitalize first letter
@@ -2381,11 +2490,14 @@ def get_commits(since_tag=None):
     else:
         range_spec = "HEAD"
 
-    # Format: hash<US>author_name<US>author_email<US>subject\0body
-    # Using %x1f (unit separator) to avoid conflict with | in author names
+    # RS (0x1e) starts each record; US (0x1f) separates the 5 fields.
+    #
+    # The old form ended each record with %x00%b%x00 and split on "\0\0". A commit
+    # body containing a NUL run merged adjacent records, and a body ending in one
+    # split a record in half -- either way the changelog silently under-reported.
     log = git(
         "log", range_spec,
-        "--format=%H%x1f%an%x1f%ae%x1f%s%x00%b%x00",
+        "--format=%x1e%H%x1f%an%x1f%ae%x1f%s%x1f%b",
         "--no-merges",
     )
 
@@ -2393,23 +2505,19 @@ def get_commits(since_tag=None):
         return []
 
     commits = []
-    # Split on double-null to get each commit entry, since body ends with \0
-    # and format ends with \0, each record ends with \0\0 between entries
-    for entry in log.split("\0\0"):
-        entry = entry.strip()
-        if not entry:
+    # NB: git()'s .strip() removes the FIRST record's leading RS, because Python
+    # counts \x1e and \x1f as whitespace ('\x1e'.isspace() is True). Splitting on
+    # RS still yields that record as element 0, so this is harmless -- but never
+    # .strip() a field expecting the separators to survive.
+    for record in log.split("\x1e"):
+        if not record.strip():
             continue
-        # Split on first null to separate "hash<US>name<US>email<US>subject" from "body"
-        if "\0" in entry:
-            header, body = entry.split("\0", 1)
-            body = body.strip()
-        else:
-            header = entry
-            body = ""
-        parts = header.split("\x1f", 3)
-        if len(parts) != 4:
+        parts = record.split("\x1f", 4)
+        if len(parts) < 4:
             continue
-        sha, name, email, subject = parts
+        sha, name, email = parts[0].strip(), parts[1], parts[2]
+        subject = parts[3]
+        body = parts[4].strip() if len(parts) == 5 else ""
         coauthor_info = parse_coauthors(body)
         coauthors = [resolve_author(ca["name"], ca["email"]) for ca in coauthor_info]
         commits.append({
@@ -2434,9 +2542,16 @@ def get_pr_number(subject: str) -> str | None:
     return None
 
 
-def generate_changelog(commits, tag_name, semver, repo_url="https://github.com/NousResearch/hermes-agent",
+def generate_changelog(commits, tag_name, semver, repo_url=None,
                        prev_tag=None, first_release=False):
-    """Generate markdown changelog from categorized commits."""
+    """Generate markdown changelog from categorized commits.
+
+    ``repo_url`` defaults to the ORIGIN remote, not upstream: a hardcoded
+    upstream default minted commit links pointing at a repo that does not carry
+    these commits.
+    """
+    if repo_url is None:
+        repo_url = f"https://github.com/{origin_repo_slug()}"
     lines = []
 
     # Header
@@ -2620,6 +2735,15 @@ def main():
         if args.bump:
             update_version_files(new_version, calver_date)
             print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
+            # Lock regen is a release step, not part of writing version files:
+            # update_version_files() is called directly by tests with REPO_ROOT
+            # pointed at a tmp dir, where running `uv lock` is meaningless.
+            try:
+                regenerate_uv_lock(new_version)
+            except RuntimeError as exc:
+                print(f"  ✗ {exc}")
+                return
+            print(f"  ✓ Regenerated uv.lock for v{new_version}")
 
             # Commit version bump
             add_files = version_files_to_stage()
@@ -2661,6 +2785,7 @@ def main():
 
         gh_cmd = [
             "gh", "release", "create", tag_name,
+            "--repo", origin_repo_slug(),
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
