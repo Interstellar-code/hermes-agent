@@ -379,7 +379,10 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         )
         _m().sys.exit(1)
     _abort_zip_update_if_dirty_tree()
-    _download_and_swap_zip(branch, f"https://github.com/NousResearch/hermes-agent/archive/refs/heads/{branch}.zip")
+    # FORK-ONLY: pull the zip from the configured source repo, not upstream.
+    from hermes_constants import hermes_repo_web_url
+
+    _download_and_swap_zip(branch, f"{hermes_repo_web_url()}/archive/refs/heads/{branch}.zip")
     _sweep_bytecode_after_update(branch)
     # Self-lock deferral: the code swap is committed; defer only the dependency sync when this process
     # holds a native extension the sync must rewrite.
