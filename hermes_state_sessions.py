@@ -34,6 +34,12 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return _sql_json_extract(col, "$._delegate_from")
 
 
+def _agent_id_json(col: str = "model_config") -> str:
+    """Owning agent identity marker written by delegate_task (#194).
+    Same JSON-blob pattern as ``_delegate_from``/``_branched_from`` — no new column."""
+    return _sql_json_extract(col, "$._agent_id")
+
+
 # _merge_model_config_json's "no such row" result — distinct from the legal None
 # ("merged config is empty → store NULL").
 _MODEL_CONFIG_ROW_MISSING = object()
@@ -92,6 +98,7 @@ def _session_filter_where(
     *, exclude_children: bool = False, source: str = None, sources: List[str] = None,
     session_key: str = None, exclude_sources: List[str] = None, cwd_prefix: str = None,
     min_message_count: int = 0, archived_only: bool = False, include_archived: bool = False,
+    parent_session_id: str = None,
 ) -> Tuple[List[str], List[Any]]:
     """Shared ``sessions s`` WHERE builder so counts line up with listed rows. ``exclude_children``
     hides sub-agent runs and compression continuations but keeps branch/reset children
@@ -115,6 +122,7 @@ def _session_filter_where(
         (f"s.source NOT IN ({_session_ids_placeholders(exclude_sources or ())})", exclude_sources or []),
         (_cwd_prefix_clause(cwd_prefix) if cwd_prefix else ("", [])),
         ("s.message_count >= ?", [min_message_count] if min_message_count > 0 else []),
+        ("s.parent_session_id = ?", [parent_session_id] if parent_session_id else []),
     ):
         if values:
             where.append(clause)
@@ -1194,15 +1202,22 @@ class SessionSessionsMixin:
         order_by_last_active: bool = False, include_archived: bool = False, archived_only: bool = False,
         id_query: str = None, search_query: str = None, compact_rows: bool = False,
         include_pinned: bool = False, session_key: str = None, include_hidden: bool = False,
+        parent_session_id: str = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview and ``last_active`` in one query. ``order_by_last_active`` sorts
         by the chain TIP via a recursive CTE (the only path honouring ``id_query`` / ``search_query``);
         ``include_pinned`` back-fills pins the page missed, still obeying the other filters."""
         self.flush_token_counts()  # rows carry token/cost totals
+        if parent_session_id:
+            # Filtering by parent targets child rows by definition, so it implies
+            # include_children — otherwise the child-exclusion clauses below would
+            # make every parent_session_id query return an empty list (#194).
+            include_children = True
         where_clauses, params = _session_filter_where(
             exclude_children=not include_children, source=source, sources=sources, session_key=session_key,
             exclude_sources=exclude_sources, cwd_prefix=cwd_prefix, min_message_count=min_message_count,
             archived_only=archived_only, include_archived=include_archived,
+            parent_session_id=parent_session_id,
         )
         if not include_hidden:
             where_clauses.append("s.hidden = 0")
@@ -1212,6 +1227,7 @@ class SessionSessionsMixin:
         select_head = (
             f"SELECT {self._compact_session_cols() if compact_rows else 's.*'}"
             + ("" if compact_rows else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved")
+            + f", {_agent_id_json('s.model_config')} AS agent_id"
             + f",\n                    {_PREVIEW_COL_SQL},\n                    "
         )
         prompt_join = (
