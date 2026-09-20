@@ -2637,13 +2637,20 @@ class CLICommandsMixin:
         """Handle /debug [nous|local] — upload debug report + logs and print share URLs.
         Default: public paste service; ``nous``: Nous-internal (staff-only); ``local``: render to
         stdout, no upload. ``local`` wins if both are given (never touches the network)."""
-        from hermes_cli.debug import run_debug_share
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
         from types import SimpleNamespace
         words = {w.lower() for w in cmd_original.split()[1:]}
         local = "local" in words
         # Typing /debug is the upload consent (yes=True); input() would hang in prompt_toolkit anyway.
-        run_debug_share(SimpleNamespace(
-            lines=200, expire=7, local=local, nous="nous" in words and not local, yes=True))
+        try:
+            run_debug_share(SimpleNamespace(
+                lines=200, expire=7, local=local, nous="nous" in words and not local, yes=True))
+        except DebugShareFailed:
+            # run_debug_share() already printed "Upload failed: ..." plus the --local hint.
+            # Swallow here, same reasoning as the /journey and /curator SystemExit guards: a
+            # library-level upload failure must not kill the interactive session or, when this
+            # runs inside the TUI slash worker, the worker subprocess (issue #224).
+            pass
 
     def _handle_update_command(self) -> bool:
         """Handle /update — exit the session and relaunch as ``hermes update``. Returns True when

@@ -426,6 +426,24 @@ class DebugShareResult:
     report: str = ""  # the summary report text (kept for local fallback)
 
 
+class DebugShareFailed(Exception):
+    """Raised by ``run_debug_share`` / ``_run_debug_share_nous`` on upload failure.
+
+    These functions are called both from the ``hermes debug share`` shell
+    entry point (``run_debug``, below) and in-process — the classic CLI's
+    ``/debug`` handler (``cli_commands_mixin._handle_debug_command``) and,
+    through it, the TUI slash-worker subprocess. A bare ``sys.exit()`` from a
+    shared library function is fatal to those in-process callers: ``SystemExit``
+    unwinds past every ``except Exception`` on the way up and kills the whole
+    worker/CLI process instead of just failing the one command (issue #224).
+
+    So this exception is raised instead — the human-readable message is
+    already printed to stderr before it's raised. Only ``run_debug`` (the
+    shell entry point) is expected to translate it into a process exit code;
+    every other caller should catch it and continue.
+    """
+
+
 def build_debug_share(
         *, log_lines: int = 200, expiry: int = 1, redact: bool = True) -> DebugShareResult:
     """Collect the debug report + full logs, upload each, return the URLs.
@@ -501,7 +519,7 @@ def run_debug_share(args):
     except RuntimeError as exc:
         print(f"\nUpload failed: {exc}", file=sys.stderr)
         print("\nRun `hermes debug share --local` to print the report instead.\n")
-        sys.exit(1)
+        raise DebugShareFailed(str(exc)) from exc
     label_width = max(len(k) for k in result.urls)
     print("\nDebug report uploaded:")
     for label, url in result.urls.items():
@@ -558,7 +576,7 @@ def _run_debug_share_nous(args, *, log_lines: int, redact: bool) -> None:
               "\nThe Nous diagnostics service may be unavailable or not yet provisioned.\n"
               "Run `hermes debug share --local` to print the report instead, "
               "or `hermes debug share` to upload to a public paste service.\n", file=sys.stderr)
-        sys.exit(1)
+        raise DebugShareFailed(str(exc)) from exc
     view_url = res.get("viewUrl") or res.get("view_url")
     expires_at = res.get("expiresAt") or res.get("expires_at")
     print("\nDebug bundle uploaded to Nous (private):")
@@ -596,10 +614,21 @@ def run_debug_delete(args):
 def run_debug(args):
     """Route debug subcommands (sweeping expired pastes opportunistically on every call)."""
     _best_effort_sweep_expired_pastes()
-    handler = {"share": run_debug_share, "delete": run_debug_delete}.get(
-        getattr(args, "debug_command", None))
+    subcmd = getattr(args, "debug_command", None)
+    handler = {"share": run_debug_share, "delete": run_debug_delete}.get(subcmd)
     if handler is None:
         print(_DEBUG_USAGE)
+        return
+    if subcmd == "share":
+        # run_debug_share() signals an upload failure by raising DebugShareFailed
+        # rather than calling sys.exit() itself (issue #224) so it's safe to call
+        # in-process (the /debug slash handler, the TUI slash worker). This is the
+        # one place — the `hermes debug share` shell entry point — that owes the
+        # shell a non-zero exit code.
+        try:
+            handler(args)
+        except DebugShareFailed:
+            sys.exit(1)
     else:
         handler(args)
 

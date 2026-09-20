@@ -47,6 +47,11 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Absolute activation floor for "auto" mode, in tokens. 0 disables.
+    # Complements threshold_pct: on huge-context models (1M+) a percentage
+    # threshold can be unreachable (10% of 2M = 200k tokens), leaving auto
+    # mode permanently dormant no matter how large the deferrable surface.
+    threshold_tokens: int = 0
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -69,7 +74,8 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            threshold_tokens=_clamped_int(raw.get("threshold_tokens"), 0, 0, 10_000_000))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}

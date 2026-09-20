@@ -1005,15 +1005,19 @@ class TestRunDebugShareNous:
         assert isinstance(blob, (bytes, bytearray)) and blob[:2] == b"\x1f\x8b"
 
     def test_nous_failure_suggests_local(self, hermes_home, capsys):
-        from hermes_cli.debug import run_debug_share
+        from hermes_cli.debug import DebugShareFailed, run_debug_share
 
+        # Signals failure with DebugShareFailed, NOT sys.exit (issue #224): a bare
+        # SystemExit is a BaseException that escapes ordinary handlers and would kill
+        # the interactive session — or the TUI slash worker subprocess — on a failed
+        # upload. `hermes debug share` still exits non-zero; the translation happens at
+        # the CLI entry point, not in the library call.
         with patch("hermes_cli.dump.run_dump"), patch(
             "hermes_cli.diagnostics_upload.share_to_nous",
             side_effect=RuntimeError("service down"),
         ):
-            with pytest.raises(SystemExit) as exc:
+            with pytest.raises(DebugShareFailed):
                 run_debug_share(self._args())
-        assert exc.value.code == 1
         err = capsys.readouterr().err
         assert "Nous upload failed" in err
         assert "--local" in err
