@@ -937,7 +937,11 @@ def run_curator_review(
         save_state(state2)
         _notify(on_summary, f"curator: {final_summary}")
 
-    if synchronous:
+    # When consolidation is off, the pass is prune/report-only and does not
+    # need a background thread. Running inline avoids cross-test / shutdown
+    # races where a daemon thread can still rewrite .curator_state after the
+    # caller has moved on.
+    if synchronous or not consolidate:
         _llm_pass()
     else:
         threading.Thread(target=_llm_pass, daemon=True, name="curator-review").start()
