@@ -1286,18 +1286,24 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                     agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform))
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
-                    # #157: a provider was explicitly CONFIGURED but did not
-                    # load. At debug level this is invisible, and the agent runs
-                    # on built-in memory while the operator believes their
-                    # configured provider is active -- the exact failure behind
-                    # the "no provider instance found" incidents. Fail loud.
-                    _ra().logger.error(
-                        "Memory provider '%s' is configured but failed to load or is "
-                        "unavailable - agent is running WITHOUT it. If this is "
-                        "'matrix-memory', the Mnemosyne engine submodule is likely "
-                        "missing: run `git submodule update --init "
-                        "plugins/memory/_matrix-memory-mnemosyne`.",
+                    # #157: a provider was explicitly CONFIGURED but produced no
+                    # usable instance, so the agent runs on built-in memory while
+                    # the operator believes their provider is active -- the failure
+                    # behind the "no provider instance found" incidents. At debug
+                    # level that is invisible.
+                    #
+                    # Routed through the SAME deduped helper as the unavailable
+                    # branch above, not a bare logger.error: the gateway builds a
+                    # fresh AIAgent per message, so an undeduped log here fires on
+                    # every turn. The helper is a no-op when that branch already
+                    # warned for this provider, which covers the _mp-not-None case;
+                    # this call is what makes the _mp IS None case (the provider
+                    # failed to load at all) audible.
+                    _warn_memory_provider_unavailable(
                         _mem_provider_name,
+                        "If this is 'matrix-memory', the Mnemosyne engine submodule is "
+                        "likely missing: run `git submodule update --init "
+                        "plugins/memory/_matrix-memory-mnemosyne`.",
                     )
                     agent._memory_manager = None
         except Exception as _mpe:
