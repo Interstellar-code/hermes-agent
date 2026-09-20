@@ -108,6 +108,59 @@ def _approval_event_choices(*, smart_denied: bool, allow_session: bool, allow_pe
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
 
+def _iso_utc(ts: float) -> str:
+    """Render a unix timestamp as a ``Z``-suffixed ISO-8601 UTC string, second precision."""
+    import datetime
+    return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _build_approval_record(
+    guard_payload: Dict[str, Any], *, approval_id: str, session_id: str, run_id: str, message_id: str,
+    profile: Optional[str] = None, now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build the canonical (internal) approval record for a pending guard request.
+
+    Mirrors the redaction/choices logic already used by ``_make_approval_notify``
+    (``api_server_runs.py``) so the two approval surfaces (``/v1/runs`` and the
+    session chat stream) agree on wire shape.
+    """
+    from tools import approval as _approval_mod
+    from gateway.run import _redact_approval_command
+
+    now = time.time() if now is None else now
+    timeout = _approval_mod._get_approval_timeout()
+    expires_at_ts = now + timeout
+    smart_denied = bool(guard_payload.get("smart_denied", False))
+    allow_permanent = bool(guard_payload.get("allow_permanent", True))
+    choices = _approval_event_choices(smart_denied=smart_denied, allow_session=True, allow_permanent=allow_permanent)
+    record: Dict[str, Any] = {
+        "kind": "approval",
+        "tool_name": "approval",
+        "approval_id": approval_id,
+        "interaction_id": approval_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "message_id": message_id,
+        "profile": profile,
+        "choices": choices,
+        "command": _redact_approval_command(guard_payload.get("command")),
+        "description": guard_payload.get("description"),
+        "pattern_key": guard_payload.get("pattern_key"),
+        "pattern_keys": guard_payload.get("pattern_keys"),
+        "allow_permanent": allow_permanent,
+        "expires_at": _iso_utc(expires_at_ts),
+        "_expires_at_ts": expires_at_ts,
+    }
+    if smart_denied:
+        record["smart_denied"] = True
+    return record
+
+
+def _public_approval_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip internal (``_``-prefixed) bookkeeping fields for wire transmission."""
+    return {key: value for key, value in record.items() if not key.startswith("_")}
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -201,6 +254,7 @@ DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+RUN_EVENTS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
@@ -1178,6 +1232,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
         self._browser_control_artifacts: Dict[str, ArtifactStore] = {}
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
+        # Pending command approvals raised on the SESSIONS chat stream, keyed by run_id.
+        # /v1/runs keeps its own registry in api_server_runs; this one exists because a
+        # sessions-stream client that reloads has no SSE stream to replay from, so
+        # GET /v1/approvals/pending is its only way to catch up on a still-open approval.
+        self._run_approval_requests: Dict[str, List[Dict[str, Any]]] = {}
+        # run_ids with a live approval, keyed by approval session_key, so a stream teardown
+        # only reaps ITS OWN approvals and leaves a sibling stream's answerable.
+        self._session_approval_runs: Dict[str, set] = {}
 
     def active_agent_work_count(self) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
@@ -1530,6 +1592,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            # Catch-up surface for a reloaded sessions-stream client: that transport
+            # has no SSE buffer to replay a still-open approval from.
+            ("GET", "/v1/approvals/pending", self._handle_list_pending_approvals),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
@@ -2193,6 +2258,56 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
 
+    def _prune_expired_approval_requests(self, now: Optional[float] = None) -> None:
+        """Drop approval records past their deadline, and any run left with none.
+
+        The core drops a timed-out entry from its OWN queue, so a record list that
+        keeps it goes stale: the FIFO head used to label a resolution receipt would
+        be a dead entry, and the pending list would advertise an approval no client
+        can answer.
+
+        Records without ``_expires_at_ts`` (synthetic or legacy entries) carry no
+        deadline and are deliberately left alone rather than assumed expired.
+        """
+        now = time.time() if now is None else now
+        for run_id, records in list(self._run_approval_requests.items()):
+            live = [
+                record for record in records
+                if not isinstance(record.get("_expires_at_ts"), (int, float))
+                or float(record["_expires_at_ts"]) > now
+            ]
+            if live:
+                self._run_approval_requests[run_id] = live
+            else:
+                self._run_approval_requests.pop(run_id, None)
+
+    @_require_auth
+    async def _handle_list_pending_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /v1/approvals/pending — approvals still awaiting an answer.
+
+        A sessions-stream client that reloads has no SSE buffer to replay, so this
+        is its only way to rediscover an approval that is still blocking a turn.
+
+        Scoped to the requesting profile: an unprefixed request sees only records
+        with no profile, and a /p/<name>/ request only that profile's. Ordered
+        oldest-first so a client answers the one that has been blocking longest.
+        """
+        self._prune_expired_approval_requests()
+        profile = self._resolve_request_profile(request)
+        if profile is _PROFILE_REJECTED:
+            return web.json_response({"error": "unknown profile"}, status=404)
+        approvals = [
+            record
+            for records in self._run_approval_requests.values()
+            for record in records
+            if (record.get("profile") or None) == (profile or None)
+        ]
+        approvals.sort(key=lambda record: float(record.get("_expires_at_ts") or 0.0))
+        return web.json_response({
+            "object": "hermes.approval.list",
+            "approvals": [_public_approval_record(record) for record in approvals],
+        })
+
     @_require_auth
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — gateway state, platforms, PID for dashboard probing (Bearer auth)."""
@@ -2706,8 +2821,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
             "message_count", "tool_call_count", "input_tokens", "output_tokens",
             "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
-            "actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id", "pinned", "archived", "hidden")
+            "actual_cost_usd", "api_call_count", "parent_session_id", "agent_id", "last_active",
+            "preview", "_lineage_root_id", "pinned", "archived", "hidden")
         payload = {key: session.get(key) for key in safe_keys if key in session}
         # SQLite stores the flags as 0/1.
         payload.update(
@@ -2769,6 +2884,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         title_filter = (request.query.get("title") or "").strip() or None
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False)
+        parent_session_id = request.query.get("parent_session_id") or None
 
         async def _list() -> list:
             # include_pinned back-fills pins past the recency window; search_query pushes the
@@ -2776,7 +2892,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             rows = await asyncio.to_thread(
                 db.list_sessions_rich, source=source, limit=limit, offset=offset,
                 include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+                search_query=title_filter, include_hidden=include_hidden,
+                parent_session_id=parent_session_id)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
@@ -3673,7 +3790,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
-        relay_metadata: Optional[Dict[str, Any]] = None) -> tuple:
+        relay_metadata: Optional[Dict[str, Any]] = None, approval_notify=None,
+        approval_session_key: Optional[str] = None, approval_cleanup=None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3690,6 +3808,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.approval import register_gateway_notify, unregister_gateway_notify
+            from tools.approval_context import reset_current_session_key, set_current_session_key
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
                     chat_id=session_id or "", session_key=gateway_session_key or session_id or "",
@@ -3698,6 +3818,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     browser_control_transport_family=request_browser_control_transport_family,
                     session_history_delivery=session_history_delivery)
                 agent = None
+                # Refcount key: this turn's own run identity, not the (possibly shared)
+                # approval_session_key -- sibling turns on the same session must not
+                # unregister the notify callback out from under each other.
+                _approval_run_id = active_run_id or session_id or str(uuid.uuid4())
+                _approval_registered = False
+                _approval_session_token = None
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
@@ -3735,6 +3861,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     )
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
+                    if approval_notify is not None and approval_session_key:
+                        _approval_session_token = set_current_session_key(approval_session_key)
+                        _run_set = self._session_approval_runs.setdefault(approval_session_key, set())
+                        if not _run_set:
+                            register_gateway_notify(approval_session_key, approval_notify)
+                        _run_set.add(_approval_run_id)
+                        _approval_registered = True
                     result = agent.run_conversation(**conversation_kwargs)
                     return self._finish_turn_result(
                         agent, result, session_id, route=route, requested_runtime=requested_runtime,
@@ -3749,6 +3882,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                          "api_calls": 0, "tools": []},
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
                 finally:
+                    if _approval_registered:
+                        _run_set = self._session_approval_runs.get(approval_session_key)
+                        if _run_set is not None:
+                            _run_set.discard(_approval_run_id)
+                            if not _run_set:
+                                unregister_gateway_notify(approval_session_key)
+                                self._session_approval_runs.pop(approval_session_key, None)
+                    if _approval_session_token is not None:
+                        with suppress(Exception):
+                            reset_current_session_key(_approval_session_token)
+                    if approval_cleanup is not None:
+                        with suppress(Exception):
+                            approval_cleanup()
                     # Turn over (any outcome): clear ownership so a late disconnect can't reap
                     # background work this turn deliberately left running.
                     if active_run_id:

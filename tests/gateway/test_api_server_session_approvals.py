@@ -75,6 +75,15 @@ def _clean_approval_registry():
 def _app(adapter: APIServerAdapter, *, multiplex: bool = False) -> web.Application:
     middlewares = []
     if multiplex:
+        # Upstream hardened _check_auth AFTER this file was written: a named profile
+        # now resolves its OWN scoped API_SERVER_KEY via _expected_api_key and fails
+        # closed rather than inheriting the owner's key (api_server.py:1402). These
+        # tests assert approval SCOPING, not key provisioning, and there is no
+        # profile-scoped key in a tmp HERMES_HOME -- so every /p/<profile>/ request
+        # would 401 before reaching the handler. Stub the resolver the same way
+        # upstream's own tests/gateway/test_api_server_runs.py:774 does, which keeps
+        # the fail-closed rule itself intact and under test elsewhere.
+        adapter._expected_api_key = lambda: adapter._api_key
         class _Runner:
             config = GatewayConfig(multiplex_profiles=True)
 

@@ -97,7 +97,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
-    ) = ({} for _ in range(7))
+        self._run_approval_requests, self._clarify_streams, self._session_approval_runs,
+    ) = ({} for _ in range(10))
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -904,7 +905,20 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         if task is None or task.done():
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
+    # Reaping must not depend on a client ever calling the list endpoint: a
+    # sessions-stream approval whose client never came back is only ever cleaned
+    # up here.
+    self._prune_expired_approval_requests(now)
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
+            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+        elif (status.get("status") == "waiting_for_approval"
+                and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
+                and run_id not in self._run_approval_sessions):
+            # Sessions-stream runs register no executor task, so a status stuck at
+            # waiting_for_approval is never reaped by the terminal-status branch
+            # above and would pin the run forever. Absence from
+            # _run_approval_sessions is what proves nobody is still waiting --
+            # with an entry there the approval really is outstanding, so leave it.
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
