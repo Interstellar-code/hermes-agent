@@ -456,9 +456,22 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
+    Redirects HERMES_HOME to a per-test tempdir so code reading ``~/.hermes/*``
+    via ``get_hermes_home()`` can't touch the real one, and pins TZ/LANG so
     datetime/locale-sensitive tests are deterministic.
+
+    **HOME is deliberately NOT redirected** — see the note below; subprocess
+    tests depend on the real one. Redirecting it was measured on 2026-09-21 and
+    breaks ~50+ tests in tests/hermes_cli/ alone.
+
+    CONSEQUENCE, and it is a real one: anything calling ``Path.home()`` DIRECTLY
+    rather than ``get_hermes_home()`` escapes this sandbox and reads — or
+    WRITES — the developer's actual home directory. ``_qwen_cli_auth_path()``
+    (hermes_cli/auth_qwen.py) is one such path, and a test fixture has already
+    leaked to a real ``~/.qwen/oauth_creds.json`` this way, where it then
+    short-circuited the credential ladder in a later unrelated run. If you add a
+    test whose code path touches ``Path.home()``, sandbox it explicitly in that
+    test; do not assume this fixture covers you.
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
