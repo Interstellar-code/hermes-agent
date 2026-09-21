@@ -209,7 +209,10 @@ def _set_busy(rid, params, key, value, session):
 
 
 def _set_verbose(rid, params, key, value, session):
-    cycle = ["off", "new", "all", "verbose"]
+    # Every value display.tool_progress accepts (gateway/display_config.py::_normalise).
+    # Rejecting "log" here made a valid, gateway-honored mode unreachable from the
+    # TUI/desktop and dropped a config.set "log" the moment the user cycled (#222).
+    cycle = ["off", "new", "all", "verbose", "log"]
     if value and value != "cycle":
         nv = str(value).strip().lower()
         if nv not in cycle:

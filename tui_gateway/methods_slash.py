@@ -112,17 +112,32 @@ def _format_live_history_output(sid: str, session: dict, arg: str) -> str:
     return "\n".join(lines)
 
 
-def _format_live_prompt_output(sid: str, session: dict, arg: str) -> str:
+def _format_live_system_prompt_output(sid: str, session: dict, arg: str) -> str:
     agent = session.get("agent")
     mirror = _metadata_mirror(session)
-    if agent is None and "system_prompt" not in mirror:
-        return _NO_AGENT
     prompt = (
         mirror.get("system_prompt") or getattr(agent, "ephemeral_system_prompt", None)
         or getattr(agent, "_cached_system_prompt", None) or "")
     if not prompt:
-        return "Current system prompt is not built yet; send a message first."
+        # no live value yet (e.g. a compute-host client whose agent never ran a turn
+        # in this process) -- fall back to the configured prompt rather than "not built yet".
+        try:
+            cfg = _load_cfg()
+            prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", ""))
+        except Exception:
+            logger.debug("system prompt config fallback failed", exc_info=True)
+    if not prompt:
+        return "No system prompt is configured."
     return f"Current system prompt:\n{prompt}"
+
+
+def _live_yolo_toggle(sid: str, session: dict, arg: str) -> str:
+    from tools.approval import disable_session_yolo, enable_session_yolo, is_session_yolo_enabled
+    skey = session["session_key"]
+    enable = _BOOL_WORDS.get((arg or "").strip().lower(), not is_session_yolo_enabled(skey))
+    (enable_session_yolo if enable else disable_session_yolo)(skey)
+    _emit("session.info", sid, _session_info(session.get("agent"), session))
+    return f"yolo mode {'enabled' if enable else 'disabled'} for this session"
 
 
 def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
@@ -202,7 +217,10 @@ _LIVE_SLASH_OUTPUT = {
     "usage": (_NO_AGENT_USAGE, _format_live_usage_output),
     "review": (None, _format_live_review_output),
     "history": ("No conversation history yet.", _format_live_history_output),
-    "prompt": (_NO_AGENT, _format_live_prompt_output),
+    "systemprompt": (_NO_AGENT, _format_live_system_prompt_output),
+    "prompt": (None, "/prompt composes the next message in $EDITOR; classic CLI only."),
+    "compose": (None, "/compose composes the next message in $EDITOR; classic CLI only."),
+    "yolo": (None, _live_yolo_toggle),
     "status": (None, _format_live_status_output),
     "context": ("Conversation is empty (no messages yet).", _format_live_context_output),
     "tools": ("No tools available.", _format_live_tools_output),
@@ -235,7 +253,7 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
 # Read-then-mutate live agent/session state that a running turn is using; rejected
 # while running (parity with session.compress / session.undo and the gateway's
 # running-agent /model guard).
-_MUTATES_WHILE_RUNNING = frozenset({"model", "personality", "prompt", "compress"})
+_MUTATES_WHILE_RUNNING = frozenset({"model", "personality", "compress"})
 
 
 def _compress_live_with_feedback(sid: str, session: dict, agent, arg: str, *, snapshot_kwargs: bool) -> str:
@@ -300,13 +318,6 @@ def _mirror_personality(sid, session, agent, arg) -> None:
         _apply_personality_to_session(sid, session, new_prompt, pname)
 
 
-def _mirror_prompt(sid, session, agent, arg) -> None:
-    if agent:
-        cfg = _load_cfg()
-        agent.ephemeral_system_prompt = _prompt_text((cfg.get("agent") or {}).get("system_prompt", "")) or None
-        agent._cached_system_prompt = None
-
-
 _FAST_TIERS = {"fast": "priority", "on": "priority", "normal": None, "off": None, "auto": "auto", "cold": "cold"}
 
 
@@ -331,7 +342,7 @@ def _mirror_stop(sid, session, agent, arg) -> None:
 _SLASH_MIRRORS = {
     "model": lambda sid, session, agent, arg: (
         _apply_model_switch(sid, session, arg).get("warning", "") if arg and agent else ""),
-    "approvals": _mirror_approvals, "personality": _mirror_personality, "prompt": _mirror_prompt,
+    "approvals": _mirror_approvals, "personality": _mirror_personality,
     "compress": lambda sid, session, agent, arg: (
         _compress_live_with_feedback(sid, session, agent, arg, snapshot_kwargs=False) if agent else ""),
     "fast": _mirror_fast,

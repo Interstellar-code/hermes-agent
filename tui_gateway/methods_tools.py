@@ -814,11 +814,64 @@ def _cmd_compress(rid, params, session, name, arg):
         return _err(rid, 5009, f"compress failed: {exc}")
 
 
+def _cmd_subgoal(rid, params, session, name, arg):
+    # /subgoal was reachable from COMMAND_REGISTRY/the palette but had no dispatch branch,
+    # so every non-CLI surface got 4018 "not a ... command" (#222). Answered in-process here
+    # rather than by the slash worker: the post-turn judge (this serving process) writes
+    # turns_used/status/last_verdict to the same goal:{session_id} meta key a worker-side
+    # write would race and clobber — see _PENDING_INPUT_COMMANDS for the routing side.
+    sid_key, goals, err = _session_key_or_err(rid, session, "hermes_cli.goals", "goals")
+    if err:
+        return err
+    try:
+        max_turns = int((_load_cfg().get("goals") or {}).get("max_turns", 20) or 20)
+    except Exception:
+        max_turns = 20
+    mgr = goals.GoalManager(session_id=sid_key, default_max_turns=max_turns)
+    if not mgr.has_goal():
+        return _exec_out(rid, "No active goal. Set one with /goal <text>.")
+    arg_str = (arg or "").strip()
+    if not arg_str:
+        return _exec_out(rid, f"{mgr.status_line()}\n{mgr.render_subgoals()}")
+    tokens = arg_str.split(None, 1)
+    verb = tokens[0].lower()
+    rest = tokens[1].strip() if len(tokens) > 1 else ""
+    if verb == "remove":
+        if not rest:
+            return _err(rid, 4004, "usage: /subgoal remove <n>")
+        try:
+            idx = int(rest.split()[0])
+        except (ValueError, IndexError):
+            return _err(rid, 4004, "/subgoal remove: <n> must be an integer (1-based index)")
+        try:
+            removed = mgr.remove_subgoal(idx)
+        except (IndexError, RuntimeError) as exc:
+            return _err(rid, 4004, f"/subgoal remove: {exc}")
+        return _exec_out(rid, f"✓ Removed subgoal {idx}: {removed}")
+    if verb == "clear":
+        try:
+            prev = mgr.clear_subgoals()
+        except RuntimeError as exc:
+            return _err(rid, 4004, f"/subgoal clear: {exc}")
+        out = f"✓ Cleared {prev} subgoal{'s' if prev != 1 else ''}." if prev else "No subgoals to clear."
+        return _exec_out(rid, out)
+    # Anything else is the criterion text itself — no "unknown subcommand" case by design
+    # (a criterion may start with any word), matching the CLI's own /subgoal grammar.
+    try:
+        text = mgr.add_subgoal(arg_str)
+    except (ValueError, RuntimeError) as exc:
+        return _err(rid, 4004, f"/subgoal: {exc}")
+    idx = len(mgr.state.subgoals) if mgr.state else 0
+    return _exec_out(
+        rid,
+        f"✓ Added subgoal {idx}: {text}\nThe judge factors it into the verdict from the next turn on.")
+
+
 _SLASH_BUILTINS = {
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
     "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
     "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
-    "compress": _cmd_compress, "compact": _cmd_compress}
+    "compress": _cmd_compress, "compact": _cmd_compress, "subgoal": _cmd_subgoal}
 
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
@@ -834,6 +887,46 @@ def _(rid, params: dict) -> dict:
                 _publish_session_control_snapshot(params.get("session_id", ""), session)
             return res
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
+
+
+def _slash_exec_handoff(rid, params: dict, arg: str) -> dict:
+    """Answer ``/handoff`` from the non-blocking ``handoff.request`` RPC.
+
+    The CLI's ``/handoff`` marks the row pending and then poll-blocks for up to
+    60s, longer than the slash worker's own deadline — so over slash.exec the
+    worker was always killed first and the CLI's cleanup never ran. Queueing via
+    the RPC (which the desktop already uses) returns immediately; the caller
+    polls ``handoff.state`` and can release it with ``handoff.fail`` (#221).
+    """
+    platform_name = (arg.strip().split(maxsplit=1)[0] if arg.strip() else "").lower()
+    if not platform_name:
+        return _ok(
+            rid,
+            {
+                "output": (
+                    "Usage: /handoff <platform>\n"
+                    "Hands the current session off to that platform's home channel.\n"
+                    "Poll handoff.state for the result."
+                )
+            },
+        )
+    result = _methods["handoff.request"](
+        rid,
+        {"session_id": params.get("session_id", ""), "platform": platform_name},
+    )
+    if "result" not in result:
+        return result
+    home_name = (result.get("result") or {}).get("home_name") or "home channel"
+    return _ok(
+        rid,
+        {
+            "output": (
+                f"Queued handoff → {platform_name} (home: {home_name}).\n"
+                "The gateway will transfer the session shortly; "
+                "poll handoff.state for the result."
+            )
+        },
+    )
 
 
 @method("slash.exec")
@@ -855,9 +948,14 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"output": live_output or "(no output)"})
     if base in _WORKER_BLOCKED_COMMANDS and _is_snapshot_restore(arg):
         return _err(rid, 4018, "snapshot restore mutates live config/state; use command.dispatch for /snapshot restore")
+    if base in _RPC_ROUTED_COMMANDS:
+        # Never let the worker drive this one -- see _RPC_ROUTED_COMMANDS.
+        return _slash_exec_handoff(rid, params, arg)
     # Pending-input built-ins route straight to command.dispatch (some clients fail the
     # error-then-retry fallback); bundles go the same way under their resolved key.
-    target = base if base in _PENDING_INPUT_COMMANDS else _bundle_key_for(base)
+    # _DISPATCH_ROUTED_COMMANDS joins the same route for a different reason (state
+    # must be written by this process, not the worker).
+    target = base if base in _PENDING_INPUT_COMMANDS or base in _DISPATCH_ROUTED_COMMANDS else _bundle_key_for(base)
     if target is not None:
         return _methods["command.dispatch"](rid, {"name": target.lstrip("/"), "arg": arg, "session_id": sid})
     if _is_profile_skill_command(session, base):

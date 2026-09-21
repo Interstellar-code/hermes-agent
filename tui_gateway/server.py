@@ -3146,19 +3146,30 @@ _TUI_HIDDEN: frozenset[str] = frozenset({"sethome", "set-home", "commands", "app
 
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/density", "Toggle compact display mode", "TUI"),
+    ("/indicator", "Pick the busy-indicator style [kaomoji|emoji|unicode|ascii]", "TUI"),
     ("/logs", "Show recent gateway log lines", "TUI"),
     ("/mouse", "Set mouse tracking preset [on|off|toggle|wheel|buttons|all]", "TUI"),
     ("/sessions", "Switch between live TUI sessions", "TUI"),
+    ("/systemprompt", "Show the current system prompt", "TUI"),
 ]
 
 # Commands that queue onto _pending_input in the CLI; the slash worker has no reader for that queue, so
 # slash.exec routes them to command.dispatch instead.
 _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset({
     "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "learn",
-    "init", "compress", "compact",
+    "init", "compress", "compact", "subgoal",
 })
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
+
+# Commands that must be answered by an in-process RPC rather than the slash worker
+# subprocess -- e.g. /handoff, whose 60s poll-block would otherwise always lose the
+# race against the worker's own deadline (#221).
+_RPC_ROUTED_COMMANDS: frozenset[str] = frozenset({"handoff"})
+
+# Commands that join _PENDING_INPUT_COMMANDS's route to command.dispatch for a
+# different reason: state that must be written by this process, not the worker.
+_DISPATCH_ROUTED_COMMANDS: frozenset[str] = frozenset({"subgoal"})
 
 
 def _skill_usage_lookup():
