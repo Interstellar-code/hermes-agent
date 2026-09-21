@@ -243,7 +243,11 @@ def test_enrichment_isolates_bad_board(stores, monkeypatch):
             raise RuntimeError("simulated board failure")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(kb, "connect", fail_named)
+    # Patch where the code READS it: enrichment calls kanban_db_connect.connect,
+    # not kanban_db.connect — the latter is a plugin-compat shim whose stated
+    # removal date has already passed, so the plugin no longer routes through it.
+    from hermes_cli import kanban_db_connect as _kbc
+    monkeypatch.setattr(_kbc, "connect", fail_named)
     enriched, errors = enrich_projects([project], None)
     assert enriched[0]["task_count"] is None
     assert enriched[0]["open_task_count"] is None

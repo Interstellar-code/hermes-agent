@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Iterable
 
 from hermes_cli import kanban_db
+# connect() is NOT re-exported from kanban_db any more: that path is a
+# plugin-compat shim whose stated removal date (2026-09-14) has already
+# passed. Import it from the module that actually owns it.
+from hermes_cli import kanban_db_connect
 from hermes_cli import projects_db
 from hermes_constants import get_hermes_home
 
@@ -42,7 +46,7 @@ def _board_enrichment(project_ids: set[str]) -> tuple[dict[str, dict], list[str]
             if resolved_path in seen_paths:
                 continue
             seen_paths.add(resolved_path)
-            conn = kanban_db.connect(db_path=db_path)
+            conn = kanban_db_connect.connect(db_path=db_path)
             rows = conn.execute(
                 """
                 SELECT t.project_id,

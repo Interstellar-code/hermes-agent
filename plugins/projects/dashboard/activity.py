@@ -9,6 +9,10 @@ import sqlite3
 from pathlib import Path
 
 from hermes_cli import kanban_db, projects_db
+# connect() is NOT re-exported from kanban_db any more: that path is a
+# plugin-compat shim whose stated removal date (2026-09-14) has already
+# passed. Import it from the module that actually owns it.
+from hermes_cli import kanban_db_connect
 from hermes_constants import get_hermes_home
 
 log = logging.getLogger(__name__)
@@ -51,7 +55,7 @@ def _task_activity(project_id: str) -> tuple[list[dict], list[str]]:
             if resolved in seen:
                 continue
             seen.add(resolved)
-            conn = kanban_db.connect(db_path=path)
+            conn = kanban_db_connect.connect(db_path=path)
             rows = conn.execute(
                 """
                 SELECT t.id, t.title, t.status, t.assignee, t.created_at,
