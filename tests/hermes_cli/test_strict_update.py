@@ -285,64 +285,76 @@ class _FakePayload:
 def test_strict_refuses_non_git_installs(monkeypatch) -> None:
     """pip/docker/nix have no fast-forward; refusing beats pretending."""
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
 
-    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "pip")
+    monkeypatch.setattr(_actions, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(_actions, "detect_install_method", lambda _root: "pip")
 
-    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+    result = _actions._apply_strict_update(_FakePayload(mode="strict"))
     assert result["ok"] is False
     assert result["error"] == "strict_unsupported_install"
 
 
 def test_concurrent_strict_update_is_409(monkeypatch) -> None:
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
     from fastapi import HTTPException
 
-    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
-    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: True)
+    monkeypatch.setattr(_actions, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(_actions, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(_actions, "_strict_update_in_flight", lambda: True)
 
     with pytest.raises(HTTPException) as exc:
-        web_server._apply_strict_update(_FakePayload(mode="strict"))
+        _actions._apply_strict_update(_FakePayload(mode="strict"))
     assert exc.value.status_code == 409
 
 
 def test_branch_is_server_owned_and_falls_back_safely(monkeypatch) -> None:
     """A client must never choose which branch gets installed."""
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
 
-    monkeypatch.setattr(web_server, "load_config", lambda: {"update": {"strict_branch": "release"}})
-    assert web_server._strict_update_branch() == "release"
+    monkeypatch.setattr(_actions, "load_config", lambda: {"update": {"strict_branch": "release"}})
+    assert _actions._strict_update_branch() == "release"
 
-    monkeypatch.setattr(web_server, "load_config", lambda: {})
-    assert web_server._strict_update_branch() == strict_update.DEFAULT_BRANCH
+    monkeypatch.setattr(_actions, "load_config", lambda: {})
+    assert _actions._strict_update_branch() == strict_update.DEFAULT_BRANCH
 
     def _boom():
         raise RuntimeError("config unreadable")
 
-    monkeypatch.setattr(web_server, "load_config", _boom)
-    assert web_server._strict_update_branch() == strict_update.DEFAULT_BRANCH
+    monkeypatch.setattr(_actions, "load_config", _boom)
+    assert _actions._strict_update_branch() == strict_update.DEFAULT_BRANCH
 
 
 def test_successful_strict_apply_flags_restart_required(monkeypatch, repos) -> None:
     """After the source moves, this process is stale — the #199 condition."""
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
 
     upstream, clone = repos
     _commit(upstream, "shipped.txt")
 
-    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
-    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
+    monkeypatch.setattr(_actions, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(_actions, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(_actions, "_strict_update_in_flight", lambda: False)
     monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
-    monkeypatch.setattr(web_server, "_record_completed_action", lambda *a, **k: None)
+    monkeypatch.setattr(_actions, "_record_completed_action", lambda *a, **k: None)
     # MUST be stubbed: the real one spawns a detached `hermes update
     # --refresh-deps --restart-after-refresh`, which installs dependencies
     # into the live venv and restarts every gateway on the machine running
     # the suite.
-    monkeypatch.setattr(web_server, "_spawn_hermes_action", _FakeProc.spawn)
+    monkeypatch.setattr(_actions, "_spawn_hermes_action", _FakeProc.spawn)
 
-    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+    result = _actions._apply_strict_update(_FakePayload(mode="strict"))
     assert result["ok"] is True
     assert result["restart_required"] is True
     assert result["mode"] == "strict"
@@ -369,18 +381,21 @@ def test_applied_source_hands_off_to_the_refresh_action(monkeypatch, repos) -> N
     its own running venv and then restart itself.
     """
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
 
     upstream, clone = repos
     _commit(upstream, "shipped.txt")
     _FakeProc.calls.clear()
 
-    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
-    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
+    monkeypatch.setattr(_actions, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(_actions, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(_actions, "_strict_update_in_flight", lambda: False)
     monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
-    monkeypatch.setattr(web_server, "_spawn_hermes_action", _FakeProc.spawn)
+    monkeypatch.setattr(_actions, "_spawn_hermes_action", _FakeProc.spawn)
 
-    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+    result = _actions._apply_strict_update(_FakePayload(mode="strict"))
 
     assert _FakeProc.calls == [
         (["update", "--refresh-deps", "--restart-after-refresh"], "hermes-update")
@@ -397,6 +412,9 @@ def test_refresh_that_cannot_start_is_reported_not_swallowed(monkeypatch, repos)
     the refresh did not start, rather than being left to assume it is running.
     """
     import hermes_cli.web_server as web_server
+    # Strict-update internals moved to web_routers/actions.py in upstream's
+    # decomposition; patch where the code lives, not where it used to.
+    from hermes_cli.web_routers import actions as _actions
 
     upstream, clone = repos
     _commit(upstream, "shipped.txt")
@@ -404,13 +422,13 @@ def test_refresh_that_cannot_start_is_reported_not_swallowed(monkeypatch, repos)
     def _boom(subcommand, name):
         raise OSError("no interpreter")
 
-    monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
-    monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
-    monkeypatch.setattr(web_server, "_strict_update_in_flight", lambda: False)
+    monkeypatch.setattr(_actions, "_dashboard_local_update_managed_externally", lambda: False)
+    monkeypatch.setattr(_actions, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(_actions, "_strict_update_in_flight", lambda: False)
     monkeypatch.setattr(web_server, "PROJECT_ROOT", clone)
-    monkeypatch.setattr(web_server, "_spawn_hermes_action", _boom)
+    monkeypatch.setattr(_actions, "_spawn_hermes_action", _boom)
 
-    result = web_server._apply_strict_update(_FakePayload(mode="strict"))
+    result = _actions._apply_strict_update(_FakePayload(mode="strict"))
 
     assert result["ok"] is True
     assert result["restart_required"] is True

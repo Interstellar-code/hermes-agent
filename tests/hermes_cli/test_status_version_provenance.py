@@ -10,11 +10,18 @@ genuinely different questions and the response has to answer both.
 from __future__ import annotations
 
 import hermes_cli.web_server as web_server
+# Upstream decomposed web_server.py into web_routers/*; the provenance helpers this
+# file exercises now live in web_routers/_common.py. Patch targets follow the code:
+# monkeypatching web_server would set a shadowing attribute that _common's own calls
+# never consult. web_server's _PLUGIN_COMPAT_LAZY is deliberately NOT used here -- it
+# is the external-plugin shim, already past its stated removal date.
+import hermes_cli as _pkg
+from hermes_cli.web_routers import _common as _provenance
 
 
 def _reset_cache() -> None:
-    web_server._ON_DISK_CACHE["mtime"] = None
-    web_server._ON_DISK_CACHE["value"] = None
+    _provenance._ON_DISK_CACHE["mtime"] = None
+    _provenance._ON_DISK_CACHE["value"] = None
 
 
 def _write_init(tmp_path, version: str, release_date: str):
@@ -25,15 +32,21 @@ def _write_init(tmp_path, version: str, release_date: str):
         f'__version__ = "{version}"\n__release_date__ = "{release_date}"\n',
         encoding="utf-8",
     )
-    return pkg / "web_server.py"
+    # The reader resolves the package dir from ITS OWN __file__. That module is now
+    # hermes_cli/web_routers/_common.py (two levels down), not hermes_cli/web_server.py
+    # (one), so the stand-in path must sit at the matching depth or parent math lands
+    # outside the fake package.
+    routers = pkg / "web_routers"
+    routers.mkdir(exist_ok=True)
+    return routers / "_common.py"
 
 
 def test_on_disk_version_is_read_from_the_package_file(tmp_path, monkeypatch):
     fake_module = _write_init(tmp_path, "9.9.9", "2099.1.1")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
     _reset_cache()
 
-    assert web_server._on_disk_version() == {
+    assert _provenance.on_disk_version() == {
         "version": "9.9.9",
         "release_date": "2099.1.1",
     }
@@ -47,12 +60,12 @@ def test_files_moving_to_B_does_not_claim_B_is_active(tmp_path, monkeypatch):
     two disagree. A client can no longer be misled in either direction.
     """
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.0")
-    monkeypatch.setattr(web_server, "__release_date__", "2026.7.26")
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.0")
+    monkeypatch.setattr(_pkg, "__release_date__", "2026.7.26")
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
 
     assert fields["runtime_version"] == "0.19.0", "the running code is still A"
     assert fields["installed_version"] == "0.19.8", "disk has moved to B"
@@ -62,11 +75,11 @@ def test_files_moving_to_B_does_not_claim_B_is_active(tmp_path, monkeypatch):
 
 def test_matching_versions_do_not_ask_for_a_restart(tmp_path, monkeypatch):
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.8")
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.8")
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
     assert fields["restart_required"] is False
 
 
@@ -76,13 +89,14 @@ def test_unreadable_package_degrades_to_unknown_not_to_stale(tmp_path, monkeypat
     ``/api/status`` is a public liveness endpoint that uptime probes hit, so an
     unreadable file has to degrade to "unknown" rather than raise or guess.
     """
-    monkeypatch.setattr(web_server, "__file__", str(tmp_path / "gone" / "web_server.py"))
+    monkeypatch.setattr(
+        _provenance, "__file__", str(tmp_path / "gone" / "web_routers" / "_common.py"))
     _reset_cache()
 
-    on_disk = web_server._on_disk_version()
+    on_disk = _provenance.on_disk_version()
     assert on_disk == {"version": None, "release_date": None}
 
-    fields = web_server._version_provenance(on_disk)
+    fields = _provenance.version_provenance(on_disk)
     assert fields["installed_version"] is None
     assert fields["restart_required"] is False, "unknown must never mean stale"
 
@@ -94,9 +108,9 @@ def test_cache_refreshes_when_the_file_changes(tmp_path, monkeypatch):
     the mtime cache must not pin the first answer forever.
     """
     fake_module = _write_init(tmp_path, "0.19.0", "2026.7.26")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
     _reset_cache()
-    assert web_server._on_disk_version()["version"] == "0.19.0"
+    assert _provenance.on_disk_version()["version"] == "0.19.0"
 
     init_py = tmp_path / "hermes_cli" / "__init__.py"
     stale_mtime = init_py.stat().st_mtime
@@ -105,7 +119,7 @@ def test_cache_refreshes_when_the_file_changes(tmp_path, monkeypatch):
 
     os.utime(init_py, (stale_mtime + 10, stale_mtime + 10))
 
-    assert web_server._on_disk_version()["version"] == "0.19.8"
+    assert _provenance.on_disk_version()["version"] == "0.19.8"
 
 
 # ---------------------------------------------------------------------------
@@ -123,13 +137,13 @@ def test_code_moving_without_a_version_bump_still_requires_restart(
     to restart" while the process ran code that no longer exists on disk.
     """
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.8")  # version did NOT move
-    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
-    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "b" * 40)
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.8")  # version did NOT move
+    monkeypatch.setitem(_provenance._RUNTIME_COMMIT_CACHE, "value", "a" * 40)
+    monkeypatch.setattr(_provenance, "_head_sha", lambda _root: "b" * 40)
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
     assert fields["restart_required"] is True
     assert fields["restart_reason"] == "commit"
     assert fields["runtime_commit"] == "a" * 40
@@ -138,13 +152,13 @@ def test_code_moving_without_a_version_bump_still_requires_restart(
 
 def test_same_commit_and_version_needs_no_restart(tmp_path, monkeypatch):
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.8")
-    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
-    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "a" * 40)
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.8")
+    monkeypatch.setitem(_provenance._RUNTIME_COMMIT_CACHE, "value", "a" * 40)
+    monkeypatch.setattr(_provenance, "_head_sha", lambda _root: "a" * 40)
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
     assert fields["restart_required"] is False
     assert fields["restart_reason"] is None
 
@@ -152,13 +166,13 @@ def test_same_commit_and_version_needs_no_restart(tmp_path, monkeypatch):
 def test_non_git_install_is_unknown_not_stale(tmp_path, monkeypatch):
     """No SHA on either side must not read as "restart" forever."""
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.8")
-    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", None)
-    monkeypatch.setattr(web_server, "_head_sha", lambda _root: None)
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.8")
+    monkeypatch.setitem(_provenance._RUNTIME_COMMIT_CACHE, "value", None)
+    monkeypatch.setattr(_provenance, "_head_sha", lambda _root: None)
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
     assert fields["restart_required"] is False
     assert fields["installed_commit"] is None
 
@@ -166,13 +180,13 @@ def test_non_git_install_is_unknown_not_stale(tmp_path, monkeypatch):
 def test_version_signal_is_reported_even_when_both_moved(tmp_path, monkeypatch):
     """A real release moves both; name the version, it is the useful one."""
     fake_module = _write_init(tmp_path, "0.19.8", "2026.7.30")
-    monkeypatch.setattr(web_server, "__file__", str(fake_module))
-    monkeypatch.setattr(web_server, "__version__", "0.19.0")
-    monkeypatch.setattr(web_server, "_RUNTIME_COMMIT", "a" * 40)
-    monkeypatch.setattr(web_server, "_head_sha", lambda _root: "b" * 40)
+    monkeypatch.setattr(_provenance, "__file__", str(fake_module))
+    monkeypatch.setattr(_pkg, "__version__", "0.19.0")
+    monkeypatch.setitem(_provenance._RUNTIME_COMMIT_CACHE, "value", "a" * 40)
+    monkeypatch.setattr(_provenance, "_head_sha", lambda _root: "b" * 40)
     _reset_cache()
 
-    fields = web_server._version_provenance(web_server._on_disk_version())
+    fields = _provenance.version_provenance(_provenance.on_disk_version())
     assert fields["restart_required"] is True
     assert fields["restart_reason"] == "version"
 
@@ -197,10 +211,10 @@ def test_head_sha_reads_a_real_checkout(tmp_path):
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
     ).stdout.strip()
-    assert web_server._head_sha(repo) == expected
+    assert _provenance._head_sha(repo) == expected
 
 
 def test_head_sha_on_a_non_checkout_is_none(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
-    assert web_server._head_sha(plain) is None
+    assert _provenance._head_sha(plain) is None

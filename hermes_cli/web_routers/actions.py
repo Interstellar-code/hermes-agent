@@ -6,6 +6,7 @@ Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch o
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import secrets
@@ -15,12 +16,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
-from hermes_cli import __version__
-from hermes_cli.config import format_docker_update_message, recommended_update_command_for_method
+from hermes_cli import __version__, strict_update
+from hermes_cli.config import format_docker_update_message, load_config, recommended_update_command_for_method
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_gateway import _ACTION_LOG_FILES
-from hermes_cli.web_routers._common import http_failure
+from hermes_cli.web_routers._common import _profile_scope, http_failure, on_disk_version, version_provenance
+
+# Delegation ids are minted by ``new_live_delegation_id()`` as ``deleg_<8 hex>``.
+# Matching that exactly is what keeps this endpoint's path join safe: the id
+# lands in a filesystem path, so anything looser (``..``, a slash, an absolute
+# path) must never reach ``live_transcript_root() / delegation_id``.
+_DELEGATION_ID_RE = re.compile(r"^deleg_[0-9a-f]{8}$")
 
 _log = logging.getLogger("hermes_cli.web_server")
 router = APIRouter()
@@ -215,9 +224,114 @@ def _update_refused(error: str, message: str, update_command: str) -> Dict[str, 
     }
 
 
+class StrictUpdateRequest(BaseModel):
+    """Body for ``POST /api/hermes/update``. All fields optional.
+
+    ``expected_*`` are ASSERTIONS about what the client confirmed against, not
+    refs. They are compared as strings and never reach a git command line.
+    """
+
+    mode: Optional[str] = None
+    expected_current_head: Optional[str] = None
+    expected_target_head: Optional[str] = None
+
+
+def _strict_update_in_flight() -> bool:
+    proc = _ACTION_PROCS.get("hermes-update")
+    return proc is not None and proc.poll() is None
+
+
+def _strict_update_branch() -> str:
+    """The one branch strict mode will advance. Server-owned, never client input.
+
+    Configurable because a fork may ship from something other than ``main``,
+    but read from server config only: accepting a branch from the caller would
+    hand a browser the choice of what code to install.
+    """
+    try:
+        cfg = load_config() or {}
+        branch = ((cfg.get("update") or {}).get("strict_branch") or "").strip()
+        return branch or strict_update.DEFAULT_BRANCH
+    except Exception:  # noqa: BLE001 — config trouble must not break updates.
+        return strict_update.DEFAULT_BRANCH
+
+
+def _apply_strict_update(payload: "StrictUpdateRequest") -> Dict[str, Any]:
+    """Strict apply, run on a worker thread (git blocks).
+
+    Returns a structured result in every case; the only raised error is the 409
+    for a concurrent attempt, which is a genuine HTTP-level conflict.
+    """
+    if _dashboard_local_update_managed_externally():
+        return {
+            "ok": False, "mode": "strict", "phase": "preflight",
+            "error": "dashboard_update_managed_externally",
+            "reason": "updates are managed outside this dashboard here",
+        }
+
+    project_root = _server_path("PROJECT_ROOT")
+    install_method = detect_install_method(project_root)
+    if install_method != "git":
+        # Strict mode is fast-forward of a checkout. There is no such thing for
+        # a pip/docker/nix install, and pretending otherwise would be worse
+        # than refusing.
+        return {
+            "ok": False, "mode": "strict", "phase": "preflight",
+            "error": "strict_unsupported_install",
+            "reason": f"strict mode requires a git checkout, this is {install_method!r}",
+            "install_method": install_method,
+        }
+
+    if _strict_update_in_flight():
+        raise HTTPException(status_code=409, detail="an update is already running")
+
+    result = strict_update.apply_strict(
+        project_root,
+        expected_current_head=payload.expected_current_head,
+        expected_target_head=payload.expected_target_head,
+        branch=_strict_update_branch(),
+    )
+    result["mode"] = "strict"
+    result["install_method"] = install_method
+
+    if result.get("ok"):
+        # The source moved, so this process is now running code older than the
+        # checkout — exactly the #199 condition, and the reason /api/status
+        # grew restart_required. Strict mode deliberately stops here: the
+        # dependency/build/restart runs in a detached fresh interpreter so this
+        # dashboard can safely hand control back to its supervisor.
+        result["restart_required"] = True
+        try:
+            proc = _spawn_hermes_action(
+                ["update", "--refresh-deps", "--restart-after-refresh"], "hermes-update",
+            )
+            result["post_update"] = "refreshing dependencies and restarting gateways"
+            result["action"] = "hermes-update"
+            result["pid"] = proc.pid
+        except Exception as exc:
+            _log.exception("Strict source update applied but refresh could not start")
+            result["post_update"] = "source updated; dependency install and restart could not start"
+            result["refresh_error"] = str(exc)
+    return result
+
+
 @router.post("/api/hermes/update")
-async def update_hermes():
-    """Kick off ``hermes update`` in the background."""
+async def update_hermes(payload: Optional[StrictUpdateRequest] = None):
+    """Kick off ``hermes update`` in the background, or apply a strict update.
+
+    Default (no body, or ``mode`` omitted) keeps the historical behaviour: the
+    shared admission gate, then spawning the CLI updater.
+
+    ``mode: "strict"`` (#200) takes a different code path entirely — see
+    :mod:`hermes_cli.strict_update`. It advances the checkout only by
+    fast-forward, refuses every other state, and cannot stash, reset, clean,
+    rebase or checkout. The git advance runs inline rather than in the
+    background: it is bounded by git timeouts, and every refusal a client needs
+    to render comes from preflight, so answering immediately with a structured
+    state beats making the client poll to discover it was blocked.
+    """
+    if payload is not None and (payload.mode or "").lower() == "strict":
+        return await run_in_threadpool(_apply_strict_update, payload)
     if _dashboard_local_update_managed_externally():
         message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
         return _update_refused("dashboard_update_managed_externally", message, "managed outside dashboard")
@@ -267,17 +381,31 @@ async def check_hermes_update(force: bool = False):
     """
     if _dashboard_local_update_managed_externally():
         return {
-            "install_method": "managed-runtime", "current_version": __version__, "behind": None,
+            "install_method": "managed-runtime", "current_version": __version__,
+            **version_provenance(on_disk_version()),
+            "behind": None,
             "update_available": False, "can_apply": False,
             "update_command": "managed outside dashboard", "message": _MANAGED_EXTERNALLY_MESSAGE,
         }
 
-    install_method = detect_install_method(_server_path("PROJECT_ROOT"))
+    project_root = _server_path("PROJECT_ROOT")
+    install_method = detect_install_method(project_root)
     payload: Dict[str, Any] = {
-        "install_method": install_method, "current_version": __version__, "behind": None,
-        "update_available": False, "can_apply": install_method == "git",
+        "install_method": install_method, "current_version": __version__,
+        **version_provenance(on_disk_version()),
+        "behind": None,
+        "update_available": False, "can_apply": install_method in ("git", "pip"),
         "update_command": recommended_update_command_for_method(install_method), "message": None,
     }
+
+    # #200: strict-mode capability, versioned so a client can feature-detect
+    # rather than infer support from a Hermes version number. Read-only — no
+    # fetch here, so a client polling "is an update available" cannot drive
+    # network traffic against the remote on every poll; the fetch happens once,
+    # inside the apply call.
+    if install_method == "git":
+        payload["strict"] = strict_update.preflight(project_root, branch=_strict_update_branch(), fetch=False)
+
     non_applyable = _NON_APPLYABLE_MESSAGES.get(install_method)
     if non_applyable is not None:
         payload["message"] = non_applyable()
@@ -420,3 +548,50 @@ async def get_update_receipt():
     if not receipt:
         raise HTTPException(status_code=404, detail="No update receipt found (no `hermes update` run recorded).")
     return {"receipt": receipt, "summary": _latest_update_receipt_summary()}
+
+
+@router.get("/api/delegation/{delegation_id}/transcript")
+async def get_delegation_transcript(
+    delegation_id: str,
+    task: Optional[int] = None,
+    lines: int = 200,
+    profile: Optional[str] = None,
+):
+    """Tail of a live delegation's per-task transcript logs, plus its manifest.
+
+    Not in ``PUBLIC_API_PATHS``: transcripts carry conversation content, so this
+    stays behind the dashboard auth gate like session bodies do.
+    """
+    if not _DELEGATION_ID_RE.match(delegation_id or ""):
+        raise HTTPException(status_code=422, detail="Malformed delegation id")
+    n_lines = min(max(lines, 1), 2000)
+
+    def _run():
+        from tools.delegation_live_log import live_transcript_root
+
+        with _profile_scope(profile):
+            root = live_transcript_root() / delegation_id
+            if not root.is_dir():
+                return None
+            manifest: Optional[Dict[str, Any]] = None
+            try:
+                manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                manifest = None
+            tasks = []
+            for log_path in sorted(root.glob("task-*.log")):
+                try:
+                    index: Optional[int] = int(log_path.stem.split("-", 1)[1])
+                except (IndexError, ValueError):
+                    index = None
+                if task is not None and index != task:
+                    continue
+                tasks.append({"index": index, "lines": _tail_lines(log_path, n_lines)})
+            return {"delegation_id": delegation_id, "manifest": manifest, "tasks": tasks}
+
+    payload = await asyncio.get_running_loop().run_in_executor(None, _run)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"No live transcript for {delegation_id}")
+    if task is not None and not payload["tasks"]:
+        raise HTTPException(status_code=404, detail=f"No task-{task} in {delegation_id}")
+    return payload

@@ -25,7 +25,7 @@ from hermes_cli import __version__, __release_date__
 from hermes_cli.config import get_config_path, get_env_path
 from hermes_constants import get_process_hermes_home, profile_name_for_home
 from hermes_cli.web_models import CuratorPause, LearningNodeRef, LearningNodeEdit, DebugShareRequest
-from hermes_cli.web_routers._common import scoped_to_thread
+from hermes_cli.web_routers._common import on_disk_version, scoped_to_thread, version_provenance
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -431,7 +431,14 @@ async def get_status(profile: Optional[str] = None):
         auth = _auth_gate_status()
 
         status = {
+            # RUNTIME version: what this process actually imported at startup.
+            # Deliberately unchanged, and deliberately not re-read from disk —
+            # clients treat this as the active runtime version, and for a
+            # remote dashboard that is the only honest answer. The
+            # installed_* fields below say what a restart would pick up. See
+            # issue #199.
             "version": __version__, "release_date": __release_date__,
+            **version_provenance(on_disk_version()),
             "config_version": current_ver, "latest_config_version": latest_ver,
             "can_update_hermes": not _dashboard_local_update_managed_externally(),
             "gateway_running": gateway_running, "gateway_state": gateway_state,

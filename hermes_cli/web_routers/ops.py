@@ -15,9 +15,9 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from hermes_cli.config import redact_key
@@ -513,32 +513,47 @@ async def run_security_audit():
     )
 
 
-def _dashboard_backup_dir() -> Path:
-    return get_hermes_home() / "backups"
+def _dashboard_backup_profile(profile: Optional[str]) -> Tuple[Optional[str], Path]:
+    """Resolve backup/import operations to one profile's HERMES_HOME (#239).
+
+    None/empty/"current" keeps the pre-#239 layout (``get_hermes_home()``) so
+    existing backups stay findable; anything else is validated via the
+    established ``_resolve_profile_dir`` seam (400/404 on an unknown profile).
+    """
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        return None, get_hermes_home()
+    return requested, _resolve_profile_dir(requested)
+
+
+def _dashboard_backup_dir(profile: Optional[str] = None) -> Path:
+    return _dashboard_backup_profile(profile)[1] / "backups"
 
 
 @router.post("/api/ops/backup")
-async def run_backup(body: BackupRequest):
+async def run_backup(body: BackupRequest, profile: Optional[str] = Query(None)):
     archive: Optional[Path] = None
     output = (body.output or "").strip()
     if not output:
         stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
-        archive = _dashboard_backup_dir() / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
+        archive = _dashboard_backup_dir(profile) / f"hermes-backup-{stamp}-{secrets.token_hex(4)}.zip"
         try:
             archive.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"Could not create backup directory: {exc}")
         output = str(archive)
-    response = _spawn_action(["backup", "-o", output], "backup", log_msg="Failed to spawn backup", prefix="Failed to run backup")
+    response = spawn_profile_action(
+        profile, ["backup", "-o", output], "backup", log_msg="Failed to spawn backup", prefix="Failed to run backup",
+    )
     if archive is not None:
         response["archive"] = str(archive)
     return response
 
 
 @router.get("/api/ops/backup/download")
-async def download_dashboard_backup(archive: str):
+async def download_dashboard_backup(archive: str, profile: Optional[str] = Query(None)):
     try:
-        backup_dir = _dashboard_backup_dir().expanduser().resolve(strict=False)
+        backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
         target = Path(archive).expanduser().resolve(strict=True)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Backup not found")
@@ -554,21 +569,60 @@ async def download_dashboard_backup(archive: str):
     )
 
 
-def _spawn_import(archive: str, force: bool) -> dict:
+@router.get("/api/ops/backup/list")
+async def list_dashboard_backups(profile: Optional[str] = Query(None)):
+    """Enumerate downloadable backups, newest first. Missing directory -> empty
+    list (not an error), mirroring the download route's containment guard."""
+    backup_dir = _dashboard_backup_dir(profile).expanduser().resolve(strict=False)
+    backups: List[Dict[str, Any]] = []
+    try:
+        entries = list(backup_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return {"backups": []}
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read backup directory: {exc}")
+
+    for entry in entries:
+        if entry.is_symlink() or entry.suffix.lower() != ".zip":
+            continue
+        try:
+            resolved = entry.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_file() or not _path_is_under(backup_dir, resolved):
+            continue
+        try:
+            st = resolved.stat()
+        except OSError:
+            continue
+        backups.append(
+            {
+                "name": entry.name,
+                "path": str(resolved),
+                "size": st.st_size,
+                "modified": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z"),
+            }
+        )
+
+    backups.sort(key=lambda b: b["modified"], reverse=True)
+    return {"backups": backups}
+
+
+def _spawn_import(archive: str, force: bool, profile: Optional[str] = None) -> dict:
     args = ["import", archive]
     if force:
         args.append("--force")
-    return _spawn_action(args, "import", log_msg="Failed to spawn import", prefix="Failed to run import")
+    return spawn_profile_action(profile, args, "import", log_msg="Failed to spawn import", prefix="Failed to run import")
 
 
 @router.post("/api/ops/import")
-async def run_import(body: ImportRequest):
+async def run_import(body: ImportRequest, profile: Optional[str] = Query(None)):
     archive = (body.archive or "").strip()
     if not archive:
         raise HTTPException(status_code=400, detail="archive path is required")
     if not os.path.isfile(archive):
         raise HTTPException(status_code=404, detail=f"Archive not found: {archive}")
-    return _spawn_import(archive, body.force)
+    return _spawn_import(archive, body.force, profile)
 
 
 def _safe_backup_upload_name(filename: str | None) -> str:
@@ -583,8 +637,9 @@ def _safe_backup_upload_name(filename: str | None) -> str:
 async def run_import_upload(
     file: UploadFile = File(...),
     force: bool = Form(False),
+    profile: Optional[str] = Query(None),
 ):
-    staging_dir = _dashboard_backup_dir()
+    staging_dir = _dashboard_backup_dir(profile)
     try:
         staging_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -599,7 +654,7 @@ async def run_import_upload(
     if not zipfile.is_zipfile(target):
         target.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Uploaded archive is not a valid zip file")
-    return {**_spawn_import(str(target), force), "archive": str(target), "uploaded_bytes": total}
+    return {**_spawn_import(str(target), force, profile), "archive": str(target), "uploaded_bytes": total}
 
 
 @router.get("/api/ops/hooks")

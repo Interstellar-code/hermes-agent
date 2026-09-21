@@ -185,6 +185,9 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "goals": "agent",
     "updates": "general",
     "onboarding": "agent",
+    # Only `api_server.interactive_clarify` is currently schema-surfaced under
+    # api_server, so keep it with the other agent-behavior toggles.
+    "api_server": "agent",
     "telegram": "discord",
     "mcp": "agent",
     "computer_use": "agent",
