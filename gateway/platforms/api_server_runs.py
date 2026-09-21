@@ -634,29 +634,24 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
-        if run_id in self._stopping_run_ids:
-            # A stop the turn never honoured must not throw the answer away. This
-            # branch catches both a stop landing microseconds after a successful turn
-            # and one the agent never noticed; either way the transcript has already
-            # persisted the answer, and dropping output/usage left a client showing
-            # "cancelled" with nothing, then a full answer on reload.
-            #
-            # Status stays "cancelled" for both: the agent's own interrupted flag is
-            # False either way so nothing can distinguish them, and flipping to
-            # "completed" would contradict the uncooperative-executor contract.
-            # interrupted is published separately so a client can still tell a turn
-            # that was genuinely cut short from one that ran to the end.
+        if run_id in self._stopping_run_ids and result.get("interrupted") is True:
+            # The agent HONOURED the stop: a genuinely truncated turn.
             _finish("cancelled",
                     {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {},
-                    output=result.get("final_response", ""), usage=usage,
-                    interrupted=bool(result.get("interrupted")))
+                    output=result.get("final_response", ""), usage=usage, interrupted=True)
         elif result.get("failed"):
             # Non-retryable client errors (401/400) return failed=True rather than raising.
             _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
         else:
             # Undelivered steer text rides on the terminal event/status for client replay.
             extra = {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {}
-            _finish("completed", extra, output=result.get("final_response", ""), usage=usage)
+            # A provisional stop cannot discard a real completion. A stop that lost the
+            # race, or one an uncooperative agent never noticed, leaves the turn having
+            # genuinely run to the end -- so it reports "completed" and keeps its
+            # output. interrupted is published either way so a client can distinguish a
+            # truncated turn from a whole one without parsing the status string.
+            _finish("completed", extra, output=result.get("final_response", ""), usage=usage,
+                    interrupted=bool(result.get("interrupted")))
     except asyncio.CancelledError:
         _finish("cancelled")
         raise

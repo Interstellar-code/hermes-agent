@@ -3395,10 +3395,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # its turn. Reporting it as "completed" would tell the client the answer
                 # is whole when it is a partial.
                 interrupted = bool(result.get("interrupted")) if is_dict else False
-                # A stop the agent never honoured still ends the run as cancelled --
-                # the user asked for it and the turn is over. _stopping_run_ids is read
-                # only here, after the executor returned, so this also covers a stop
-                # that landed just after a successful turn.
+                # Status follows the OUTCOME, not the request: a provisional stop
+                # cannot discard a real completion. Only a turn the agent actually cut
+                # short reports "cancelled"; a stop that lost the race, or one an
+                # uncooperative agent ignored, ran to the end and reports "completed".
+                # Either way the answer is kept and `interrupted` is published, so a
+                # client never has to parse the status string to tell them apart.
                 stop_requested = run_id in self._stopping_run_ids
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
@@ -3418,9 +3420,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 # status record too -- discarding it would leave the client with a
                 # cancelled run and no way to see what the agent had produced.
                 self._set_run_status(
-                    run_id, "cancelled" if (interrupted or stop_requested) else "completed",
+                    run_id, "cancelled" if interrupted else "completed",
                     session_id=effective_session_id, usage=usage,
-                    last_event="run.cancelled" if (interrupted or stop_requested) else "run.completed",
+                    last_event="run.cancelled" if interrupted else "run.completed",
                     interrupted=interrupted,
                     **({"output": final_response} if (interrupted or stop_requested) else {}),
                     **({"pending_steer": pending_steer} if pending_steer else {}))

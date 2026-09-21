@@ -457,7 +457,10 @@ async def test_double_stop_is_idempotent(adapter, session_db):
             release.set()
             await asyncio.wait_for(body_task, timeout=10)
 
-    assert adapter._run_statuses[run_id]["status"] == "cancelled"
+    # Uncooperative agent: the turn ran to a normal, complete result, so the status
+    # is "completed" -- a provisional stop cannot discard a real completion.
+    # `interrupted` carries the nuance instead of the status string.
+    assert adapter._run_statuses[run_id]["status"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -503,7 +506,10 @@ async def test_wedged_stop_is_reported_not_force_cancelled(adapter, session_db):
             release.set()
             await asyncio.wait_for(body_task, timeout=10)
 
-    assert adapter._run_statuses[run_id]["status"] == "cancelled"
+    # Uncooperative agent: the turn ran to a normal, complete result, so the status
+    # is "completed" -- a provisional stop cannot discard a real completion.
+    # `interrupted` carries the nuance instead of the status string.
+    assert adapter._run_statuses[run_id]["status"] == "completed"
     assert adapter.active_agent_work_count() == 0
 
 
@@ -566,7 +572,10 @@ async def test_stop_that_loses_the_race_keeps_the_completed_output(adapter):
             await _wait_for(lambda: run_id not in adapter._active_run_tasks)
 
     record = adapter._run_statuses[run_id]
-    assert record["status"] == "cancelled"
+    # Uncooperative agent: the turn ran to a normal, complete result, so the status
+    # is "completed" -- a provisional stop cannot discard a real completion.
+    # `interrupted` carries the nuance instead of the status string.
+    assert record["status"] == "completed"
     assert record["interrupted"] is False, "the agent never honoured the stop"
     assert record["output"] == "full answer"
     assert record["usage"]["total_tokens"] == 8
