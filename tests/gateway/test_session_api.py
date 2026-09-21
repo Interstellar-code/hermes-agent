@@ -229,7 +229,25 @@ async def test_run_agent_registers_active_run_id_for_steering(adapter, monkeypat
 async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_finishes(
     adapter, session_db
 ):
-    """Disconnects must interrupt the live run without dropping its control refs early."""
+    """A disconnect must not drop the run's control refs before the executor finishes.
+
+    FORK SEMANTICS, chosen deliberately over upstream's. This transport does NOT
+    interrupt the agent when the client goes away: the sessions stream is
+    session-backed, its turn persists to the transcript, and its run-events
+    transport survives a disconnect so a client can reconnect. Killing the run
+    while keeping its stream would let a client reconnect to the stream of a run
+    that was already dead, and a browser reload must not make a live agent
+    unstoppable. The run stays registered and is ended explicitly via
+    POST /v1/runs/{run_id}/stop.
+
+    This differs from /v1/chat/completions, which IS interrupted on disconnect
+    (tests/gateway/test_sse_agent_cancel.py) — that transport is stateless, so an
+    abandoned turn has nobody to deliver to and only burns tokens.
+
+    What this test still guards, unchanged, is the part that mattered: the
+    control refs outlive the disconnect, so the run remains reachable until the
+    executor thread genuinely returns.
+    """
     session_id = session_db.create_session("disconnect-stream-session", "api_server")
     run_started = threading.Event()
     interrupt_called = threading.Event()
@@ -298,17 +316,15 @@ async def test_session_chat_stream_disconnect_keeps_control_refs_until_executor_
         assert run_started.is_set()
         run_id = next(iter(adapter._run_statuses))
 
-        for _ in range(40):
-            if interrupt_called.is_set():
-                break
-            await asyncio.sleep(0.05)
-
-        assert interrupt_called.is_set()
+        # The agent is deliberately NOT interrupted by the disconnect (see docstring).
+        assert not interrupt_called.is_set(), "disconnect must not kill a session-stream turn"
         assert run_id in adapter._active_run_agents
-        # Not in _active_run_tasks: session-stream turns are counted via
-        # _inflight_agent_runs; a task entry would double-count them in the
-        # shutdown drain (active_agent_work_count).
-        assert run_id not in adapter._active_run_tasks
+        # IS in _active_run_tasks: registering the task is what makes this run
+        # reachable from POST /v1/runs/{run_id}/stop during the pre-agent window,
+        # when _create_agent has not returned yet. The double-count that entry
+        # would otherwise cause in active_agent_work_count is avoided by passing
+        # count_inflight=False to _run_agent, not by leaving the task unregistered.
+        assert run_id in adapter._active_run_tasks
         assert not handler_task.done()
 
         allow_finish.set()
