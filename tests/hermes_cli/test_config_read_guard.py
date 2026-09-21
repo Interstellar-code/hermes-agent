@@ -56,6 +56,15 @@ EXCLUDED_DIR_PARTS = {
     # Compiled bytecode is not source. Sibling test processes also create
     # and delete these directories while this scan walks the tree.
     "__pycache__",
+    # Vendored git SUBMODULES are separate repositories with their own
+    # conventions and their own CI; this guard governs THIS repo's modules. The
+    # Mnemosyne engine under plugins/memory/_matrix-memory-mnemosyne reads its
+    # OWN config.yaml, not Hermes's, so routing it through
+    # hermes_cli.config.load_config() would be wrong, not safer. Invisible to
+    # this scan until the submodule is checked out, which is why it surfaced
+    # only after `git submodule update --init` (a fresh worktree does not
+    # inherit initialized submodules).
+    "_matrix-memory-mnemosyne",
 }
 
 # A safe_load within this many lines of a config.yaml reference is treated
