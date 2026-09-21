@@ -9,7 +9,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
-from tests.gateway.test_api_server_runs import _create_runs_app
+from tests.gateway.test_api_server_runs import _claim_run, _create_runs_app
 
 
 @pytest.fixture
@@ -34,6 +34,7 @@ async def test_run_approval_persists_receipt_and_emits_rich_payload(adapter, ses
     run_id = "run_receipt"
     session_id = session_db.create_session("approval-session", "api_server")
     adapter._run_statuses[run_id] = {"run_id": run_id, "status": "waiting_for_approval", "session_id": session_id}
+    _claim_run(adapter, run_id)
     adapter._run_approval_sessions[run_id] = "session-123"
     adapter._run_approval_requests[run_id] = [{
         "approval_id": "approval_1",
@@ -53,7 +54,7 @@ async def test_run_approval_persists_receipt_and_emits_rich_payload(adapter, ses
             assert resp.status == 200, await resp.text()
             payload = await resp.json()
 
-    mock_resolve.assert_called_once_with("session-123", "once", resolve_all=False)
+    mock_resolve.assert_called_once_with("session-123", "once", resolve_all=False, request_id=None)
     assert payload == {
         "object": "hermes.run.approval_response",
         "run_id": run_id,
@@ -101,6 +102,7 @@ async def test_run_approval_string_false_does_not_resolve_all_and_keeps_queue_or
     app = _create_runs_app(adapter)
     run_id = "run_bool_parse"
     adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running", "session_id": "sess-x"}
+    _claim_run(adapter, run_id)
     adapter._run_approval_sessions[run_id] = "session-123"
     adapter._run_approval_requests[run_id] = [
         {"approval_id": "approval_oldest", "session_id": "sess-x", "run_id": run_id, "message_id": "m1", "choices": ["once", "session", "always", "deny"]},
@@ -116,7 +118,7 @@ async def test_run_approval_string_false_does_not_resolve_all_and_keeps_queue_or
             )
 
     assert approval_resp.status == 200
-    mock_resolve.assert_called_once_with("session-123", "once", resolve_all=False)
+    mock_resolve.assert_called_once_with("session-123", "once", resolve_all=False, request_id=None)
     mock_receipt.assert_called_once()
     approval_meta = mock_receipt.call_args.args[1]
     assert approval_meta["approval_id"] == "approval_oldest"

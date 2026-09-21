@@ -98,7 +98,8 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
         self._run_approval_requests, self._clarify_streams, self._session_approval_runs,
-    ) = ({} for _ in range(10))
+        self._session_interactions,
+    ) = ({} for _ in range(11))
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -887,10 +888,19 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
     # reloaded client is invited to answer something already resolved.
     approval_id_field = (
         {"approval_id": _resolved_records[0].get("approval_id")} if _resolved_records else {})
-    _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
+    approval_meta = _resolved_records[0] if _resolved_records else {}
+    approval_session_id = approval_meta.get("session_id")
+    approved = choice != "deny"
+    if approval_session_id:
+        self._persist_approval_receipt(approval_session_id, approval_meta, choice, resolved)
+    _mark_run_event(
+        self, run_id, "approval.responded", choice=choice, **request_id_field, **approval_id_field,
+        session_id=approval_session_id, message_id=approval_meta.get("message_id"),
+        action=approval_meta.get("command"), context=approval_meta.get("description"),
+        approved=approved, resolved=resolved)
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
-        **approval_id_field, "resolved": resolved})
+        **approval_id_field, "approved": approved, "resolved": resolved})
 
 
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
