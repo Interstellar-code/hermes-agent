@@ -634,8 +634,22 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
-        if run_id in self._stopping_run_ids and result.get("interrupted") is True:
-            _finish("cancelled")
+        if run_id in self._stopping_run_ids:
+            # A stop the turn never honoured must not throw the answer away. This
+            # branch catches both a stop landing microseconds after a successful turn
+            # and one the agent never noticed; either way the transcript has already
+            # persisted the answer, and dropping output/usage left a client showing
+            # "cancelled" with nothing, then a full answer on reload.
+            #
+            # Status stays "cancelled" for both: the agent's own interrupted flag is
+            # False either way so nothing can distinguish them, and flipping to
+            # "completed" would contradict the uncooperative-executor contract.
+            # interrupted is published separately so a client can still tell a turn
+            # that was genuinely cut short from one that ran to the end.
+            _finish("cancelled",
+                    {"pending_steer": result["pending_steer"]} if result.get("pending_steer") else {},
+                    output=result.get("final_response", ""), usage=usage,
+                    interrupted=bool(result.get("interrupted")))
         elif result.get("failed"):
             # Non-retryable client errors (401/400) return failed=True rather than raising.
             _finish("failed", error=_redact_api_error_text(result.get("error") or "agent run failed"))
@@ -713,11 +727,30 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     return run_id, status, agent, task, None
 
 
+def _with_stop_progress(self, status: Dict[str, Any]) -> Dict[str, Any]:
+    """Add the derived stopping fields to a status ABOUT to be served.
+
+    Derived at read time and never stored: a wedged flag written into the record
+    would be a snapshot that goes stale the moment it is persisted, and would then
+    disagree with the clock on the next read. The stored fact is
+    ``stop_requested_at``; everything else about the stop is computed from it.
+    """
+    if status.get("status") != "stopping" or not status.get("stop_requested_at"):
+        return status
+    pending = max(0.0, time.time() - float(status["stop_requested_at"]))
+    return {
+        **status,
+        "stopping_for_seconds": pending,
+        "stop_wedged": pending >= float(
+            getattr(self, "_RUN_STOP_WEDGED_SECONDS", 20.0)),
+    }
+
+
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
-    return err or web.json_response(status)
+    return err or web.json_response(_with_stop_progress(self, status))
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
@@ -912,7 +945,13 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
-    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+    # Stamp the FIRST stop only. The wedged clock measures the whole stopping
+    # window; restamping on a repeat press would reset it and hide an agent that
+    # has been ignoring the interrupt the entire time.
+    stop_fields = {}
+    if not status.get("stop_requested_at"):
+        stop_fields["stop_requested_at"] = time.time()
+    self._set_run_status(run_id, "stopping", last_event="run.stopping", **stop_fields)
     self._stopping_run_ids.add(run_id)
     if agent is not None:
         with suppress(Exception):

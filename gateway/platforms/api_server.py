@@ -3378,17 +3378,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, active_run_id=run_id,
                     approval_notify=_approval_notify, approval_session_key=session_id,
-                    approval_cleanup=_approval_cleanup, **ctx["run_kwargs"])
+                    approval_cleanup=_approval_cleanup,
+                    agent_register=lambda _agent: self._active_run_agents.__setitem__(run_id, _agent),
+                    # This run registers its own task in _active_run_tasks below, which
+                    # active_agent_work_count() already sums; counting it as an inflight
+                    # run too would spend two concurrency slots.
+                    count_inflight=False,
+                    **ctx["run_kwargs"])
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
                 effective_session_id = result.get("session_id", session_id) if is_dict else session_id
                 turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
                 effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
+                # A stop that the agent honoured comes back as a normal return carrying
+                # interrupted=True, NOT as CancelledError -- the executor thread finished
+                # its turn. Reporting it as "completed" would tell the client the answer
+                # is whole when it is a partial.
+                interrupted = bool(result.get("interrupted")) if is_dict else False
+                # A stop the agent never honoured still ends the run as cancelled --
+                # the user asked for it and the turn is over. _stopping_run_ids is read
+                # only here, after the executor returned, so this also covers a stop
+                # that landed just after a successful turn.
+                stop_requested = run_id in self._stopping_run_ids
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, "completed": True,
-                    "partial": bool(result.get("partial")) if is_dict else False,
-                    "interrupted": False, "runtime": effective_runtime}))
+                    "partial": (bool(result.get("partial")) if is_dict else False) or interrupted,
+                    "interrupted": interrupted, "runtime": effective_runtime}))
                 # A steer accepted after the final reply lands in result["pending_steer"]; surface
                 # it so clients can replay it rather than lose it.
                 pending_steer = result.get("pending_steer") if is_dict else None
@@ -3398,9 +3414,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
                 await queue.put(_event_payload("run.completed", completed_payload))
+                # The partial answer is already in the transcript, so it goes on the
+                # status record too -- discarding it would leave the client with a
+                # cancelled run and no way to see what the agent had produced.
                 self._set_run_status(
-                    run_id, "completed", session_id=effective_session_id, usage=usage,
-                    last_event="run.completed",
+                    run_id, "cancelled" if (interrupted or stop_requested) else "completed",
+                    session_id=effective_session_id, usage=usage,
+                    last_event="run.cancelled" if (interrupted or stop_requested) else "run.completed",
+                    interrupted=interrupted,
+                    **({"output": final_response} if (interrupted or stop_requested) else {}),
                     **({"pending_steer": pending_steer} if pending_steer else {}))
             except asyncio.CancelledError:
                 self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
@@ -3412,12 +3434,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
                 self._active_run_agents.pop(run_id, None)
+                self._active_run_tasks.pop(run_id, None)
+                # A finished run is no longer stoppable; leaving the marker would make
+                # a later stop look accepted against a run that has already gone.
+                self._stopping_run_ids.discard(run_id)
                 self._release_run_owner_if_forgotten(run_id)
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
-        # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
+        # Registered in _active_run_tasks so POST /v1/runs/{id}/stop can reach this run
+        # from its FIRST frame. _create_agent runs in the executor and takes seconds
+        # (toolset load, memory provider), so _active_run_agents alone leaves a real
+        # queued-before-agent window in which /stop would 404 while the status already
+        # says running. _run_agent is called with count_inflight=False so this turn is
+        # counted once, here, and not twice.
         task = asyncio.create_task(_run_and_signal())
+        self._active_run_tasks[run_id] = task
         self._track_background_task(task)
         headers = {
             "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
@@ -3873,7 +3905,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, approval_notify=None,
-        approval_session_key: Optional[str] = None, approval_cleanup=None) -> tuple:
+        approval_session_key: Optional[str] = None, approval_cleanup=None,
+        agent_register=None, count_inflight: bool = True) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -3881,7 +3914,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``session_history_delivery`` declares #98619 session-id provenance and default-denies: only audited
         producers whose client can address the id again pass "1" (see
         ``_bind_api_server_session``).
-        ``turn_author`` only labels the turn for memory attribution. It grants nothing."""
+        ``turn_author`` only labels the turn for memory attribution. It grants nothing.
+
+        ``count_inflight`` controls the ``_inflight_agent_runs`` accounting behind
+        ``active_agent_work_count``. A caller that registers its OWN task in
+        ``_active_run_tasks`` is already counted by that path and must pass ``False``,
+        or one turn spends two concurrency slots and the shutdown drain waits on work
+        that does not exist.
+
+        ``agent_register`` is called with the live agent as soon as it exists, from the
+        EXECUTOR thread. /stop needs the agent reachable the moment it is constructed,
+        and _create_agent takes seconds (toolset load, memory provider)."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -3916,6 +3959,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if agent_register is not None:
+                        # Executor thread: /stop must find this agent from the instant it
+                        # exists, not after the turn returns.
+                        with suppress(Exception):
+                            agent_register(agent)
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
@@ -3996,15 +4044,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                                 getattr(agent, "session_id", None) or session_id, gateway_session_key)
                     clear_session_vars(tokens)
         self._activate_admitted_request()
-        self._inflight_agent_runs += 1
+        if count_inflight:
+            self._inflight_agent_runs += 1
         try:
             return await loop.run_in_executor(None, _run)
         finally:
-            self._inflight_agent_runs -= 1
+            if count_inflight:
+                self._inflight_agent_runs -= 1
 
     # -- /v1/runs, room grants, room dispatch: thin delegators (real methods: tests assert
     # __dict__ membership and patch the module-level implementations) ---------------------
 
+    # How long a run may sit in "stopping" before the status reports it wedged.
+    # Reporting only -- "stopping" deliberately has NO deadline: the turn runs on a
+    # run_in_executor thread, so cancelling the asyncio wrapper would abandon it
+    # rather than stop it, while the agent kept writing the transcript and holding
+    # its resources. The bound is on what we TELL the client, not on the run.
+    _RUN_STOP_WEDGED_SECONDS = 20.0
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
