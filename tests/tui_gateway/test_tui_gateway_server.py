@@ -15352,8 +15352,11 @@ def test_handoff_request_uses_session_profile_home(monkeypatch, tmp_path):
         def get_session(self, _key):
             return {"id": _key}
 
-        def request_handoff(self, _key, platform):
-            return platform == "discord"
+        def expire_stale_handoffs(self):
+            return []
+
+        def request_handoff_status(self, _key, platform):
+            return "queued" if platform == "discord" else "in_flight"
 
     @contextlib.contextmanager
     def profile_db(_session):

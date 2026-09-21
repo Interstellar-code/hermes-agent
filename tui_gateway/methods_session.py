@@ -1139,10 +1139,16 @@ def _(rid, params: dict, session: dict) -> dict:
         try:
             if not db.get_session(key):
                 db.set_session_title(key, f"handoff-{key[:8]}")
-            if not db.request_handoff(key, platform_name):
-                return _err(rid, 4027, "session is already in flight for handoff — wait for it to settle, then retry")
+            # Reap anything an earlier caller abandoned so it neither blocks this
+            # request nor gets actioned by the watcher long after it went stale.
+            db.expire_stale_handoffs()
+            status = db.request_handoff_status(key, platform_name)
         except Exception as e:
             return _err(rid, 5007, str(e))
+    if status == "missing":
+        return _err(rid, 4028, "session has no state.db record yet — send a message first, then retry the handoff")
+    if status != "queued":
+        return _err(rid, 4027, "session is already in flight for handoff — wait for it to settle, then retry")
     return _ok(rid, {"queued": True, "session_key": key, "platform": platform_name, "home_name": home.name})
 
 
