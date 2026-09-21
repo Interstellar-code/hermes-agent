@@ -225,3 +225,24 @@ native/fts5_cjk/*.so
 
 # Disposable profile created by scripts/probe_active_session_exclusivity.py
 .probe-home/
+
+# setuptools bdist output at repo root (pip install / python -m build)
+/build/
+
+# local session-analysis dumps (weekly-digests skill scratch).
+# analysis/*.md reports ARE tracked — only the raw jsonl exports are ignored.
+/analysis/*.jsonl
+
+# Agent / orchestration runtime state created in-repo — never codebase artifacts.
+.omc/
+.codegraph/
+.omo/
+*.log
+CLAUDE.md
+hindsight.py
+.claude/
+cache/
+
+# Serena MCP project cache (15M of cache/, memories/, project state).
+# Regenerated on demand; never a repo artifact.
+.serena/

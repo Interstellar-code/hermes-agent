@@ -279,7 +279,9 @@ def _load_provider_from_dir(provider_dir: Path, *, register_skills: bool = True)
             # falling through to the subclass scan would hand back a bare second
             # instance — a silent downgrade that looks like success.
             if collector.provider is None:
-                logger.debug("register() failed for %s: %s", name, e)
+                # fork: bumped from debug to warning+exc_info so register() failures
+                # aren't silently swallowed (see Interstellar-code/hermes-agent#157).
+                logger.warning("register() failed for %s: %s", name, e, exc_info=True)
             else:
                 logger.warning(
                     "Memory provider '%s' raised after registering (%s) — "

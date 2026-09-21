@@ -66,7 +66,7 @@ def _new_module(name: str, file: Path, search_locations: Optional[List[str]] = N
 
 
 def _exec(mod: Any, logger: Optional[logging.Logger] = None) -> bool:
-    """Exec a ``_new_module`` module (None -> False); False + debug-log if it raised. The sys.modules
+    """Exec a ``_new_module`` module (None -> False); False + error-log if it raised. The sys.modules
     entry stays on failure; callers needing a clean retry pop it themselves."""
     if mod is None:
         return False
@@ -74,8 +74,12 @@ def _exec(mod: Any, logger: Optional[logging.Logger] = None) -> bool:
         mod.__spec__.loader.exec_module(mod)
         return True
     except Exception as e:
+        # Surface import-time failures loudly (#157): a named plugin module whose
+        # exec raises (e.g. matrix-memory's shim raising because the Mnemosyne
+        # submodule is missing) was previously logged at DEBUG and silently
+        # dropped. The exception message carries the fix hint.
         if logger:
-            logger.debug("Failed to exec_module %s: %s", mod.__name__, e)
+            logger.error("Failed to exec_module %s: %s", mod.__name__, e, exc_info=True)
         return False
 
 

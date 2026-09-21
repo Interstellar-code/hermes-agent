@@ -28,6 +28,21 @@ Two invariants shape almost every design decision and are the lens for reviewing
   every API call, so the bar for a new *core* tool is high. New capability should arrive as a
   CLI command + skill, a service-gated tool, or a plugin — not as core surface.
 
+## Fork divergence — read before changing shared surface
+
+This checkout is the **Interstellar-code fork**. It carries divergence upstream
+does not have, and an upstream merge is a routine event here.
+
+`FORK-REGISTRY.md` (repo root) is the durable record of what the fork owns:
+fork-only plugins, core-file patches, contract routes, and diverged decisions —
+each with the SHAs that implement it and its status against the current upstream
+tag. **Any change that touches fork-owned surface updates the relevant registry
+row in the same commit.** A divergence-touching change with no registry delta is
+incomplete.
+
+If you are about to edit a file and are unsure whether it is fork-owned, check
+the registry first — it is cheaper than discovering it during a merge.
+
 ## Contribution Rubric — What We Want / What We Don't
 
 The project's intent layer. It serves humans aiming a contribution AND the automated triage
@@ -353,6 +368,36 @@ scripts/run_tests.sh -v --tb=long                       # pytest flags pass thro
   ```
   Tests that `patch.object(Path, "home", ...)` must ALSO set `HERMES_HOME` — code reads the
   env var, not `Path.home()/.hermes`.
+
+### A stale `uv.lock` silently disables the whole Python test suite
+Any change to `pyproject.toml` dependencies or to the project version MUST be
+followed by `uv lock`. If the lockfile disagrees with `pyproject.toml`,
+`uv lock --check` fails and `uv sync --locked` aborts — so every Python CI job
+dies **at the install step, before collecting a single test**. On the CI
+dashboard that is indistinguishable from a real test failure.
+
+This is not theoretical: `8712d5b` pinned `nemo-relay==0.5.0` without
+regenerating the lock, and the Python suite did not actually run for **176
+commits**. Eight genuine test failures accumulated invisibly behind it
+(#211). If you see every test slice failing at once, check
+`uv lock --check` first — it is almost never eight unrelated regressions.
+
+### `gh` subcommands that use GraphQL fail on this repo
+This repo is large enough to break GitHub's GraphQL API. `gh pr create`,
+`gh pr checks`, and `gh pr diff` all fail here — `pr create` reports the
+actively misleading `No commits between <base> and <head>` even when the
+branch is correctly ahead, and `pr diff` returns HTTP 406. Use the REST
+endpoints via `gh api` instead:
+
+```bash
+gh api repos/<owner>/<repo>/pulls -X POST -f title=... -f head=... -f base=... -F body=@body.md
+gh api "repos/<owner>/<repo>/commits/<sha>/check-runs?per_page=100"
+gh api repos/<owner>/<repo>/pulls/<n>/merge -X PUT -f merge_method=rebase
+```
+
+If you build a CI-watching loop, make it log a warning when it cannot parse a
+response. A loop that silently retries on a GraphQL failure looks exactly like
+one where CI is still running — that mistake cost an hour of blind waiting.
 
 ### Don't fake the host OS
 

@@ -836,7 +836,15 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict) -> None:
             # (or drops the row when nous.guest is off), so only a real account fetches.
             tier_row = _free_tier_nous_row({"name": get_label(hermes_slug), "models": []})
             real_account = tier_row is not None and not tier_row["models"]
-            model_ids = _nous_picker_model_ids(b.curated, b.force_fresh_nous_tier) if real_account else []
+            if real_account:
+                # Fetched live (with in-repo fallback) here rather than up front in
+                # _build_curated_lists — real_account already gates this branch, so we know a
+                # nous row is actually about to be emitted.
+                from hermes_cli.models import get_curated_nous_model_ids
+                b.curated["nous"] = get_curated_nous_model_ids()
+                model_ids = _nous_picker_model_ids(b.curated, b.force_fresh_nous_tier)
+            else:
+                model_ids = []
         else:
             model_ids = _live_or_curated_ids(hermes_slug, b.curated, hermes_slug, pid)
         b.add_builtin_row(
@@ -1046,11 +1054,13 @@ def _lap_custom_provider_rows(b: _PickerBuild, custom_providers: list) -> None:
 def _build_curated_lists(current_provider: str, current_base_url: str, current_model: str) -> dict[str, list[str]]:
     """Curated model lists keyed by hermes provider id, plus the dynamic ones (nous manifest,
     Ollama Cloud, LM Studio live probe)."""
-    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS, get_curated_nous_model_ids
+    from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
     curated: dict[str, list[str]] = dict(_PROVIDER_MODELS)
     curated["openrouter"] = [mid for mid, _ in OPENROUTER_MODELS]
-    # Remote manifest so new Portal models surface without a release; in-repo snapshot fallback.
-    curated["nous"] = get_curated_nous_model_ids()
+    # The nous live manifest fetch is deferred to the real-account branch in _lap_overlay_rows —
+    # it only runs once we know a nous row will actually be emitted, so callers listing unrelated
+    # providers never pay for a network round trip. curated["nous"] keeps the _PROVIDER_MODELS
+    # static snapshot here as a harmless default for any other (unused) lookup.
     if "ollama-cloud" not in curated:
         from hermes_cli.models import fetch_ollama_cloud_models
         curated["ollama-cloud"] = fetch_ollama_cloud_models()
