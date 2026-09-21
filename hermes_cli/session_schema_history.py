@@ -203,6 +203,9 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
             ('+', 'compression_recovery_deadline', 'compression_ineffective_count'),
         )),
         ('26 2026-09-02T14:22Z 8e4366d358', (('+', 'tool_names', 'last_read_at'),)),
+        # FORK (#221): the handoff-expiry feature's column, added by Phase D unit 3
+        # (7ff9436289). Declared in SCHEMA_SQL right after handoff_error.
+        ('27 2026-09-20T01:26Z 7ff9436289', (('+', 'handoff_requested_at', 'handoff_error'),)),
         ),
     ),
     "messages": _TableHistory(

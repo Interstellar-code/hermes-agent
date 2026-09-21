@@ -1530,6 +1530,7 @@ _PLUGIN_COMPAT_LAZY = {
     'atomic_json_write': ('utils', 'atomic_json_write'),
     'build_context_files_prompt': ('agent.prompt_builder', 'build_context_files_prompt'),
     'build_environment_hints': ('agent.prompt_builder', 'build_environment_hints'),
+    'build_nous_subscription_prompt': ('agent.prompt_builder', 'build_nous_subscription_prompt'),
     'build_skills_system_prompt': ('agent.prompt_builder', 'build_skills_system_prompt'),
     'check_toolset_requirements': ('model_tools', 'check_toolset_requirements'),
     'convert_scratchpad_to_think': ('agent.trajectory', 'convert_scratchpad_to_think'),
