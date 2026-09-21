@@ -174,14 +174,40 @@ class VisionMessagePrepMixin:
         return prefix or suffix or "[A multimodal message was converted to text for Anthropic compatibility.]"
 
     def _get_transport(self, api_mode: str = None):
-        """Return the cached transport for the given (or current) api_mode (lazy; None if unregistered)."""
+        """Return the cached transport for the given (or current) api_mode.
+
+        NEVER returns None. All 13 call sites dereference the result immediately
+        (``.build_kwargs(...)``), so a None here surfaces as
+        ``'NoneType' object has no attribute 'build_kwargs'`` three retries deep,
+        naming neither the mode nor the provider.
+
+        An EMPTY or missing api_mode falls back to ``chat_completions``: that is
+        already the documented default in ``_resolve_api_mode``'s final branch
+        and in the request metadata, and ``api_mode: ''`` is a legal value in a
+        profile config that reaches here verbatim through the runtime-restore
+        path (agent_runtime_helpers.py:894 assigns ``rt["api_mode"]`` unchanged).
+
+        A NON-empty but unregistered mode also falls back, with a warning: the
+        wire format may then be wrong, but a wrong-wire request fails with a
+        provider error that says what happened, while the alternative is an
+        AttributeError that says nothing.
+        """
         mode = api_mode or self.api_mode
         cache = getattr(self, "_transport_cache", None)
         if cache is None:
             cache = self._transport_cache = {}
         if cache.get(mode) is None:
             from agent.transports import get_transport
-            cache[mode] = get_transport(mode)
+            resolved = get_transport(mode)
+            if resolved is None:
+                if mode:
+                    _logger = __import__("logging").getLogger(__name__)
+                    _logger.warning(
+                        "No transport registered for api_mode %r (provider=%s); "
+                        "falling back to chat_completions.",
+                        mode, getattr(self, "provider", None))
+                resolved = get_transport("chat_completions")
+            cache[mode] = resolved
         return cache[mode]
 
     def _prepare_messages_for_non_vision_model(self, api_messages: list) -> list:
