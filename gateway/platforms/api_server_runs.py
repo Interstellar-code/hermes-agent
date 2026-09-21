@@ -747,8 +747,21 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     try:
         while True:
             try:
-                event = await asyncio.wait_for(q.get(), timeout=30.0)
+                event = await asyncio.wait_for(
+                    q.get(), timeout=_api_server.RUN_EVENTS_SSE_KEEPALIVE_SECONDS)
             except asyncio.TimeoutError:
+                # The queue now outlives a disconnect (see the finally below), so a
+                # client can reconnect to a run whose end-of-stream sentinel an earlier
+                # reader already consumed. Nothing more will ever arrive for a run at a
+                # terminal status with an empty queue, and nothing at all for a
+                # transport the orphan sweep already reaped -- close rather than hold
+                # the connection open on keepalives forever.
+                finished = (self._run_statuses.get(run_id) or {}).get("status") in {
+                    "completed", "failed", "cancelled",
+                }
+                if self._run_streams.get(run_id) is not q or (finished and q.empty()):
+                    await response.write(b": stream closed\n\n")
+                    break
                 await response.write(b": keepalive\n\n")
                 continue
             if event is None:  # run finished
@@ -758,8 +771,17 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     except Exception as exc:
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
+        # Drop the SUBSCRIBER, not the transport. A client that disconnects mid-run
+        # (tab closed, network blip, page reload) must be able to reconnect and drain
+        # what buffered while nobody was listening; popping the queue here made the
+        # reconnect 404 and silently lost every event in it -- including an
+        # approval.request the run is still blocked on.
+        #
+        # Still bounded: if no subscriber returns, the orphan sweep reaps the transport
+        # _RUN_STREAM_TTL after stream creation whether or not the client ever comes
+        # back. Buffering with no reader is already the normal state for a run nobody
+        # subscribed to.
         self._run_stream_subscribers.discard(run_id)
-        _drop_run_transport(self, run_id)
     return response
 
 

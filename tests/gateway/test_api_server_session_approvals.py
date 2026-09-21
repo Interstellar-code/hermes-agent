@@ -522,6 +522,11 @@ async def test_stream_teardown_leaves_a_sibling_approval_answerable(adapter, ses
 async def test_run_events_disconnect_keeps_stream_for_reconnect(adapter):
     """``/v1/runs`` reconnect used to 404 — the queue was popped on disconnect."""
     run_id = "run_disconnect"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     queue: "asyncio.Queue" = asyncio.Queue()
     adapter._run_streams[run_id] = queue
     adapter._run_streams_created[run_id] = time.time()
@@ -567,6 +572,11 @@ async def test_reconnect_to_a_finished_run_closes_instead_of_hanging(adapter, mo
         "gateway.platforms.api_server.RUN_EVENTS_SSE_KEEPALIVE_SECONDS", 0.02
     )
     run_id = "run_finished"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     adapter._run_streams[run_id] = asyncio.Queue()
     adapter._run_streams_created[run_id] = time.time()
     adapter._run_statuses[run_id] = {"run_id": run_id, "status": "completed"}
@@ -588,6 +598,11 @@ async def test_reconnect_to_a_live_run_stays_open(adapter, monkeypatch):
         "gateway.platforms.api_server.RUN_EVENTS_SSE_KEEPALIVE_SECONDS", 0.02
     )
     run_id = "run_waiting"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     queue: "asyncio.Queue" = asyncio.Queue()
     adapter._run_streams[run_id] = queue
     adapter._run_streams_created[run_id] = time.time()
