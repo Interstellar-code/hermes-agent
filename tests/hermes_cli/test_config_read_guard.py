@@ -65,6 +65,12 @@ EXCLUDED_DIR_PARTS = {
     # only after `git submodule update --init` (a fresh worktree does not
     # inherit initialized submodules).
     "_matrix-memory-mnemosyne",
+    # setuptools/uv build artifacts: build/lib/ holds COPIES of the very modules
+    # this guard inspects, so every real offender would be double-reported and
+    # every fixed one would keep failing from a stale copy. The directory appears
+    # whenever a wheel is built — including from the gateway's own dependency
+    # self-repair — so its absence is not something a checkout can rely on.
+    "build",
 }
 
 # A safe_load within this many lines of a config.yaml reference is treated
