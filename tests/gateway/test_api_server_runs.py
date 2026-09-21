@@ -843,7 +843,21 @@ class TestStopRun:
     async def test_completion_wins_before_uncooperative_stop_is_acknowledged(
         self, adapter
     ):
-        """A provisional Stop cannot discard a real completion."""
+        """A provisional Stop cannot discard a real COMPLETION's output.
+
+        Status semantics follow the FORK here: a stop that loses the race ends
+        "cancelled", not "completed". The agent's own ``interrupted`` flag is False
+        for both "the stop arrived after the turn finished" and "the agent never
+        noticed the stop", so the status cannot distinguish them -- and the user did
+        press stop, so the record reports the request. ``interrupted`` is published
+        alongside it, which is what lets a client tell a turn that was genuinely cut
+        short from one that ran to the end.
+
+        What this test guards is unchanged and is the part that actually mattered:
+        the real answer is NOT discarded. See
+        tests/gateway/test_api_server_session_stop.py::
+        test_stop_that_loses_the_race_keeps_the_completed_output.
+        """
         app = _create_runs_app(adapter)
         run_can_finish = threading.Event()
         run_finished = threading.Event()
@@ -886,7 +900,8 @@ class TestStopRun:
 
                 assert run_id not in adapter._active_run_agents
                 assert run_id not in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "completed"
+                assert adapter._run_statuses[run_id]["status"] == "cancelled"
+                assert adapter._run_statuses[run_id]["interrupted"] is False
                 assert adapter._run_statuses[run_id]["output"] == "late result"
 
     @pytest.mark.asyncio

@@ -940,7 +940,11 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
     if err is not None:
         return err
     if status.get("status") in TERMINAL_STATUSES:
-        return web.json_response(status)
+        # A finished run is not stoppable. Answering 200 read as "stop accepted" for a
+        # run that had already ended, so a UI would show a pending stop that never
+        # resolves. 404 is the "nothing to stop" signal, paired with a 200 from
+        # GET /v1/runs/{id} which still serves the terminal record.
+        return _run_not_found(_openai_error, run_id)
     if agent is None and task is None:
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",

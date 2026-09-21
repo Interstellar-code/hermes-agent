@@ -3483,7 +3483,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _drain_session_stream_task_on_disconnect(
         self, run_id: str, task: "asyncio.Task", *, interrupt_message: str, shield_wait: bool
     ) -> None:
-        """Preserve live run control refs until the executor-backed turn actually exits."""
+        """Preserve live run control refs until the executor-backed turn actually exits.
+
+        A client going away does NOT interrupt the agent on this transport. The
+        sessions stream is session-backed: the turn persists to the transcript, and
+        since the run-events transport survives a disconnect for reconnect, killing
+        the run while keeping its stream would let a client reconnect to the stream of
+        a run that was already dead. The turn keeps running, stays registered, and
+        stays reachable from POST /v1/runs/{run_id}/stop — a browser reload must not
+        make a live agent unstoppable.
+
+        This differs deliberately from /v1/chat/completions, which IS interrupted on
+        disconnect (tests/gateway/test_sse_agent_cancel.py): that transport is
+        stateless, so an abandoned turn has nobody to deliver to and only burns tokens.
+
+        ``interrupt_message`` is retained for the caller's log line and for any future
+        caller that does want the interrupt; it is intentionally unused here.
+        """
+        del interrupt_message  # see docstring: disconnect does not interrupt this transport
         agent = self._active_run_agents.get(run_id)
         if agent is None:
             if not task.done():
@@ -3491,8 +3508,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 with suppress(Exception):
                     await task
             return
-        with suppress(Exception):
-            agent.interrupt(interrupt_message)
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
@@ -3950,6 +3965,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 _approval_registered = False
                 _approval_session_token = None
                 try:
+                    # A stop that lands before the agent exists must prevent the turn,
+                    # not race it. _create_agent runs HERE, on the executor thread, and
+                    # takes seconds (toolset load, memory provider), so this window is
+                    # wide in practice; building the agent anyway would burn that work
+                    # and then immediately interrupt it.
+                    if active_run_id and active_run_id in self._stopping_run_ids:
+                        return {"final_response": "", "interrupted": True, "partial": True}, {}
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
                         stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
