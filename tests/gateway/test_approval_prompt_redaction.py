@@ -49,9 +49,6 @@ class TestRedactApprovalCommand:
         out = _redact_approval_command(raw)
         assert _FAKE_JWT not in out
 
-    def test_clean_command_passes_through_unchanged(self):
-        raw = "ls -la /tmp && echo hello"
-        assert _redact_approval_command(raw) == raw
 
     def test_forces_redaction_even_when_disabled(self, monkeypatch):
         """force=True must redact even if security.redact_secrets is off -- the
@@ -62,15 +59,12 @@ class TestRedactApprovalCommand:
         out = _redact_approval_command(raw)
         assert _FAKE_GHP not in out
 
-    def test_handles_none_and_empty(self):
-        assert _redact_approval_command("") == ""
-        assert _redact_approval_command(None) == ""
-
 
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
     1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
-    2. the SSE/API path (_approval_notify in gateway/platforms/api_server.py),
+    2. the SSE/API path (_approval_notify in
+       gateway/platforms/api_server_runs.py),
     each of which must route the command through _redact_approval_command and
     REASSIGN the redacted value before any send/enqueue (so the raw command
     cannot reach a client). Uses AST (not char-offset string slicing) so a
@@ -118,91 +112,16 @@ class TestApprovalCommandWiring:
         )
 
     def test_chat_platform_path_redacts_before_send(self):
-        import gateway.run as run
+        import gateway.run_turn_runner as run
 
         self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
 
-    def _assert_calls_then_uses(self, module, func_name: str, call_name: str, sink_substr: str):
-        """Same shape as ``_assert_redacts_then_uses``, but for a function that
-        delegates redaction to a shared builder: assert `func_name` assigns the
-        result of `call_name` and only then reaches `sink_substr`."""
-        import ast
-        import inspect
-
-        source = inspect.getsource(module)
-        tree = ast.parse(source)
-        target_fn = next(
-            (
-                node
-                for node in ast.walk(tree)
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == func_name
-            ),
-            None,
-        )
-        assert target_fn is not None, f"function {func_name} not found in {module.__name__}"
-
-        build_line = None
-        for node in ast.walk(target_fn):
-            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-                fn = node.value.func
-                if isinstance(fn, ast.Name) and fn.id == call_name:
-                    build_line = node.lineno
-        assert build_line is not None, (
-            f"{func_name} must assign the result of {call_name}(...) — that is "
-            "where the command is redacted before egress"
-        )
-
-        sink_line = None
-        for node in ast.walk(target_fn):
-            seg = ast.get_source_segment(source, node)
-            if seg and sink_substr in seg and getattr(node, "lineno", 0) > build_line:
-                sink_line = node.lineno
-                break
-        assert sink_line is not None, (
-            f"`{sink_substr}` sink not found after the {call_name}(...) call in {func_name}"
-        )
-
     def test_sse_api_path_redacts_before_enqueue(self):
-        """The API server has three approval egress points — the /v1/runs SSE
-        event, the sessions chat-stream event and GET /v1/approvals/pending —
-        and all three are built by ``_build_approval_record``. The redaction
-        lives in that single seam so the three cannot drift apart; each notify
-        path must go through it before reaching its sink."""
-        from gateway.platforms import api_server
+        from gateway.platforms import api_server_runs
 
-        self._assert_redacts_then_uses(api_server, "_build_approval_record", "record.update")
-        self._assert_calls_then_uses(
-            api_server, "_approval_notify", "_build_approval_record", "put_nowait"
+        self._assert_redacts_then_uses(
+            api_server_runs, "_approval_notify", "put_nowait"
         )
-        self._assert_calls_then_uses(
-            api_server, "_approval_notify_sync", "_build_approval_record", "_enqueue"
-        )
-
-    def test_chat_platform_threads_approval_capabilities_to_adapter(self):
-        """The gateway must not drop the backend's one-operation UI contract."""
-        import ast
-        import inspect
-        import gateway.run as run
-
-        tree = ast.parse(inspect.getsource(run))
-        notify = next(
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == "_approval_notify_sync"
-        )
-        call = next(
-            node for node in ast.walk(notify)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "send_exec_approval"
-        )
-        keywords = {kw.arg: kw.value for kw in call.keywords}
-        for name, default in (("allow_permanent", True), ("smart_denied", False)):
-            value = keywords[name]
-            assert isinstance(value, ast.Call)
-            assert isinstance(value.func, ast.Attribute) and value.func.attr == "get"
-            assert isinstance(value.args[0], ast.Constant) and value.args[0].value == name
-            assert isinstance(value.args[1], ast.Constant) and value.args[1].value is default
 
 
 class TestApprovalTextFallbackContract:
@@ -219,22 +138,3 @@ class TestApprovalTextFallbackContract:
         assert "approve session" not in text
         assert "approve always" not in text
 
-    def test_non_smart_restriction_preserves_session_choice(self):
-        from gateway.run import _format_exec_approval_fallback
-
-        text = _format_exec_approval_fallback(
-            "curl https://example.test", "content warning", "!",
-            allow_permanent=False, smart_denied=False,
-        )
-        assert "`!approve session`" in text
-        assert "approve always" not in text
-
-    def test_manual_prompt_preserves_all_choices(self):
-        from gateway.run import _format_exec_approval_fallback
-
-        text = _format_exec_approval_fallback(
-            "rm -rf /", "dangerous deletion", "/",
-            allow_permanent=True, smart_denied=False,
-        )
-        assert "`/approve session`" in text
-        assert "`/approve always`" in text

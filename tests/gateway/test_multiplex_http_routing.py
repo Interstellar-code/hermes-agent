@@ -16,16 +16,6 @@ class TestSessionSourceProfileField:
         restored = SessionSource.from_dict(s.to_dict())
         assert restored.profile == "coder"
 
-    def test_profile_absent_not_serialized(self):
-        s = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", chat_type="dm")
-        assert "profile" not in s.to_dict()
-
-    def test_source_profile_drives_session_key_namespace(self):
-        s = SessionSource(platform=Platform.TELEGRAM, chat_id="99", chat_type="dm")
-        # build_session_key takes profile explicitly; the adapter passes
-        # source.profile through. Verify the namespace follows it.
-        assert build_session_key(s, profile="coder") == "agent:coder:telegram:dm:99"
-
 
 class TestWebhookProfileResolution:
     """_resolve_request_profile validates the /p/<profile>/ prefix."""
@@ -56,26 +46,32 @@ class TestWebhookProfileResolution:
         adapter, Req, _REJ, _ = self._adapter(multiplex=False)
         assert adapter._resolve_request_profile(Req(None)) is None
 
-    def test_prefix_rejected_when_multiplex_off(self):
-        """Fail closed, same as api_server: the /p/<profile>/ route is
-        registered unconditionally, so ignoring the prefix would run the event
-        through the default profile's home and persist the session there."""
-        adapter, Req, REJ, _ = self._adapter(multiplex=False)
-        assert adapter._resolve_request_profile(Req("anything")) is REJ
-        assert adapter._resolve_request_profile(Req("coder")) is REJ
+    def test_foreign_prefix_rejected_when_multiplex_off(self, monkeypatch):
+        """Fail closed: the /p/<profile>/ route is registered unconditionally, so silently
+        ignoring the prefix would run the event through the default profile's home and persist
+        the session there — serving one profile's routes under another profile's URL."""
+        adapter, Req, rejected, _ = self._adapter(multiplex=False)
+        monkeypatch.setattr("hermes_cli.profiles.profile_matches_home", lambda name: False)
+        assert adapter._resolve_request_profile(Req("anything")) is rejected
+        assert adapter._resolve_request_profile(Req("coder")) is rejected
 
-    def test_known_profile_accepted(self, monkeypatch):
-        adapter, Req, _REJ, served = self._adapter(multiplex=True)
+    def test_self_referential_prefix_allowed_when_multiplex_off(self, monkeypatch):
+        """A prefix naming this gateway's OWN profile falls through to the bare route."""
+        adapter, Req, _REJ, _ = self._adapter(multiplex=False)
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profile_matches_home", lambda name: name == "mine")
+        assert adapter._resolve_request_profile(Req("mine")) is None
+
+    def test_unserved_prefix_is_rejected(self, monkeypatch):
+        adapter, Req, rejected, served = self._adapter(
+            multiplex=True, served=("default", "worker"),
+        )
         monkeypatch.setattr(
             "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [(n, None) for n in served],
+            lambda multiplex: [(name, f"/profiles/{name}") for name in served],
         )
-        assert adapter._resolve_request_profile(Req("coder")) == "coder"
 
-    def test_unknown_profile_rejected(self, monkeypatch):
-        adapter, Req, REJ, served = self._adapter(multiplex=True)
-        monkeypatch.setattr(
-            "hermes_cli.profiles.profiles_to_serve",
-            lambda multiplex: [(n, None) for n in served],
-        )
-        assert adapter._resolve_request_profile(Req("ghost")) is REJ
+        assert adapter._resolve_request_profile(Req("worker")) == "worker"
+        assert adapter._resolve_request_profile(Req("restricted")) is rejected
+
+

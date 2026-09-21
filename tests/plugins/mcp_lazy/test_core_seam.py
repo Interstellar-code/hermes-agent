@@ -34,13 +34,22 @@ def test_transform_tools_dispatches_with_the_agent_kwarg():
     assert "agent" in seen[0], f"agent kwarg not passed through: {sorted(seen[0])}"
 
 
-def test_build_api_kwargs_fires_transform_tools_after_binding_tools():
-    from agent import chat_completion_helpers as cch
+def test_build_api_request_fires_transform_tools_before_cache_decoration():
+    """The hook must fire where the tool list is final and BEFORE the prompt-cache plan.
 
-    src = inspect.getsource(cch.build_api_kwargs)
-    assert "transform_tools" in src, "build_api_kwargs does not fire transform_tools"
-    assert src.index("tools_for_api = agent.tools") < src.index("transform_tools"), \
-        "transform_tools fires before tools_for_api is bound"
+    Pre-0.21.3 this lived in ``chat_completion_helpers.build_api_kwargs``, which bound
+    ``tools_for_api = agent.tools`` itself. Upstream's decomposition made that a thin
+    wrapper that RECEIVES the tool list, and moved cache decoration into
+    ``_redecorate_prompt_cache_for_provider``, which runs first. Firing the hook after
+    that point would plan cache markers over one tool list and ship a different one, so
+    the seam moved to ``turn_api_request.build_api_request``.
+    """
+    from agent import turn_api_request as tar
+
+    src = inspect.getsource(tar.build_api_request)
+    assert "transform_tools" in src, "build_api_request does not fire transform_tools"
+    assert src.index("transform_tools") < src.index("_redecorate_prompt_cache_for_provider("), \
+        "transform_tools must fire BEFORE the prompt-cache plan is built"
 
 
 def test_usage_observer_registry_exists():

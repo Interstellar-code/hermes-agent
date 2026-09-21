@@ -41,6 +41,16 @@ from tools import approval as approval_mod
 AUTH = {"Authorization": "Bearer test-key"}
 
 
+class _DefaultScopeRequest:
+    """Minimal stand-in for an unprefixed request, for _run_idempotency_scope()."""
+    match_info: dict = {}
+    headers: dict = {}
+    query: dict = {}
+
+
+_DEFAULT_SCOPE_REQUEST = _DefaultScopeRequest()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -75,6 +85,15 @@ def _clean_approval_registry():
 def _app(adapter: APIServerAdapter, *, multiplex: bool = False) -> web.Application:
     middlewares = []
     if multiplex:
+        # Upstream hardened _check_auth AFTER this file was written: a named profile
+        # now resolves its OWN scoped API_SERVER_KEY via _expected_api_key and fails
+        # closed rather than inheriting the owner's key (api_server.py:1402). These
+        # tests assert approval SCOPING, not key provisioning, and there is no
+        # profile-scoped key in a tmp HERMES_HOME -- so every /p/<profile>/ request
+        # would 401 before reaching the handler. Stub the resolver the same way
+        # upstream's own tests/gateway/test_api_server_runs.py:774 does, which keeps
+        # the fail-closed rule itself intact and under test elsewhere.
+        adapter._expected_api_key = lambda: adapter._api_key
         class _Runner:
             config = GatewayConfig(multiplex_profiles=True)
 
@@ -503,6 +522,11 @@ async def test_stream_teardown_leaves_a_sibling_approval_answerable(adapter, ses
 async def test_run_events_disconnect_keeps_stream_for_reconnect(adapter):
     """``/v1/runs`` reconnect used to 404 — the queue was popped on disconnect."""
     run_id = "run_disconnect"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     queue: "asyncio.Queue" = asyncio.Queue()
     adapter._run_streams[run_id] = queue
     adapter._run_streams_created[run_id] = time.time()
@@ -548,6 +572,11 @@ async def test_reconnect_to_a_finished_run_closes_instead_of_hanging(adapter, mo
         "gateway.platforms.api_server.RUN_EVENTS_SSE_KEEPALIVE_SECONDS", 0.02
     )
     run_id = "run_finished"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     adapter._run_streams[run_id] = asyncio.Queue()
     adapter._run_streams_created[run_id] = time.time()
     adapter._run_statuses[run_id] = {"run_id": run_id, "status": "completed"}
@@ -569,6 +598,11 @@ async def test_reconnect_to_a_live_run_stays_open(adapter, monkeypatch):
         "gateway.platforms.api_server.RUN_EVENTS_SSE_KEEPALIVE_SECONDS", 0.02
     )
     run_id = "run_waiting"
+    # Per-run ownership (#93689) landed after this file was written: an unstamped
+    # run is "an unanswered authorization question, not a run anyone may control",
+    # so the request 404s before reaching the handler. Production stamps this in
+    # _handle_session_chat_stream; a hand-seeded run must too.
+    adapter._run_owners[run_id] = adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST)
     queue: "asyncio.Queue" = asyncio.Queue()
     adapter._run_streams[run_id] = queue
     adapter._run_streams_created[run_id] = time.time()
@@ -606,6 +640,13 @@ def _seed(adapter, run_id, *, approval_id, profile=None, expires_in=60.0, now=No
             now=now,
         )
     adapter._run_approval_requests.setdefault(run_id, []).append(record)
+    # Upstream added per-run ownership AFTER this file was written (#93689): a run with
+    # no _run_owners stamp is "an unanswered authorization question, not a run anyone may
+    # control", so /v1/runs/{id}/approval 404s before reaching the handler. Production
+    # stamps it in _handle_session_chat_stream; a hand-seeded run must do the same or it
+    # is not testing the resolution path at all. Stamped with the default (unprefixed)
+    # scope, matching what these tests' requests carry.
+    adapter._run_owners.setdefault(run_id, adapter._run_idempotency_scope(_DEFAULT_SCOPE_REQUEST))
     return record
 
 

@@ -100,7 +100,19 @@ def fetch_transcript_with_cloakbrowser(video_id: str):
         shutil.which("node"),
         "node",
     ]
-    node_cmd = next((c for c in candidates if c), None)
+    # Pick the first candidate that is actually RUNNABLE, not merely non-empty.
+    # A truthiness-only check selects a hardcoded absolute path even on a machine
+    # where it does not exist, and the caller's blanket except then swallows the
+    # resulting failure -- so the feature silently never works anywhere but the
+    # machine that path came from.
+    def _runnable(candidate: str) -> "str | None":
+        if not candidate:
+            return None
+        if os.path.sep in candidate:
+            return candidate if os.access(candidate, os.X_OK) else None
+        return shutil.which(candidate)
+
+    node_cmd = next((r for c in candidates if (r := _runnable(c))), None)
     if not node_cmd:
         raise RuntimeError("node not found")
 

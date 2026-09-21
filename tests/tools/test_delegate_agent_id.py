@@ -135,9 +135,9 @@ class TestDelegateTaskAgentId(unittest.TestCase):
         parent = _make_mock_parent()
 
         tasks = [
-            {"goal": "task a", "agent_id": "neo"},
-            {"goal": "task b", "agent_id": "trinity"},
-            {"goal": "task c"},  # falls back to top-level agent_id
+            {"goal": "do task a thoroughly", "agent_id": "neo"},
+            {"goal": "do task b thoroughly", "agent_id": "trinity"},
+            {"goal": "do task c thoroughly"},  # falls back to top-level agent_id
         ]
         json.loads(
             delegate_task(tasks=tasks, agent_id="morpheus", parent_agent=parent)

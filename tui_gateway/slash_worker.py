@@ -3,15 +3,13 @@
 Protocol: reads JSON lines from stdin {id, command}, writes {id, ok, output|error} to stdout.
 """
 
-# Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory
-# from shadowing Hermes's own top-level modules.  This worker is spawned as
-# ``-m tui_gateway.slash_worker`` and inherits the user's CWD, so the ``import
-# cli`` below would otherwise resolve ``utils`` to a colliding local package
-# and crash the child in a retry loop (issue #51286).  ``hermes_bootstrap``
-# lives at the repo root, so importing it is safe before the guard runs (its
-# name won't collide with a user package), and it owns the canonical
-# path-hardening logic shared with the other entry points — #51693 added the
-# guard to ``entry.py``/``acp_adapter/entry.py`` but missed this child.
+# Stop a ``utils/`` (or ``proxy/``, ``ui/``) package in the launch directory from shadowing Hermes's own
+# top-level modules: this worker is spawned as ``-m tui_gateway.slash_worker`` with the user's CWD, so
+# ``import cli`` would otherwise resolve ``utils`` to a colliding local package and crash the child in a
+# retry loop. ``hermes_bootstrap`` lives at the repo root (no collision risk), so importing it first is safe.
+# ``hermes_bootstrap`` lives at the repo root, so importing it is safe before the guard runs (its name won't
+# collide with a user package), and it owns the canonical path-hardening logic shared with the other entry
+# points — #51693 added the guard to ``entry.py``/``acp_adapter/entry.py`` but missed this child.
 import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
@@ -20,6 +18,7 @@ import argparse
 import contextlib
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -27,27 +26,15 @@ import time
 
 import cli as cli_mod
 from cli import HermesCLI
+from tui_gateway._env import env_float
 from tui_gateway._stdin_recovery import handle_spurious_eof
 from rich.console import Console
 
 # Env-overridable so the integration test can drive sub-second timing.
-def _env_float(name: str, default: float) -> float:
-    """Parse a float env knob, falling back to ``default`` on absent/malformed
-    values. A bare ``float(os.environ.get(...))`` would raise ValueError at
-    import time on a typo (e.g. ``HERMES_SLASH_WATCHDOG_POLL_S=2s``) and kill
-    the worker before it can serve a single command."""
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return default
-
-
-_WATCHDOG_POLL_S = max(0.05, _env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
-_ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
+_WATCHDOG_POLL_S = max(0.05, env_float("HERMES_SLASH_WATCHDOG_POLL_S", 2.0))
+_ORPHAN_GRACE_S = max(0.0, env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
 _in_flight = threading.Event()  # set while a command is executing
+logger = logging.getLogger(__name__)
 
 
 def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
@@ -56,23 +43,13 @@ def _is_orphaned(original_ppid, getppid=os.getppid) -> bool:
 
 
 def _prepare_slash_worker_runtime() -> None:
-    """Start bounded MCP discovery before HermesCLI snapshots tools.
+    """Start bounded MCP discovery before HermesCLI snapshots tools: each slash_worker child is its
+    own process — the parent ``hermes serve`` discovery thread does not populate this registry.
 
-    Each slash_worker child is its own process — the parent ``hermes serve``
-    discovery thread does not populate this registry (issue #61891).
+    See #61891.
     """
-    import logging
-
-    from hermes_cli.mcp_startup import (
-        start_background_mcp_discovery,
-        wait_for_mcp_discovery,
-    )
-
-    logger = logging.getLogger(__name__)
-    start_background_mcp_discovery(
-        logger=logger,
-        thread_name="slash-worker-mcp-discovery",
-    )
+    from hermes_cli.mcp_startup import start_background_mcp_discovery, wait_for_mcp_discovery
+    start_background_mcp_discovery(logger=logger, thread_name="slash-worker-mcp-discovery")
     wait_for_mcp_discovery()
 
 
@@ -84,7 +61,6 @@ def _start_parent_death_watchdog(original_ppid) -> None:
         while _in_flight.is_set() and time.monotonic() < deadline:
             time.sleep(0.05)  # let an in-flight command finish/flush
         os._exit(0)
-
     threading.Thread(target=_loop, daemon=True).start()
 
 
@@ -92,35 +68,32 @@ def _run(cli: HermesCLI, command: str) -> str:
     cmd = (command or "").strip()
     if not cmd:
         return ""
-    if not cmd.startswith("/"):
-        cmd = f"/{cmd}"
-
     buf = io.StringIO()
-
-    # Rich Console captures its file handle at construction time, so
-    # contextlib.redirect_stdout won't affect it. Swap the console's
-    # underlying file to our buffer so self.console.print() is captured.
+    # Rich Console captures its file handle at construction, so redirect_stdout won't affect it; swap
+    # the console's file so self.console.print() is captured. cli._cprint is likewise redirected.
     cli.console = Console(file=buf, force_terminal=True, width=120)
-
     old = getattr(cli_mod, "_cprint", None)
     if old is not None:
         cli_mod._cprint = lambda text: print(text)
-
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            cli.process_command(cmd)
+            cli.process_command(cmd if cmd.startswith("/") else f"/{cmd}")
     finally:
         if old is not None:
             cli_mod._cprint = old
-
-    # Desktop chat bubbles render plain text, not ANSI. A worker-routed command
-    # that emits Rich color (e.g. /journey building its own Console, which picks
-    # up truecolor from the gateway's inherited COLORTERM) would otherwise leak
-    # raw escapes; strip them at the single choke point. (The TUI opens /journey
-    # as an overlay, so it never travels this path.)
+    # Desktop chat bubbles render plain text, not ANSI. A command that emits Rich color (e.g. /journey
+    # under the gateway's inherited COLORTERM) would leak raw escapes; strip at this single choke point.
     from tools.ansi_strip import strip_ansi
-
     return strip_ansi(buf.getvalue().rstrip())
+
+
+def _sw_log(reason: str) -> None:
+    print(f"[slash-worker] {reason}", file=sys.stderr, flush=True)
+
+
+def _reply(**fields) -> None:
+    sys.stdout.write(json.dumps(fields) + "\n")
+    sys.stdout.flush()
 
 
 def main():
@@ -128,81 +101,67 @@ def main():
     p.add_argument("--session-key", required=True)
     p.add_argument("--model", default="")
     args = p.parse_args()
-
     os.environ["HERMES_SESSION_KEY"] = args.session_key
     os.environ["HERMES_INTERACTIVE"] = "1"
-
-    # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
-    # an orphan risk if the gateway dies mid-spawn.
-    orig_ppid = os.getppid()
-    _start_parent_death_watchdog(orig_ppid)
+    # Start before the (hundreds-of-ms) HermesCLI build — that window is itself an orphan risk if the
+    # gateway dies mid-spawn.
+    _start_parent_death_watchdog(os.getppid())
     _prepare_slash_worker_runtime()
-
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
 
-    # This process has no interactive terminal: stdin is the JSON-RPC line
-    # protocol below, and no prompt_toolkit app is running (HermesCLI.run() is
-    # never called here).  Without this flag a confirm-prompting command
-    # (/new, /reload-mcp, /update, /model <expensive>, /billing …) would fall
-    # through to a bare input() that reads the protocol pipe — hanging the
-    # worker until the gateway's timeout kills it and consuming the next
-    # request line (issue #220).  Deliberately a dedicated attribute rather
-    # than HERMES_INTERACTIVE, which governs tool-approval fail-closed
-    # behaviour and must keep its current value here.
+    # This process has no interactive terminal: stdin is the JSON-RPC line protocol
+    # below, and no prompt_toolkit app is running (HermesCLI.run() is never called
+    # here). Without this flag a confirm-prompting command (/new, /reload-mcp,
+    # /update, /model <expensive>, /billing ...) falls through to a bare input()
+    # that reads the protocol pipe -- hanging the worker until the gateway's
+    # timeout kills it, AND consuming the next request line (#220). Deliberately a
+    # dedicated attribute rather than HERMES_INTERACTIVE, which governs
+    # tool-approval fail-closed behaviour and must keep its value here.
     cli._noninteractive_confirm = True
-
-    # Spurious stdin-EOF recovery (same O_NONBLOCK shared file-description
-    # issue as the gateway entry point — any child inheriting fd 0 can flip
-    # the flag and launder EAGAIN into an apparent EOF).
+    # Spurious stdin-EOF recovery (same shared-file-description O_NONBLOCK issue as the gateway entry
+    # point — any child inheriting fd 0 can flip the flag).
     _sw_recovery_times: list[float] = []
-
-    def _sw_log(reason: str) -> None:
-        print(f"[slash-worker] {reason}", file=sys.stderr, flush=True)
-
     while True:
         raw = sys.stdin.readline()
         if not raw:
             if not handle_spurious_eof(_sw_recovery_times, _sw_log):
                 break
             continue
-
         line = raw.strip()
         if not line:
             continue
-
         _in_flight.set()
         rid = None
         try:
             req = json.loads(line)
             rid = req.get("id")
-            out = _run(cli, req.get("command", ""))
-            sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": out}) + "\n")
-            sys.stdout.flush()
+            _reply(id=rid, ok=True, output=_run(cli, req.get("command", "")))
         except SystemExit as e:
-            # A stray sys.exit() from deep inside a command handler (argparse
-            # error path, a library forgetting it's being called in-process,
-            # ...) is a BaseException, not an Exception, so it would otherwise
-            # skip the handler below and kill this worker with no response
-            # frame written (issue #224). KeyboardInterrupt is deliberately
-            # left uncaught here so Ctrl-C still unwinds normally instead of
-            # being reported as a command error.
+            # A stray sys.exit() from inside a command handler (an argparse error
+            # path, a library forgetting it is running in-process) is a
+            # BaseException, not an Exception, so it would skip the handler below
+            # and kill this worker with NO response frame written -- the client
+            # then waits out the full timeout on a request that is already dead
+            # (#224). KeyboardInterrupt is deliberately left uncaught so Ctrl-C
+            # still unwinds normally instead of being reported as a command error.
             code = e.code
             if code in (None, 0):
-                sys.stdout.write(json.dumps({"id": rid, "ok": True, "output": ""}) + "\n")
+                _reply(id=rid, ok=True, output="")
             else:
-                sys.stdout.write(
-                    json.dumps(
-                        {"id": rid, "ok": False, "error": f"command exited with code {code!r}"}
-                    )
-                    + "\n"
-                )
-            sys.stdout.flush()
+                _reply(id=rid, ok=False, error=f"command exited with code {code!r}")
         except Exception as e:
-            sys.stdout.write(json.dumps({"id": rid, "ok": False, "error": str(e)}) + "\n")
-            sys.stdout.flush()
+            _reply(id=rid, ok=False, error=str(e))
         finally:
             _in_flight.clear()
+            # Workers persist for the TUI session: release allocator pages at the command boundary like
+            # other long-lived gateway processes (trim_memory's shared cooldown coalesces nearby activity).
+            try:
+                from hermes_cli.mem_trim import trim_memory
+                trim_memory(reason="slash worker command completion")
+            except Exception as exc:
+                # debug, not warning — a persistent failure would repeat every command.
+                logger.debug("slash worker memory trim failed: %s: %s", type(exc).__name__, exc)
 
 
 if __name__ == "__main__":

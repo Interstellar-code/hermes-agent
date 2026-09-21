@@ -34,29 +34,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VERSION_FILE = REPO_ROOT / "hermes_cli" / "__init__.py"
 PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
-
-# ACP Registry manifest must stay version-locked with pyproject.toml.
-# tests/acp/test_registry_manifest.py enforces this lockstep so the release
-# bump touches both files atomically.
-# Read by tests and kept for reference; the release tool no longer writes it.
-# See the note in update_version_files() for why the manifest is not bumped.
-ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
-
-# uv.lock embeds hermes-agent's own version as a package entry (source =
-# { editable = "." }). It must be regenerated in lockstep with pyproject.toml
-# — see regenerate_uv_lock() for why this is not optional.
+# uv.lock embeds hermes-agent's own version as a package entry
+# (source = { editable = "." }). It must be regenerated in lockstep with
+# pyproject.toml -- see regenerate_uv_lock() for why this is not optional.
 UV_LOCK_FILE = REPO_ROOT / "uv.lock"
-
-# The Electron app's package.json tracks pyproject's version (electron-builder
-# reads it for artifact names). update_version_files() bumps it, so it must be
-# staged with the rest — otherwise the bump is left uncommitted in the worktree
-# and the next release diffs against a stale value.
-#
-# Resolved through a function rather than a module-level constant on purpose:
-# the tests monkeypatch REPO_ROOT to a tmp dir, and a constant captured at
-# import time would ignore that and write to the real repo.
-def desktop_package_json() -> Path:
-    return REPO_ROOT / "apps" / "desktop" / "package.json"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
@@ -68,7 +49,10 @@ def desktop_package_json() -> Path:
 # This dict is kept only so existing history keeps resolving; the effective
 # AUTHOR_MAP below merges it with the directory (directory wins).
 LEGACY_AUTHOR_MAP = {
+    "declanbatesmith@outlook.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
+    "drbs2004@me.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
     "122438640+ragingbulld@users.noreply.github.com": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)
+    "shady2k@gmail.com": "shady2k",  # PR #60104 salvage of #66143 (MCP loop-owned shutdown drain)
     "zzpigpinggai@users.noreply.github.com": "zzpigpinggai",  # PR #66017 salvage of #63617 (OpenRouter explicit-provider picker visibility)
     "stellarisw@users.noreply.github.com": "StellarisW",  # PR #66222 salvage (Discord WebSocket liveness + systemd watchdog; #26656 follow-up)
     "wx.xw@bytedance.com": "wxy-nlp",  # PR #66222 salvage (systemd event-loop watchdog co-author)
@@ -96,7 +80,11 @@ LEGACY_AUTHOR_MAP = {
     "embwl0x@users.noreply.github.com": "embwl0x",  # PR #65105 salvage (gateway: preserve external supervisor ownership)
     "41409874+2751738943@users.noreply.github.com": "2751738943",  # PR #54785 salvage (tui: post-turn completion ownership routing)
     "Burgunthy@users.noreply.github.com": "Burgunthy",  # PR #20096 salvage (gateway: profile-based routing for inbound messages)
+    "BB-light@users.noreply.github.com": "BB-light",  # PR #76015 salvage (caching: honor cache_ttl disable; #33555)
     "75556242+webtecnica@users.noreply.github.com": "webtecnica",  # PR #63360 salvage (nous: restore inference-api base_url)
+    "contato@webtecnica.com.br": "webtecnica",  # PR #70888 salvage
+    "webtecnica@gmail.com": "webtecnica",  # PR #75838 salvage (aux: free-only fallback guard; #75803)
+    "ckaznocha@gmail.com": "ckaznocha",  # PR #71543 salvage (matrix: crypto store reset + pickle migration)
     "skosarevivan@yandex.ru": "Epoxidex",  # PR #29820 salvage (ollama: top-level reasoning_effort=none; #25758)
     "jdjiayou@163.com": "JiaDe-Wu",  # PR #34742 salvage (bedrock: bearer routing + streaming fallback + image decode; #28156)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
@@ -105,6 +93,7 @@ LEGACY_AUTHOR_MAP = {
     "marceloparra.hm@gmail.com": "marcelohildebrand",  # PR #42346 salvage (lmstudio: JIT load mode)
     "qlskssk@gmail.com": "Soju06",  # agent turn-latency perf PRs
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
+    "wangzhe00zju@gmail.com": "flyingdoubleG",  # PR #18166 salvage (memory-provider tools honor disabled_toolsets in initial and MCP-refresh injection)
     "VrtxOmega@pm.me": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
     "gn00742754@gmail.com": "SemonCat",  # PR #56786 salvage (Slack Agent View manifests and Assistant APIs)
     "KCAYAAI@users.noreply.github.com": "KCAYAAI",  # PR #62248 partial salvage (resume typing after clarify reply)
@@ -125,6 +114,9 @@ LEGACY_AUTHOR_MAP = {
     "xwolf.live@gmail.com": "vizi0uz",  # PR #59795 adopted in #62290
     "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
     "humphreysun98@gmail.com": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "merlin@threewizards.agency": "light-merlin-dark",  # PR #7821 salvage (zai: parallel endpoint detection probes)
+    "4850809+frizikk@users.noreply.github.com": "frizikk",  # PR #63389 salvage (session-search: fields projection skips unused context enrichment)
+    "endeavorisforever@gmail.com": "EndeavorYen",  # PR #33971 salvage (image: parallel image_generate batches + FileSyncManager transaction lock)
     "sonxi@nous.local": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
     "lemonwan@users.noreply.github.com": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
     "luxuguangno1@163.com": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
@@ -265,7 +257,10 @@ LEGACY_AUTHOR_MAP = {
     "jmmaloney4@gmail.com": "jmmaloney4",  # PR #25206 salvage (re-select credential pool on primary runtime restore; #25205)
     "hmirin@users.noreply.github.com": "hmirin",
     "dale@dalenguyen.me": "dalenguyen",  # PR #53678 salvage (strip VIRTUAL_ENV/CONDA_PREFIX from terminal subprocess env; #23473)
+    "prashantjain25@gmail.com": "prashantjain25",  # PR #80740 salvage (custom-endpoint /v1/models disk cache; #72762)
     "liruixinch@outlook.com": "HexLab98",  # PR #53863 salvage (env-only proxy policy for auxiliary OpenAI clients on macOS; #53702)
+    "fangliquan@qq.com": "fangliquanflq",  # PR #99265 (linear lowercase env-assignment redaction; #99255) - merged directly by maintainer
+    "devops@sycamore.group": "sycamoregroupltd",  # PR #97779 salvage (estop fleet-root sentinel for profile gateways)
     "blaryx@gmail.com": "Blaryxoff",  # PR #32602 salvage (deep-merge PUT /api/config to preserve unrelated sections; #13396)
     "diamondeyesfox@gmail.com": "DiamondEyesFox",  # PR #53351 salvage (rebaseline in-place compression flushes to prevent duplicate compacted rows; #9096)
     "piyrw9754@gmail.com": "rlaope",  # PR #35075 salvage (align cron invisible-unicode set with install-time scanner; #35075)
@@ -354,6 +349,8 @@ LEGACY_AUTHOR_MAP = {
     "joelbrilliant1@gmail.com": "joelbrilliant",  # PR #58486 salvage (session-expiry cleanup must not end row as agent_close)
     "bassisho@Mac-mini-bassis.local": "hydracoco7",  # PR #61382 salvage (id-less cron job freeze)
     "AlexFucuson9@users.noreply.github.com": "AlexFucuson9",  # PR #61209 salvage (hygiene compression data loss)
+    "shauneccles@gmail.com": "shauneccles",  # PR #95433 salvage (compression stall-fallback retry on fallback_chain; #78981)
+    "shtorm@fedosis.ru": "fedosis",  # PR #94996 salvage (compression rotation dedupe current-turn rows)
     "email@adambig.gs": "adambiggs",  # PR #43819 salvage (holographic shared SQLite connection)
     "koho.jung@outlook.com": "kohoj",  # PR #61667 salvage (nonce-CSP HTML session export)
     "t.chen@aftership.com": "cypctlinux",  # PR #52403 salvage (Slack bot/workflow auth before no-user-id guard)
@@ -582,6 +579,7 @@ LEGACY_AUTHOR_MAP = {
     "frowte3k@gmail.com": "Frowtek",
     "211828103+julio-cloudvisor@users.noreply.github.com": "julio-cloudvisor",
     "17778+kweiner@users.noreply.github.com": "kweiner",
+    "ken@kenweiner.com": "kweiner",
     "223516181+faisfamilytravel@users.noreply.github.com": "faisfamilytravel",
     "45189813+baofuen@users.noreply.github.com": "baofuen",
     "interstellar.consulting@gmail.com": "Interstellar-code",
@@ -738,6 +736,7 @@ LEGACY_AUTHOR_MAP = {
     "mike@grossmann.at": "ReqX",
     "axmaiqiu@gmail.com": "qWaitCrypto",
     "44045911+kidonng@users.noreply.github.com": "kidonng",
+    "ayushere@users.noreply.github.com": "ayushere",
     "daniellsmarta@gmail.com": "DanielLSM",
     "264291321+v1b3coder@users.noreply.github.com": "v1b3coder",
     "silverchris@foxmail.com": "ming1523",
@@ -943,6 +942,7 @@ LEGACY_AUTHOR_MAP = {
     "thomasjhon6666@gmail.com": "ThomassJonax",
     "focusflow.app.help@gmail.com": "yes999zc",
     "rob@atlas.lan": "rmoen",
+    "huajiang@tubi.tv": "thirstycrow",  # PR #23630 salvage (config-aware memory status labels)
     # Slack ephemeral slash-ack salvage (May 2026)
     "probepark@users.noreply.github.com": "probepark",
     # Slack batch salvage (May 2026)
@@ -1012,6 +1012,7 @@ LEGACY_AUTHOR_MAP = {
     "massivemassimo@users.noreply.github.com": "MassiveMassimo",
     "82637225+kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "keifergu@tencent.com": "keifergu",
+    "kshitij@kshitij.dev": "kshitijk4poor",
     "kshitijk4poor@users.noreply.github.com": "kshitijk4poor",
     "SHL0MS@users.noreply.github.com": "SHL0MS",
     "abner.the.foreman@agentmail.to": "Abnertheforeman",
@@ -1196,6 +1197,7 @@ LEGACY_AUTHOR_MAP = {
     "jan@mg5.org": "mijanx",
     "incharge.automation@gmail.com": "inchargeautomation-lab",
     "danielrpike9@gmail.com": "Bartok9",
+    "kuangmi@deeparchi.com": "kuangmi-bit",
     "96944678+ymylive@users.noreply.github.com": "sweetcornna",
     "laflamme@illinoisalumni.org": "briancl2",
     "skozyuk@cruxexperts.com": "CruxExperts",
@@ -1360,6 +1362,7 @@ LEGACY_AUTHOR_MAP = {
     "iamagenius00@users.noreply.github.com": "iamagenius00",
     "9219265+cresslank@users.noreply.github.com": "cresslank",
     "trevmanthony@gmail.com": "trevthefoolish",
+    "at828@proton.me": "ATran28",  # PR #77270 whatsapp bridge reconnect wedge fix
     "ziliangpeng@users.noreply.github.com": "ziliangpeng",
     "ziliangdotme@gmail.com": "ziliangpeng",
     "centripetal-star@users.noreply.github.com": "centripetal-star",
@@ -1453,6 +1456,7 @@ LEGACY_AUTHOR_MAP = {
     "xiayh17@gmail.com": "xiayh0107",
     "zhujianxyz@gmail.com": "opriz",
     "tuancanhnguyen706@gmail.com": "xxxigm",
+    "j.brownemoore@gmail.com": "ElSnacko",
     "timchris.roth@pm.me": "x9x9x9x9x9x91",
     "larcombe.n@gmail.com": "NickLarcombe",
     "54813621+xxxigm@users.noreply.github.com": "xxxigm",
@@ -1584,6 +1588,7 @@ LEGACY_AUTHOR_MAP = {
     "17683456+wanazhar@users.noreply.github.com": "wanazhar",
     "26782336+cixuuz@users.noreply.github.com": "cixuuz",
     "aleksandr.pasevin@openzeppelin.com": "pasevin",
+    "pasevin@gmail.com": "pasevin",
     "ubuntu@localhost.localdomain": "holynn-q",
     "holynn@placeholder.local": "holynn-q",
     "agent@hermes.local": "jacdevos",
@@ -2017,6 +2022,8 @@ LEGACY_AUTHOR_MAP = {
     "andrewdmwalker@gmail.com": "capt-marbles",  # PR #38440 salvage (resolve xAI OAuth credentials across profiles; #43589)
     "infinitycrew39@gmail.com": "infinitycrew39",  # PR #47945 salvage (scope langfuse trace state by turn/request ids; #48292)
     "eurekaxun@163.com": "huangxun375-stack",  # PR #37251 / #48894 structured OpenViking sync
+    "koshaji@gmail.com": "koshaji",  # PR #49832 salvage (OpenViking runtime autostart shutdown drain)
+    "thor753@foxmail.com": "wgd753",  # PR #59454 salvage (OpenViking trusted-mode retry matching)
     "218421507+Sahil-SS9@users.noreply.github.com": "Sahil-SS9",  # PR #48466/#44919/#44909/#42209 salvage (cron/checkpoint/kanban/skill)
     "mango001@126.com": "max-chen",  # PR #51194 salvage (single-pass list_profiles alias map + skill-count cache; #54751)
     # v0.17.0 additions
@@ -2065,6 +2072,7 @@ LEGACY_AUTHOR_MAP = {
     "rodisoft1@gmail.com": "0disoft",  # PR #53511 salvage (gateway PID probe TTL cache)
     "craigs.seller.sixx@gmail.com": "0-CYBERDYNE-SYSTEMS-0",  # PR #53966 salvage (session DB reads off event loop)
     "sebastianlutycz@users.noreply.github.com": "sebastianlutycz",  # PR #39140 salvage (descendant CTE); bare noreply (no NNN+ prefix) needs explicit mapping
+    "bobclawblaw@users.noreply.github.com": "BobClawblaw",  # PR #77870 salvage (output-cap compression on retry path; #55546)
     "wafy.081107@gmail.com": "mahdiwafy",  # PR #60347 salvage (session messages pagination)
     "codeforgenet@icloud.com": "CodeForgeNet",  # PR #47437 salvage (compact_rows blob skip)
     "i@dex.moe": "dexhunter",  # PR #60339 salvage (skills snapshot manifest speedup)
@@ -2113,7 +2121,7 @@ def git(*args, cwd=None):
     """Run a git command and return stdout."""
     result = subprocess.run(
         ["git"] + list(args),
-        capture_output=True, text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
         cwd=cwd or str(REPO_ROOT),
     )
     if result.returncode != 0:
@@ -2127,7 +2135,7 @@ def git_result(*args, cwd=None):
     return subprocess.run(
         ["git"] + list(args),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8", errors="replace",
         cwd=cwd or str(REPO_ROOT),
     )
 
@@ -2154,7 +2162,7 @@ def next_available_tag(base_tag: str) -> tuple[str, str]:
 
 def get_current_version():
     """Read current semver from __init__.py."""
-    content = VERSION_FILE.read_text()
+    content = VERSION_FILE.read_text(encoding="utf-8")
     match = re.search(r'__version__\s*=\s*"([^"]+)"', content)
     return match.group(1) if match else "0.0.0"
 
@@ -2184,7 +2192,7 @@ def bump_version(current: str, part: str) -> str:
 def update_version_files(semver: str, calver_date: str):
     """Update version strings in source files."""
     # Update __init__.py
-    content = VERSION_FILE.read_text()
+    content = VERSION_FILE.read_text(encoding="utf-8")
     content = re.sub(
         r'__version__\s*=\s*"[^"]+"',
         f'__version__ = "{semver}"',
@@ -2195,23 +2203,28 @@ def update_version_files(semver: str, calver_date: str):
         f'__release_date__ = "{calver_date}"',
         content,
     )
-    VERSION_FILE.write_text(content)
+    VERSION_FILE.write_text(content, encoding="utf-8")
 
     # Update pyproject.toml
-    pyproject = PYPROJECT_FILE.read_text()
+    pyproject = PYPROJECT_FILE.read_text(encoding="utf-8")
     pyproject = re.sub(
         r'^version\s*=\s*"[^"]+"',
         f'version = "{semver}"',
         pyproject,
+        # Turn-end file-mutation verifier footer appended by run_agent.py
+        # (``_format_file_mutation_failure_footer``). It's a UI affordance — reading "warning file mutation
+        # verifier, 2 files were NOT modified..." aloud is noise (#40772). The footer is a ``⚠️
+        # File-mutation verifier:`` header line followed by indented ``•`` bullet lines; strip the whole
+        # block.
         flags=re.MULTILINE,
     )
-    PYPROJECT_FILE.write_text(pyproject)
+    PYPROJECT_FILE.write_text(pyproject, encoding="utf-8")
 
     # Keep the desktop Electron app's package.json version in lockstep with the
     # Python package version. The desktop About panel reads the live Hermes
     # version at runtime, but app.getVersion()/packaging metadata still come
     # from this field, so it must track pyproject to avoid drift.
-    desktop_pkg = desktop_package_json()
+    desktop_pkg = REPO_ROOT / "apps" / "desktop" / "package.json"
     if desktop_pkg.exists():
         pkg_text = desktop_pkg.read_text(encoding="utf-8")
         pkg_text = re.sub(
@@ -2222,24 +2235,46 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
-    # The ACP Registry manifest is deliberately NOT bumped here.
-    #
-    # Its uvx spec pins an exact PyPI version (`hermes-agent[acp]==X`), and
-    # this fork does not publish to PyPI — the `hermes-agent` project there
-    # belongs to upstream Nous Research, so a trusted-publishing exchange from
-    # this repo fails with `invalid-publisher` and always will. Bumping the
-    # manifest in lockstep therefore minted a pin to a version that would
-    # never exist on the index, breaking `uvx hermes-agent[acp]==X` for
-    # anyone who resolved the manifest. v0.19.10 and v0.19.11 both shipped
-    # such a pin.
-    #
-    # The manifest now describes upstream's published release and is left
-    # alone by the release tool. See tests/acp/test_registry_manifest.py.
+    # Keep the bootstrap installer (Hermes-Setup.dmg CFBundleShortVersionString)
+    # in lockstep with the Python package version. Tauri reads `version` from
+    # package.json + tauri.conf.json; a hardcoded 0.0.1 ships in the DMG.
+    installer_pkg = REPO_ROOT / "apps" / "bootstrap-installer" / "package.json"
+    if installer_pkg.exists():
+        pkg_text = installer_pkg.read_text(encoding="utf-8")
+        pkg_text = re.sub(
+            r'("version"\s*:\s*)"[^"]+"',
+            rf'\g<1>"{semver}"',
+            pkg_text,
+            count=1,
+        )
+        installer_pkg.write_text(pkg_text, encoding="utf-8")
 
-    # Regenerate uv.lock so its embedded hermes-agent version entry matches
-    # the version we just wrote above. Never skip this — see the function's
-    # docstring for the incident that made it mandatory.
-    regenerate_uv_lock(semver)
+    installer_tauri = (
+        REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri" / "tauri.conf.json"
+    )
+    if installer_tauri.exists():
+        pkg_text = installer_tauri.read_text(encoding="utf-8")
+        pkg_text = re.sub(
+            r'("version"\s*:\s*)"[^"]+"',
+            rf'\g<1>"{semver}"',
+            pkg_text,
+            count=1,
+        )
+        installer_tauri.write_text(pkg_text, encoding="utf-8")
+
+    installer_cargo = (
+        REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri" / "Cargo.toml"
+    )
+    if installer_cargo.exists():
+        cargo_text = installer_cargo.read_text(encoding="utf-8")
+        cargo_text = re.sub(
+            r'^version\s*=\s*"[^"]+"',
+            f'version = "{semver}"',
+            cargo_text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        installer_cargo.write_text(cargo_text, encoding="utf-8")
 
 
 def _managed_uv_path() -> Path:
@@ -2247,9 +2282,8 @@ def _managed_uv_path() -> Path:
 
     Mirrors ``hermes_cli.managed_uv.managed_uv_path()``: ``$HERMES_HOME/bin/uv``
     (``uv.exe`` on Windows), defaulting to ``~/.hermes/bin/uv`` when
-    ``HERMES_HOME`` is unset. Reimplemented locally (rather than imported)
-    so this script keeps working even when run outside an installed
-    hermes-agent environment.
+    ``HERMES_HOME`` is unset. Reimplemented locally rather than imported so
+    this script keeps working outside an installed hermes-agent environment.
     """
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     home = Path(hermes_home) if hermes_home else Path.home() / ".hermes"
@@ -2257,22 +2291,17 @@ def _managed_uv_path() -> Path:
 
 
 def _find_uv_bin():
-    """Locate the ``uv`` binary, or return ``None`` if it can't be found.
+    """Locate the ``uv`` binary, or None. PATH first, then Hermes's managed install.
 
-    Checks ``PATH`` first (``shutil.which``) since that's correct for anyone
-    with uv installed normally or a venv-activated shell. Falls back to
-    Hermes's own managed uv install, because uv is *not* guaranteed to be on
-    ``PATH`` in every environment that runs a release (e.g. this machine has
-    it only at ``~/.hermes/bin/uv``).
+    uv is not guaranteed to be on ``PATH`` in every environment that cuts a
+    release -- on the maintainer's machine it exists only at ``~/.hermes/bin/uv``.
     """
     uv_bin = shutil.which("uv")
     if uv_bin:
         return uv_bin
-
     managed = _managed_uv_path()
     if managed.is_file() and os.access(managed, os.X_OK):
         return str(managed)
-
     return None
 
 
@@ -2283,90 +2312,69 @@ def regenerate_uv_lock(semver: str) -> None:
     (``source = { editable = "." }``). Bumping ``pyproject.toml`` without
     re-running ``uv lock`` leaves the lockfile stale, and ``uv lock --check``
     (which ``uv sync --locked`` runs before installing) then fails at the
-    install step — before a single test runs. An install-time abort looks
-    just like a real test failure on the CI dashboard.
+    install step -- before a single test runs. An install-time abort looks just
+    like a real test failure on the CI dashboard.
 
-    This is not a hypothetical: commit 8712d5b7b introduced exactly this
-    drift and the Python test suite silently did not run for 176 commits,
-    during which 8 real test failures accumulated invisibly. Never let this
-    step fail silently — abort the release rather than ship a stale lock.
+    Not hypothetical: commit 8712d5b7b introduced exactly this drift and the
+    Python suite silently did not run for 176 commits, during which 8 real test
+    failures accumulated invisibly. Abort the release rather than ship a stale
+    lock.
     """
     uv_bin = _find_uv_bin()
     if not uv_bin:
         raise RuntimeError(
             "Cannot regenerate uv.lock: no `uv` binary found on PATH or at "
             f"{_managed_uv_path()}. Install uv (https://docs.astral.sh/uv/) "
-            "or set HERMES_HOME to an install that has one, then re-run "
-            "this release."
+            "or set HERMES_HOME to an install that has one, then re-run."
         )
-
-    result = subprocess.run(
-        [uv_bin, "lock"],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-    )
+    result = subprocess.run([uv_bin, "lock"], cwd=str(REPO_ROOT),
+                            capture_output=True, text=True)
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(f"`uv lock` failed:\n{detail}")
-
-    # Verify the lock actually changed as expected rather than assuming a
-    # zero exit code means the embedded version updated too.
     if not UV_LOCK_FILE.exists():
         raise RuntimeError(f"`uv lock` reported success but {UV_LOCK_FILE} is missing.")
-
     lock_text = UV_LOCK_FILE.read_text(encoding="utf-8")
     match = re.search(r'^name = "hermes-agent"\nversion = "([^"]+)"', lock_text, re.MULTILINE)
     if not match or match.group(1) != semver:
         found = match.group(1) if match else "<no hermes-agent entry found>"
         raise RuntimeError(
-            f"uv.lock still shows hermes-agent version {found!r} after "
-            f"`uv lock` (expected {semver!r}). Refusing to publish with a "
-            "stale lockfile — investigate before retrying."
+            f"uv.lock still shows hermes-agent version {found!r} after `uv lock` "
+            f"(expected {semver!r}). Refusing to publish with a stale lockfile."
         )
 
 
-def build_release_artifacts(semver: str) -> list[Path]:
-    """Build sdist/wheel artifacts for the current release.
+def origin_repo_slug() -> str:
+    """Return 'owner/repo' parsed from the origin remote URL.
 
-    Tries ``uv build`` first, falls back to
-    ``python -m build`` if uv is unavailable.
+    The fork must not publish releases to upstream's repo. Every `gh` call that
+    can target a repo passes this.
     """
-    dist_dir = REPO_ROOT / "dist"
-    shutil.rmtree(dist_dir, ignore_errors=True)
+    fallback = "NousResearch/hermes-agent"
+    url = git("remote", "get-url", "origin")
+    if not url:
+        return fallback
+    m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", url)
+    if m:
+        return m.group(1)
+    return fallback
 
-    # Prefer uv build, fall back to python -m build. These artifacts are
-    # attached to the GitHub Release — that is now the only distribution
-    # channel for this fork (no PyPI publish; see update_version_files).
-    uv_bin = _find_uv_bin()
-    if uv_bin:
-        cmd = [uv_bin, "build", "--sdist", "--wheel"]
-    else:
-        cmd = [sys.executable, "-m", "build", "--sdist", "--wheel"]
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        print("  ⚠ Could not build Python release artifacts.")
-        stderr = result.stderr.strip()
-        stdout = result.stdout.strip()
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        elif stdout:
-            print(f"    {stdout.splitlines()[-1]}")
-        print("    Install uv or the 'build' package to attach sdist/wheel assets.")
-        return []
-
-    artifacts = sorted(p for p in dist_dir.iterdir() if p.is_file())
-    matching = [p for p in artifacts if semver in p.name]
-    if not matching:
-        print("  ⚠ Built artifacts did not match the expected release version.")
-        return []
-    return matching
+def version_files_to_stage() -> list[str]:
+    """Return version-bearing files that exist and should be `git add`ed after a bump."""
+    candidates = [
+        VERSION_FILE,
+        PYPROJECT_FILE,
+        UV_LOCK_FILE,
+        REPO_ROOT / "apps" / "desktop" / "package.json",
+        REPO_ROOT / "apps" / "bootstrap-installer" / "package.json",
+        REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri" / "tauri.conf.json",
+        REPO_ROOT / "apps" / "bootstrap-installer" / "src-tauri" / "Cargo.toml",
+    ]
+    return [str(path) for path in candidates if path.exists()]
 
 
 def resolve_author(name: str, email: str) -> str:
@@ -2425,20 +2433,15 @@ def categorize_commit(subject: str) -> str:
 
 
 def clean_subject(subject: str) -> str:
-    """Clean up a commit subject for display.
-
-    Strips the whole conventional-commit prefix, including the optional
-    ``(scope)`` and the ``!`` breaking marker. The scope group is not
-    optional decoration: without it, ``feat(api_server): x`` matched only
-    ``feat`` plus a single ``(`` from the separator class, so the prefix was
-    stripped to ``api_server): x`` and then title-cased into
-    ``Api_server): x``. Every scoped commit shipped mangled that way — see
-    the v0.19.10 notes.
-
-    A malformed prefix with an unclosed scope (``feat(oops: x``) now fails to
-    match and is left verbatim, which is preferable to half-stripping it.
-    """
-    # Remove conventional commit prefix: type, optional (scope), optional !
+    """Clean up a commit subject for display."""
+    # Remove conventional commit prefix
+    # The (scope) group is not optional decoration: without it,
+    # ``feat(api_server): x`` matched only ``feat`` plus a single ``(`` from the
+    # separator class, stripping the prefix to ``api_server): x`` which then
+    # title-cased into ``Api_server): x``. Every scoped commit shipped mangled
+    # that way -- see the v0.19.10 notes. A malformed prefix with an unclosed
+    # scope (``feat(oops: x``) now fails to match and is left verbatim, which
+    # beats half-stripping it.
     cleaned = re.sub(
         r"^(feat|fix|docs|chore|refactor|test|perf|ci|build|improve|add|update"
         r"|cleanup|hotfix|breaking|enhance|optimize|bugfix|bug|feature|tests"
@@ -2480,21 +2483,6 @@ def parse_coauthors(body: str) -> list:
     return results
 
 
-def origin_repo_slug() -> str:
-    """Return 'owner/repo' parsed from the origin remote URL."""
-    fallback = "NousResearch/hermes-agent"
-    url = git("remote", "get-url", "origin")
-    if not url:
-        return fallback
-    m = re.match(r"git@[^:]+:(.+?)(?:\.git)?$", url)
-    if m:
-        return m.group(1)
-    m = re.match(r"https?://[^/]+/(.+?)(?:\.git)?$", url)
-    if m:
-        return m.group(1)
-    return fallback
-
-
 def get_commits(since_tag=None):
     """Get commits since a tag (or all commits if None)."""
     if since_tag:
@@ -2502,7 +2490,11 @@ def get_commits(since_tag=None):
     else:
         range_spec = "HEAD"
 
-    # Format: RS (0x1e) starts each record; US (0x1f) separates fields.
+    # RS (0x1e) starts each record; US (0x1f) separates the 5 fields.
+    #
+    # The old form ended each record with %x00%b%x00 and split on "\0\0". A commit
+    # body containing a NUL run merged adjacent records, and a body ending in one
+    # split a record in half -- either way the changelog silently under-reported.
     log = git(
         "log", range_spec,
         "--format=%x1e%H%x1f%an%x1f%ae%x1f%s%x1f%b",
@@ -2513,16 +2505,17 @@ def get_commits(since_tag=None):
         return []
 
     commits = []
+    # NB: git()'s .strip() removes the FIRST record's leading RS, because Python
+    # counts \x1e and \x1f as whitespace ('\x1e'.isspace() is True). Splitting on
+    # RS still yields that record as element 0, so this is harmless -- but never
+    # .strip() a field expecting the separators to survive.
     for record in log.split("\x1e"):
-        record = record.strip()
-        if not record:
+        if not record.strip():
             continue
         parts = record.split("\x1f", 4)
         if len(parts) < 4:
             continue
-        sha = parts[0]
-        name = parts[1]
-        email = parts[2]
+        sha, name, email = parts[0].strip(), parts[1], parts[2]
         subject = parts[3]
         body = parts[4].strip() if len(parts) == 5 else ""
         coauthor_info = parse_coauthors(body)
@@ -2551,9 +2544,14 @@ def get_pr_number(subject: str) -> str | None:
 
 def generate_changelog(commits, tag_name, semver, repo_url=None,
                        prev_tag=None, first_release=False):
+    """Generate markdown changelog from categorized commits.
+
+    ``repo_url`` defaults to the ORIGIN remote, not upstream: a hardcoded
+    upstream default minted commit links pointing at a repo that does not carry
+    these commits.
+    """
     if repo_url is None:
         repo_url = f"https://github.com/{origin_repo_slug()}"
-    """Generate markdown changelog from categorized commits."""
     lines = []
 
     # Header
@@ -2735,19 +2733,20 @@ def main():
 
         # Update version files
         if args.bump:
+            update_version_files(new_version, calver_date)
+            print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
+            # Lock regen is a release step, not part of writing version files:
+            # update_version_files() is called directly by tests with REPO_ROOT
+            # pointed at a tmp dir, where running `uv lock` is meaningless.
             try:
-                update_version_files(new_version, calver_date)
+                regenerate_uv_lock(new_version)
             except RuntimeError as exc:
                 print(f"  ✗ {exc}")
                 return
-            print(f"  ✓ Updated version files to v{new_version} ({calver_date})")
             print(f"  ✓ Regenerated uv.lock for v{new_version}")
 
-            # Commit version bump. The ACP Registry manifest is intentionally
-            # absent — update_version_files() no longer touches it.
-            add_files = [str(VERSION_FILE), str(PYPROJECT_FILE), str(UV_LOCK_FILE)]
-            if desktop_package_json().exists():
-                add_files.append(str(desktop_package_json()))
+            # Commit version bump
+            add_files = version_files_to_stage()
             add_result = git_result("add", *add_files)
             if add_result.returncode != 0:
                 print(f"  ✗ Failed to stage version files: {add_result.stderr.strip()}")
@@ -2780,14 +2779,6 @@ def main():
             print("    Continue manually after fixing access:")
             print("    git push origin HEAD --tags")
 
-        # Build semver-named Python artifacts so downstream packagers
-        # (e.g. Homebrew) can target them without relying on CalVer tag names.
-        artifacts = build_release_artifacts(new_version)
-        if artifacts:
-            print("  ✓ Built release artifacts:")
-            for artifact in artifacts:
-                print(f"    - {artifact.relative_to(REPO_ROOT)}")
-
         # Create GitHub release
         changelog_file = REPO_ROOT / ".release_notes.md"
         changelog_file.write_text(changelog, encoding="utf-8")
@@ -2798,13 +2789,12 @@ def main():
             "--title", f"Hermes Agent v{new_version} ({calver_date})",
             "--notes-file", str(changelog_file),
         ]
-        gh_cmd.extend(str(path) for path in artifacts)
 
         gh_bin = shutil.which("gh")
         if gh_bin:
             result = subprocess.run(
                 gh_cmd,
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=str(REPO_ROOT),
             )
         else:
@@ -2823,9 +2813,9 @@ def main():
             print("    Tag was created locally. Create the release manually:")
             print(
                 f"    gh release create {tag_name} --title 'Hermes Agent v{new_version} ({calver_date})' "
-                f"--notes-file .release_notes.md {' '.join(str(path) for path in artifacts)}"
+                f"--notes-file .release_notes.md"
             )
-            print(f"\n  ✓ Release artifacts prepared for manual publish: v{new_version} ({tag_name})")
+            print(f"\n  ✓ Release v{new_version} ({tag_name}) prepared for manual publish.")
     else:
         print(f"\n{'='*60}")
         print("  Dry run complete. To publish, add --publish")
