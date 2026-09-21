@@ -1281,6 +1281,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always restore stdio even on
     ``sys.exit``. Self-lock deferral deliberately does NOT run here (pre-fetch it stranded users
     on the OLD checkout in an exit-2 loop); it runs right before the dependency sync."""
+    # Strict API post-processing. The web endpoint has already proved this is a local
+    # git checkout and performed the fast-forward, so this runs BEFORE the normal
+    # managed-install guards -- those would refuse an install method that the strict
+    # path has already handled. Without this branch --refresh-deps parses and does
+    # nothing, so the dashboard's strict update reports success while the new source
+    # runs against the old dependencies and the old built frontend.
+    if getattr(args, "refresh_deps", False):
+        from hermes_cli.update_cmd_deps import _run_post_source_refresh
+        raise SystemExit(_run_post_source_refresh(
+            restart_after=bool(getattr(args, "restart_after_refresh", False))))
+
     opts = _resolve_update_options(args, gateway_mode)
     gw_input_fn, assume_yes = opts.gw_input_fn, opts.assume_yes
 

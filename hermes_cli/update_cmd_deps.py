@@ -256,6 +256,57 @@ def _clip(reason: str, limit: int = 200) -> str:
     return reason if len(reason) <= limit else reason[:limit] + "..."
 
 
+def _run_post_source_refresh(*, restart_after: bool = False) -> int:
+    """Install runtime assets after a strict, ALREADY-APPLIED source update.
+
+    Deliberately does not touch git. The strict endpoint has already proved and
+    performed the fast-forward; this phase only makes the new checkout runnable,
+    and optionally asks the supervisor to restart gateways.
+
+    Reached from ``hermes update --refresh-deps``, which the dashboard's strict
+    update spawns (hermes_cli/web_routers/actions.py). Without it that flag parses
+    and does nothing: the button reports success while the new source runs against
+    the OLD dependencies and the OLD built frontend.
+    """
+    from hermes_cli.main_install_repair import (
+        _clear_update_incomplete_marker, _install_python_dependencies_with_optional_fallback)
+    from hermes_cli.main_web_build import _build_web_ui
+    from hermes_cli.update_cmd import _write_update_incomplete_marker
+    from hermes_cli.config import get_project_root
+
+    project_root = get_project_root()
+    try:
+        _write_update_incomplete_marker()
+        from hermes_cli.managed_uv import ensure_uv, update_managed_uv
+
+        update_managed_uv()
+        uv_bin = ensure_uv()
+        if uv_bin:
+            _install_python_dependencies_with_optional_fallback(
+                [uv_bin, "pip"],
+                env={**os.environ, "VIRTUAL_ENV": str(project_root / "venv")},
+                group="all")
+        else:
+            _install_python_dependencies_with_optional_fallback(
+                [sys.executable, "-m", "pip"], group="all")
+        _clear_update_incomplete_marker()
+        _refresh_active_lazy_features()
+        _update_node_dependencies()
+        _build_web_ui(project_root / "web")
+        if restart_after:
+            restart = subprocess.run(
+                [sys.executable, "-m", "hermes_cli.main", "gateway", "restart", "--all"],
+                cwd=project_root, check=False)
+            if restart.returncode != 0:
+                print("⚠ Dependencies installed, but gateway restart failed.")
+                return restart.returncode or 1
+        print("✓ Dependencies and frontend assets refreshed.")
+        return 0
+    except Exception as exc:  # noqa: BLE001 — the action status carries the failure.
+        print(f"✗ Post-update refresh failed: {exc}")
+        return 1
+
+
 def _refresh_active_lazy_features(
     install_cmd_prefix: list[str] | None = None, *, env: dict[str, str] | None = None,
     features: list[str] | None = None) -> bool:
