@@ -144,3 +144,22 @@ def test_per_profile_isolation(tmp_path):
         b.close()
 
 
+
+
+def test_delete_project_clears_dangling_active_pointer(conn):
+    """The active pointer lives in project_meta, a KV table with no FK to
+    projects -- so it does not cascade. Deleting the active project must clear
+    it, or every later reader resolves `active_id` to a row that is gone."""
+    victim = pdb.create_project(conn, name="Victim", folders=["/www/victim"])
+    bystander = pdb.create_project(conn, name="Bystander", folders=["/www/bystander"])
+
+    pdb.set_active(conn, victim)
+    assert pdb.delete_project(conn, victim) is True
+    assert pdb.get_active_id(conn) is None
+
+    # Deleting a NON-active project must leave the pointer alone (negative
+    # control: a fix that just always cleared would pass the assert above).
+    pdb.set_active(conn, bystander)
+    other = pdb.create_project(conn, name="Other", folders=["/www/other"])
+    assert pdb.delete_project(conn, other) is True
+    assert pdb.get_active_id(conn) == bystander

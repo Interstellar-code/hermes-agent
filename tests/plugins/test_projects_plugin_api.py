@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import projects_db
 from hermes_cli import kanban_db
+from hermes_cli import kanban_db_connect as _kdb_connect
 from hermes_state import SessionDB
 
 
@@ -147,11 +148,11 @@ def test_activity_is_cross_board_mixed_and_paginated(client: TestClient, tmp_pat
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     kanban_db._INITIALIZED_PATHS.clear()
     kanban_db.create_board("work", name="Work")
-    with kanban_db.connect(board="default") as conn:
+    with _kdb_connect.connect(board="default") as conn:
         first = kanban_db.create_task(conn, title="Default task", project_id=project_id)
         conn.execute("UPDATE task_events SET created_at = 100 WHERE task_id = ?", (first,))
         conn.commit()
-    with kanban_db.connect(board="work") as conn:
+    with _kdb_connect.connect(board="work") as conn:
         second = kanban_db.create_task(conn, title="Work task", project_id=project_id)
         conn.execute("UPDATE task_events SET created_at = 300 WHERE task_id = ?", (second,))
         conn.commit()
@@ -199,7 +200,7 @@ def test_activity_cursor_is_stable_across_ties_and_newer_inserts(
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-root"))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     kanban_db._INITIALIZED_PATHS.clear()
-    with kanban_db.connect(board="default") as conn:
+    with _kdb_connect.connect(board="default") as conn:
         ids = [kanban_db.create_task(conn, title=f"task-{n}", project_id=project_id) for n in range(3)]
         conn.execute("UPDATE task_events SET created_at = 100")
         conn.commit()
@@ -214,7 +215,7 @@ def test_activity_cursor_is_stable_across_ties_and_newer_inserts(
         seen.append(response["items"][0]["id"])
         cursor = response["next_cursor"]
         if page_number == 0:
-            with kanban_db.connect(board="default") as conn:
+            with _kdb_connect.connect(board="default") as conn:
                 newer = kanban_db.create_task(conn, title="newer", project_id=project_id)
                 conn.execute("UPDATE task_events SET created_at = 200 WHERE task_id = ?", (newer,))
                 conn.commit()

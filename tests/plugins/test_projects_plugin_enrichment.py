@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as _kdb_connect
 from hermes_cli import projects_db as pdb
 from hermes_state import SessionDB
 from plugins.projects.dashboard.activity import project_activity
@@ -47,11 +48,11 @@ def test_enrichment_aggregates_shared_boards_and_uses_stable_project_id(stores):
     project = _project(repo)
     kb.create_board("work", name="Work Board", icon="W", color="#abc")
 
-    with kb.connect(board="default") as conn:
+    with _kdb_connect.connect(board="default") as conn:
         kb.create_task(conn, title="todo", project_id=project.slug)
         done = kb.create_task(conn, title="done", project_id=project.id)
         kb.complete_task(conn, done)
-    with kb.connect(board="work") as conn:
+    with _kdb_connect.connect(board="work") as conn:
         archived = kb.create_task(conn, title="archived", project_id=project.id)
         kb.archive_task(conn, archived)
 
@@ -81,7 +82,7 @@ def test_enrichment_counts_every_canonical_status(stores):
     project = _project(repo)
     statuses = sorted(kb.VALID_STATUSES)
 
-    with kb.connect(board="default") as conn:
+    with _kdb_connect.connect(board="default") as conn:
         task_ids = [
             kb.create_task(conn, title=status, project_id=project.id)
             for status in statuses
@@ -178,7 +179,7 @@ def test_enrichment_unions_event_and_session_activity(stores):
     home, repo = stores
     project = _project(repo)
     event_at = int(time.time()) + 100
-    with kb.connect(board="default") as conn:
+    with _kdb_connect.connect(board="default") as conn:
         task_id = kb.create_task(conn, title="event", project_id=project.id)
         conn.execute(
             "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
@@ -221,7 +222,7 @@ def test_enrichment_ignores_dangling_task_links_and_keeps_archived_board(stores)
     _home, repo = stores
     project = _project(repo)
     kb.write_board_metadata("work", archived=True)
-    with kb.connect(board="work") as conn:
+    with _kdb_connect.connect(board="work") as conn:
         task_id = kb.create_task(conn, title="linked", project_id=project.id)
         conn.execute("UPDATE tasks SET project_id = ? WHERE id = ?", ("p_deleted", task_id))
         conn.commit()
@@ -236,7 +237,7 @@ def test_enrichment_isolates_bad_board(stores, monkeypatch):
     _home, repo = stores
     project = _project(repo)
     kb.create_board("work", name="Work Board")
-    original = kb.connect
+    original = _kdb_connect.connect
 
     def fail_named(*args, **kwargs):
         if kwargs.get("db_path") and str(kwargs["db_path"]).endswith("/work/kanban.db"):
@@ -246,8 +247,7 @@ def test_enrichment_isolates_bad_board(stores, monkeypatch):
     # Patch where the code READS it: enrichment calls kanban_db_connect.connect,
     # not kanban_db.connect — the latter is a plugin-compat shim whose stated
     # removal date has already passed, so the plugin no longer routes through it.
-    from hermes_cli import kanban_db_connect as _kbc
-    monkeypatch.setattr(_kbc, "connect", fail_named)
+    monkeypatch.setattr(_kdb_connect, "connect", fail_named)
     enriched, errors = enrich_projects([project], None)
     assert enriched[0]["task_count"] is None
     assert enriched[0]["open_task_count"] is None
@@ -259,7 +259,7 @@ def test_enrichment_deduplicates_pinned_kanban_db(stores, monkeypatch):
     _home, repo = stores
     project = _project(repo)
     pinned = Path(kb.kanban_home()) / "pinned.db"
-    with kb.connect(db_path=pinned) as conn:
+    with _kdb_connect.connect(db_path=pinned) as conn:
         kb.create_task(conn, title="pinned", project_id=project.id)
     kb.create_board("work", name="Work Board")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))

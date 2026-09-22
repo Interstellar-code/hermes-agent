@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import hermes_cli.kanban_db as kb
+import hermes_cli.kanban_db_connect as _kdb_connect
 from hermes_cli import kanban_templates as kt
 
 
@@ -317,7 +318,7 @@ class TestInstantiate:
         instance_id = result["instance_id"]
         expected_wtid = f"linked@{instance_id}"
 
-        conn = kb.connect(board="test-board")
+        conn = _kdb_connect.connect(board="test-board")
         rows = conn.execute(
             "SELECT workflow_template_id FROM tasks WHERE workflow_template_id IS NOT NULL"
         ).fetchall()
@@ -330,7 +331,7 @@ class TestInstantiate:
         kt.save_template("linked", _YAML_WITH_LINKS)
         kt.instantiate("linked", board_slug="test-board")
 
-        conn = kb.connect(board="test-board")
+        conn = _kdb_connect.connect(board="test-board")
         rows = conn.execute(
             "SELECT current_step_key FROM tasks ORDER BY created_at ASC"
         ).fetchall()
@@ -343,7 +344,7 @@ class TestInstantiate:
         result = kt.instantiate("linked", board_slug="test-board")
         instance_id = result["instance_id"]
 
-        conn = kb.connect(board="test-board")
+        conn = _kdb_connect.connect(board="test-board")
         rows = conn.execute(
             "SELECT idempotency_key FROM tasks ORDER BY created_at ASC"
         ).fetchall()
@@ -357,7 +358,7 @@ class TestInstantiate:
         result = kt.instantiate("linked", board_slug="test-board")
         task_ids = result["task_ids"]
 
-        conn = kb.connect(board="test-board")
+        conn = _kdb_connect.connect(board="test-board")
         links = conn.execute(
             "SELECT parent_id, child_id FROM task_links"
         ).fetchall()
@@ -382,7 +383,7 @@ tasks:
         kt.save_template("ready-tmpl", yaml_ready)
         kt.instantiate("ready-tmpl", board_slug="ready-board", auto_dispatch=False)
 
-        conn = kb.connect(board="ready-board")
+        conn = _kdb_connect.connect(board="ready-board")
         rows = conn.execute("SELECT status FROM tasks").fetchall()
         conn.close()
         for row in rows:
@@ -409,7 +410,7 @@ tasks:
             variables={"project": "myproj"},
             board_slug="some-board",
         )
-        conn = kb.connect(board="some-board")
+        conn = _kdb_connect.connect(board="some-board")
         titles = [r[0] for r in conn.execute("SELECT title FROM tasks").fetchall()]
         conn.close()
         assert any("myproj" in t for t in titles)
@@ -455,7 +456,7 @@ tasks:
 class TestSaveBoardAsTemplate:
     def _create_board_with_tasks(self, board="src-board"):
         kb.init_db(board=board)
-        conn = kb.connect(board=board)
+        conn = _kdb_connect.connect(board=board)
         t1 = kb.create_task(conn, title="Setup server", board=board)
         t2 = kb.create_task(conn, title="Deploy app", board=board)
         kb.link_tasks(conn, t1, t2)
@@ -465,7 +466,7 @@ class TestSaveBoardAsTemplate:
     def test_strips_runtime_fields_resets_statuses(self, template_home):
         self._create_board_with_tasks()
         # Mark a task as done to verify status reset
-        conn = kb.connect(board="src-board")
+        conn = _kdb_connect.connect(board="src-board")
         kb.complete_task(conn, kb.list_tasks(conn)[0].id)
         conn.close()
 
@@ -480,7 +481,7 @@ class TestSaveBoardAsTemplate:
     def test_keep_status_preserves_statuses(self, template_home):
         self._create_board_with_tasks()
         # Force a task to ready status
-        conn = kb.connect(board="src-board")
+        conn = _kdb_connect.connect(board="src-board")
         conn.execute("UPDATE tasks SET status='ready' WHERE rowid=1")
         conn.commit()
         conn.close()
@@ -528,7 +529,7 @@ class TestDependencyTopology:
     """Multi-edge instantiation: chain, diamond, multi-parent."""
 
     def _task_links(self, board: str) -> list[tuple[str, str]]:
-        conn = kb.connect(board=board)
+        conn = _kdb_connect.connect(board=board)
         rows = conn.execute(
             "SELECT parent_id, child_id FROM task_links"
         ).fetchall()
@@ -536,7 +537,7 @@ class TestDependencyTopology:
         return [(r[0], r[1]) for r in rows]
 
     def _task_status(self, board: str, task_id: str) -> str:
-        conn = kb.connect(board=board)
+        conn = _kdb_connect.connect(board=board)
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -603,7 +604,7 @@ links:
         assert (task_ids["c"], task_ids["d"]) in links
 
         # D must have exactly parents B and C
-        conn = kb.connect(board="diamond-board")
+        conn = _kdb_connect.connect(board="diamond-board")
         d_parents = {
             r[0]
             for r in conn.execute(
@@ -634,7 +635,7 @@ links:
         result = kt.instantiate("mp-tmpl", board_slug="mp-board")
         task_ids = result["task_ids"]
 
-        conn = kb.connect(board="mp-board")
+        conn = _kdb_connect.connect(board="mp-board")
         c_parents = {
             r[0]
             for r in conn.execute(
@@ -649,7 +650,7 @@ links:
     def test_save_instantiate_roundtrip_links(self, template_home):
         # Build a 3-task chain on a source board via kanban_db
         kb.init_db(board="src-chain")
-        conn = kb.connect(board="src-chain")
+        conn = _kdb_connect.connect(board="src-chain")
         t1 = kb.create_task(conn, title="Alpha", board="src-chain")
         t2 = kb.create_task(conn, title="Beta", board="src-chain")
         t3 = kb.create_task(conn, title="Gamma", board="src-chain")
@@ -677,7 +678,7 @@ class TestResetStatusClamp:
     def _create_board_with_ready_task(self, board: str = "clamp-board") -> str:
         """Create a board with one ready task; return its id."""
         kb.init_db(board=board)
-        conn = kb.connect(board=board)
+        conn = _kdb_connect.connect(board=board)
         task_id = kb.create_task(conn, title="Ready Task", board=board)
         conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
         conn.commit()
@@ -711,7 +712,7 @@ class TestFieldRoundTrip:
 
     def test_fields_survive_roundtrip(self, template_home):
         kb.init_db(board="fields-src")
-        conn = kb.connect(board="fields-src")
+        conn = _kdb_connect.connect(board="fields-src")
         task_id = kb.create_task(
             conn,
             title="Timed Task",
@@ -731,7 +732,7 @@ class TestFieldRoundTrip:
         result = kt.instantiate("fields-snap", board_slug="fields-dest")
         new_task_id = list(result["task_ids"].values())[0]
 
-        conn2 = kb.connect(board="fields-dest")
+        conn2 = _kdb_connect.connect(board="fields-dest")
         row = conn2.execute(
             "SELECT max_runtime_seconds, goal_max_turns FROM tasks WHERE id = ?",
             (new_task_id,),
@@ -771,7 +772,7 @@ links:
             kt.instantiate("fatal-tmpl", board_slug="fatal-board")
 
         # Board must have 0 non-archived tasks (rolled back)
-        conn = kb.connect(board="fatal-board")
+        conn = _kdb_connect.connect(board="fatal-board")
         live_count = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status != 'archived'"
         ).fetchone()[0]
@@ -788,7 +789,7 @@ links:
 
 class TestScheduledAt:
     def _sched_of(self, board_slug: str) -> list:
-        conn = kb.connect(board=board_slug)
+        conn = _kdb_connect.connect(board=board_slug)
         try:
             return [
                 r[0]
@@ -875,7 +876,7 @@ class TestScheduledAt:
         assert self._sched_of("plain-board") == [None]
 
     def test_save_board_as_template_omits_scheduled_at(self, template_home):
-        conn = kb.connect(board="src-board")
+        conn = _kdb_connect.connect(board="src-board")
         kb.create_task(
             conn,
             title="deferred",

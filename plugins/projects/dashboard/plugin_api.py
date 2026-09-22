@@ -292,9 +292,7 @@ def delete_project(project_id_or_slug: str) -> dict:
             raise HTTPException(status_code=404, detail="project not found")
         if not project.archived:
             raise HTTPException(status_code=409, detail="only archived projects can be deleted")
-        deleted = projects_db.delete_project(
-            conn, project.id, clear_active=True, archived_only=True
-        )
+        deleted = projects_db.delete_project(conn, project.id)
         if not deleted:
             current = projects_db.get_project(conn, project.id)
             if current is None:

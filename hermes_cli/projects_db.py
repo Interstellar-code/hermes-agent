@@ -384,8 +384,20 @@ def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 
 def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    """Hard-delete a project and its folders (cascade)."""
-    return _execute_rowcount(conn, "DELETE FROM projects WHERE id = ?", (project_id,)) > 0
+    """Hard-delete a project and its folders (cascade).
+
+    Also clears the active-project pointer when it names this project.
+    ``project_meta`` is a plain KV table with no foreign key to ``projects``,
+    so that pointer does NOT cascade -- without this it would dangle at a
+    deleted id and every reader would resolve the active project to None-ish
+    garbage. Both statements share one transaction so a crash between them
+    cannot leave the pointer orphaned.
+    """
+    with write_txn(conn):
+        if _get_meta(conn, _ACTIVE_META_KEY) == project_id:
+            conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
+        cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    return cur.rowcount > 0
 
 
 # --- Active-project pointer + discovery policy (project_meta KV) --------------
