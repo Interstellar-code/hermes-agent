@@ -401,10 +401,13 @@ def _build_project_tree(
             session_bindings = pdb.get_session_projects(
                 _pconn, [str(s.get("id") or "") for s in sessions if s.get("id")])
     except Exception as _bexc:  # noqa: BLE001
-        # Explicit logger, not this module's bare `logger`: that name is injected
-        # by bind_module onto the SERVER's globals, and `_`-prefixed helpers are
-        # skipped by it -- so a bare `logger` here would AttributeError exactly
-        # when the projects DB is already failing.
+        # Explicit logger rather than this module's bare `logger`. The bare name
+        # WOULD resolve here: bind_module rebinds this module's functions onto
+        # server.py's globals, and its `skip=("_",)` matches the name exactly
+        # equal to "_" (the @method handler pattern) — NOT every underscore
+        # helper. Verified by binding this module against a stand-in server:
+        # _build_project_tree is published and its globals do see `logger`.
+        # Kept explicit only so the dependency is visible at the call site.
         import logging as _logging
         _logging.getLogger(__name__).debug(
             "project bindings unavailable, falling back to cwd inference: %s", _bexc)
