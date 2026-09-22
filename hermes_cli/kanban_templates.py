@@ -45,6 +45,11 @@ from typing import Any, Optional
 import yaml
 
 import hermes_cli.kanban_db as _kdb
+# connect() is NOT a real member of kanban_db — it is a PLUGIN-COMPAT pointer whose
+# removal date (2026-09-14) has passed (plugin_compat.removal_in_effect() is True).
+# Every other _kdb.* name used here is real. Imported as a module, not a bound
+# function, so tests that patch kanban_db_connect.connect still reach it.
+import hermes_cli.kanban_db_connect as _kdb_connect
 
 log = logging.getLogger("hermes_cli.kanban_templates")
 
@@ -761,7 +766,7 @@ def instantiate(
         log.info("created board %r for template instance %s@%s", board_slug, slug, instance_id)
 
     # 4. Guardrail
-    conn = _kdb.connect(board=board_slug)
+    conn = _kdb_connect.connect(board=board_slug)
     try:
         open_count = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('done', 'archived')"
@@ -997,7 +1002,7 @@ def save_board_as_template(
     _validate_slug(board_slug, label="board_slug")
     _validate_slug(template_slug)
 
-    conn = _kdb.connect(board=board_slug)
+    conn = _kdb_connect.connect(board=board_slug)
     try:
         rows = conn.execute(
             "SELECT id, title, body, assignee, priority, skills, "
