@@ -11,38 +11,33 @@ _BASE = dict(enabled="auto", threshold_pct=10.0,
 
 # ------------------------------------------------- threshold_tokens floor
 
-def test_floor_activates_when_pct_unreachable():
-    # 2M-context model: pct threshold = 200k, deferrable 80k → dormant
-    # without the floor, active with it.
-    cfg = ToolSearchConfig(**_BASE, threshold_tokens=20_000)
-    assert should_activate(cfg, 80_000, 2_000_000) is True
+def test_auto_activates_whenever_anything_is_deferrable():
+    """The guarantee that REPLACED the old threshold_tokens floor.
+
+    The floor existed because a percentage threshold is unreachable on huge
+    contexts (10% of 2M = 200k), which left "auto" permanently dormant however
+    large the deferrable surface got. should_activate no longer consults any
+    threshold: any deferrable token activates. That dormancy is now structurally
+    impossible, so the floor is subsumed rather than lost -- and the config key
+    it was configured with has been removed instead of left inert.
+    """
+    cfg = ToolSearchConfig(**_BASE)
+    assert should_activate(cfg, 80_000, 2_000_000) is True    # was dormant pre-floor
+    assert should_activate(cfg, 1, 2_000_000) is True
+    assert should_activate(cfg, 1, None) is True              # unknown context
 
 
-def test_floor_disabled_by_default_preserves_behavior():
-    cfg = ToolSearchConfig(**_BASE, threshold_tokens=0)
-    assert should_activate(cfg, 80_000, 2_000_000) is False
+def test_no_activation_when_off_or_nothing_deferrable():
+    assert should_activate(ToolSearchConfig(**{**_BASE, "enabled": "off"}),
+                           999_999, 2_000_000) is False
+    assert should_activate(ToolSearchConfig(**_BASE), 0, 2_000_000) is False
 
 
-def test_floor_not_crossed_falls_back_to_pct():
-    cfg = ToolSearchConfig(**_BASE, threshold_tokens=100_000)
-    assert should_activate(cfg, 80_000, 2_000_000) is False
-    assert should_activate(cfg, 250_000, 2_000_000) is True
-
-
-def test_floor_ignored_when_off_or_no_deferrable():
-    cfg = ToolSearchConfig(**{**_BASE, "enabled": "off"}, threshold_tokens=1)
-    assert should_activate(cfg, 999_999, 2_000_000) is False
-    cfg = ToolSearchConfig(**_BASE, threshold_tokens=1)
-    assert should_activate(cfg, 0, 2_000_000) is False
-
-
-def test_from_raw_parses_threshold_tokens():
-    assert ToolSearchConfig.from_raw(
-        {"enabled": "auto", "threshold_tokens": 15_000}).threshold_tokens == 15_000
-    assert ToolSearchConfig.from_raw({"enabled": "auto"}).threshold_tokens == 0
-    assert ToolSearchConfig.from_raw({"threshold_tokens": -5}).threshold_tokens == 0
-    assert ToolSearchConfig.from_raw(True).threshold_tokens == 0
-    assert ToolSearchConfig.from_raw(None).threshold_tokens == 0
+def test_threshold_tokens_key_is_gone_not_silently_ignored():
+    """A removed key must not resurface as a dead attribute nothing reads."""
+    assert not hasattr(ToolSearchConfig(**_BASE), "threshold_tokens")
+    assert not hasattr(ToolSearchConfig.from_raw({"threshold_tokens": 15_000}),
+                       "threshold_tokens")   # unknown keys stay ignored, no crash
 
 
 # --------------------------------------- deferred_tool_recovery_message
