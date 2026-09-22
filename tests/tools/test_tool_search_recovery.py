@@ -77,7 +77,7 @@ def test_recovery_message_carries_schema_and_tool_call_hint(monkeypatch):
     import model_tools
     monkeypatch.setattr(model_tools, "get_tool_definitions",
                         lambda **kw: [_TOOL_DEF])
-    monkeypatch.setattr(ts, "is_deferrable_tool_name", lambda n: True)
+    monkeypatch.setattr(ts, "is_deferrable_tool_name", lambda n, d=None: True)
 
     msg = te.deferred_tool_recovery_message(FakeAgent(), "mcp_gh_create_issue")
     assert msg is not None
@@ -94,3 +94,34 @@ def test_recovery_none_when_tool_search_inactive():
 def test_recovery_none_for_out_of_scope_name(monkeypatch):
     monkeypatch.setattr(te, "_tool_search_scoped_names", lambda a: frozenset())
     assert te.deferred_tool_recovery_message(FakeAgent(), "no_such_tool") is None
+
+
+def test_recovery_resolves_tools_in_both_defer_list_and_core_set(monkeypatch):
+    """Regression: the recovery path must use the SAME defer set the producer
+    used to hide the tool.
+
+    ``is_deferrable_tool_name(name)`` without ``defer_tools`` skips the
+    defer-list branch and falls through to the core-set check, so every tool in
+    BOTH _DEFAULT_DEFERRED_TOOLS and _HERMES_CORE_TOOLS answered "not
+    deferrable" here while the assembly had already hidden it. The model would
+    see such a tool deferred, call it by name, and get an unknown-tool error
+    instead of an executable recovery message.
+
+    Deliberately does NOT stub is_deferrable_tool_name -- the real one is what
+    regressed.
+    """
+    both = sorted(set(ts._DEFAULT_DEFERRED_TOOLS) & set(ts._core_tool_names()))
+    assert both, "fixture assumes the two lists overlap"
+    name = both[0]
+
+    monkeypatch.setattr(te, "_tool_search_scoped_names", lambda a: frozenset({name}))
+    import model_tools
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [{"type": "function", "function": {
+            "name": name, "description": "d",
+            "parameters": {"type": "object", "properties": {}}}}])
+
+    msg = te.deferred_tool_recovery_message(FakeAgent(), name)
+    assert msg is not None, f"{name} is deferred by the producer but unresolvable here"
+    assert name in msg

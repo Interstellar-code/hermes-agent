@@ -382,7 +382,16 @@ def deferred_tool_recovery_message(agent, name: str) -> Optional[str]:
         if name not in _tool_search_scoped_names(agent):
             return None  # not a deferred tool (typo, or out of scope)
         from tools import tool_search as _ts
-        if not _ts.is_deferrable_tool_name(name):
+        # Must use the SAME defer set the producer used when it hid this tool
+        # (tool_search.py's assembly passes effective_defer_tools). Calling the
+        # bare 1-arg form skips the defer-list branch and falls through to the
+        # core-set check, so the 6 tools that are in BOTH the curated defer list
+        # and the core set resolve as "not deferrable" here -- the model would
+        # see them deferred, call one by name, and land on an unknown-tool error
+        # instead of executing it.
+        if not _ts.is_deferrable_tool_name(
+            name, _ts.load_config_readonly().effective_defer_tools
+        ):
             return None
         import model_tools
         tool_defs = model_tools.get_tool_definitions(
