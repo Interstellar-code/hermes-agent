@@ -1662,9 +1662,18 @@ def _fallback_api_mode_hint(fb: dict, fb_provider: str, fb_base_url_hint: Option
     rewrites a dual-surface /anthropic base to /v1, losing the Anthropic wire signal. An explicit
     ``api_mode`` always wins (even "chat_completions") and suppresses later re-detection;
     ``provider: anthropic`` without a base_url still resolves to anthropic_messages."""
-    explicit = str(fb.get("api_mode") or "").strip()
+    raw = str(fb.get("api_mode") or "").strip()
+    # Validate through the SAME parser the primary provider path uses (aliases canonicalized,
+    # unknown values -> None). Passing the raw string through let an unregistered mode such as
+    # ``openai_compatible`` become agent.api_mode, and get_transport() then returned None for it.
+    from hermes_cli.runtime_provider import _parse_api_mode
+    explicit = _parse_api_mode(raw) if raw else None
     if explicit:
         return True, explicit
+    if raw:
+        logger.warning(
+            "Fallback provider %r has unrecognized api_mode %r; ignoring it and auto-detecting "
+            "from the provider/base_url instead.", fb_provider, raw)
     if fb_provider == "anthropic" or (fb_base_url_hint and _is_anthropic_wire_url(fb_base_url_hint)):
         return False, "anthropic_messages"
     return False, "chat_completions"
