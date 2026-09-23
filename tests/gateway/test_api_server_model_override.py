@@ -694,3 +694,23 @@ async def test_model_with_explicit_provider_is_one_off_not_a_sticky_switch(adapt
 
     assert mock_switch.call_count == 0
     assert runner._session_model_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_unlisted_model_soft_accepted_by_resolver_is_still_a_400(adapter):
+    """A custom endpoint's resolver soft-accepts a name its /models listing lacks
+    (success=True, recognized=False) -- fine for the interactive /model, which shows the
+    warning. Over HTTP that was a silent 200 that installed a model failing every turn."""
+    unlisted = SimpleNamespace(
+        success=True, new_model="nope-model", target_provider="manifest", api_key="k",
+        base_url="http://lan/v1", api_mode="chat_completions", recognized=False,
+        warning_message="Note: `nope-model` was not found in this custom endpoint's model listing")
+    runner = SimpleNamespace(_session_model_overrides={})
+    _stub_run_agent(adapter)
+    app = _create_session_app(adapter)
+    with _patched_switch(unlisted), patch("gateway.run._gateway_runner_ref", lambda: runner):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await _post_chat(cli, "/chat", _chat_body("nope-model"), {"X-Hermes-Session-Key": SESSION_KEY})
+            assert resp.status == 400
+            assert "not found" in (await resp.json())["error"]["message"]
+    assert runner._session_model_overrides == {}

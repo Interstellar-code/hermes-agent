@@ -434,6 +434,10 @@ class ModelSwitchResult:
     request_overrides: Optional[dict] = None
     error_message: str = ""
     warning_message: str = ""
+    # False when the provider's catalog does not list the model and it was only soft-accepted
+    # (custom endpoints). The interactive /model accepts that with a warning; the HTTP surface
+    # must not, since a silent 200 is how #216 bugs hide.
+    recognized: bool = True
     provider_label: str = ""
     resolved_via_alias: str = ""
     capabilities: Optional[ModelCapabilities] = None
@@ -1506,7 +1510,8 @@ def _build_switch_result(st: _Switch) -> ModelSwitchResult:
         provider_label=st.provider_label, resolved_via_alias=st.resolved_alias, capabilities=capabilities,
         runtime_capabilities={
             k: v for k, v in runtime_capabilities.items() if isinstance(k, str) and isinstance(v, bool)},
-        model_info=model_info, is_global=st.is_global)
+        model_info=model_info, is_global=st.is_global,
+        recognized=bool((st.validation or {}).get("recognized", True)))
 
 
 def switch_model(
