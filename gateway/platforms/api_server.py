@@ -260,6 +260,16 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 RUN_EVENTS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+# Key under which a session's HTTP-issued model override is stored inside the
+# sessions row's ``model_config`` JSON blob. Namespaced with a leading
+# underscore like the other internal markers in that blob (``_delegate_from``,
+# ``_branched_from``, ``_agent_id``) and nested so it cannot be confused with
+# the flat model/provider/base_url keys other producers write there.
+_MODEL_OVERRIDE_CONFIG_KEY = "_model_override"
+# Non-secret parts of an override that may be written to disk. Mirrors
+# gateway.session.PERSISTABLE_MODEL_OVERRIDE_KEYS: api_key/api_mode are
+# re-resolved from the provider at rehydration, never persisted.
+_PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 # Backstop for /goal auto-continuation on ONE streaming request (#230). This is
 # NOT the goal's turn budget: GoalManager already enforces that per session and
 # persists ``turns_used`` in state_meta, so it survives across HTTP requests and
@@ -1320,6 +1330,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
+        # Per-session ``model`` overrides for API-server sessions, used only
+        # when no in-process GatewayRunner owns the map (standalone serve).
+        # The runner's ``_session_model_overrides`` is authoritative whenever
+        # it exists — one store, shared with the native /model slash command.
+        self._local_session_model_overrides: Dict[str, Dict[str, Any]] = {}
         # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
@@ -2101,26 +2116,403 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return "hermes_browser" if text == "browser" else text
 
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The gateway's per-session ``/model`` override for *session_key*, if any — a
-        user-issued ``/model`` always wins over static route config."""
+        """The per-session model override for *session_key*, if any — a user-issued ``/model``
+        (or HTTP ``model`` switch) always wins over static route config.
+
+        One store: ``GatewayRunner._session_model_overrides`` when a runner owns the process,
+        shared with the native ``/model`` slash command; the adapter-local map only when running
+        standalone. The runner map is checked first so the transports never disagree."""
         if not session_key:
             return None
         try:
+            runner = self._gateway_runner_for_overrides()
+            if runner is not None:
+                try:
+                    rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
+                    if callable(rehydrate):
+                        rehydrate(session_key)
+                except Exception:
+                    logger.debug(
+                        "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
+                override = runner._session_model_overrides.get(session_key)
+                if isinstance(override, dict):
+                    return dict(override)
+        except Exception:
+            pass
+        override = self._local_session_model_overrides.get(session_key)
+        return dict(override) if isinstance(override, dict) else None
+
+    @staticmethod
+    def _gateway_runner_for_overrides() -> Optional[Any]:
+        """Return the in-process GatewayRunner, or None when running standalone."""
+        try:
             from gateway.run import _gateway_runner_ref
-            runner = _gateway_runner_ref()
-            if runner is None:
-                return None
-            try:
-                rehydrate = getattr(runner, "_rehydrate_session_model_override", None)
-                if callable(rehydrate):
-                    rehydrate(session_key)
-            except Exception:
-                logger.debug(
-                    "api_server failed to rehydrate session /model override for %s", session_key, exc_info=True)
-            override = runner._session_model_overrides.get(session_key)
-            return dict(override) if isinstance(override, dict) else None
+            return _gateway_runner_ref()
         except Exception:
             return None
+
+    def _effective_model_name(self, session_key: Optional[str]) -> str:
+        """Model this session will actually run on — override first, else the default.
+
+        ``self._model_name`` is resolved once at construction, so stamping it
+        on a run-status record reported the default even for a session that
+        had switched models.
+        """
+        override = self._session_model_override_for(session_key)
+        return (override or {}).get("model") or self._model_name
+
+    def _set_session_model_override(
+        self, session_key: str, override: Optional[Dict[str, Any]]
+    ) -> None:
+        """Install (or clear) the in-memory session model override.
+
+        Writes into ``GatewayRunner._session_model_overrides`` when a runner
+        owns the process — that is the map ``_session_model_override_for``
+        and the native gateway both read, so a model chosen over HTTP is
+        honoured by an adapter turn on the same session key.  Falls back to
+        the adapter-local map otherwise.  The runner's cached agent for this
+        key is evicted so the next turn rebuilds from the new override,
+        mirroring the /model slash command.
+        """
+        if not session_key:
+            return
+        runner = self._gateway_runner_for_overrides()
+        if runner is not None:
+            try:
+                if override is None:
+                    runner._session_model_overrides.pop(session_key, None)
+                else:
+                    runner._session_model_overrides[session_key] = dict(override)
+                evict = getattr(runner, "_evict_cached_agent", None)
+                if callable(evict):
+                    evict(session_key)
+                return
+            except Exception:
+                logger.debug(
+                    "Failed to write session model override to gateway runner",
+                    exc_info=True,
+                )
+        if override is None:
+            self._local_session_model_overrides.pop(session_key, None)
+        else:
+            self._local_session_model_overrides[session_key] = dict(override)
+
+    def _persist_session_model_override(
+        self, session_id: str, override: Optional[Dict[str, Any]]
+    ) -> None:
+        """Write the non-secret parts of *override* onto the session row.
+
+        The API server has no ``SessionStore`` (that is a GatewayRunner
+        attribute, and ``SessionStore.set_model_override`` no-ops for a
+        session key it has no entry for).  Its own durable record is the
+        ``sessions`` row, so the override is written through to
+        ``model_config['_model_override']`` and the ``model`` column, and
+        read back by ``_rehydrated_model_override`` after a restart.
+
+        Only model/provider/base_url are persisted — matching
+        ``gateway.session.PERSISTABLE_MODEL_OVERRIDE_KEYS``.  ``api_key`` is
+        never written to disk; credentials are re-resolved on rehydration.
+        """
+        if not session_id:
+            return
+        db = self._ensure_session_db()
+        if db is None:
+            return
+        try:
+            row = db.get_session(session_id)
+            if not row:
+                return
+            raw = row.get("model_config")
+            try:
+                model_config = json.loads(raw) if raw else {}
+            except (TypeError, ValueError):
+                model_config = {}
+            if not isinstance(model_config, dict):
+                model_config = {}
+            if override is None:
+                model_config.pop(_MODEL_OVERRIDE_CONFIG_KEY, None)
+                new_model = None
+            else:
+                persisted = {
+                    key: str(override[key])
+                    for key in _PERSISTABLE_MODEL_OVERRIDE_KEYS
+                    if override.get(key) not in (None, "")
+                }
+                if not persisted.get("model"):
+                    return
+                model_config[_MODEL_OVERRIDE_CONFIG_KEY] = persisted
+                new_model = persisted["model"]
+            db.update_session_meta(session_id, json.dumps(model_config), new_model)
+        except Exception:
+            logger.debug("Failed to persist session model override", exc_info=True)
+
+    def _rehydrated_model_override(self, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Restore a persisted model override for *session_id* after a restart.
+
+        Mirrors ``GatewayRunner._rehydrate_session_model_override``: the
+        non-secret parts come off the session row, and credentials are
+        re-resolved through the normal runtime provider resolution rather
+        than being read from disk.  Returns None when nothing is persisted.
+        """
+        if not session_id:
+            return None
+        db = self._ensure_session_db()
+        if db is None:
+            return None
+        try:
+            row = db.get_session(session_id)
+            if not row:
+                return None
+            raw = row.get("model_config")
+            model_config = json.loads(raw) if raw else {}
+            persisted = (model_config or {}).get(_MODEL_OVERRIDE_CONFIG_KEY)
+        except Exception:
+            logger.debug("Failed to read persisted session model override", exc_info=True)
+            return None
+        if not isinstance(persisted, dict) or not persisted.get("model"):
+            return None
+        override: Dict[str, Any] = {
+            "model": persisted.get("model"),
+            "provider": persisted.get("provider"),
+            "base_url": persisted.get("base_url"),
+        }
+        provider = persisted.get("provider")
+        if provider:
+            # On failure (credentials removed since the switch) keep the
+            # credential-less override: _create_agent falls back to the
+            # env/config-resolved runtime and applies model/provider on top.
+            try:
+                from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                override["api_key"] = runtime.get("api_key")
+                override["api_mode"] = runtime.get("api_mode")
+                override["credential_pool"] = runtime.get("credential_pool")
+                if not override.get("base_url"):
+                    override["base_url"] = runtime.get("base_url")
+            except Exception:
+                logger.debug(
+                    "Credential re-resolution failed for persisted override "
+                    "(provider=%s); using credential-less override",
+                    provider, exc_info=True,
+                )
+        logger.info(
+            "Rehydrated persisted model override for session=%s: model=%s provider=%s",
+            session_id, override.get("model"), provider or "",
+        )
+        return override
+
+    async def _apply_requested_model(
+        self,
+        body: Dict[str, Any],
+        session_id: str,
+        gateway_session_key: Optional[str],
+    ) -> Optional["web.Response"]:
+        """Honour a ``model`` field on a session chat request.
+
+        Resolves the requested model to a full provider credential set and
+        installs it as this session's override, so the agent built for this
+        turn — and every later turn on the session — runs on it.  This is the
+        HTTP equivalent of a user-issued ``/model``: it outranks static
+        ``model_routes`` config (see _create_agent's precedence comment).
+
+        The switch is **sticky**, not one-turn: a model picked in a chat UI
+        is expected to stay selected until changed again, and the client
+        need not re-send ``model`` on every message.  (The slash command's
+        ``--once`` form has no HTTP equivalent, so the write-through
+        exclusion that protects it does not apply here.)
+
+        Returns an error ``Response`` when the model cannot be resolved, so
+        the caller can fail the request.  An unresolvable model is a 400
+        rather than a silent fall back to the default model — a silent
+        fallback is exactly what made this class of bug invisible on
+        /v1/chat/completions.
+        """
+        requested = body.get("model")
+        if requested is None:
+            return None
+        if not isinstance(requested, str) or not requested.strip():
+            return web.json_response(
+                _openai_error("model must be a non-empty string", param="model", code="invalid_model"),
+                status=400,
+            )
+        requested = requested.strip()
+        session_key = gateway_session_key or session_id
+
+        # The advertised name from GET /v1/models ("hermes-agent", or the
+        # profile name) is this server's identity, not a real model id — a
+        # client echoing it back is expressing no preference. Treat it as a
+        # no-op rather than failing to resolve it. It deliberately does NOT
+        # clear an existing override: clients that pin this name as a static
+        # field would otherwise silently undo a switch made elsewhere.
+        if requested == self._model_name:
+            return None
+
+        # Already on this model — skip resolution entirely.  switch_model()
+        # can block on a models.dev fetch and a live /v1/models probe, which
+        # would otherwise be paid on every message a UI sends after a switch.
+        #
+        # Compare against BOTH the resolved id and the string that produced
+        # it: switch_model resolves aliases and aggregator slugs, so a client
+        # that keeps sending the alias it was given ("glm-4.6") never matches
+        # the stored resolved id ("zai/glm-4.6") and would defeat the guard on
+        # every single message.  ``requested`` is a cache only — it is not
+        # persisted, so the first turn after a restart resolves once more.
+        current = self._session_model_override_for(session_key)
+        if current and requested in {current.get("model"), current.get("requested")}:
+            return None
+
+        # A configured ``model_routes`` alias is a valid model identifier for
+        # this server, so honour it here too instead of failing to resolve it
+        # upstream. Unlike /v1/chat/completions — where a route applies to the
+        # single request — this installs it as the session's override, because
+        # on this transport the selection is what the session runs on until
+        # changed.
+        route = self._resolve_route(requested)
+        if route:
+            override = self._override_from_route(route)
+            if override:
+                override["requested"] = requested
+                self._set_session_model_override(session_key, override)
+                await asyncio.to_thread(
+                    self._persist_session_model_override, session_id, override
+                )
+                logger.info(
+                    "api_server model override set from route: session=%s model=%s",
+                    session_key, override.get("model"),
+                )
+                return None
+
+        result, error = await self._resolve_model_switch(requested, current)
+        if error is not None:
+            return web.json_response(
+                _openai_error(error, param="model", code="model_not_available"),
+                status=400,
+            )
+
+        override = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+            # What the client asked for, before alias resolution. Read only by
+            # the short-circuit above; every consumer of this dict reads named
+            # keys, so the extra entry is inert everywhere else.
+            "requested": requested,
+        }
+        self._set_session_model_override(session_key, override)
+        # Write-through so the selection survives a gateway restart.  Runs
+        # off-loop: SessionDB is synchronous SQLite.
+        await asyncio.to_thread(self._persist_session_model_override, session_id, override)
+        logger.info(
+            "api_server model override set: session=%s model=%s provider=%s",
+            session_key, result.new_model, result.target_provider,
+        )
+        return None
+
+    def _override_from_route(self, route: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build a session override from a ``model_routes`` entry.
+
+        Resolves the routed provider's real credentials the same way
+        _create_agent does for a per-request route, so a route that names a
+        provider without an explicit api_key still gets that provider's auth
+        rather than the default provider's.
+        """
+        if not route.get("model"):
+            return None
+        override: Dict[str, Any] = {"model": route["model"]}
+        provider = route.get("provider")
+        if provider:
+            override["provider"] = provider
+            try:
+                from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(provider)
+                override["api_key"] = provider_kwargs.get("api_key")
+                override["base_url"] = provider_kwargs.get("base_url")
+                override["api_mode"] = provider_kwargs.get("api_mode")
+                override["credential_pool"] = provider_kwargs.get("credential_pool")
+            except Exception:
+                logger.debug(
+                    "Credential resolution failed for routed provider %s", provider,
+                    exc_info=True,
+                )
+        # Explicit per-route secrets win over the resolved provider defaults.
+        if route.get("api_key"):
+            override["api_key"] = route["api_key"]
+        if route.get("base_url"):
+            override["base_url"] = route["base_url"]
+        return override
+
+    async def _resolve_model_switch(
+        self, requested: str, current: Optional[Dict[str, Any]]
+    ) -> tuple[Any, Optional[str]]:
+        """Resolve *requested* to a full provider credential set.
+
+        Reuses ``hermes_cli.model_switch.switch_model`` — the same resolver
+        the ``/model`` slash command uses — so aliases, aggregator slugs and
+        per-provider ``api_mode`` quirks behave identically over HTTP.  The
+        current model/provider context is read from config and then layered
+        with any active session override, mirroring gateway/slash_commands.
+
+        Offloaded to a thread: switch_model can fall through to a models.dev
+        HTTP fetch and a live endpoint probe, which would freeze the event
+        loop (see #20525, #41289).  Returns ``(result, None)`` on success or
+        ``(None, error_message)`` on failure.
+        """
+        from gateway.run import _load_gateway_config
+
+        current_model = ""
+        current_provider = "openrouter"
+        current_base_url = ""
+        current_api_key = ""
+        user_provs = None
+        custom_provs = None
+        try:
+            cfg = _load_gateway_config()
+            if cfg:
+                model_cfg = cfg.get("model", {})
+                if isinstance(model_cfg, dict):
+                    current_model = model_cfg.get("default", "")
+                    current_provider = model_cfg.get("provider", current_provider)
+                    current_base_url = model_cfg.get("base_url", "")
+                user_provs = cfg.get("providers")
+                try:
+                    from hermes_cli.config import get_compatible_custom_providers
+                    custom_provs = get_compatible_custom_providers(cfg)
+                except Exception:
+                    custom_provs = cfg.get("custom_providers")
+        except Exception:
+            pass
+        if current:
+            current_model = current.get("model") or current_model
+            current_provider = current.get("provider") or current_provider
+            current_base_url = current.get("base_url") or current_base_url
+            current_api_key = current.get("api_key") or current_api_key
+
+        try:
+            from hermes_cli.model_switch import switch_model as _switch_model
+            result = await asyncio.to_thread(
+                _switch_model,
+                raw_input=requested,
+                current_provider=current_provider,
+                current_model=current_model,
+                current_base_url=current_base_url,
+                current_api_key=current_api_key,
+                # Never touch config.yaml from an HTTP request: the switch is
+                # scoped to this session, not the whole gateway.
+                is_global=False,
+                explicit_provider="",
+                user_providers=user_provs,
+                custom_providers=custom_provs,
+            )
+        except Exception as exc:
+            logger.warning("api_server model switch failed for %r: %s", requested, exc)
+            return None, f"Could not resolve model {requested!r}: {exc}"
+        if not result.success:
+            return None, result.error_message or f"Unknown model: {requested}"
+        if not result.new_model:
+            return None, f"Unknown model: {requested}"
+        return result, None
 
     def _request_route_conflict_error(
         self, *, session_id: Optional[str], gateway_session_key: Optional[str], requested_model: Optional[str],
@@ -2225,6 +2617,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_row_model = _clean_request_string(session_model)
         current_provider = _clean_request_string(runtime_kwargs.get("provider"))
         session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
+        if session_override is None and not confirmed_runtime_lock:
+            # Nothing live in memory: a restart clears the map, so fall back to the override
+            # written through onto the session row (#216), and reinstall it so the rehydration
+            # cost is paid once per session.
+            session_override = self._rehydrated_model_override(session_id)
+            if session_override:
+                self._set_session_model_override(session_key, session_override)
         # Model-string precedence (override > session-persisted > global) is owned by
         # hermes_cli.model_switch.resolve_effective_model.
         from hermes_cli.model_switch import resolve_effective_model
@@ -3491,6 +3890,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             if runtime_request.get("model_options"):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
+            # #216: a body ``model`` is a sticky session switch (HTTP equivalent of /model):
+            # resolved, validated (unresolvable -> 400, never a silent default), installed in the
+            # one shared override store and written through to the session row. Runs before the
+            # agent is built and before any SSE frame, so failure is a plain JSON 400.
+            # Upstream's contract wins where the two overlap: ``model`` WITH an explicit
+            # ``provider`` is a one-off per-request selection (it must not become sticky, and must
+            # not be rejected by the /model resolver), so only a bare ``model`` switches.
+            if not _clean_request_string(body.get("provider")):
+                model_err = await self._apply_requested_model(body, session_id, gateway_session_key)
+                if model_err is not None:
+                    return None, model_err
             stored_model = self._stored_session_model(session)
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
@@ -3703,6 +4113,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         payload = {
             "object": "hermes.session.chat.completion",
             "session_id": effective_session_id or session_id,
+            # #216: the EFFECTIVE model, not an echo of the request -- a client that sent no
+            # ``model`` still learns which one answered, and one that did can confirm the switch.
+            "model": self._effective_model_name(gateway_session_key or session_id),
             "message": {"role": "assistant", "content": final_response}, "usage": usage,
             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)}
         # /goal (#230): the sync endpoint has no continuation loop -- one HTTP
@@ -3735,7 +4148,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # See #93689.
         self._run_owners[run_id] = self._run_idempotency_scope(request)
         self._set_run_status(
-            run_id, "queued", session_id=session_id, model=ctx["body"].get("model", self._model_name))
+            run_id, "queued", session_id=session_id,
+            model=self._effective_model_name(gateway_session_key or session_id))
 
         def _delta(delta: str) -> None:
             if delta:
@@ -3864,6 +4278,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
+                    # #216: effective model for this turn, so a UI can confirm a switch took.
+                    "model": self._effective_model_name(gateway_session_key or session_id),
                     "runtime": runtime_meta}))
                 self._set_run_status(run_id, "running", last_event="run.started")
                 # /goal continuation (#230): a turn may end with the goal judge asking
