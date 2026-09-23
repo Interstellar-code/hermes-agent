@@ -175,8 +175,9 @@ class PluginDispatchMixin:
         Payloads evolve additively: ``**kwargs`` callbacks get everything, narrow signatures only
         what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
         ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
-        closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
-        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
+        closed with a block directive on timeout OR a raised exception, others skip/log-and-swallow.
+        ``_HOOK_CALLER_THREAD_HOOKS`` always run on the caller thread. ``pre_llm_call`` may return
+        ``{"context": "..."}`` (or a str) to inject.
         """
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
@@ -200,8 +201,13 @@ class PluginDispatchMixin:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s", hook_name, getattr(cb, "__name__", repr(cb)), exc)
+                cb_name = getattr(cb, "__name__", repr(cb))
+                logger.warning("Hook '%s' callback %s raised: %s", hook_name, cb_name, exc, exc_info=True)
+                if fail_closed:  # policy hook: fail closed with a block directive
+                    results.append({
+                        "action": "block",
+                        "message": f"pre_tool_call plugin callback '{cb_name}' raised {type(exc).__name__}: {exc}",
+                    })
         return results
 
     def _run_hook_callback_bounded(

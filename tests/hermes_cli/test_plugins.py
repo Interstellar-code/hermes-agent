@@ -1303,6 +1303,81 @@ class TestForceReloadSymmetry:
         assert _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE in result
         hold.set()
 
+    def test_pre_tool_call_raising_callback_fails_closed(self, monkeypatch):
+        """E2E: a pre_tool_call callback that raises blocks handle_function_call before dispatch
+        (same fail-closed contract as a timeout, driven the same way)."""
+        import json
+
+        def raising_policy(**_kwargs):
+            raise ValueError("boom")
+
+        mgr = PluginManager()
+        mgr._hooks["pre_tool_call"] = [raising_policy]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        dispatch_calls = []
+
+        def _dispatch(name, args, **kwargs):
+            dispatch_calls.append((name, args))
+            return json.dumps({"ok": True})
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.side_effect = _dispatch
+
+        with patch("model_tools.registry", mock_registry):
+            from model_tools import handle_function_call
+
+            result = handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="s1",
+            )
+
+        assert dispatch_calls == []
+        assert "raising_policy" in result
+        assert "ValueError" in result
+
+    def test_post_tool_call_raising_callback_does_not_block(self, monkeypatch):
+        """Negative control: a raising post_tool_call callback must NOT block — fail-open
+        semantics stay unchanged for every hook other than pre_tool_call."""
+        import json
+
+        def raising_observer(**_kwargs):
+            raise ValueError("boom")
+
+        mgr = PluginManager()
+        mgr._hooks["post_tool_call"] = [raising_observer]
+
+        import hermes_cli.plugins as plugins_mod
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+
+        dispatch_calls = []
+
+        def _dispatch(name, args, **kwargs):
+            dispatch_calls.append((name, args))
+            return json.dumps({"ok": True})
+
+        mock_registry = MagicMock()
+        mock_registry.dispatch.side_effect = _dispatch
+
+        with patch("model_tools.registry", mock_registry):
+            from model_tools import handle_function_call
+
+            result = handle_function_call(
+                "web_search",
+                {"query": "test"},
+                task_id="t1",
+                session_id="s1",
+            )
+
+        assert dispatch_calls == [("web_search", {"query": "test"})]
+        assert json.loads(result) == {"ok": True}
+
     def test_force_reload_of_one_profile_does_not_orphan_another(self, monkeypatch):
         """Real two-manager regression: force-reloading profile A's plugin
         manager must leave profile B's shell hook registered exactly once —

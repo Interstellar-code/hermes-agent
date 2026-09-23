@@ -269,7 +269,12 @@ def _on_pre_llm_call(**kwargs: Any) -> None:
 
 @_raft_hook
 def _on_pre_tool_call(**kwargs: Any) -> None:
-    _emit("PreToolUse", kwargs, tool_name=kwargs.get("tool_name"), tool_input=kwargs.get("args"))
+    # pre_tool_call fails CLOSED on a raise (plugins_dispatch): an unguarded activity-report
+    # failure here would block the tool call itself. Telemetry must never act as a policy gate.
+    try:
+        _emit("PreToolUse", kwargs, tool_name=kwargs.get("tool_name"), tool_input=kwargs.get("args"))
+    except Exception:
+        logger.debug("[raft] PreToolUse activity report failed", exc_info=True)
 
 
 @_raft_hook

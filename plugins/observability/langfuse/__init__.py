@@ -867,8 +867,10 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
         state = _TRACE_STATE.get(task_key)
         if state is None:
             return
-        observation = _start_child_observation(state, name=f"Tool: {tool_name}", as_type="tool", input_value=_capture_content(args),
-                                               metadata={"tool_name": tool_name, "tool_call_id": tool_call_id})
+        observation = None
+        with _failsafe(f"start tool observation ({tool_name})"):
+            observation = _start_child_observation(state, name=f"Tool: {tool_name}", as_type="tool", input_value=_capture_content(args),
+                                                   metadata={"tool_name": tool_name, "tool_call_id": tool_call_id})
         if tool_call_id:
             state.tools[tool_call_id] = observation
         else:
