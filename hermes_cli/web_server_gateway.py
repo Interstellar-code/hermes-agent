@@ -167,7 +167,7 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
         except Exception:
             runtime = None
         served = [str(p) for p in ((runtime or {}).get("served_profiles") or [])]
-        if name == "default" and len(served) > 1:
+        if len(served) > 1:
             multiplex = True
         plats = (runtime or {}).get("platforms")
         if isinstance(plats, dict) and plats:

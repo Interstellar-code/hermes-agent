@@ -210,7 +210,34 @@ class TestCollectProfileGatewayTopology:
         topo = _collect_profile_gateway_topology()
         assert topo["profile_platforms"] == {}
 
+    def test_multiplex_detected_regardless_of_serving_profile_name(self, tmp_path, monkeypatch):
+        # A gateway serving >1 profile is multiplex even when the serving
+        # profile itself isn't named "default" (e.g. "hermes-switch").
+        homes = [("hermes-switch", tmp_path / "hs")]
+        runtimes = {
+            "hermes-switch": {
+                "served_profiles": ["hermes-switch", "default", "morpheus", "neo", "trinity"],
+            },
+        }
+        _patch_topology(monkeypatch, homes, running={"hermes-switch"}, runtimes=runtimes)
+        monkeypatch.setattr(
+            _web_server_gateway, "_profile_gateway_writer_identity", lambda home, runtime: None,
+        )
+        topo = _collect_profile_gateway_topology()
+        assert topo["gateway_mode"] == "multiplex"
+        assert topo["gateways"][0]["served_profiles"] == [
+            "hermes-switch", "default", "morpheus", "neo", "trinity",
+        ]
 
+    def test_single_served_profile_is_not_multiplex(self, tmp_path, monkeypatch):
+        homes = [("hermes-switch", tmp_path / "hs")]
+        runtimes = {"hermes-switch": {"served_profiles": ["hermes-switch"]}}
+        _patch_topology(monkeypatch, homes, running={"hermes-switch"}, runtimes=runtimes)
+        monkeypatch.setattr(
+            _web_server_gateway, "_profile_gateway_writer_identity", lambda home, runtime: None,
+        )
+        topo = _collect_profile_gateway_topology()
+        assert topo["gateway_mode"] == "single"
 
     def test_enumeration_failure_degrades_gracefully(self, monkeypatch):
         import hermes_cli.profiles as profiles_mod
