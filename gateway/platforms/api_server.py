@@ -1164,6 +1164,40 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+# EADDRINUSE on bind with NOTHING listening is TIME_WAIT debris from the
+# previous gateway's clients: reuse_address is deliberately off on darwin
+# (see connect()), so those sockets keep the port unbindable for up to ~60s
+# after the old process is gone. Capped well inside the 30s platform connect
+# timeout (gateway.platform_connect_timeout) -- a 60s ladder gets cancelled
+# mid-sleep. The long horizon belongs to the reconnect watcher, not here.
+# Module-level so tests can shrink it.
+BIND_RETRY_DELAYS = (1, 2, 4, 8)
+
+
+async def _has_live_listener(host: str, port: int, timeout: float = 0.5) -> bool:
+    """True if something is accepting connections on host:port right now.
+
+    Used only to classify an EADDRINUSE that already happened -- never to
+    decide whether to bind. The pre-probe removed in #10297 raced the real
+    bind because it gated it; here bind stays authoritative and this only
+    answers "was that a live conflict, or debris?"
+    """
+    if host in ("", "0.0.0.0"):
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -4490,33 +4524,66 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # while both report success — disable. - Linux: SO_REUSEADDR only permits rebinding past
             # TIME_WAIT (a second live listener needs SO_REUSEPORT, never set), so keep the default
             # (enabled) for instant restart rebinds.
-            self._site = web.TCPSite(
-                self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
-            try:
-                await self._site.start()
-            except OSError as exc:
+            # Fork restore (399ed37a9b + follow-ups, dropped by the v0.21.3 adopt): upstream marks
+            # EVERY EADDRINUSE non-retryable, and gateway.run's reconnect watcher drops non-retryable
+            # failures outright -- so a restart that races TIME_WAIT debris leaves the gateway up with
+            # no API listener until someone intervenes by hand (hit again 2026-09-23 06:31). Probe
+            # to tell debris from a live conflict: wait out debris, never wait on a live conflict, and
+            # keep only the live case non-retryable (#52132 protection preserved).
+            # ponytail: fixed backoff, not a config knob -- covers one OS behavior of known duration.
+            bind_error: Optional[OSError] = None
+            live_conflict = False
+            for delay in (*BIND_RETRY_DELAYS, None):
+                self._site = web.TCPSite(
+                    self._runner, self._host, self._port, reuse_address=False if sys.platform == "darwin" else None)
+                try:
+                    await self._site.start()
+                    bind_error = None
+                    break
+                except OSError as exc:
+                    bind_error = exc
+                    self._site = None
+                    if getattr(exc, "errno", None) != errno.EADDRINUSE:
+                        break
+                    # Probe on EVERY EADDRINUSE, including the last attempt, so a genuine conflict
+                    # never loses its non-retryable marking when the ladder is exhausted.
+                    live_conflict = await _has_live_listener(self._host, self._port)
+                    if live_conflict or delay is None:
+                        break
+                    logger.warning(
+                        "[%s] %s:%d not bindable yet (%s) but nothing is listening — TIME_WAIT "
+                        "debris from the previous gateway; retrying in %ds",
+                        self.name, self._host, self._port, exc, delay)
+                    await asyncio.sleep(delay)
+
+            if bind_error is not None:
+                exc = bind_error
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
-                    # Config error: non-retryable, or the reconnect watcher leaks fds forever.
+                if getattr(exc, "errno", None) == errno.EADDRINUSE and live_conflict:
+                    # A LIVE conflict is a configuration error: another process holds the port for its
+                    # lifetime. Retryable would loop forever at the backoff cap (1568+ retries over 5
+                    # days, #52132) leaking ResponseStore fds; the operator recovers with
+                    # ``/platform resume api_server`` after changing the port.
                     self._set_fatal_error(
-                        # A port conflict is a configuration error, not a transient blip — another process
-                        # holds the port for its lifetime. A bare ``return False`` makes the reconnect
-                        # watcher in gateway.run treat it as retryable and loop forever at the backoff cap
-                        # (observed: 1568+ retries over 5 days across multi-profile setups all defaulting to
-                        # the same port, #52132), filling errors.log and leaking the adapter's ResponseStore
-                        # fds each retry. Non-retryable drops it from the reconnect queue; the operator
-                        # recovers with ``/platform resume api_server`` after changing the port.
                         "api_server_port_in_use",
                         f"Port {self._port} already in use. Set "
                         f"platforms.api_server.port in config.yaml to a "
                         f"different value, then `/platform resume api_server`.",
                         retryable=False)
+                    logger.error(
+                        "[%s] Could not bind %s:%d: %s. Set a different port in "
+                        "config.yaml: platforms.api_server.port",
+                        self.name, self._host, self._port, exc)
+                    return False
+                # Nothing listening = debris that clears on its own. Leave it retryable so the
+                # reconnect watcher heals it on its next pass.
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc)
+                    "[%s] Could not bind %s:%d after %ds of retries: %s. Nothing is listening, so this "
+                    "is lingering TIME_WAIT debris rather than a port conflict — leaving it retryable "
+                    "for the reconnect watcher.",
+                    self.name, self._host, self._port, sum(BIND_RETRY_DELAYS), exc)
                 return False
             from gateway.platforms.shared_ingress import listener_base_url
             self._mark_connected(listener_base=listener_base_url(self._host, self._port))
