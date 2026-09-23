@@ -260,6 +260,16 @@ CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 RUN_EVENTS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+# Backstop for /goal auto-continuation on ONE streaming request (#230). This is
+# NOT the goal's turn budget: GoalManager already enforces that per session and
+# persists ``turns_used`` in state_meta, so it survives across HTTP requests and
+# pauses the goal itself (hermes_cli/goals.py, ``turns_used >= max_turns``).
+# This cap only bounds how long a single HTTP connection can be held open if
+# that budget is somehow not reached -- corrupt state, a judge that answers
+# "continue" forever, a goal whose max_turns was set absurdly high. On hitting
+# it the stream closes normally and the goal stays active, so the client simply
+# drives the next turn with another request.
+MAX_GOAL_CONTINUATIONS_PER_REQUEST = 10
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 
 
@@ -672,6 +682,29 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_task_id = ""
     agent._gateway_turn_process_baseline = frozenset()
     agent._gateway_turn_process_epoch = None
+
+
+def _merge_usage_totals(base: Dict[str, Any], extra: Any) -> Dict[str, Any]:
+    """Accumulate token counts across the turns of ONE streaming request.
+
+    A /goal continuation (#230) runs additional agent turns inside a single
+    request, but ``run.completed`` reports one usage block. Numeric fields are
+    summed so a client is not silently billed for the last turn only; anything
+    non-numeric (model names, flags) takes the most recent value.
+    """
+    merged = dict(base or {})
+    if not isinstance(extra, dict):
+        return merged
+    for key, value in extra.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            merged[key] = value
+            continue
+        prior = merged.get(key)
+        if isinstance(prior, (int, float)) and not isinstance(prior, bool):
+            merged[key] = prior + value
+        else:
+            merged[key] = value
+    return merged
 
 
 def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
@@ -3485,6 +3518,132 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return ""
         return "confirmed" if runtime else "accepted"
 
+    # ────────────────────────────────────────────────────────────────
+    # /goal — post-turn continuation (#230)
+    #
+    # The CLI (_maybe_continue_goal_after_turn) and the messaging gateway
+    # (GatewayRunner._post_turn_goal_continuation) both run the goal judge at
+    # every turn boundary. This surface had no goal machinery at all, so a
+    # goal set from a web/API client was persisted, reported active by
+    # /goal status, and never evaluated -- accepted work that nothing carried
+    # out. These two helpers close that gap; the messaging hook is the
+    # template since it is already async and already fast-paths "no goal".
+    # ────────────────────────────────────────────────────────────────
+    def _goal_max_turns_from_config(self) -> int:
+        """Resolve the configured /goal turn budget.
+
+        Mirrors GatewayRunner._goal_max_turns_from_config. ``self.config`` here
+        is a PlatformConfig carrying only this platform's block, so the
+        top-level ``goals`` block is reachable only through the user config.
+        ``load_config_readonly`` because we never mutate the result and this
+        runs on every turn (cache hit ~130us, and only when a goal exists).
+        """
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            goals_cfg = (load_config_readonly() or {}).get("goals") or {}
+            return int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            return 20
+
+    async def _evaluate_goal_after_turn(
+        self,
+        session_id: str,
+        final_response: str,
+        *,
+        user_initiated: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the goal judge for *session_id* after a turn.
+
+        Returns ``None`` when there is nothing to report -- no goal, goals
+        module unavailable, or the judge blew up -- and a decision dict
+        otherwise (the GoalManager keys plus ``turns_used``/``max_turns``
+        read back off the persisted state).
+
+        Keyed on the Hermes ``session_id``, because that is what the goal
+        meta key is built from (``goal:{session_id}``, hermes_cli/goals.py)
+        -- NOT the gateway session key from X-Hermes-Session-Key, which only
+        scopes per-connection state like approvals and yolo mode.
+
+        This must never break a chat turn: every failure path degrades to
+        "no goal block", logged at debug, exactly like the gateway hook.
+
+        Unlike the gateway hook this hands the work to a thread. The judge is
+        a blocking LLM call and the API server is a shared aiohttp process --
+        running it inline would stall every other request (and this stream's
+        own keepalives) for the duration of the judge call.
+        """
+        if not session_id:
+            return None
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            logger.debug("[api_server] goal continuation: goals module unavailable: %s", exc)
+            return None
+
+        def _evaluate() -> Optional[Dict[str, Any]]:
+            # Constructing the manager loads the persisted state; when there is
+            # no active goal that single read is the entire cost of this hook.
+            mgr = GoalManager(
+                session_id=session_id,
+                default_max_turns=self._goal_max_turns_from_config(),
+            )
+            if not mgr.is_active():
+                return None
+            try:
+                from hermes_cli.goals import (
+                    count_active_delegations,
+                    gather_background_processes,
+                )
+
+                background = gather_background_processes(owner_task_id=session_id)
+                active_delegations = count_active_delegations(session_id)
+            except Exception:
+                # The judge treats a missing snapshot as "nothing in flight" --
+                # it must not stop the goal from being evaluated.
+                background = None
+                active_delegations = 0
+            decision = dict(
+                mgr.evaluate_after_turn(
+                    final_response or "",
+                    user_initiated=user_initiated,
+                    background_processes=background,
+                    active_delegations=active_delegations,
+                )
+                or {}
+            )
+            # The budget lives in the persisted state, which evaluate_after_turn
+            # has just updated; surface it so a client can render "3/20" without
+            # a second round trip through /goal status.
+            state = getattr(mgr, "state", None)
+            decision["turns_used"] = int(getattr(state, "turns_used", 0) or 0)
+            decision["max_turns"] = int(getattr(state, "max_turns", 0) or 0)
+            return decision
+
+        try:
+            return await asyncio.to_thread(_evaluate)
+        except Exception as exc:
+            logger.debug("[api_server] goal continuation: evaluation failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _goal_public_block(decision: Dict[str, Any]) -> Dict[str, Any]:
+        """Project a GoalManager decision into the wire shape.
+
+        Deliberately a fixed key set: ``reason`` is the judge's internal
+        rationale and rides inside ``message`` when it matters, so it stays
+        off the public contract.
+        """
+        return {
+            "status": decision.get("status"),
+            "verdict": decision.get("verdict"),
+            "message": decision.get("message") or "",
+            "should_continue": bool(decision.get("should_continue")),
+            "continuation_prompt": decision.get("continuation_prompt") or None,
+            "turns_used": int(decision.get("turns_used", 0) or 0),
+            "max_turns": int(decision.get("max_turns", 0) or 0),
+        }
+
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
@@ -3500,12 +3659,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         final_response = _resolve_media_to_data_urls(
             result.get("final_response", "") if is_dict else "")
         headers = self._session_headers(effective_session_id or session_id, gateway_session_key)
-        return web.json_response(
-            {"object": "hermes.session.chat.completion",
-             "session_id": effective_session_id or session_id,
-             "message": {"role": "assistant", "content": final_response}, "usage": usage,
-             "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)},
-            headers=headers)
+        payload = {
+            "object": "hermes.session.chat.completion",
+            "session_id": effective_session_id or session_id,
+            "message": {"role": "assistant", "content": final_response}, "usage": usage,
+            "runtime": self._effective_turn_runtime(ctx["runtime_request"], result, usage)}
+        # /goal (#230): the sync endpoint has no continuation loop -- one HTTP
+        # request is one turn -- but it still must report the judge's verdict
+        # so a client polling this endpoint sees the same goal state the SSE
+        # stream would have emitted as goal.status.
+        goal_decision = await self._evaluate_goal_after_turn(session_id, final_response)
+        if goal_decision is not None:
+            payload["goal"] = self._goal_public_block(goal_decision)
+        return web.json_response(payload, headers=headers)
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -3634,53 +3800,120 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._run_approval_requests.pop(run_id, None)
             self._run_approval_sessions.pop(run_id, None)
 
+        def _client_disconnected() -> bool:
+            """True once this request's transport is gone (#230).
+
+            A /goal continuation runs another full agent turn with no client
+            waiting on it; without this check an abandoned tab would keep the
+            goal driving turns against a connection nothing is reading from.
+            """
+            transport = getattr(request, "transport", None)
+            if transport is None:
+                return True
+            is_closing = getattr(transport, "is_closing", None)
+            if not callable(is_closing):
+                return False
+            try:
+                return bool(is_closing())
+            except Exception:
+                return False
+
         async def _run_and_signal() -> None:
+            nonlocal message_id
             try:
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
                     "runtime": runtime_meta}))
                 self._set_run_status(run_id, "running", last_event="run.started")
-                await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
-                    conversation_history=history, stream_delta_callback=_delta,
-                    tool_progress_callback=_tool_progress, active_run_id=run_id,
-                    approval_notify=_approval_notify, approval_session_key=session_id,
-                    approval_cleanup=_approval_cleanup,
-                    agent_register=_register_stream_agent,
-                    # This run registers its own task in _active_run_tasks below, which
-                    # active_agent_work_count() already sums; counting it as an inflight
-                    # run too would spend two concurrency slots.
-                    count_inflight=False,
-                    **ctx["run_kwargs"])
-                is_dict = isinstance(result, dict)
-                final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
-                effective_session_id = result.get("session_id", session_id) if is_dict else session_id
-                turn_messages = self._turn_transcript_messages(history, user_message, result) if is_dict else []
-                effective_runtime = self._effective_turn_runtime(runtime_request, result, usage)
-                # A stop that the agent honoured comes back as a normal return carrying
-                # interrupted=True, NOT as CancelledError -- the executor thread finished
-                # its turn. Reporting it as "completed" would tell the client the answer
-                # is whole when it is a partial.
-                interrupted = bool(result.get("interrupted")) if is_dict else False
-                # Status follows the OUTCOME, not the request: a provisional stop
-                # cannot discard a real completion. Only a turn the agent actually cut
-                # short reports "cancelled"; a stop that lost the race, or one an
-                # uncooperative agent ignored, ran to the end and reports "completed".
-                # Either way the answer is kept and `interrupted` is published, so a
-                # client never has to parse the status string to tell them apart.
-                stop_requested = run_id in self._stopping_run_ids
-                await queue.put(_event_payload("assistant.completed", {
-                    "session_id": effective_session_id, "message_id": message_id,
-                    "content": final_response, "completed": True,
-                    "partial": (bool(result.get("partial")) if is_dict else False) or interrupted,
-                    "interrupted": interrupted, "runtime": effective_runtime}))
-                # A steer accepted after the final reply lands in result["pending_steer"]; surface
-                # it so clients can replay it rather than lose it.
-                pending_steer = result.get("pending_steer") if is_dict else None
+                # /goal continuation (#230): a turn may end with the goal judge asking
+                # for another one. Everything below ran once before; it now runs per
+                # turn, with the same callbacks and message.started/assistant.completed
+                # pair each time -- a continuation is indistinguishable from a fresh
+                # user turn to anything reading the event stream.
+                turn_user_message = user_message
+                continuations = 0
+                turn_messages: List[Dict[str, Any]] = []
+                usage: Dict[str, Any] = {}
+                final_response = ""
+                effective_session_id = session_id
+                effective_runtime: Dict[str, Any] = {}
+                interrupted = False
+                stop_requested = False
+                pending_steer = None
+                while True:
+                    await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+                    history = await self._conversation_history_for_session(session_id)
+                    result, turn_usage = await self._run_agent(
+                        conversation_history=history, stream_delta_callback=_delta,
+                        tool_progress_callback=_tool_progress, active_run_id=run_id,
+                        approval_notify=_approval_notify, approval_session_key=session_id,
+                        approval_cleanup=_approval_cleanup,
+                        agent_register=_register_stream_agent,
+                        # This run registers its own task in _active_run_tasks below, which
+                        # active_agent_work_count() already sums; counting it as an inflight
+                        # run too would spend two concurrency slots.
+                        count_inflight=False,
+                        **{**ctx["run_kwargs"], "user_message": turn_user_message})
+                    is_dict = isinstance(result, dict)
+                    final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
+                    effective_session_id = result.get("session_id", session_id) if is_dict else session_id
+                    if is_dict:
+                        turn_messages.extend(self._turn_transcript_messages(history, turn_user_message, result))
+                    effective_runtime = self._effective_turn_runtime(runtime_request, result, turn_usage)
+                    usage = _merge_usage_totals(usage, turn_usage)
+                    # A stop that the agent honoured comes back as a normal return carrying
+                    # interrupted=True, NOT as CancelledError -- the executor thread finished
+                    # its turn. Reporting it as "completed" would tell the client the answer
+                    # is whole when it is a partial.
+                    interrupted = bool(result.get("interrupted")) if is_dict else False
+                    # Status follows the OUTCOME, not the request: a provisional stop
+                    # cannot discard a real completion. Only a turn the agent actually cut
+                    # short reports "cancelled"; a stop that lost the race, or one an
+                    # uncooperative agent ignored, ran to the end and reports "completed".
+                    # Either way the answer is kept and `interrupted` is published, so a
+                    # client never has to parse the status string to tell them apart.
+                    stop_requested = run_id in self._stopping_run_ids
+                    await queue.put(_event_payload("assistant.completed", {
+                        "session_id": effective_session_id, "message_id": message_id,
+                        "content": final_response, "completed": True,
+                        "partial": (bool(result.get("partial")) if is_dict else False) or interrupted,
+                        "interrupted": interrupted, "runtime": effective_runtime}))
+                    # A steer accepted after the final reply lands in result["pending_steer"]; surface
+                    # it so clients can replay it rather than lose it.
+                    pending_steer = result.get("pending_steer") if is_dict else None
+
+                    if interrupted or stop_requested or _client_disconnected():
+                        break
+                    decision = await self._evaluate_goal_after_turn(session_id, final_response)
+                    if decision is None:
+                        break
+                    goal_block = self._goal_public_block(decision)
+                    if goal_block["message"]:
+                        await queue.put(_event_payload("goal.status", dict(goal_block, message_id=message_id)))
+                    continuation_prompt = goal_block["continuation_prompt"]
+                    if not goal_block["should_continue"] or not continuation_prompt:
+                        break
+                    if continuations >= MAX_GOAL_CONTINUATIONS_PER_REQUEST:
+                        await queue.put(_event_payload("goal.status", dict(
+                            goal_block, message_id=message_id, capped=True,
+                            message=(
+                                f"Goal continuation stopped after "
+                                f"{MAX_GOAL_CONTINUATIONS_PER_REQUEST} turns on this request. "
+                                "The goal is still active -- send another turn to keep going."))))
+                        break
+                    if run_id in self._stopping_run_ids or _client_disconnected():
+                        break
+                    continuations += 1
+                    message_id = f"msg_{uuid.uuid4().hex}"
+                    turn_user_message = continuation_prompt
+                    await queue.put(_event_payload("goal.continuation", {
+                        "message_id": message_id, "turn": continuations,
+                        "turns_used": goal_block["turns_used"], "max_turns": goal_block["max_turns"],
+                        "status": goal_block["status"], "continuation_prompt": continuation_prompt}))
                 completed_payload = {
                     "session_id": effective_session_id, "message_id": message_id, "completed": True,
-                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}
+                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime,
+                    **({"goal_continuations": continuations} if continuations else {})}
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
                 await queue.put(_event_payload("run.completed", completed_payload))
