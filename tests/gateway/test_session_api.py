@@ -1393,3 +1393,104 @@ async def test_session_chat_reasoning_effort_is_per_request_not_sticky(adapter, 
             resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two"})
             assert resp.status == 200, await resp.text()
     assert seen == ["ultra", None]
+
+
+# ---------------------------------------------------------------------------
+# usage.update SSE event (context_percent mirror for hermes-switchui context ring)
+# ---------------------------------------------------------------------------
+
+
+def _usage_update_events(body):
+    """Pull every usage.update SSE frame's JSON payload out of an SSE body."""
+    import json as _json
+
+    events = []
+    for block in body.split("\n\n"):
+        if "event: usage.update" in block:
+            for line in block.splitlines():
+                if line.startswith("data: "):
+                    events.append(_json.loads(line[len("data: "):]))
+    return events
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_emits_usage_update_on_call_and_compaction(adapter, session_db):
+    """usage.update must fire after a model call and after a compaction, both
+    mirroring context_usage_fields()'s context_percent (the same figure
+    /api/sessions reports), never reimplementing the formula.
+    """
+    from agent.context_breakdown import context_usage_fields
+
+    session_id = session_db.create_session("usage-update-session", "api_server")
+
+    class _FakeCompressor:
+        last_prompt_tokens = 4000
+        context_length = 8000
+
+    class _FakeAgent:
+        context_compressor = _FakeCompressor()
+
+    fake_agent = _FakeAgent()
+    expected_percent = context_usage_fields(fake_agent.context_compressor)["context_percent"]
+
+    async def fake_run(**kwargs):
+        usage_callback = kwargs["usage_callback"]
+        # (a) after a model call: not compacted, before == after.
+        usage_callback(fake_agent, False, 3, 3)
+        # (b) after a compaction: compacted, before != after.
+        usage_callback(fake_agent, True, 10, 4)
+        return {"final_response": "ok", "session_id": session_id}, {}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "hi"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = _usage_update_events(body)
+    assert len(events) == 2, body
+
+    call_event, compaction_event = events
+    assert {k: call_event[k] for k in ("context_percent", "compacted", "messages_before", "messages_after")} == {
+        "context_percent": expected_percent,
+        "compacted": False,
+        "messages_before": 3,
+        "messages_after": 3,
+    }
+    assert {k: compaction_event[k] for k in ("context_percent", "compacted", "messages_before", "messages_after")} == {
+        "context_percent": expected_percent,
+        "compacted": True,
+        "messages_before": 10,
+        "messages_after": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_never_emits_usage_update(adapter):
+    """usage.update is a session-chat-stream-only event; /v1/chat/completions
+    must never wire a usage_callback nor emit the frame.
+    """
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+
+    async def fake_run(**kwargs):
+        assert kwargs.get("usage_callback") is None
+        return (
+            {"final_response": "ok", "messages": [], "api_calls": 1},
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    assert "usage.update" not in body

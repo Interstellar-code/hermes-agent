@@ -3732,6 +3732,9 @@ def compress_context(
         lifecycle.commit_status = (
             "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         )
+        if lifecycle.commit_status == "committed" and getattr(agent, "usage_callback", None):
+            with _swallow('usage_callback error in compaction completion', exc_info=True):
+                agent.usage_callback(agent, True, _pre_msg_count, len(compressed))
         _emit_compression_attempt_telemetry(
             agent, started_at=attempt.started_at, commit_status=lifecycle.commit_status, split_status=split_status,
             failure_class=("session_split_failed" if split_status in {"failed_not_indexed", "aborted"} else None),
@@ -3845,6 +3848,9 @@ def _compress_context_via_codex_app_server(
     existing_prompt = _existing_system_prompt(agent, system_message)
     # Terminal edge only on success — failure/interrupt paths above return
     # without it, matching the main compress_context() gating.
+    if getattr(agent, "usage_callback", None):
+        with _swallow('usage_callback error in compaction completion', exc_info=True):
+            agent.usage_callback(agent, True, len(messages), len(messages))
     _emit_compaction_done(agent)
     return messages, existing_prompt
 

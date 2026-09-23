@@ -2684,7 +2684,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
-        interactive_clarify: bool = False) -> Any:
+        interactive_clarify: bool = False, usage_callback=None) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2742,7 +2742,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,
-            "gateway_session_key": gateway_session_key}
+            "gateway_session_key": gateway_session_key,
+            "usage_callback": usage_callback}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
         agent = AIAgent(**agent_kwargs)
@@ -4161,6 +4162,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
                 events.enqueue(event_type, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        def _usage_update(agent, compacted: bool, messages_before: int, messages_after: int) -> None:
+            """Mirror /api/sessions' context_percent onto this run's SSE stream. Executor thread."""
+            from agent.context_breakdown import context_usage_fields
+            fields = context_usage_fields(getattr(agent, "context_compressor", None))
+            if "context_percent" not in fields:
+                return
+            events.enqueue("usage.update", {
+                "context_percent": fields["context_percent"], "compacted": compacted,
+                "messages_before": messages_before, "messages_after": messages_after})
+
         _approval_profile = _api_request_profile.get()
 
         def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -4305,7 +4316,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         tool_progress_callback=_tool_progress, active_run_id=run_id,
                         approval_notify=_approval_notify, approval_session_key=session_id,
                         approval_cleanup=_approval_cleanup,
-                        agent_register=_register_stream_agent,
+                        agent_register=_register_stream_agent, usage_callback=_usage_update,
                         # This run registers its own task in _active_run_tasks below, which
                         # active_agent_work_count() already sums; counting it as an inflight
                         # run too would spend two concurrency slots.
@@ -4886,7 +4897,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         relay_metadata: Optional[Dict[str, Any]] = None, approval_notify=None,
         approval_session_key: Optional[str] = None, approval_cleanup=None,
         agent_register=None, count_inflight: bool = True,
-        interactive_clarify: bool = False) -> tuple:
+        interactive_clarify: bool = False, usage_callback=None) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -4944,7 +4955,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
                         session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
-                        interactive_clarify=interactive_clarify)
+                        interactive_clarify=interactive_clarify, usage_callback=usage_callback)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if agent_register is not None:

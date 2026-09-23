@@ -8,6 +8,7 @@ loop-internal helpers resolve lazily so ``patch("agent.conversation_loop.X")`` k
 
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 import logging
 import time
@@ -191,6 +192,9 @@ def check_api_response(
     if _usage_outcome.rearmed:
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
+    if getattr(agent, "usage_callback", None):
+        with suppress(Exception):
+            agent.usage_callback(agent, False, len(messages), len(messages))
 
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
