@@ -135,6 +135,32 @@ class TestPrimaryRuntimeSnapshot:
 
 
 # =============================================================================
+# _apply_primary_runtime_fields() — empty api_mode restore (root-cause regression)
+# =============================================================================
+
+class TestApplyPrimaryRuntimeFieldsApiModeNormalization:
+    def test_empty_snapshot_api_mode_normalizes_instead_of_blanking(self):
+        """A snapshot taken before api_mode was resolved (provider=custom, LAN/
+        custom base_url) can carry api_mode == ''. Restoring it verbatim leaves
+        agent.api_mode == '', and get_transport('') later returns None, crashing
+        with 'NoneType' object has no attribute 'build_kwargs'. The restore must
+        normalize through determine_api_mode instead of assigning '' directly.
+        """
+        from agent.agent_runtime_helpers import _apply_primary_runtime_fields
+
+        agent = _make_agent(provider="custom", base_url="http://192.168.0.56:38238")
+        rt = dict(agent._primary_runtime)
+        rt["api_mode"] = ""
+        rt["provider"] = "custom"
+        rt["base_url"] = "http://192.168.0.56:38238"
+
+        _apply_primary_runtime_fields(agent, rt)
+
+        assert agent.api_mode != ""
+        assert agent.api_mode == "chat_completions"
+
+
+# =============================================================================
 # _restore_primary_runtime()
 # =============================================================================
 

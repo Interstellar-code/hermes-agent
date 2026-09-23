@@ -890,8 +890,15 @@ def _apply_primary_runtime_fields(agent, rt: Dict[str, Any]) -> None:
     agent.provider = rt["provider"]
     agent.requested_provider = rt.get("requested_provider", agent.provider)
     agent.base_url = rt["base_url"]           # setter updates _base_url_lower
-    from hermes_cli.providers import is_actual_route
-    agent.api_mode = "chat_completions" if is_actual_route(agent.provider, agent.base_url) else rt["api_mode"]
+    from hermes_cli.providers import determine_api_mode, is_actual_route
+    if is_actual_route(agent.provider, agent.base_url):
+        agent.api_mode = "chat_completions"
+    else:
+        # rt["api_mode"] can be '' for a snapshot taken before api_mode was
+        # resolved (e.g. provider=custom); never assign '' verbatim, or a
+        # later get_transport('') returns None. Normalize through the same
+        # resolver the fresh path uses.
+        agent.api_mode = rt["api_mode"] or determine_api_mode(agent.provider, agent.base_url, agent.model)
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
     agent.api_key = rt["api_key"]
