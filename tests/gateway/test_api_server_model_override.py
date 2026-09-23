@@ -670,3 +670,27 @@ async def test_absent_model_field_leaves_the_session_untouched(adapter):
 
     assert mock_switch.call_count == 0
     assert runner._session_model_overrides == {}
+
+
+# ---------------------------------------------------------------------------
+# Overlap with upstream's per-request selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_model_with_explicit_provider_is_one_off_not_a_sticky_switch(adapter):
+    """``model`` WITH ``provider`` is upstream's one-off per-request selection: it must not be
+    routed through the /model resolver (whose rejection would 400 a valid one-off) and must not
+    install a sticky override. Only a bare ``model`` is the #216 session switch."""
+    runner = SimpleNamespace(_session_model_overrides={})
+    _stub_run_agent(adapter)
+    app = _create_session_app(adapter)
+
+    with _patched_switch() as mock_switch, patch("gateway.run._gateway_runner_ref", lambda: runner):
+        async with TestClient(TestServer(app)) as cli:
+            body = dict(_chat_body(SWITCHED_MODEL), provider=SWITCHED_PROVIDER)
+            resp = await _post_chat(cli, "/chat", body, {"X-Hermes-Session-Key": SESSION_KEY})
+            assert resp.status == 200
+
+    assert mock_switch.call_count == 0
+    assert runner._session_model_overrides == {}

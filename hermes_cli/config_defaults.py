@@ -24,6 +24,11 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    # Switch UI can opt into interactive session-chat clarify while stateless
+    # OpenAI-compatible paths (/v1/chat/completions, /v1/responses) stay safe.
+    "api_server": {
+        "interactive_clarify": False,
+    },
     # journal_mode: SQLite journal mode for every Hermes DB. "wal" default; use "delete" on
     # weak-fsync/shared filesystems where WAL is not crash-safe (macOS virtiofs, NFS, SMB).
     "database": {
