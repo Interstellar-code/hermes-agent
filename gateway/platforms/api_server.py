@@ -359,6 +359,29 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _requested_reasoning_effort(body: Dict[str, Any]) -> Any:
+    """Validate a top-level ``reasoning_effort`` body field (SwitchUI reasoning picker).
+    Returns ``(effort_or_None, None)`` on success (``None`` = absent/explicit null, no
+    preference) or ``(None, error_response)`` on an invalid value. Rejecting loudly is the
+    point here (unlike ``_request_reasoning_config``'s lenient ``model_options`` handling)."""
+    from hermes_constants import parse_reasoning_effort
+    if "reasoning_effort" not in body:
+        return None, None
+    raw = body.get("reasoning_effort")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, str) or not raw.strip():
+        return None, _error_response(
+            f"reasoning_effort must be a non-empty string, got {raw!r}", 400,
+            param="reasoning_effort", code="invalid_reasoning_effort")
+    cleaned = raw.strip().lower()
+    if parse_reasoning_effort(cleaned) is None:
+        return None, _error_response(
+            f"Invalid reasoning_effort: {raw!r}", 400,
+            param="reasoning_effort", code="invalid_reasoning_effort")
+    return cleaned, None
+
+
 def _apply_runtime_agent_overrides(
     runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge resolved provider/runtime fields into ``runtime_kwargs`` in place."""
@@ -2261,7 +2284,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        interactive_clarify: bool = False) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2295,6 +2319,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             policy = RoomExecutionPolicy.from_mapping(room_execution_policy or {})
             enabled_toolsets = list(policy.enabled_toolsets)
             max_iterations = policy.max_iterations
+        # `clarify` is stripped from every static toolset (toolsets.py) because it blocks the
+        # agent thread on a human answer, which would hang headless OpenAI-compat clients. Only
+        # the interactive SSE chat-stream path passes interactive_clarify=True, and only when the
+        # operator has opted in via config, do we hand the model the tool back.
+        if interactive_clarify and bool(user_config.get("api_server", {}).get("interactive_clarify")):
+            enabled_toolsets = sorted(set(enabled_toolsets) | {"clarify"})
         # Reasoning resolves against the model that actually runs (per-model overrides), so only
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
@@ -2662,6 +2692,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        from gateway.run import _load_gateway_config
+        interactive_clarify = bool(
+            _load_gateway_config().get("api_server", {}).get("interactive_clarify"))
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2678,6 +2711,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
                 **_STATIC_FEATURE_FLAGS,
                 "cors": bool(self._cors_origins),
+                "interactive_clarify": interactive_clarify,
                 # Always advertised for feature-detection; enabled follows config.
                 "browser_extension_control": {
                     "enabled": self._browser_control_enabled(),
@@ -3435,6 +3469,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return None, _error_response("system_message must be a string", 400, code="invalid_system_message")
+        reasoning_effort, reasoning_err = _requested_reasoning_effort(body)
+        if reasoning_err is not None:
+            return None, reasoning_err
         runtime_request = self._effective_session_runtime_request(session=session, body=body)
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
@@ -3465,6 +3502,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 requested_provider=agent_overrides.get("requested_provider"), route=route)
             if selection_error:
                 return None, _error_response(selection_error, 400)
+        if reasoning_effort is not None:
+            model_options_override = dict(agent_overrides.get("model_options") or {})
+            model_options_override["reasoning_effort"] = reasoning_effort
+            agent_overrides["model_options"] = model_options_override
         run_kwargs = dict(
             user_message=user_message, ephemeral_system_prompt=system_prompt, session_id=session_id,
             gateway_session_key=gateway_session_key, route=route, session_model=session_model,
@@ -3853,6 +3894,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         # active_agent_work_count() already sums; counting it as an inflight
                         # run too would spend two concurrency slots.
                         count_inflight=False,
+                        # Only the interactive SSE stream requests the clarify tool back;
+                        # _create_agent still ANDs this with api_server.interactive_clarify
+                        # before handing it to the model.
+                        interactive_clarify=True,
                         **{**ctx["run_kwargs"], "user_message": turn_user_message})
                     is_dict = isinstance(result, dict)
                     final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
@@ -4424,7 +4469,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_history_delivery: str = "", turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None, approval_notify=None,
         approval_session_key: Optional[str] = None, approval_cleanup=None,
-        agent_register=None, count_inflight: bool = True) -> tuple:
+        agent_register=None, count_inflight: bool = True,
+        interactive_clarify: bool = False) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
@@ -4481,7 +4527,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+                        interactive_clarify=interactive_clarify)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if agent_register is not None:

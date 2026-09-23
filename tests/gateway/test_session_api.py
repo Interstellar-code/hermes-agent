@@ -1301,3 +1301,95 @@ async def test_session_chat_stream_survives_a_raising_goal_manager(adapter, sess
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: goal.continuation" not in body
+
+
+# ---------------------------------------------------------------------------
+# Per-request reasoning_effort (SwitchUI reasoning picker)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/chat", "/chat/stream"])
+async def test_session_chat_rejects_invalid_reasoning_effort(adapter, session_db, path):
+    session_id = session_db.create_session("reasoning-bad", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}{path}",
+                json={"message": "hello", "reasoning_effort": "turbo"},
+            )
+            assert resp.status == 400
+            payload = await resp.json()
+    assert payload["error"]["code"] == "invalid_reasoning_effort"
+    assert "turbo" in payload["error"]["message"]
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_non_string_reasoning_effort(adapter, session_db):
+    session_id = session_db.create_session("reasoning-nonstring", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "hello", "reasoning_effort": 3},
+            )
+            assert resp.status == 400
+            payload = await resp.json()
+    assert payload["error"]["code"] == "invalid_reasoning_effort"
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_session_chat_forwards_reasoning_effort_to_the_turn(adapter, session_db):
+    session_id = session_db.create_session("reasoning-forward", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "hello", "reasoning_effort": "HIGH "},
+            )
+            assert resp.status == 200, await resp.text()
+    captured = mock_run.call_args.kwargs
+    assert captured["model_options"]["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_without_reasoning_effort_leaves_it_unset(adapter, session_db):
+    session_id = session_db.create_session("reasoning-absent", "api_server")
+    mock_run = AsyncMock(return_value=({"final_response": "hi", "session_id": session_id}, {}))
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "hello"})
+            assert resp.status == 200, await resp.text()
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs.get("model_options", {}).get("reasoning_effort") is None
+
+
+@pytest.mark.asyncio
+async def test_session_chat_reasoning_effort_is_per_request_not_sticky(adapter, session_db):
+    session_id = session_db.create_session("reasoning-sticky", "api_server")
+    seen = []
+
+    async def fake_run(**kwargs):
+        seen.append(kwargs.get("model_options", {}).get("reasoning_effort"))
+        return {"final_response": "hi", "session_id": session_id}, {}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "one", "reasoning_effort": "ultra"},
+            )
+            assert resp.status == 200, await resp.text()
+            resp = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "two"})
+            assert resp.status == 200, await resp.text()
+    assert seen == ["ultra", None]
