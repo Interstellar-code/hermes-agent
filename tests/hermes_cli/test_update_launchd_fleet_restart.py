@@ -213,6 +213,10 @@ class TestGetServicePidsScoping:
         monkeypatch.setattr(
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
+        # ``all_profiles=True`` also widens via a raw ``launchctl list`` prefix scan
+        # (gateway.py:193) — unmocked, this hits the real launchd on the dev machine
+        # and leaks its live gateway PID into the expected set.
+        monkeypatch.setattr(gw.subprocess, "run", lambda *a, **k: _completed())
 
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
@@ -642,13 +646,20 @@ class TestWaitForLaunchdServicePid:
 
 
 class TestIncompleteWarningMentionsLaunchctl:
-    def test_launchd_labels_get_launchctl_hint(self, capsys):
+    def test_launchd_labels_get_launchctl_hint(self, monkeypatch, capsys):
+        # ai.hermes.* labels only exist on macOS; is_macos() must be pinned rather
+        # than left to whatever host runs the suite (it was, and leaked host state).
+        monkeypatch.setattr(gw, "is_macos", lambda: True)
         _warn_incomplete_gateway_fleet_restart(["ai.hermes.gateway-merit-ops"])
         out = capsys.readouterr().out
         assert "Update incomplete" in out
-        assert "launchctl kickstart -k" in out
+        assert "launchctl bootstrap" in out
+        # `kickstart -k` SIGKILLs the process — can't revive a deregistered agent
+        # and drops live sessions, so the recovery hint must not suggest it (#88848).
+        assert "launchctl kickstart -k" not in out
 
-    def test_systemd_units_keep_systemctl_hint(self, capsys):
+    def test_systemd_units_keep_systemctl_hint(self, monkeypatch, capsys):
+        monkeypatch.setattr(gw, "is_macos", lambda: False)
         _warn_incomplete_gateway_fleet_restart(["hermes-gateway-coder"])
         out = capsys.readouterr().out
         assert "systemctl" in out
