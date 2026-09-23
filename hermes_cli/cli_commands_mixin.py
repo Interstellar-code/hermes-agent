@@ -2560,8 +2560,9 @@ class CLICommandsMixin:
 
     # ---- model-behaviour settings: /reasoning, /busy, /indicator, /fast -------------------
     def _handle_reasoning_command(self, cmd: str):
-        """Handle /reasoning [<level> [--global]|show|hide|full|clamp] — effort level (session
-        scope unless --global) and thinking display toggles (always saved)."""
+        """Handle /reasoning [<level> [--global]|show|hide|full|clamp] — effort level and the
+        show/hide toggle are session scope unless --global; full/clamp have no session-scoped
+        store on either the CLI or gateway/TUI surface, so they are always saved globally."""
         from cli import CLI_CONFIG, _parse_reasoning_config
         raw = _command_arg(cmd)
         if not raw:  # show current state
@@ -2581,8 +2582,16 @@ class CLICommandsMixin:
             setattr(self, attr, value)
             if attr == "show_reasoning" and self.agent:
                 self.agent.reasoning_callback = self._current_reasoning_callback()
-            _save(f"display.{attr}", value)
-            _cp(_accent_line(f"✓ Reasoning display: {headline} (saved)"))
+            if attr == "show_reasoning":
+                # Session-scoped by default; --global persists (parity with /reasoning <level>).
+                saved = explicit_global and _save(f"display.{attr}", value)
+                outcome = _scope_outcome(explicit_global, saved)
+                _cp(_accent_line(f"✓ Reasoning display: {headline} {outcome}"))
+            else:
+                # reasoning_full has no session-scoped store on either the CLI or gateway/TUI
+                # surface, so the write is always global — say so plainly.
+                _save(f"display.{attr}", value)
+                _cp(_accent_line(f"✓ Reasoning display: {headline} (saved globally)"))
             if note:
                 _cp(_dim_line(f"  {note}"))
             if attr == "reasoning_full" and value and not self.show_reasoning:
