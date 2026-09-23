@@ -1,5 +1,5 @@
 ---
-id: leadership-morpheus-cmo
+id: leadership-cmo
 category: leadership
 glyph: MO
 name: Morpheus
