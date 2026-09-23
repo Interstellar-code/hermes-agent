@@ -2512,6 +2512,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None, result.error_message or f"Unknown model: {requested}"
         if not result.new_model:
             return None, f"Unknown model: {requested}"
+        if not getattr(result, "recognized", True):
+            # A custom endpoint whose /models listing does not contain the name: the CLI /model
+            # soft-accepts it with a warning, but over HTTP that is a silent 200 on a model that
+            # will fail every turn. Reject it here, with the resolver's own explanation.
+            return None, result.warning_message or f"Unknown model: {requested}"
         return result, None
 
     def _request_route_conflict_error(
