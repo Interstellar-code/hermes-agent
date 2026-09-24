@@ -1594,3 +1594,28 @@ async def test_session_yolo_requires_auth(adapter, session_db):
         # not that it rejects — a keyless adapter accepts by design.
         resp = await cli.post(f"/api/sessions/{session_id}/yolo", json={"enabled": False})
         assert resp.status in (200, 401)
+
+
+# --- fork keeps its source's project binding (fork 7e44e6a2b3; dropped by the v0.21.3 adopt) ---
+
+@pytest.mark.asyncio
+async def test_fork_inherits_source_project_binding(adapter, session_db, tmp_path):
+    from hermes_cli import projects_db
+    with projects_db.connect_closing() as pconn:
+        pid = projects_db.create_project(pconn, name="Test Project", folders=[str(tmp_path)])
+        projects_db.bind_session(pconn, pid, "source-session", bound_by="test")
+
+    source_id = session_db.create_session("source-session", "api_server", model="test-model")
+    session_db.append_message(source_id, "user", "first path")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(f"/api/sessions/{source_id}/fork", json={"title": "Alternative"})
+        assert resp.status == 201
+        fork = (await resp.json())["session"]
+
+    with projects_db.connect_closing() as pconn:
+        binding = projects_db.get_session_project(pconn, fork["id"])
+    assert binding is not None
+    assert binding.project_id == pid
+    assert binding.bound_by == "fork"

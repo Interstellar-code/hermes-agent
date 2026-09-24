@@ -95,7 +95,7 @@ class TestListJobs:
                 assert resp.status == 200
                 data = await resp.json()
                 assert "jobs" in data
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert data["jobs"] == [{**SAMPLE_JOB, "status": "idle", "active_session_id": None, "last_execution": None}]  # fork: execution-status enrichment
 
     # -------------------------------------------------------------------
     # 2. test_list_jobs_include_disabled
@@ -204,7 +204,7 @@ class TestGetJob:
                 resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["job"] == SAMPLE_JOB
+                assert data["job"] == {**SAMPLE_JOB, "status": "idle", "active_session_id": None, "last_execution": None}  # fork: execution-status enrichment
                 mock_get.assert_called_once_with(VALID_JOB_ID)
 
 
@@ -487,7 +487,7 @@ class TestCronUnavailable:
                 resp = await cli.get("/api/jobs?include_disabled=true")
                 assert resp.status == 200
                 data = await resp.json()
-                assert data["jobs"] == [SAMPLE_JOB]
+                assert data["jobs"] == [{**SAMPLE_JOB, "status": "idle", "active_session_id": None, "last_execution": None}]  # fork: execution-status enrichment
                 assert captured["include_disabled"] is True
 
     @pytest.mark.asyncio
@@ -557,3 +557,83 @@ class TestCronPromptScanParity:
                 assert "Blocked" in data["error"] or "threat" in data["error"].lower()
                 mock_create.assert_not_called()
 
+
+# Restored: execution-status enrichment (fork 731bde0c5f), dropped by the v0.21.3 adopt.
+class TestEnrichJobStatus:
+    JOB = {"id": "deadbeef1234", "name": "cron-job"}
+
+    @staticmethod
+    def _seed(db, session_id, *, ended_at=None, end_reason=None):
+        def _insert(conn):
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at, ended_at, end_reason) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, "cron", 1000.0, ended_at, end_reason),
+            )
+        db._execute_write(_insert)
+
+    @pytest.fixture
+    def db(self, tmp_path):
+        from hermes_state import SessionDB
+        d = SessionDB(db_path=tmp_path / "state.db")
+        yield d
+        try:
+            d.close()
+        except Exception:
+            pass
+
+    def test_running_when_execution_session_is_open(self, adapter, db):
+        self._seed(db, "cron_deadbeef1234_1700000000")
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "running"
+        assert out["active_session_id"] == "cron_deadbeef1234_1700000000"
+        assert out["last_execution"]["status"] == "running"
+
+    def test_finished_execution_reports_end_reason(self, adapter, db):
+        self._seed(
+            db, "cron_deadbeef1234_1700000000",
+            ended_at=2000.0, end_reason="completed",
+        )
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["active_session_id"] is None
+        assert out["last_execution"]["end_reason"] == "completed"
+        assert out["last_execution"]["ended_at"] == 2000.0
+
+    def test_newest_execution_wins(self, adapter, db):
+        # older row is open, newer row finished — newest must win, so the job
+        # is idle rather than being pinned "running" by a stale session
+        def _insert(conn):
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?,?,?)",
+                ("cron_deadbeef1234_old", "cron", 1000.0),
+            )
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at, ended_at, end_reason) "
+                "VALUES (?,?,?,?,?)",
+                ("cron_deadbeef1234_new", "cron", 5000.0, 6000.0, "completed"),
+            )
+        db._execute_write(_insert)
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["last_execution"]["session_id"] == "cron_deadbeef1234_new"
+        assert out["status"] == "idle"
+
+    def test_other_jobs_sessions_are_not_claimed(self, adapter, db):
+        self._seed(db, "cron_someotherjob_1700000000")
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["last_execution"] is None
+
+    def test_no_sessions_is_idle(self, adapter, db):
+        out = adapter._enrich_job_status(self.JOB, db)
+        assert out["status"] == "idle"
+        assert out["last_execution"] is None
+
+    def test_query_failure_is_logged_loudly_and_degrades(self, adapter, caplog):
+        """A broken session_db must warn, not vanish at DEBUG."""
+        broken = SimpleNamespace()   # no _execute_write at all -> AttributeError
+        with caplog.at_level(logging.WARNING):
+            out = adapter._enrich_job_status(self.JOB, broken)
+        assert out["status"] == "idle"
+        assert "enrichment failed" in caplog.text
+        assert "AttributeError" in caplog.text
