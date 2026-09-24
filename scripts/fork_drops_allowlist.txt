@@ -1,0 +1,79 @@
+# Fork-drop allowlist for scripts/check_fork_drops.py
+# Format: name  # reason
+# Every entry below has a specific, verified reason. Anything without one is
+# left OUT deliberately so it surfaces as a possible real drop.
+
+# --- Renamed/ported during replay (verified via git grep) ---
+_on_disk_version  # renamed to on_disk_version during replay
+_coerce_tool_message_content  # renamed to _coerce_tool_content during replay
+_version_provenance  # renamed to version_provenance during replay
+_is_cron_session  # renamed to _is_cron_approval_context during replay
+_approval_timeout_seconds  # collapsed into a direct inline call, no longer a named helper
+create_template  # renamed to create_template_endpoint in plugins/kanban/dashboard/plugin_api.py:1816
+get_template  # renamed to get_template_endpoint in plugins/kanban/dashboard/plugin_api.py:1761
+instantiate_template  # renamed to instantiate_template_endpoint in plugins/kanban/dashboard/plugin_api.py:1869
+update_template  # renamed to update_template_endpoint in plugins/kanban/dashboard/plugin_api.py:1829
+
+# --- Intentionally dropped (feature parked or sunset, not a regression) ---
+_tick_single_profile  # multi-profile cron ticking was never ported; PARKED pending 0.19 port (see project memory)
+_SessionState  # nemo_relay/matrix_coder session state; matrix_coder plugin sunset
+
+# --- Converged upstream (upstream now provides equivalent behavior) ---
+desktop_package_json  # upstream's own build now generates this; fork's version converged/removed
+
+# --- Triaged 2026-09-24 after the v0.21.3 sweep (see commit messages / FORK-REGISTRY) ---
+limit and offset must be integers  # 8188ce6db7: pagination validation reworded: 'limit and offset must be non-negative integers' (api_server.py, code=invalid_pagination)
+[api_server] clarify resolution failed for %s  # f0ee854c48: clarify core restored in b7a8e0c47e; failure log wording differs
+Keychain: credentials payload is not text (%s)  # c494b53189: keychain guard deliberately not re-ported: upstream's conftest stubs the keychain reader (Phase D decision)
+kanban_template_list: unexpected error loading %s: %s  # 143199cfaa: kanban templates re-ported (units 12/17/18/19); error wording differs
+Running checkout: %s @ %s (python=%s)  # f53bdb71bb: converged: upstream gateway_state.json records code_sha/code_version of the running checkout
+_ProjectsBindingBackend  # 8657d13844: project binding re-ported as hermes_cli.projects_db module functions (units 15/16/29)
+project: no binding found for session {sid}  # 8657d13844: project binding re-ported as hermes_cli.projects_db module functions (units 15/16/29)
+_parse_profile_header  # e823d300ad: X-Hermes-Profile superseded by the /p/<profile>/ multiplex prefix (SwitchUI proxy maps the header to it); session_id-in-prompt survives at agent/system_prompt.py
+X-Hermes-Profile rejected: no API key configured  # e823d300ad: X-Hermes-Profile superseded by the /p/<profile>/ multiplex prefix (SwitchUI proxy maps the header to it); session_id-in-prompt survives at agent/system_prompt.py
+tool_search active: enabled=on (deferrable_tokens=%d)  # 37ea1dcb8f: converged: upstream tool_search logs the activation decision (tools/tool_search.py should_activate)
+tool_search inactive: deferrable_tokens=0  # 37ea1dcb8f: converged: upstream tool_search logs the activation decision (tools/tool_search.py should_activate)
+tool_search inactive: enabled=off  # 37ea1dcb8f: converged: upstream tool_search logs the activation decision (tools/tool_search.py should_activate)
+_finalize_run_status_if_open  # cf7a2dc986: sessions-stream stop re-ported in Phase D units 41-43 (oracle 11/11); helpers restructured
+_register_agent  # cf7a2dc986: sessions-stream stop re-ported in Phase D units 41-43 (oracle 11/11); helpers restructured
+_release_run_control_state  # cf7a2dc986: sessions-stream stop re-ported in Phase D units 41-43 (oracle 11/11); helpers restructured
+_stop_progress_fields  # cf7a2dc986: sessions-stream stop re-ported in Phase D units 41-43 (oracle 11/11); helpers restructured
+credential pool lookup failed  # 088f76bc99: #216 restored in aa0968e055; credential-pool path reworded upstream
+CompressNotice  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+_classify_compress_args  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+_compose_system_prompt  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+_compress_preview_notice  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+ensure_session_row  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+resolve_personality_prompt  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  (or edit config.yaml) for this personality to apply globally.  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  No personality overlay — using your agent.system_prompt.  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  Note: agent.system_prompt is set in your config and takes  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  Session is already {in_flight} for handoff. Wait for it to settle, then retry.  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  Session-scoped by default; --global persists agent.personality.  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  This session has no record in state.db yet — send a message first, then retry /handoff.  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  Usage: /personality <name> [--global]  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  precedence, so future sessions will keep using it. Clear it  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: CLAMPED to 10 lines (saved globally){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: FULL (saved globally){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: OFF (config save failed){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: OFF (saved){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: OFF (this session){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: ON (config save failed){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: ON (saved){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_ACCENT}✓ Reasoning display: ON (this session){_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {_DIM}  Use --global to persist.{_RST}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+  {name:<12} - {preview}{marker}  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+(^_^) Personality cleared (this session — use --global to persist)  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+(^_^) Personality cleared (this session; config save failed)  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+personality prompt resolution failed  # 77b3dc8e0c: #227: 7/9 fixes ported under new names (methods_slash, personality.py rewrite, handoff units 23/40); #225 restored in 78f1d1f6ed; #226 was a false positive
+_yolo_session_key  # 5953712ee9: #228 restored in 2a9a189f7e as _yolo_session_keys (applies to every key the guard reads); prompt lookup reworded
+configured system prompt lookup failed  # 5953712ee9: #228 restored in 2a9a189f7e as _yolo_session_keys (applies to every key the guard reads); prompt lookup reworded
+_current_db_home  # 92f6633ae2: #232 profile-scoped DB ported: session_workdir._workdir_owner_db routes profile_home -> hermes_state_registry.acquire(<profile>/state.db) (verified 2026-09-22)
+_db_for  # 92f6633ae2: #232 profile-scoped DB ported: session_workdir._workdir_owner_db routes profile_home -> hermes_state_registry.acquire(<profile>/state.db) (verified 2026-09-22)
+_db_for_home  # 92f6633ae2: #232 profile-scoped DB ported: session_workdir._workdir_owner_db routes profile_home -> hermes_state_registry.acquire(<profile>/state.db) (verified 2026-09-22)
+_open_profile_db  # 92f6633ae2: #232 profile-scoped DB ported: session_workdir._workdir_owner_db routes profile_home -> hermes_state_registry.acquire(<profile>/state.db) (verified 2026-09-22)
+_reset_db_caches  # 92f6633ae2: #232 profile-scoped DB ported: session_workdir._workdir_owner_db routes profile_home -> hermes_state_registry.acquire(<profile>/state.db) (verified 2026-09-22)
+_dispatchable_bundle_entries  # cdaa6500dd: #237 dispatch ported into tui_gateway/methods_tools.py command.dispatch pipeline (_dispatch_bundle/_resolve_name)
+_normalize_skill_ident  # cdaa6500dd: #237 dispatch ported into tui_gateway/methods_tools.py command.dispatch pipeline (_dispatch_bundle/_resolve_name)
+_new_dashboard_backup_path  # 5eb7f40868: #239 backup path inlined in hermes_cli/web_routers/ops.py run_backup
+_yolo_session_key  # 5953712ee9: #228 restored in 2a9a189f7e as _yolo_session_keys (plural: applies to every key the approval guard reads)
