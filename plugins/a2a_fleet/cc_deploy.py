@@ -173,7 +173,7 @@ def _is_git_repo(repo: Path) -> bool:
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` atomically (temp file in same dir + os.replace)."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)  # atomic on POSIX
 
 
@@ -206,7 +206,7 @@ def upsert_hermes_gitignore(gitignore_path: Path) -> None:
     existing_lines: List[str] = []
     if gitignore_path.exists():
         try:
-            existing_lines = gitignore_path.read_text().splitlines()
+            existing_lines = gitignore_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             existing_lines = []
     present = {ln.strip() for ln in existing_lines}
@@ -249,7 +249,7 @@ def upsert_claude_md_import(claude_md_path: Path) -> str:
         _atomic_write_text(claude_md_path, block + "\n")
         return "imported"
 
-    content = claude_md_path.read_text()
+    content = claude_md_path.read_text(encoding="utf-8")
     start_idx = content.find(CLAUDE_MD_START)
     end_idx = content.find(CLAUDE_MD_END)
 
@@ -322,7 +322,7 @@ def build_receiver_config(
 def _read_pid(pid_path: Path) -> Optional[int]:
     """Read an int PID from ``pid_path``; None if missing/garbage."""
     try:
-        raw = pid_path.read_text().strip()
+        raw = pid_path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     try:
@@ -822,7 +822,7 @@ async def cc_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[s
 
     port: Optional[int] = None
     try:
-        cfg = json.loads(config_path.read_text())
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
         if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
             port = int(cfg["bind_port"])
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -898,7 +898,7 @@ def _managed_receiver_port(repo: Path, mode: str) -> int:
     default = int(getattr(module, "DEFAULT_BIND_PORT"))
     config_filename = str(getattr(module, "CONFIG_FILENAME"))
     try:
-        cfg = json.loads((repo / ".hermes" / config_filename).read_text())
+        cfg = json.loads((repo / ".hermes" / config_filename).read_text(encoding="utf-8"))
         if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
             return int(cfg["bind_port"])
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -916,7 +916,7 @@ def _configured_bind_port(repo: Path, mode: str) -> Optional[int]:
     module = _managed_receiver_module(mode)
     config_filename = str(getattr(module, "CONFIG_FILENAME"))
     try:
-        cfg = json.loads((repo / ".hermes" / config_filename).read_text())
+        cfg = json.loads((repo / ".hermes" / config_filename).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
         return None
     if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
@@ -1005,7 +1005,7 @@ def _read_managed_token_file(repo: Path, mode: str) -> Optional[str]:
     module = _managed_receiver_module(mode)
     token_filename = str(getattr(module, "TOKEN_FILENAME"))
     try:
-        raw = (repo / ".hermes" / token_filename).read_text().strip()
+        raw = (repo / ".hermes" / token_filename).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return raw or None
@@ -1040,7 +1040,7 @@ def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]
 def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:
     """Read the receiver's bound port from <repo>/.hermes/a2a_receiver.json."""
     try:
-        cfg = json.loads((repo / ".hermes" / CONFIG_FILENAME).read_text())
+        cfg = json.loads((repo / ".hermes" / CONFIG_FILENAME).read_text(encoding="utf-8"))
         if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
             return int(cfg["bind_port"])
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -1067,7 +1067,7 @@ def _port_from_peer_url(url: Optional[str]) -> Optional[int]:
 def _read_token_file(repo: Path) -> Optional[str]:
     """Read the persisted receiver token from <repo>/.hermes/.token (None if absent)."""
     try:
-        raw = (repo / ".hermes" / TOKEN_FILENAME).read_text().strip()
+        raw = (repo / ".hermes" / TOKEN_FILENAME).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return raw or None

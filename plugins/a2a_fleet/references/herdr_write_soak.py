@@ -36,7 +36,7 @@ sys.path.insert(0, "/Users/rohits/.hermes/hermes-agent/plugins")
 HOME = Path(tempfile.mkdtemp(prefix="herdr_write_soak_"))
 PROFILE = HOME / "profiles" / "switch"
 PROFILE.mkdir(parents=True)
-(HOME / "active_profile").write_text("switch")
+(HOME / "active_profile").write_text("switch", encoding="utf-8")
 os.environ["HERMES_HOME"] = str(PROFILE)
 (PROFILE / "fleet.yaml").write_text(
     yaml.safe_dump(

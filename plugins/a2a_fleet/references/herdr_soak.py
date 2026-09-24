@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO / "plugins"))
 HOME = Path(tempfile.mkdtemp(prefix="herdr_soak_"))
 PROFILE = HOME / "profiles" / "switch"
 PROFILE.mkdir(parents=True)
-(HOME / "active_profile").write_text("switch")
+(HOME / "active_profile").write_text("switch", encoding="utf-8")
 os.environ["HERMES_HOME"] = str(PROFILE)
 
 REAL_WORKSPACES = [

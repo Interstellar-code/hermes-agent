@@ -1720,6 +1720,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
+            # #228: per-session approval bypass, served by the process whose agents enforce it.
+            ("GET", "/api/sessions/{session_id}/yolo", self._handle_get_session_yolo),
+            ("POST", "/api/sessions/{session_id}/yolo", self._handle_set_session_yolo),
             ("POST", "/api/sessions/{session_id}/chat/clarify", self._handle_session_clarify),
             (
                 "POST", "/api/sessions/{session_id}/chat/interactions/{interaction_id}/respond",
@@ -3845,6 +3848,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             await asyncio.to_thread(db.set_session_title, fork_id, str(title))
         except ValueError as exc:
             return _error_response(str(exc), 400, code="invalid_title")
+        try:
+            # Fork 7e44e6a2b3 (dropped by the v0.21.3 adopt): a fork stays bound to its source's project.
+            from hermes_cli import projects_db
+
+            def _inherit_project_binding():
+                with projects_db.connect_closing() as pconn:
+                    binding = projects_db.get_session_project(pconn, source_id)
+                    if binding is not None:
+                        projects_db.bind_session(pconn, binding.project_id, fork_id, bound_by="fork")
+            await asyncio.to_thread(_inherit_project_binding)
+        except Exception as p_exc:
+            logger.debug("Failed to inherit project binding for fork %s: %s", fork_id, p_exc)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
         return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
 
@@ -4132,6 +4147,100 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if goal_decision is not None:
             payload["goal"] = self._goal_public_block(goal_decision)
         return web.json_response(payload, headers=headers)
+
+    def _yolo_session_keys(self, request: "web.Request", session_id: str) -> tuple:
+        """Approval-bypass keys for this session (#228), matching what the guard reads.
+
+        The approval guard resolves the session key from the approval contextvar, else
+        ``HERMES_SESSION_KEY``. At v0.21.3 those differ: the session chat STREAM binds the
+        contextvar to ``session_id`` (``approval_session_key=session_id``), while other turns
+        run with ``HERMES_SESSION_KEY = gateway_session_key or session_id``. With an
+        ``X-Hermes-Session-Key`` header these are different strings, so the bypass is applied
+        to BOTH -- a key the enforcing agent never reads would report a bypass that isn't in
+        force (the #219 failure mode this endpoint exists to prevent)."""
+        gateway_session_key, _ = self._parse_session_key_header(request)
+        return tuple(dict.fromkeys(k for k in (session_id, gateway_session_key or session_id) if k))
+
+    async def _handle_get_session_yolo(self, request: "web.Request") -> "web.Response":
+        """GET /api/sessions/{session_id}/yolo — read the approval-bypass state."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        from tools.approval import is_session_yolo_enabled
+
+        keys = self._yolo_session_keys(request, session_id)
+        return web.json_response(
+            {
+                "object": "hermes.session.yolo",
+                "session_id": session_id,
+                "enabled": any(is_session_yolo_enabled(k) for k in keys),
+            }
+        )
+
+    async def _handle_set_session_yolo(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/yolo — set the approval bypass.
+
+        This endpoint exists because the approval bypass is per-PROCESS state
+        (``tools.approval._session_yolo`` is a module-level set with no IPC),
+        and agents serving this transport live in THIS process. Toggling it
+        anywhere else — the tui_gateway dashboard, or the slash worker before
+        that — flips a set the enforcing agent never reads, so the client is
+        told the bypass changed when it did not (#219).
+
+        Body: ``{"enabled": true|false}``; omit ``enabled`` to toggle.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        from tools.approval import (
+            disable_session_yolo,
+            enable_session_yolo,
+            is_session_yolo_enabled,
+        )
+
+        keys = self._yolo_session_keys(request, session_id)
+        current = any(is_session_yolo_enabled(k) for k in keys)
+
+        raw = body.get("enabled", None)
+        if raw is None:
+            enabled = not current
+        elif isinstance(raw, bool):
+            enabled = raw
+        elif isinstance(raw, str) and raw.strip().lower() in {"1", "on", "true", "yes"}:
+            enabled = True
+        elif isinstance(raw, str) and raw.strip().lower() in {"0", "off", "false", "no"}:
+            enabled = False
+        else:
+            return web.json_response(
+                _openai_error(
+                    "enabled must be a boolean (omit it to toggle)",
+                    param="enabled",
+                    code="invalid_enabled",
+                ),
+                status=400,
+            )
+
+        for k in keys:
+            (enable_session_yolo if enabled else disable_session_yolo)(k)
+        logger.info(
+            "api_server approval bypass %s for session=%s",
+            "enabled" if enabled else "disabled",
+            ",".join(keys),
+        )
+        return web.json_response(
+            {
+                "object": "hermes.session.yolo",
+                "session_id": session_id,
+                "enabled": any(is_session_yolo_enabled(k) for k in keys),
+                "previous": current,
+            }
+        )
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
@@ -4567,7 +4676,78 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return web.json_response({"error": scan_error}, status=400)
         return None
 
-    def _job_response(self, fn, job_id: str, *, notify: bool) -> "web.Response":
+    # Restored 2026-09-24 (fork 731bde0c5f / 7e44e6a2b3, dropped by the v0.21.3 adopt).
+    def _enrich_job_status(self, job: Dict[str, Any], session_db: Optional[Any] = None) -> Dict[str, Any]:
+        """Enrich a cron job dict with live execution status from SessionDB.
+
+        Cron execution sessions use session IDs formatted as ``cron_{job_id}_{timestamp}``.
+        A row whose ``ended_at`` is unset is still running; a finished row surfaces its
+        ``end_reason`` and ``ended_at`` as the last execution.
+
+        The sessions table keys on ``id`` (not ``session_id``) and timestamps the start as
+        ``started_at`` (not ``created_at``) — see ``hermes_state.py``. Reads go through
+        ``SessionDB._execute_write``, which is the serialized connection accessor used for
+        reads as well as writes in this codebase, and hands back ``sqlite3.Row`` objects
+        (hence ``dict(row)`` rather than ``row.get``).
+        """
+        if not isinstance(job, dict):
+            return job
+        job_id = job.get("id")
+        if not job_id:
+            return job
+
+        enriched = dict(job)
+        enriched["status"] = "idle"
+        enriched["active_session_id"] = None
+        enriched["last_execution"] = None
+
+        if session_db is None:
+            return enriched
+
+        def _latest_run(conn):
+            return conn.execute(
+                "SELECT id, started_at, ended_at, end_reason FROM sessions "
+                "WHERE id LIKE ? ORDER BY started_at DESC LIMIT 1",
+                (f"cron_{job_id}_%",),
+            ).fetchone()
+
+        try:
+            row = session_db._execute_write(_latest_run)
+        except (sqlite3.Error, AttributeError, TypeError) as e:
+            # Narrow on purpose, and WARNING not DEBUG: the two ways this
+            # originally failed — a method that did not exist and columns that
+            # did not exist — are both programming errors, and a bare
+            # ``except Exception`` at DEBUG hid them so the endpoint reported
+            # every job as "idle" forever. Enrichment stays best-effort so
+            # /api/jobs still answers, but a failure must be visible.
+            logger.warning(
+                "Cron job %s: execution-status enrichment failed (%s: %s)",
+                job_id, type(e).__name__, e,
+            )
+            return enriched
+
+        if row:
+            run = dict(row)   # sqlite3.Row has no .get()
+            session_id = run.get("id")
+            ended_at = run.get("ended_at")
+            end_reason = run.get("end_reason")
+
+            is_active = ended_at is None or str(ended_at).strip() == ""
+            if is_active:
+                enriched["status"] = "running"
+                enriched["active_session_id"] = session_id
+
+            enriched["last_execution"] = {
+                "session_id": session_id,
+                "started_at": run.get("started_at"),
+                "ended_at": ended_at,
+                "end_reason": end_reason,
+                "status": "running" if is_active else (end_reason or "completed"),
+            }
+
+        return enriched
+
+    def _job_response(self, fn, job_id: str, *, notify: bool, session_db: Optional[Any] = None) -> "web.Response":
         """Run ``fn(job_id)``: 404 when falsy, else ``{"job": ...}``; exceptions -> 500."""
         try:
             job = fn(job_id)
@@ -4575,6 +4755,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             if notify:
                 _notify_cron_provider_jobs_changed()
+            if session_db is not None:
+                job = self._enrich_job_status(job, session_db)
             return web.json_response({"job": job})
         except Exception as e:
             return self._cron_error_response(e)
@@ -4590,7 +4772,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return err
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
-            return web.json_response({"jobs": _cron_list(include_disabled=include_disabled)})
+            jobs = _cron_list(include_disabled=include_disabled)
+            session_db = await self._ensure_session_db_async()
+            return web.json_response({"jobs": [self._enrich_job_status(j, session_db) for j in jobs]})
         except Exception as e:
             return self._cron_error_response(e)
 
@@ -4638,7 +4822,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} — get a single cron job."""
-        return await self._job_lookup_or_mutate(request, _cron_get, notify=False)
+        job_id, err = self._cron_request_guard(request, need_job_id=True)
+        if err:
+            return err
+        return self._job_response(_cron_get, job_id, notify=False,
+                                  session_db=await self._ensure_session_db_async())
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""

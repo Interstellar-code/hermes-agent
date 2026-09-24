@@ -1,0 +1,58 @@
+# Known, expected test failures on the fork's macOS dev host (upstream v0.21.3 base).
+# Generated 2026-09-24 from a full isolated run: scripts/run_tests.sh -j 6 --file-timeout 300.
+# Every entry ALSO fails on pure upstream v0.21.3 (checked by running the same files in an
+# upstream worktree) unless its reason says otherwise -- none of these are fork regressions.
+#
+# A failure NOT listed here blocks a merge (scripts/check_known_failures.py exits 1).
+# A listed test that now PASSES is reported as FIXED: delete its line.
+
+tests/computer_use/test_cua_no_overlay.py::TestEmbeddedDaemonOverlayFlag::test_serve_process_disables_overlay_when_policy_requires_it  # optional native backend not installed (tflite / CuaDriver)
+tests/cron/test_file_permissions.py::TestConfigFilePermissions::test_ensure_hermes_home_sets_0700  # macOS: tmp file mode differs (umask)
+tests/cron/test_multiplex_cron_scheduler.py::TestMultiplexCronScheduler::test_multiplex_cron_tick_serves_all_profiles  # not ported by design: multi-profile cron ticking (FORK-REGISTRY)
+tests/gateway/test_msgraph_webhook.py::TestMSGraphNotifications::test_resource_patterns_accept_leading_slash[trio]  # trio/asyncio event-loop conflict in the test
+tests/gateway/test_msgraph_webhook.py::TestMSGraphNotifications::test_valid_notification_accepted_and_scheduled[trio]  # trio/asyncio event-loop conflict in the test
+tests/gateway/test_msgraph_webhook.py::TestMSGraphSourceIPAllowlist::test_loopback_bind_without_allowlist_still_accepts_local_requests[trio]  # trio/asyncio event-loop conflict in the test
+tests/gateway/test_msgraph_webhook.py::TestMSGraphValidationHandshake::test_connect_allows_loopback_without_source_allowlist[trio]  # trio/asyncio event-loop conflict in the test
+tests/gateway/test_session_title_rename_lane.py::test_native_thread_rename_passes_only_the_initial_name_guard[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/gateway/test_teams.py::TestTeamsAttachmentClassification::test_file_download_info_sets_document_type[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/gateway/test_teams.py::TestTeamsAttachmentClassification::test_mixed_image_and_document_prefers_document[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/gateway/test_teams.py::TestTeamsBotFrameworkAttachments::test_token_refresh_is_serialized_under_lock[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_dashboard_auth_gate.py::test_start_server_loopback_public_url_enables_gate  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_dashboard_auth_gate.py::test_start_server_loopback_sets_auth_required_false  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_local_quickstart.py::test_quickstart_runs_all_three_legs  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_local_quickstart.py::test_quickstart_skips_satisfied_legs  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_ordinary_divergence_skips_rescue_ref  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_guard_skips_rescue_ref_when_pre_pull_sha_missing  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_history_backs_up_before_reset  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_rescue_ref_write_failure_message_is_honest  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_rescue_refs_expired_by_age  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_cmd_update_orphan_rescue_refs_pruned_beyond_keep_limit  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_update_keep_stash_parks_instead_of_restoring  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_autostash.py::test_update_without_keep_stash_still_restores  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_cli/test_update_head_moved_gate.py::test_update_success_when_head_moves  # fails on upstream v0.21.3 too (host-dependent)
+tests/hermes_state/test_cross_vm_fs_wal_refusal.py::TestDetectCrossVmFs::test_only_virtiofs_and_9p_mounts_are_flagged[/data/agent-True]  # macOS: /tmp is a symlink to /private/tmp
+tests/hermes_state/test_cross_vm_fs_wal_refusal.py::TestDetectCrossVmFs::test_only_virtiofs_and_9p_mounts_are_flagged[/mnt/host/db-True]  # macOS: /tmp is a symlink to /private/tmp
+tests/hermes_state/test_cross_vm_fs_wal_refusal.py::TestDetectCrossVmFs::test_only_virtiofs_and_9p_mounts_are_flagged[/mnt/my share/db-True]  # macOS: /tmp is a symlink to /private/tmp
+tests/hermes_state/test_guest_durability_barriers.py::test_guest_barriers_leave_synchronous_alone_when_unset  # fails on upstream v0.21.3 too (host-dependent)
+tests/plugins/test_teams_pipeline_plugin.py::TestTeamsMeetingPipeline::test_missing_transcript_and_recording_schedules_retry[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/plugins/test_teams_pipeline_plugin.py::TestTeamsMeetingPipeline::test_recording_fallback_uses_stt_and_updates_sink_records[trio]  # fails on upstream v0.21.3 too (host-dependent)
+tests/scripts/test_contributor_map.py::test_add_contributor_refuses_a_case_collision  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_approval.py::TestDetectDangerousRm::test_nonrecursive_verification_artifact_cleanup_is_not_dangerous  # fails on upstream v0.21.3 too (host-dependent)
+tests/tools/test_code_kernel.py::TestKernelOwnershipAndLifecycle::test_parallel_cells_share_one_kernel_process  # fails on upstream v0.21.3 too (host-dependent)
+tests/tools/test_delegate.py::TestDelegateTask::test_child_dedicated_db_follows_parents_db_path  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[man-args4-None-True]  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[man-args5-None-True]  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_execution_flag_detection.py::test_real_binaries_execute_leading_dash_program_payload[sort-args2-{bulk}-False]  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_file_tools.py::TestPatchHandler::test_replace_mode_calls_patch_replace  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_file_tools.py::TestWriteFileHandler::test_writes_content  # macOS: /tmp is a symlink to /private/tmp
+tests/tools/test_microsoft_graph_auth.py::TestMicrosoftGraphTokenProvider::test_concurrent_calls_share_one_token_fetch[trio]  # trio/asyncio event-loop conflict in the test
+tests/tools/test_modal_snapshot_isolation.py::test_modal_environment_migrates_legacy_snapshot_key_and_uses_snapshot_id  # lazy installs disabled (security.allow_lazy_installs=false)
+tests/tools/test_modal_snapshot_isolation.py::test_resolve_modal_image_uses_snapshot_ids_and_registry_images  # lazy installs disabled (security.allow_lazy_installs=false)
+tests/tools/test_read_file_utf8_binary_regression.py::TestSiblingSites::test_search_finds_cjk_content  # macOS: killpg EPERM on an exited process group
+tests/tools/test_transcription_tools.py::TestTranscribeLocalExtended::test_config_device_and_compute_type_passed_to_whisper  # fails on upstream v0.21.3 too (host-dependent)
+tests/tools/test_voice_mode.py::TestPulseSocketReachable::test_listening_socket_reachable_via_xdg_runtime  # macOS: AF_UNIX socket path too long
+tests/tools/test_voice_mode.py::TestPulseSocketReachable::test_stale_socket_file_not_reachable  # macOS: AF_UNIX socket path too long
+tests/tools/test_voice_mode.py::TestWSL2PowerShellFallback::test_powershell_pipeline_preserves_real_exit_status  # macOS: AF_UNIX socket path too long
+tests/tools/test_voice_mode.py::TestWSL2PowerShellFallback::test_wsl2_unique_temp_filename  # macOS: AF_UNIX socket path too long
+tests/tools/test_wake_word.py::test_openwakeword_ensures_base_models_for_custom_path  # optional native backend not installed (tflite / CuaDriver)

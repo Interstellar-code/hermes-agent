@@ -274,6 +274,23 @@ upstream-equivalent rows.
 plugin, a core-file patch, a contract route, a reverted decision — updates the relevant §1–§4 row
 **in the same commit**. A divergence-touching change without a registry delta is incomplete.
 
+**Automated drop check.** `scripts/check_fork_drops.py` codifies the manual sweep that caught the
+v0.21.3 adopt's silent drops. Run once per adopt+replay, after the replay is believed complete:
+`python scripts/check_fork_drops.py --before <pre-adopt-ref> --fork-base <merge-base>`. It diffs
+fork commits for added defs/classes/constants and distinctive log strings, then flags any that no
+longer exist anywhere in `--after` (default `HEAD`). Exit 1 lists drops; allowlist intentional ones
+(renames, sunsets, convergence) in `scripts/fork_drops_allowlist.txt` with a reason.
+
+**Upgrade checklist (run all three before merging an upgrade).**
+1. *Missing-parts check* — `scripts/check_fork_drops.py` (above). Takes ~15 min.
+2. *Client contract* — `tests/gateway/test_switchui_contract.py` pins every SSE event, field and
+   capability hermes-switchui reads, each citing the client line that reads it. A red test means the
+   gateway stopped sending something the UI depends on.
+3. *Known failures* — `scripts/run_tests.sh -j 6 --file-timeout 300 > run.log 2>&1`, then
+   `python scripts/check_known_failures.py run.log`. Any failure not in `tests/known_failures.txt`
+   blocks the merge; a listed test that now passes is reported FIXED (delete its line).
+   Run with the checkout's own `venv/` (a stray `.venv/` is picked first by run_tests.sh).
+
 **Per-merge verification procedure** (run at every upstream-merge exercise, against the target tag
 *after* refs are refreshed):
 

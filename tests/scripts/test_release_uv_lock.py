@@ -164,62 +164,34 @@ def test_regenerate_uv_lock_succeeds_when_version_matches(monkeypatch, tmp_path)
 # ── update_version_files wiring ─────────────────────────────────────────
 
 
-def test_update_version_files_calls_regenerate_uv_lock(monkeypatch, tmp_path):
-    """End-to-end regression guard: update_version_files() is the function
-    release.py's --publish path actually calls, so it must drive the uv.lock
-    regeneration too -- this is the exact omission that caused 176 commits
-    of silently-skipped CI (commit 8712d5b7b)."""
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "hermes-agent"\nversion = "0.13.0"\n', encoding="utf-8"
-    )
-    version_dir = tmp_path / "hermes_cli"
-    version_dir.mkdir()
-    (version_dir / "__init__.py").write_text(
-        '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
-        encoding="utf-8",
-    )
+def test_publish_regenerates_uv_lock_after_writing_version_files():
+    """uv.lock regeneration is a PUBLISH step, not part of update_version_files().
 
-    module = _load_release_module(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
-    monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
-    monkeypatch.setattr(
-        module, "ACP_REGISTRY_MANIFEST", tmp_path / "acp_registry" / "agent.json"
-    )
+    The fork originally called regenerate_uv_lock() inside update_version_files()
+    (7d6cf940e5). Upstream v0.21.3 moved it to the --publish/--bump path on purpose:
+    update_version_files() is also called by tests with REPO_ROOT pointed at a tmp
+    dir, where `uv lock` is meaningless. The guarantee that matters is unchanged:
+    a bump regenerates the lock, and a failed regeneration aborts the release
+    before the commit. Pin that ordering in main()'s source.
+    """
+    import inspect
 
-    calls = []
-    monkeypatch.setattr(
-        module, "regenerate_uv_lock", lambda semver: calls.append(semver)
-    )
-
-    module.update_version_files("0.14.0", "2026-05-21")
-
-    assert calls == ["0.14.0"]
+    module = _load_release_module_plain()
+    src = inspect.getsource(module.main)
+    bump = src.index("update_version_files(new_version")
+    regen = src.index("regenerate_uv_lock(new_version)")
+    stage = src.index("version_files_to_stage()")
+    assert bump < regen < stage, "uv.lock must be regenerated after the bump and before staging"
+    # A RuntimeError from the regeneration aborts (return) instead of being swallowed.
+    tail = src[regen:stage]
+    assert "except RuntimeError" in tail and "return" in tail
 
 
-def test_update_version_files_propagates_uv_lock_failure(monkeypatch, tmp_path):
-    """A stale/failed uv.lock regeneration must abort update_version_files
-    (and therefore the release) rather than being swallowed."""
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "hermes-agent"\nversion = "0.13.0"\n', encoding="utf-8"
-    )
-    version_dir = tmp_path / "hermes_cli"
-    version_dir.mkdir()
-    (version_dir / "__init__.py").write_text(
-        '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
-        encoding="utf-8",
-    )
-
-    module = _load_release_module(monkeypatch, tmp_path)
-    monkeypatch.setattr(module, "VERSION_FILE", version_dir / "__init__.py")
-    monkeypatch.setattr(module, "PYPROJECT_FILE", tmp_path / "pyproject.toml")
-    monkeypatch.setattr(
-        module, "ACP_REGISTRY_MANIFEST", tmp_path / "acp_registry" / "agent.json"
-    )
-
-    def _boom(semver):
-        raise RuntimeError("uv not found")
-
-    monkeypatch.setattr(module, "regenerate_uv_lock", _boom)
-
-    with pytest.raises(RuntimeError, match="uv not found"):
-        module.update_version_files("0.14.0", "2026-05-21")
+def _load_release_module_plain():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "scripts" / "release.py"
+    spec = importlib.util.spec_from_file_location("_release_under_test_plain", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
