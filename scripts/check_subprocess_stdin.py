@@ -82,6 +82,8 @@ SKIP_DIRS = {
     "hermes_cli/",
     "gateway/",
     "cron/",
+    # Vendored git submodule with its own repo and CI (fork memory plugin); not TUI code.
+    "_matrix-memory-mnemosyne/",
 }
 
 

@@ -142,7 +142,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg = dict(DEFAULTS)
     cfg["codex_extra_flags"] = list(DEFAULTS["codex_extra_flags"])
     try:
-        raw = json.loads(config_path.read_text())
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             for key, val in raw.items():
                 if val is not None:
@@ -158,7 +158,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
     role_file = cfg.get("role_file")
     if role_file:
         try:
-            cfg["role_prompt"] = Path(role_file).read_text().strip()
+            cfg["role_prompt"] = Path(role_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
             log.warning("role_file %s unreadable (%s); using role_prompt", role_file, exc)
 
@@ -201,7 +201,7 @@ _SESSION_MAP_LOCK = threading.Lock()
 def load_session_map(path: Path = SESSION_MAP_PATH) -> Dict[str, Dict[str, Any]]:
     """Load the durable Codex thread map. Malformed content -> empty map."""
     try:
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
     except (json.JSONDecodeError, OSError) as exc:
@@ -243,7 +243,7 @@ def store_thread_id_for_context(context_id: str, thread_id: str, path: Path = SE
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, path)
         except OSError as exc:
             log.warning("session map persist failed (%s)", exc)
@@ -269,7 +269,7 @@ def clear_thread_id_for_context(context_id: str, path: Path = SESSION_MAP_PATH) 
         del data[context_id]
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
+            tmp.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, path)
         except OSError as exc:
             log.warning("session map clear failed for ctx=%s (%s)", context_id, exc)
@@ -777,7 +777,7 @@ def post_reply(
 def _read_offset(path: Path) -> int:
     """Read a persisted processed-line offset. Missing/garbage -> 0."""
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return 0
     try:
@@ -791,7 +791,7 @@ def _write_offset(path: Path, offset: int) -> None:
     """Persist the processed-line offset atomically (write tmp + os.replace)."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp.write_text(str(offset))
+        tmp.write_text(str(offset), encoding="utf-8")
         os.replace(tmp, path)  # atomic on POSIX
     except OSError as exc:
         log.warning("offset persist failed (%s)", exc)
@@ -885,7 +885,7 @@ class Receiver:
         if not self.inbox_path.exists():
             return
         try:
-            lines = self.inbox_path.read_text().splitlines()
+            lines = self.inbox_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             log.warning("inbox read failed (%s)", exc)
             return
@@ -1189,7 +1189,7 @@ def write_pid_file(path: Optional[Path] = None) -> None:
     if path is None:
         path = PID_PATH
     try:
-        path.write_text(str(os.getpid()))
+        path.write_text(str(os.getpid()), encoding="utf-8")
     except OSError as exc:
         log.warning("could not write PID file %s (%s)", path, exc)
 

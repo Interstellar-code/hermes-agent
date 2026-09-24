@@ -125,7 +125,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
     cfg = dict(DEFAULTS)
     cfg["claude_extra_flags"] = list(DEFAULTS["claude_extra_flags"])
     try:
-        raw = json.loads(config_path.read_text())
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             for key, val in raw.items():
                 if val is not None:
@@ -141,7 +141,7 @@ def load_config(config_path: Path = CONFIG_PATH) -> Dict[str, Any]:
     role_file = cfg.get("role_file")
     if role_file:
         try:
-            cfg["role_prompt"] = Path(role_file).read_text().strip()
+            cfg["role_prompt"] = Path(role_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
             log.warning("role_file %s unreadable (%s); using role_prompt", role_file, exc)
 
@@ -286,7 +286,7 @@ def resolve_mcp_config(repo_path: Path) -> Optional[Path]:
         log.debug("no .mcp.json in %s; running without --mcp-config", repo_path)
         return None
     try:
-        json.loads(mcp_path.read_text())
+        json.loads(mcp_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         log.warning(".mcp.json present but unusable (%s); skipping --mcp-config", exc)
         return None
@@ -729,7 +729,7 @@ def post_reply(
 def _read_offset(path: Path) -> int:
     """Read a persisted processed-line offset. Missing/garbage -> 0."""
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return 0
     try:
@@ -743,7 +743,7 @@ def _write_offset(path: Path, offset: int) -> None:
     """Persist the processed-line offset atomically (write tmp + os.replace)."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp.write_text(str(offset))
+        tmp.write_text(str(offset), encoding="utf-8")
         os.replace(tmp, path)  # atomic on POSIX
     except OSError as exc:
         log.warning("offset persist failed (%s)", exc)
@@ -845,7 +845,7 @@ class Receiver:
         # BYTE offset (read from there to EOF) and/or periodic inbox compaction.
         # Left as a clear TODO deliberately — not half-built here.
         try:
-            lines = self.inbox_path.read_text().splitlines()
+            lines = self.inbox_path.read_text(encoding="utf-8").splitlines()
         except OSError as exc:
             log.warning("inbox read failed (%s)", exc)
             return
@@ -1173,7 +1173,7 @@ def write_pid_file(path: Optional[Path] = None) -> None:
     if path is None:
         path = PID_PATH
     try:
-        path.write_text(str(os.getpid()))
+        path.write_text(str(os.getpid()), encoding="utf-8")
     except OSError as exc:
         log.warning("could not write PID file %s (%s)", path, exc)
 

@@ -79,6 +79,7 @@ EXCLUDED_DIRS = {
     "site-packages",
     "website/build",
     "optional-skills",  # external skills
+    "_matrix-memory-mnemosyne",  # vendored git submodule, own repo + CI
 }
 
 # File globs we never scan (beyond the dirs above).

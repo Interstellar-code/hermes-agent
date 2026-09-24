@@ -136,7 +136,7 @@ def _is_git_repo(repo: Path) -> bool:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
+    tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -156,7 +156,7 @@ def upsert_hermes_gitignore(gitignore_path: Path) -> None:
     existing_lines: List[str] = []
     if gitignore_path.exists():
         try:
-            existing_lines = gitignore_path.read_text().splitlines()
+            existing_lines = gitignore_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             existing_lines = []
     present = {ln.strip() for ln in existing_lines}
@@ -183,7 +183,7 @@ def upsert_claude_md_import(claude_md_path: Path) -> str:
         _atomic_write_text(claude_md_path, block + "\n")
         return "imported"
 
-    content = claude_md_path.read_text()
+    content = claude_md_path.read_text(encoding="utf-8")
     start_idx = content.find(CLAUDE_MD_START)
     end_idx = content.find(CLAUDE_MD_END)
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
@@ -235,7 +235,7 @@ def build_receiver_config(
 
 def _read_pid(pid_path: Path) -> Optional[int]:
     try:
-        raw = pid_path.read_text().strip()
+        raw = pid_path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     try:
@@ -631,7 +631,7 @@ async def oc_receiver_status_handler(repo_path: str, **_injected: Any) -> Dict[s
 
         port: Optional[int] = None
         try:
-            cfg = json.loads(config_path.read_text())
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
             if isinstance(cfg, dict) and cfg.get("bind_port") is not None:
                 port = int(cfg["bind_port"])
         except (OSError, json.JSONDecodeError, ValueError, TypeError):

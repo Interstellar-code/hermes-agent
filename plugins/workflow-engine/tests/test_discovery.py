@@ -27,7 +27,7 @@ FIXTURE_FILES = [
 # ---------------------------------------------------------------------------
 
 def test_parse_hello_world():
-    content = (FIXTURES_DIR / "hello-world.yaml").read_text()
+    content = (FIXTURES_DIR / "hello-world.yaml").read_text(encoding="utf-8")
     workflow, error = parse_workflow(content, "hello-world.yaml")
     assert error is None, f"Unexpected error: {error}"
     assert workflow is not None
@@ -121,7 +121,7 @@ def test_all_fixture_files_parse():
     """Each fixture YAML must parse cleanly individually."""
     for fname in FIXTURE_FILES:
         path = FIXTURES_DIR / fname
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
         workflow, error = parse_workflow(content, fname)
         assert error is None, f"{fname} failed: {error}"
         assert workflow is not None

@@ -151,7 +151,7 @@ def test_register_garbage_json_422(client):
 def test_register_persists_manifest(client_with_state):
     c, state_file = client_with_state
     c.post("/register", json=_VALID_MANIFEST)
-    raw = json.loads(state_file.read_text())
+    raw = json.loads(state_file.read_text(encoding="utf-8"))
     assert raw.get("manifest", {}).get("version") == "1.2.3"
 
 
@@ -170,7 +170,7 @@ def test_settings_strips_token(client_with_state):
     payload = {"theme": "dark", "HERMES_API_TOKEN": "secret", "auth_token": "abc"}
     resp = c.post("/settings", json=payload)
     assert resp.status_code == 200
-    raw = json.loads(state_file.read_text())
+    raw = json.loads(state_file.read_text(encoding="utf-8"))
     reported = raw.get("reported_settings", {})
     assert "HERMES_API_TOKEN" not in reported
     assert "auth_token" not in reported
@@ -182,7 +182,7 @@ def test_settings_strips_password(client_with_state):
     payload = {"lang": "en", "HERMES_PASSWORD": "hunter2"}
     resp = c.post("/settings", json=payload)
     assert resp.status_code == 200
-    raw = json.loads(state_file.read_text())
+    raw = json.loads(state_file.read_text(encoding="utf-8"))
     reported = raw.get("reported_settings", {})
     assert "HERMES_PASSWORD" not in reported
     assert reported.get("lang") == "en"
