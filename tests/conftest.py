@@ -810,6 +810,154 @@ def _state_db_write_guard(request, monkeypatch):
     yield
 
 
+# ── Copilot credential / network guard ──────────────────────────────────────
+#
+# Restored 2026-09-24: dropped by the v0.21.3 adopt (359fb1595a); found by the
+# fork-only failures in tests/test_credential_guard.py. `gh` is installed and
+# authenticated on the dev machine, so without this any provider-listing test
+# read the real GitHub token.
+#
+# ``agent.credential_pool._seed_from_singletons("copilot")`` resolves a
+# Copilot token via ``hermes_cli.copilot_auth.resolve_copilot_token()``,
+# which falls back to shelling out to the REAL ``gh auth token`` CLI when no
+# env var is set — reading the developer's real, authenticated GitHub
+# credential straight out of their ``gh`` keyring/hosts.yml. That raw token
+# is then handed to ``get_copilot_api_token()`` -> ``exchange_copilot_token()``,
+# which makes a real ``GET https://api.github.com/copilot_internal/v2/token``
+# network call using it.
+#
+# ``_hermetic_environment`` above already blanks the env-var branch
+# (``GH_TOKEN`` / ``GITHUB_TOKEN`` / ``COPILOT_GITHUB_TOKEN`` all match the
+# credential-shaped filters), but that alone does not stop the ``gh`` CLI
+# fallback — ``gh`` reads its own credential store independent of env vars —
+# and it does not stop a test-supplied *fake* token from still triggering a
+# real round-trip to GitHub (see ``test_load_pool_seeds_copilot_via_gh_auth_token``
+# in tests/agent/test_credential_pool.py, which sets a syntactically-fake
+# token and previously relied on a live 401 from GitHub to exercise its
+# fallback path).
+#
+# ``list_authenticated_providers()`` (hermes_cli/model_switch.py) calls
+# ``credential_pool.load_pool()`` for every provider including "copilot", so
+# ~20+ test files that merely enumerate available providers were silently
+# reading this machine's real GitHub token and phoning home to GitHub on
+# every run — with the failure invisible because ``get_copilot_api_token()``
+# swallows every exception and falls back to the raw token.
+#
+# Fix, in two parts:
+#   1. Block the ``gh auth token`` shell-out at its source
+#      (``_try_gh_cli_token``) so a real credential is never read.
+#   2. Block the specific GitHub/Copilot endpoints ``exchange_copilot_token()``
+#      and ``copilot_device_code_login()`` talk to, so even a test-supplied
+#      placeholder token cannot trigger a live network call.
+#
+# Both guards raise loudly (matching the ``_live_system_guard`` convention
+# below) the moment the guarded code path is reached. Inside
+# ``_seed_from_singletons("copilot")`` that exception is swallowed by that
+# function's own ``except Exception`` — exactly the same graceful
+# degradation it already applies when ``gh`` genuinely isn't configured — so
+# the ~20 unrelated test files that never cared about Copilot simply see an
+# empty copilot pool, as if `gh` were absent. A test that *directly* calls
+# ``resolve_copilot_token()`` / ``exchange_copilot_token()`` /
+# ``get_copilot_api_token()`` without mocking gets a clear, loud failure
+# instead of a silent leak — a test reaching for the real network is a bug
+# worth surfacing.
+#
+# Tests that deliberately exercise these functions (tests/hermes_cli/
+# test_copilot_auth.py, tests/hermes_cli/test_copilot_token_exchange.py,
+# tests/agent/test_credential_pool.py) already patch ``_try_gh_cli_token`` /
+# ``urllib.request.urlopen`` / ``resolve_copilot_token`` themselves inside
+# the test body — those per-test patches are applied after this fixture has
+# already run and win for the duration of the test, so they are unaffected.
+
+# Captured on first use of the guard fixture, before the real function is
+# swapped out — see the `real_try_gh_cli_token` opt-out fixture below.
+_REAL_TRY_GH_CLI_TOKEN = None
+
+
+def _guarded_try_gh_cli_token():
+    raise RuntimeError(
+        "tests/conftest.py credential guard: blocked a real `gh auth "
+        "token` shell-out from hermes_cli.copilot_auth._try_gh_cli_token(). "
+        "Tests must never read a real GitHub/Copilot credential from the "
+        "developer's `gh` CLI. Mock `_try_gh_cli_token` (or "
+        "`resolve_copilot_token`) explicitly if this call is intentional. "
+        "If you need the real function because you have already stubbed "
+        "`copilot_auth.subprocess.run`, request the "
+        "`real_try_gh_cli_token` fixture."
+    )
+
+
+@pytest.fixture
+def real_try_gh_cli_token(monkeypatch):
+    """Restore the real ``_try_gh_cli_token`` for tests that stub subprocess.
+
+    A test that has already replaced ``copilot_auth.subprocess.run`` with a
+    fake never shells out and never reads a credential, so the guard above is
+    pure collateral for it — but it still needs the genuine function body to
+    assert on (e.g. that the Windows no-window ``creationflags`` are passed).
+
+    Requesting this fixture is a deliberate, greppable opt-out. Do NOT use it
+    without stubbing ``copilot_auth.subprocess.run`` first, or the real `gh`
+    binary will be invoked.
+    """
+    import hermes_cli.copilot_auth as _copilot_auth
+
+    monkeypatch.setattr(
+        _copilot_auth, "_try_gh_cli_token", _REAL_TRY_GH_CLI_TOKEN
+    )
+    return _REAL_TRY_GH_CLI_TOKEN
+
+
+# Path fragments unique to the Copilot OAuth/token-exchange endpoints. Kept
+# narrow (rather than blocking the whole api.github.com/github.com host) so
+# unrelated urllib.request.urlopen traffic elsewhere in the codebase is
+# untouched.
+_COPILOT_NETWORK_URL_MARKERS = (
+    "copilot_internal/v2/token",  # exchange_copilot_token()
+    "/login/device/code",  # copilot_device_code_login() step 1
+    "/login/oauth/access_token",  # copilot_device_code_login() step 2
+)
+
+
+@pytest.fixture(autouse=True)
+def _block_real_copilot_credentials(monkeypatch):
+    """Prevent tests from reading a real `gh` token or reaching GitHub.
+
+    See the block comment above for the full story. Tests that
+    intentionally exercise these code paths patch around this fixture
+    (see tests/hermes_cli/test_copilot_auth.py and
+    tests/hermes_cli/test_copilot_token_exchange.py).
+    """
+    import hermes_cli.copilot_auth as _copilot_auth
+
+    global _REAL_TRY_GH_CLI_TOKEN
+    if _REAL_TRY_GH_CLI_TOKEN is None:
+        _REAL_TRY_GH_CLI_TOKEN = _copilot_auth._try_gh_cli_token
+
+    monkeypatch.setattr(_copilot_auth, "_try_gh_cli_token", _guarded_try_gh_cli_token)
+
+    import urllib.request as _urllib_request
+
+    real_urlopen = _urllib_request.urlopen
+
+    def _guarded_urlopen(request, *args, **kwargs):
+        url = getattr(request, "full_url", None)
+        if url is None:
+            url = request if isinstance(request, str) else ""
+        if any(marker in url for marker in _COPILOT_NETWORK_URL_MARKERS):
+            raise RuntimeError(
+                "tests/conftest.py credential guard: blocked a real "
+                f"network call to {url!r} — this is a GitHub Copilot "
+                "OAuth/token-exchange endpoint. Tests must never reach "
+                "the real GitHub API. Mock urllib.request.urlopen (or "
+                "the specific hermes_cli.copilot_auth function under "
+                "test) explicitly if this call is intentional."
+            )
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(_urllib_request, "urlopen", _guarded_urlopen)
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``

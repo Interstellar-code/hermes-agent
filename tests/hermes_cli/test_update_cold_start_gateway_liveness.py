@@ -22,6 +22,12 @@ from hermes_cli import update_cmd
 def _run_cold_start(monkeypatch, capsys, *, surviving_pids):
     monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
     monkeypatch.setattr(main_install_repair, "_is_windows", lambda: True)
+    # Host isolation: Desktop-lifecycle ownership reads the REAL spawn ledger and
+    # process table. On a dev machine whose live dashboard was spawned from this
+    # checkout, it answers True and the cold-start silently returns before
+    # spawning, so the assertions below never run against the code under test.
+    import hermes_cli.update_cmd as _update_cmd
+    monkeypatch.setattr(_update_cmd, "_desktop_owns_gateway_lifecycle", lambda: False)
 
     # The pre-spawn re-check (``all_profiles=True``) must find nothing
     # running so the cold-start path proceeds and actually spawns.

@@ -84,8 +84,13 @@ class TestResolveToken:
         mock_cli.assert_not_called()
 
 
+@pytest.mark.usefixtures("real_try_gh_cli_token")
 class TestGhCliTokenCache:
     """The gh-CLI probe result is cached — a miss must not re-spawn gh.
+
+    Opts out of the conftest credential guard on ``_try_gh_cli_token``: every test
+    here stubs ``_probe_gh_cli_token`` (the actual `gh` shell-out), so the real
+    caching wrapper runs and no credential is ever read.
 
     Regression: /api/model/options ran `gh auth token` four times per build;
     with no gh credential store each probe blocked its full 5s timeout, so the
