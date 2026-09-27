@@ -2623,7 +2623,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         route_provider = _clean_request_string(route_cfg.get("provider"))
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
-        current_provider = _clean_request_string(runtime_kwargs.get("provider"))
+        # Re-resolve by the NAME the runtime was resolved from, not the canonical provider. A
+        # named custom provider (providers.<name> in config.yaml) canonicalizes to "custom", and
+        # re-resolving the bare "custom" loses its base_url/key: it falls through to generic env
+        # credentials (OPENAI_API_KEY) and the OpenRouter default URL, which is how a session with
+        # a stored model got 401 "Missing Authentication header" while new sessions worked.
+        canonical_provider = _clean_request_string(runtime_kwargs.get("provider"))
+        current_provider = _clean_request_string(runtime_kwargs.get("requested_provider")) or canonical_provider
         session_override = None if confirmed_runtime_lock else self._session_model_override_for(session_key)
         if session_override is None and not confirmed_runtime_lock:
             # Nothing live in memory: a restart clears the map, so fall back to the override
@@ -2668,7 +2674,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 applied = self._apply_provider_runtime(
                     runtime_kwargs, effective_provider, target_model=effective_model,
                     required=bool(request_provider) or confirmed_runtime_lock)
-            if not applied and effective_provider and effective_provider != current_provider:
+            if not applied and effective_provider and effective_provider not in {current_provider, canonical_provider}:
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
             # Per-route explicit transport secrets/base URLs win after provider resolution.
