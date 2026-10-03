@@ -1200,7 +1200,10 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        "agent_context": "primary",
+        # #251: platform="cron" (cron/scheduler.py) / "subagent" (delegate_task) is the per-agent run
+        # kind; providers skip writes for non-primary contexts (MemoryProvider.initialize). Same as
+        # upstream 6f305f3dc1. Background review / curator / batch never load a provider (skip_memory).
+        "agent_context": platform if platform in ("cron", "subagent") else "primary",
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
