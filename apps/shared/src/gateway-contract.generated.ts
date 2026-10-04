@@ -323,12 +323,14 @@ export interface HandoffRequestParams {
   session_id: string
   profile?: string | null
   platform: string
+  target?: string | null
 }
 export interface HandoffRequestResult {
   queued: boolean
   session_key: string
   platform: string
   home_name: string
+  target?: string | null
 }
 /** Any method addressed at one live session. */
 export interface SessionParams {

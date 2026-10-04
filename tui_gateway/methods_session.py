@@ -1130,6 +1130,14 @@ def _(rid, params: dict, session: dict) -> dict:
     if not (home := gw_config.get_home_channel(platform)) or not home.chat_id:
         return _err(rid, 4026, f"no home channel configured for {platform_name} — set one with "
                     "/sethome on the destination chat first")
+    # FORK-ONLY (switchui): optional "<platform>:<chat_id>[:<thread_id>]" to reuse an existing chat/topic.
+    # Shape-checked here; the gateway enforces the known-chat allowlist when it resolves the row.
+    target = (params.get("target") or "").strip() or None
+    if target:
+        from gateway.delivery import DeliveryTarget
+        parsed = DeliveryTarget.parse(target)
+        if parsed.platform != platform or not parsed.chat_id:
+            return _err(rid, 4038, f"target must look like '{platform_name}:<chat_id>[:<thread_id>]'")
     # The watcher transfers a persisted row, so make sure one exists for an empty chat.
     _ensure_session_db_row(session)
     key = session["session_key"]
@@ -1142,14 +1150,15 @@ def _(rid, params: dict, session: dict) -> dict:
             # Reap anything an earlier caller abandoned so it neither blocks this
             # request nor gets actioned by the watcher long after it went stale.
             db.expire_stale_handoffs()
-            status = db.request_handoff_status(key, platform_name)
+            status = db.request_handoff_status(key, platform_name, **({"target": target} if target else {}))
         except Exception as e:
             return _err(rid, 5007, str(e))
     if status == "missing":
         return _err(rid, 4028, "session has no state.db record yet — send a message first, then retry the handoff")
     if status != "queued":
         return _err(rid, 4027, "session is already in flight for handoff — wait for it to settle, then retry")
-    return _ok(rid, {"queued": True, "session_key": key, "platform": platform_name, "home_name": home.name})
+    return _ok(rid, {"queued": True, "session_key": key, "platform": platform_name, "home_name": home.name,
+                     "target": target})
 
 
 @method("handoff.state")

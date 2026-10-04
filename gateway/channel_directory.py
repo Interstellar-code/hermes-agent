@@ -399,6 +399,13 @@ def lookup_channel_type(platform_name: str, chat_id: str) -> Optional[str]:
     return next((ch.get("type") for ch in channels if ch.get("id") == chat_id), None)
 
 
+def is_known_chat(platform_name: str, chat_id: str) -> bool:
+    """FORK-ONLY (switchui): True when *chat_id* is in this profile's directory (live channels + session
+    origins). Entry ids may carry a ``:<thread>`` suffix; only the chat part is compared."""
+    channels = load_directory().get("platforms", {}).get(platform_name, [])
+    return bool(chat_id) and any(str(ch.get("id", "")).split(":", 1)[0] == chat_id for ch in channels)
+
+
 def resolve_channel_name(platform_name: str, name: str) -> Optional[str]:
     """Resolve a friendly channel name (e.g. "bot-home", "#bot-home", "GuildName/bot-home",
     Slack "#engineering") to an ID; case-insensitive, first match wins."""

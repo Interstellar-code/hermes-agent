@@ -17,6 +17,7 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id
 from gateway.platforms.base import BasePlatformAdapter
@@ -1466,30 +1467,49 @@ class GatewayStartupMixin:
                 f"no home channel configured for {platform_name}; run /sethome on the desired chat first"
             )
         home_chat_id = str(home.chat_id)
+        # FORK-ONLY (switchui): explicit ``<platform>:<chat_id>[:<thread_id>]`` target. Only the home
+        # chat or a chat in this profile's channel directory is allowed — never an arbitrary chat id.
+        target_thread_id = None
+        raw_target = (row.get("handoff_target") or "").strip()
+        if raw_target:
+            from gateway.channel_directory import is_known_chat
+            from gateway.delivery import DeliveryTarget
+            target = DeliveryTarget.parse(raw_target)
+            if target.platform != platform or not target.chat_id:
+                raise RuntimeError(f"invalid handoff target '{raw_target}' for {platform_name}")
+            if target.chat_id != home_chat_id and not is_known_chat(platform_name, target.chat_id):
+                raise RuntimeError(f"handoff target chat {target.chat_id} is not a known {platform_name} chat")
+            home_chat_id, target_thread_id = target.chat_id, target.thread_id or None
         # Fresh thread for the handoff's own scrollback; None when unsupported or creation failed.
         cli_title = row.get("title") or cli_session_id[:8]
-        try:
-            new_thread_id = await transport.adapter.create_handoff_thread(
-                home_chat_id, f"Hermes — {cli_title}",
-            )
-        except Exception as exc:
-            logger.debug("Handoff: create_handoff_thread raised on %s: %s", platform_name, exc, exc_info=True)
-            new_thread_id = None
-        effective_thread_id = new_thread_id or (str(home.thread_id) if home.thread_id else None)
+        new_thread_id = None
+        if not target_thread_id:
+            try:
+                new_thread_id = await transport.adapter.create_handoff_thread(
+                    home_chat_id, f"Hermes — {cli_title}",
+                )
+            except Exception as exc:
+                logger.debug("Handoff: create_handoff_thread raised on %s: %s", platform_name, exc, exc_info=True)
+        is_home_chat = home_chat_id == str(home.chat_id)
+        effective_thread_id = target_thread_id or new_thread_id or (
+            str(home.thread_id) if home.thread_id and is_home_chat else None)
         # Telegram private-chat DM topics use the DM-topic source shape (user_id == chat_id) so the
         # synthetic turn binds the same key later inbound turns arrive on (`dm`, not `thread`).
         is_telegram_private_chat = (
             platform == Platform.TELEGRAM and looks_like_telegram_private_chat_id(home_chat_id)
         )
-        is_thread = bool(new_thread_id) and not is_telegram_private_chat
+        is_thread = bool(new_thread_id or target_thread_id) and not is_telegram_private_chat
+        # An existing Telegram group topic keys like inbound forum messages (``forum``, not ``thread``).
+        thread_chat_type = (
+            "forum" if target_thread_id and platform == Platform.TELEGRAM else "thread")
         # Discord builds in-thread messages with ``chat_id == thread id``: key on the thread's OWN id.
         dest_source = SessionSource(
             platform=platform,
             chat_id=str(effective_thread_id) if (
                 is_thread and platform == Platform.DISCORD and effective_thread_id
             ) else home_chat_id,
-            chat_name=home.name,
-            chat_type="thread" if is_thread else "dm",
+            chat_name=home.name if is_home_chat else None,
+            chat_type=thread_chat_type if is_thread else "dm",
             user_id=home_chat_id if is_telegram_private_chat else "system:handoff",
             user_name="Handoff", thread_id=effective_thread_id, profile=profile_name,
         )
@@ -1532,6 +1552,14 @@ class GatewayStartupMixin:
         cli_session_id = row["id"]
         dest = await self._handoff_resolve_destination(row, profile_name)
         session_key = self._handoff_session_key(dest, profile_name)
+        # FORK-ONLY (switchui): an existing topic-mode lane carries a (chat, thread) → session binding the synthetic
+        # turn would otherwise follow back to the topic's previous session. Rebind BEFORE switching so a
+        # refusal (session already linked to another topic → ValueError) fails the handoff cleanly.
+        if row.get("handoff_target") and await asyncio.to_thread(self._is_telegram_topic_lane, dest.source):
+            await asyncio.to_thread(
+                self._record_telegram_topic_binding, dest.source,
+                SimpleNamespace(session_key=session_key, session_id=cli_session_id),
+            )
         # Ensure a session_store entry exists for this key; switch_session then re-points it.
         await self.async_session_store.get_or_create_session(dest.source)
         # switch_session ends the prior session and reopens the CLI session under the new key.
@@ -1543,9 +1571,11 @@ class GatewayStartupMixin:
         self._evict_cached_agent(session_key)
         self._release_running_agent_state(session_key)
         cli_title = row.get("title") or cli_session_id[:8]
+        origin_label = {"cli": "CLI", "api_server": "the web UI"}.get(
+            row.get("source") or "cli", row.get("source"))
         synthetic_event = MessageEvent(
             text=(
-                f"[Session was just handed off from CLI (\"{cli_title}\") to this "
+                f"[Session was just handed off from {origin_label} (\"{cli_title}\") to this "
                 f"channel. The full prior conversation history is loaded above. "
                 f"Briefly confirm you're working here and summarize what we were "
                 f"working on, so the user can continue from this device.]"
@@ -1556,7 +1586,7 @@ class GatewayStartupMixin:
         logger.info(
             "Handoff: dispatching synthetic turn for CLI session %s → %s "
             "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, dest.platform_name, dest.home.chat_id, dest.effective_thread_id, session_key,
+            cli_session_id, dest.platform_name, dest.home_chat_id, dest.effective_thread_id, session_key,
         )
         # Inline _handle_message keeps success/failure observable (handle_message would detach it).
         response_text = await self._handle_message(synthetic_event)
@@ -1568,7 +1598,7 @@ class GatewayStartupMixin:
         send_metadata = {"thread_id": dest.effective_thread_id} if dest.effective_thread_id else None
         try:
             result = await dest.transport.send(
-                dest.platform, str(dest.home.chat_id), response_text, send_metadata,
+                dest.platform, dest.home_chat_id, response_text, send_metadata,
             )
         except Exception as exc:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc

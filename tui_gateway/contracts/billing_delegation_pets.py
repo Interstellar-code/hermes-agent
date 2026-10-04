@@ -424,6 +424,7 @@ method("subagent.steer", params=SubagentSteerParams, result=SubagentSteerResult,
 
 class HandoffRequestParams(SessionParams):
     platform: str
+    target: str | None = None  # FORK-ONLY (switchui): "<platform>:<chat_id>[:<thread_id>]"
 
 
 class HandoffRequestResult(Result):
@@ -431,6 +432,7 @@ class HandoffRequestResult(Result):
     session_key: str
     platform: str
     home_name: str
+    target: str | None = None
 
 
 method("handoff.request", params=HandoffRequestParams, result=HandoffRequestResult,

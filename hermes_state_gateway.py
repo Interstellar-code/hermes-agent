@@ -129,7 +129,7 @@ _ORPHAN_CONTIGUITY_DONORS_SQL = f"""
                         ORDER BY last_active DESC
                         LIMIT 2
                         """
-_HANDOFF_FAIL_SQL = "UPDATE sessions SET handoff_state = 'failed', handoff_error = ? WHERE "
+_HANDOFF_FAIL_SQL = "UPDATE sessions SET handoff_state = 'failed', handoff_error = ?, handoff_target = NULL WHERE "
 
 
 class SessionGatewayMixin:
@@ -614,13 +614,17 @@ class SessionGatewayMixin:
             " ORDER BY last_heartbeat DESC")
         return [dict(r) for r in rows]
 
-    def request_handoff_status(self, session_id: str, platform: str) -> str:
+    def request_handoff_status(self, session_id: str, platform: str, target: Optional[str] = None) -> str:
         """FORK-ONLY (#221). Arm a handoff and say precisely what happened.
 
         ``"queued"``    — the row was armed with ``handoff_state='pending'``.
         ``"missing"``   — there is no ``sessions`` row with this id at all
                           (a session that has never flushed a message).
         ``"in_flight"`` — the row exists but is already ``pending``/``running``.
+
+        FORK-ONLY (switchui): *target* (``"<platform>:<chat_id>[:<thread_id>]"``) pins the handoff to an
+        existing chat/topic instead of a fresh thread in the home channel; stored in ``handoff_target``,
+        cleared on completion/failure. The gateway re-validates it against the profile's known chats.
 
         ``request_handoff`` used to collapse the last two into a bare ``False``, so callers
         reported "already in flight for handoff" for a session that had no handoff record
@@ -633,10 +637,11 @@ class SessionGatewayMixin:
                 "SET handoff_state = 'pending', "
                 "    handoff_platform = ?, "
                 "    handoff_error = NULL, "
-                "    handoff_requested_at = ? "
+                "    handoff_requested_at = ?, "
+                "    handoff_target = ? "
                 "WHERE id = ? AND (handoff_state IS NULL "
                 "                  OR handoff_state IN ('completed', 'failed'))",
-                (platform, time.time(), session_id),
+                (platform, time.time(), target or None, session_id),
             )
             if cur.rowcount > 0:
                 return "queued"
@@ -742,7 +747,7 @@ class SessionGatewayMixin:
     def complete_handoff(self, session_id: str) -> None:
         """Mark a handoff as completed."""
         self._write_sql(
-            "UPDATE sessions SET handoff_state = 'completed', handoff_error = NULL WHERE id = ?",
+            "UPDATE sessions SET handoff_state = 'completed', handoff_error = NULL, handoff_target = NULL WHERE id = ?",
             (session_id,))
 
     def fail_handoff(

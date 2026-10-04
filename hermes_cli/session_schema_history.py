@@ -206,6 +206,8 @@ SCHEMA_HISTORY: dict[str, _TableHistory] = {
         # FORK (#221): the handoff-expiry feature's column, added by Phase D unit 3
         # (7ff9436289). Declared in SCHEMA_SQL right after handoff_error.
         ('27 2026-09-20T01:26Z 7ff9436289', (('+', 'handoff_requested_at', 'handoff_error'),)),
+        # FORK: handoff to an existing Telegram topic stores the chosen target.
+        ('28 2026-10-04T00:00Z handoff-target', (('+', 'handoff_target', 'handoff_requested_at'),)),
         ),
     ),
     "messages": _TableHistory(

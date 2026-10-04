@@ -11672,6 +11672,18 @@
           "platform": {
             "title": "Platform",
             "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target"
           }
         },
         "required": [
@@ -11699,6 +11711,18 @@
           "home_name": {
             "title": "Home Name",
             "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Target"
           }
         },
         "required": [
