@@ -118,6 +118,9 @@ class HermesTaskConfig(BaseModel):
     skills: Optional[List[str]] = None
     agent_hint: Optional[str] = None
     model_hint: Optional[str] = None
+    # Route this prompt node to another profile via the gateway (agent_session.py).
+    profile: Optional[str] = Field(None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    timeout_s: Optional[int] = Field(None, gt=0, le=86400)
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +372,15 @@ def validate_dag_node(raw: Any, index: int) -> tuple[DagNode | None, list[str]]:
     if idle_timeout is not None:
         if not isinstance(idle_timeout, (int, float)) or idle_timeout <= 0 or not math.isfinite(idle_timeout):
             errors.append(f"{label}: 'idle_timeout' must be a finite positive number (ms)")
+            return None, errors
+
+    hermes_task = raw.get("hermes_task")
+    if isinstance(hermes_task, dict) and hermes_task.get("profile") is not None:
+        if not has_prompt:
+            errors.append(f"{label}: hermes_task.profile is only supported on prompt nodes")
+            return None, errors
+        if hermes_task["profile"] == "default":
+            errors.append(f"{label}: hermes_task.profile 'default' cannot be routed to")
             return None, errors
 
     # Try to construct the concrete model

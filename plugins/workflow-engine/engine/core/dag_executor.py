@@ -108,6 +108,8 @@ class DagRunContext:
     cwd: Optional[str] = None
     # node_id → interactive-loop pause meta ({"iteration", "prev_output"})
     loop_resume: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Hermes home whose config.yaml holds workflow.routing (routed prompt nodes)
+    home: Optional[str] = None
 
 
 @dataclass

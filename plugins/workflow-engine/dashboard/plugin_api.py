@@ -80,12 +80,15 @@ async def health() -> dict:
         profile = profile_for_dir(home)
     else:  # :memory: engine has no daemon
         alive, at, profile = False, None, "default"
+    from engine.nodes.agent_session import routing_config  # noqa: PLC0415
+    routing = routing_config(Path(db_path).parent if db_path else None)
     return {
         "ok": True,
         "version": _VERSION,
         "profile": profile,
         "scheduler_alive": alive,
         "scheduler_heartbeat_at": at,
+        "routing": {"enabled": routing["enabled"], "allowed_profiles": routing["allowed_profiles"]},
     }
 
 
@@ -907,6 +910,8 @@ async def list_active_node_runs() -> JSONResponse:
             "status": r.get("status"),
             "startedAt": r.get("started_at"),
             "workerId": r.get("worker_id"),
+            "sessionId": r.get("session_id"),
+            "gatewayRunId": r.get("gateway_run_id"),
         }
         for r in rows
     ]

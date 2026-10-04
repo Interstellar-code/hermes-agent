@@ -58,6 +58,9 @@ async def dispatch_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "Node
     elif hasattr(node, "command"):
         from engine.nodes.command import execute_command_node
         result = await execute_command_node(node, node_outputs, ctx)
+    elif hasattr(node, "prompt") and node.hermes_task and node.hermes_task.profile:
+        from engine.nodes.agent_session import execute_agent_session_node
+        result = await execute_agent_session_node(node, node_outputs, ctx)
     elif hasattr(node, "prompt"):
         from engine.nodes.prompt import execute_prompt_node
         result = await execute_prompt_node(node, node_outputs, ctx)

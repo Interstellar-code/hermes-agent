@@ -381,6 +381,7 @@ class WorkflowRunner:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             ctx = self._build_ctx(run_id, working_path, prior_completed)
             ctx.cwd = cwd
+            ctx.home = str(self._runs_dir.parent)
             ctx.log_dir = str(self._runs_dir / run_id)
             ctx.loop_resume = loop_resume or {}
             ctx.workflow_vars = {
@@ -573,6 +574,18 @@ class WorkflowRunner:
                     node_run_id = nr["id"]
                 except Exception as e:
                     logger.debug("create_node_run skipped: %s", e)
+            elif event_type == "node_session_started":
+                nr = run_store.find_node_run(run_id, payload.get("node_id", ""))
+                if nr:
+                    node_run_id = nr["id"]
+                    try:
+                        run_store.update_node_run(nr["id"], {
+                            "assigned_agent": payload.get("profile"),
+                            "session_id": payload.get("session_id"),
+                            "gateway_run_id": payload.get("gateway_run_id"),
+                        })
+                    except Exception as e:
+                        logger.debug("update_node_run failed: %s", e)
             elif event_type in (
                 "node_completed",
                 "node_failed",

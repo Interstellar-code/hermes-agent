@@ -279,7 +279,10 @@ class RunStore:
                    nr.dag_node_id  AS dag_node_id,
                    wr.workflow_id  AS workflow_id,
                    nr.status       AS status,
-                   nr.started_at   AS started_at
+                   nr.started_at   AS started_at,
+                   nr.assigned_agent AS worker_id,
+                   nr.session_id   AS session_id,
+                   nr.gateway_run_id AS gateway_run_id
               FROM node_runs nr
               JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
              WHERE nr.status IN ('running', 'waiting')
@@ -291,7 +294,6 @@ class RunStore:
         for r in rows:
             d = dict(r)
             d["started_at"] = _ms_to_dt(d.get("started_at"))
-            d["worker_id"] = None  # column absent in current schema
             out.append(d)
         return out
 
@@ -595,7 +597,7 @@ class RunStore:
             "status", "error", "summary", "completed_at", "started_at",
             "kanban_task_id", "assigned_agent", "approval_response",
             "artifact_refs", "metadata", "skip_reason", "retries",
-            "approval_message",
+            "approval_message", "session_id", "gateway_run_id",
         }
         cols: List[str] = []
         vals: List[Any] = []

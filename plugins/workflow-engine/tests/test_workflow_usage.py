@@ -233,7 +233,7 @@ def test_migration_007_half_applied_converges():
         conn.commit()
         # simulate half-applied: some 007 columns present, version still 6
         ensure_schema(conn)
-        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "7"
+        assert int(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]) >= 7
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(node_runs)")}
         assert {"input_tokens", "model", "provider"} <= cols
 
