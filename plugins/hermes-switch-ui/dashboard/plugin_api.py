@@ -135,36 +135,81 @@ def heartbeat():
     return JSONResponse({"ok": True})
 
 
-def _listable_project_counts(state_db: Path, projects_db: Path) -> tuple[dict, int]:
-    """({project_id: listable bound sessions}, listable total) for one profile.
+_CHAIN_DEPTH_CAP = 50  # parent_session_id walks; also the cycle guard
 
-    "Listable" = the dashboard session list/count rule (exclude_children, archived=exclude),
-    via the shared ``_session_filter_where`` so totals match ``profile_totals``. One read-only
-    connection with projects.db ATTACHed; missing files yield ({}, 0) and nothing is created.
+
+def _project_rollup(state_db: Path, projects_db: Path) -> dict:
+    """Inherited folders + listable counts for one profile, read-only, missing files -> zeros.
+
+    - ``inherited``: {session_id: project_id} for non-subagent sessions with no explicit binding
+      whose nearest parent_session_id ancestor has one (explicit always wins; depth-capped walk,
+      so cycles terminate).
+    - ``counts`` / ``listable_total``: the dashboard list/count rule (``_session_filter_where``,
+      exclude_children, archived=exclude -> matches ``profile_totals``). A listed row shows its
+      compression TIP, so each listable root is filed under its tip's effective project.
     """
+    empty = {"inherited": {}, "counts": {}, "listable_total": 0}
     if not state_db.is_file():
-        return {}, 0
+        return empty
     try:
+        from hermes_state_common import _ephemeral_child_sql, _sql_json_extract
         from hermes_state_sessions import _session_filter_where, _where_sql
     except ImportError:
-        return {}, 0
+        return empty
     where, params = _session_filter_where(exclude_children=True)
+    delegate = _sql_json_extract("{a}.model_config", "$._delegate_from")
     conn = sqlite3.connect(f"{state_db.resolve().as_uri()}?mode=ro", uri=True)
     try:
-        total = conn.execute(f"SELECT COUNT(*) FROM sessions s{_where_sql(where, ' ')}", params).fetchone()[0]
+        if not projects_db.is_file():
+            total = conn.execute(f"SELECT COUNT(*) FROM sessions s{_where_sql(where, ' ')}", params).fetchone()[0]
+            return {**empty, "listable_total": total}
+        conn.execute("ATTACH DATABASE ? AS pj", (f"{projects_db.resolve().as_uri()}?mode=ro",))
+        # Effective project per non-subagent session: walk up until the first bound node.
+        effective: dict = {}
+        inherited: dict = {}
+        for sid, pid, depth in conn.execute(
+            f"""WITH RECURSIVE up(start, cur, depth, pid) AS (
+                SELECT s.id, s.id, 0, b.project_id FROM sessions s
+                LEFT JOIN pj.project_sessions b ON b.session_id = s.id
+                WHERE NOT {_ephemeral_child_sql('s')} AND {delegate.format(a='s')} IS NULL
+                UNION ALL
+                SELECT up.start, p.parent_session_id, up.depth + 1, b.project_id FROM up
+                JOIN sessions p ON p.id = up.cur
+                LEFT JOIN pj.project_sessions b ON b.session_id = p.parent_session_id
+                WHERE up.pid IS NULL AND p.parent_session_id IS NOT NULL AND up.depth < ?
+            ) SELECT start, pid, depth FROM up WHERE pid IS NOT NULL""",
+            (_CHAIN_DEPTH_CAP,),
+        ):
+            effective[sid] = pid
+            if depth:
+                inherited[sid] = pid
+        # Listable roots -> deepest compression descendant (the row the list shows).
         counts: dict = {}
-        if projects_db.is_file():
-            conn.execute("ATTACH DATABASE ? AS pj", (f"{projects_db.resolve().as_uri()}?mode=ro",))
-            counts = {
-                pid: n for pid, n in conn.execute(
-                    "SELECT ps.project_id, COUNT(*) FROM pj.project_sessions ps "
-                    f"JOIN sessions s ON s.id = ps.session_id AND {' AND '.join(where)} "
-                    "GROUP BY ps.project_id", params)
-            }
-        return counts, total
+        total = 0
+        for _root, tip in conn.execute(
+            f"""WITH RECURSIVE down(root, cur, depth) AS (
+                SELECT s.id, s.id, 0 FROM sessions s{_where_sql(where, ' ')}
+                UNION ALL
+                SELECT down.root, c.id, down.depth + 1 FROM down
+                JOIN sessions p ON p.id = down.cur AND p.end_reason = 'compression'
+                JOIN sessions c ON c.parent_session_id = p.id
+                    AND {_sql_json_extract('c.model_config', '$._branched_from')} IS NULL
+                    AND {delegate.format(a='c')} IS NULL AND COALESCE(c.source, '') != 'tool'
+                WHERE down.depth < ?
+            ), ranked AS (
+                SELECT root, cur, ROW_NUMBER() OVER (PARTITION BY root ORDER BY depth DESC, cur DESC) AS rn
+                FROM down
+            ) SELECT root, cur FROM ranked WHERE rn = 1""",
+            [*params, _CHAIN_DEPTH_CAP],
+        ):
+            total += 1
+            pid = effective.get(tip)
+            if pid:
+                counts[pid] = counts.get(pid, 0) + 1
+        return {"inherited": inherited, "counts": counts, "listable_total": total}
     except sqlite3.Error as exc:
-        log.warning("project-map listable counts failed: %s", exc)
-        return {}, 0
+        log.warning("project-map rollup failed: %s", exc)
+        return empty
     finally:
         conn.close()
 
@@ -175,7 +220,9 @@ def project_map(request: Request, profile: str | None = None):
 
     Read-only: a missing projects.db yields an empty map (never created on read).
     Response: { version, projects: [{id,slug,name,icon,color,archived,board_slug}],
-                sessions: {session_id: project_id} }; ETag + 304 on If-None-Match.
+                sessions: {session_id: project_id} (explicit + inherited from the parent chain),
+                inherited: {session_id: true}, counts: {project_id: listable sessions},
+                listable_total, unfiled }; ETag + 304 on If-None-Match.
     """
     try:
         from hermes_cli import projects_db
@@ -212,9 +259,12 @@ def project_map(request: Request, profile: str | None = None):
                 for r in conn.execute("SELECT session_id, project_id FROM project_sessions")
             }
 
-    counts, listable_total = _listable_project_counts(db_path.parent / "state.db", db_path)
+    rollup = _project_rollup(db_path.parent / "state.db", db_path)
+    sessions.update(rollup["inherited"])
+    counts, listable_total = rollup["counts"], rollup["listable_total"]
     payload = {
-        "version": _VERSION, "projects": projects, "sessions": sessions, "counts": counts,
+        "version": _VERSION, "projects": projects, "sessions": sessions,
+        "inherited": {sid: True for sid in rollup["inherited"]}, "counts": counts,
         "listable_total": listable_total, "unfiled": max(0, listable_total - sum(counts.values())),
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
