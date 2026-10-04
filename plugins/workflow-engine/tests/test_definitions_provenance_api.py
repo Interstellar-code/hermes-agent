@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from engine.store.run_store import STORE_LOCK
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
@@ -84,14 +85,15 @@ def client(client_and_engine):
 def _insert_bundled_row(engine, yaml_text=_FACTORY_YAML):
     """Directly insert a bundled row with correct provenance fields."""
     checksum = _sha256(yaml_text)
-    engine._conn.execute(
-        "INSERT INTO workflow_definitions "
-        "(id, name, source, yaml, checksum, bundled_checksum, user_modified, created_at, updated_at, kind) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("bundled-wf", "Bundled Workflow", "bundled", yaml_text, checksum,
-         checksum, 0, 1, 1, "workflow"),
-    )
-    engine._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._conn.execute(
+            "INSERT INTO workflow_definitions "
+            "(id, name, source, yaml, checksum, bundled_checksum, user_modified, created_at, updated_at, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("bundled-wf", "Bundled Workflow", "bundled", yaml_text, checksum,
+             checksum, 0, 1, 1, "workflow"),
+        )
+        engine._conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +211,14 @@ def test_reset_factory_api_endpoint_404_for_nonbundled(client_and_engine):
     client, engine = client_and_engine
 
     # Insert a user row
-    engine._conn.execute(
-        "INSERT INTO workflow_definitions "
-        "(id, name, source, yaml, checksum, created_at, updated_at, kind) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("user-wf", "User WF", "user", _OTHER_YAML, _sha256(_OTHER_YAML), 1, 1, "workflow"),
-    )
-    engine._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._conn.execute(
+            "INSERT INTO workflow_definitions "
+            "(id, name, source, yaml, checksum, created_at, updated_at, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("user-wf", "User WF", "user", _OTHER_YAML, _sha256(_OTHER_YAML), 1, 1, "workflow"),
+        )
+        engine._conn.commit()
 
     r = client.post("/definitions/user-wf/reset-factory")
     assert r.status_code == 403, r.text
@@ -281,13 +284,14 @@ nodes:
 
 def test_mark_user_edit_not_bundled_raises_value_error(client_and_engine):
     _, engine = client_and_engine
-    engine._conn.execute(
-        "INSERT INTO workflow_definitions "
-        "(id, name, source, yaml, checksum, created_at, updated_at, kind) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        ("user-wf", "User WF", "user", _USER_WF_YAML, _sha256(_USER_WF_YAML), 1, 1, "workflow"),
-    )
-    engine._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._conn.execute(
+            "INSERT INTO workflow_definitions "
+            "(id, name, source, yaml, checksum, created_at, updated_at, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("user-wf", "User WF", "user", _USER_WF_YAML, _sha256(_USER_WF_YAML), 1, 1, "workflow"),
+        )
+        engine._conn.commit()
 
     with pytest.raises(ValueError, match="[Nn]ot a bundled row"):
         engine._def_store.mark_user_edit("user-wf", _USER_WF_YAML)

@@ -20,9 +20,13 @@ from typing import Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
 from engine.core.executor_shared import (
-    substitute_node_output_refs,
+    NODE_OUTPUT_REF_RE,
+    communicate_or_kill,
     format_subprocess_failure,
+    node_output_env_name,
+    subprocess_cwd,
     substitute_workflow_variables,
+    workflow_env,
 )
 
 logger = logging.getLogger("workflow.nodes.script")
@@ -96,12 +100,23 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
     # by design. Interpolating caller-controlled inputs into script source is code injection.
     # Env-var hardening is now active for caller-controlled variables: script nodes must
     # read os.environ["USER_MESSAGE"] instead.
-    # System-generated / validated variables ($ARTIFACTS_DIR, $BASE_BRANCH, $DOCS_DIR,
-    # $WORKFLOW_ID) still interpolate into the script source via substitute_workflow_variables.
-    if "$USER_MESSAGE" in raw_script or "$ARGUMENTS" in raw_script:
+    # $BASE_BRANCH can come from caller inputs, so it is env-only too.
+    # Engine-generated variables ($ARTIFACTS_DIR, $DOCS_DIR, $WORKFLOW_ID)
+    # still interpolate into the script source via substitute_workflow_variables.
+    if "$USER_MESSAGE" in raw_script or "$ARGUMENTS" in raw_script or "$BASE_BRANCH" in raw_script:
         err = (
-            f"Script node '{node.id}' cannot interpolate $USER_MESSAGE or $ARGUMENTS into script body; "
-            f"use os.environ[\"USER_MESSAGE\"] instead"
+            f"Script node '{node.id}' cannot interpolate $USER_MESSAGE, $ARGUMENTS or $BASE_BRANCH "
+            f"into script body; use os.environ[\"USER_MESSAGE\"] instead"
+        )
+        ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
+        return NodeExecutionResult(state="failed", error=err)
+    # Node outputs (LLM text, fetched content) are attacker-influenced: never
+    # splice them into interpreter source (L2-08). They arrive as env vars.
+    ref = NODE_OUTPUT_REF_RE.search(raw_script)
+    if ref:
+        err = (
+            f"Script node '{node.id}' cannot interpolate {ref.group(0)} into script body; "
+            f"read os.environ[\"{node_output_env_name(ref.group(1))}\"] instead"
         )
         ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
         return NodeExecutionResult(state="failed", error=err)
@@ -120,11 +135,10 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
         ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
         return NodeExecutionResult(state="failed", error=err)
 
-    # Substitute $nodeId.output refs
-    final_script = substitute_node_output_refs(raw_script, node_outputs)
+    final_script = raw_script
 
     # HIGH 8: inline-vs-named detection
-    cwd = getattr(ctx, "cwd", None)
+    cwd = subprocess_cwd(ctx)
     node_deps: List[str] = list(getattr(node, "deps", None) or [])
 
     if not _is_inline_script(final_script):
@@ -154,33 +168,19 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
         use_temp = False
 
     try:
-
-        exec_env = dict(os.environ)
-        if wf_vars.get("artifacts_dir"):
-            exec_env["ARTIFACTS_DIR"] = wf_vars["artifacts_dir"]
-        if wf_vars.get("user_message"):
-            exec_env["USER_MESSAGE"] = str(wf_vars["user_message"])
-        if wf_vars.get("base_branch"):
-            exec_env["BASE_BRANCH"] = str(wf_vars["base_branch"])
-        if wf_vars.get("docs_dir"):
-            exec_env["DOCS_DIR"] = str(wf_vars["docs_dir"])
-        if wf_vars.get("workflow_id"):
-            exec_env["WORKFLOW_ID"] = str(wf_vars["workflow_id"])
-
+        # ponytail: full host env is inherited (scripts rely on gh/uv auth);
+        # an allowlist would need per-workflow opt-ins.
         proc = await asyncio.create_subprocess_exec(
             *cmd_parts,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env=exec_env,
+            env=workflow_env(ctx, node_outputs),
+            start_new_session=True,
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_b, stderr_b = await communicate_or_kill(proc, timeout)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
             err = f"Script node '{node.id}' timed out after {timeout}s"
             ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
             return NodeExecutionResult(state="failed", error=err)

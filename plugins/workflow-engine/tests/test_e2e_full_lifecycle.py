@@ -3,7 +3,7 @@ True End-to-End Test Suite for the Workflow Engine Plugin.
 
 Tests exercise the full runtime path:
   YAML definition → DB storage → DAG execution → bash subprocess →
-  status/events in DB → approval lifecycle → Kanban dispatcher wiring.
+  status/events in DB → approval lifecycle .
 
 NOT scaffolded — every test starts a real asyncio event loop with real bash
 subprocesses and verifies final state in the SQLite database.
@@ -20,11 +20,11 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from engine.store.run_store import STORE_LOCK
 import pytest_asyncio
 
 from engine.wiring import create_engine
 from engine.facade import WorkflowEngine
-from engine.dispatcher.kanban import KanbanDispatcher
 
 
 # ── YAML Definitions ─────────────────────────────────────────────────────────
@@ -127,16 +127,17 @@ nodes:
 
 def _seed_def(engine: WorkflowEngine, wf_id: str, yaml_text: str) -> None:
     """Directly insert a workflow_definitions row for testing."""
-    conn = engine._conn
-    now = int(time.time() * 1000)
-    checksum = hashlib.sha256(yaml_text.encode()).hexdigest()
-    conn.execute(
-        """INSERT OR IGNORE INTO workflow_definitions
-             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
-           VALUES (?, ?, ?, 'bundled', ?, ?, ?, ?, 'workflow')""",
-        (wf_id, wf_id, wf_id, yaml_text, checksum, now, now),
-    )
-    conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        conn = engine._conn
+        now = int(time.time() * 1000)
+        checksum = hashlib.sha256(yaml_text.encode()).hexdigest()
+        conn.execute(
+            """INSERT OR IGNORE INTO workflow_definitions
+                 (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+               VALUES (?, ?, ?, 'bundled', ?, ?, ?, ?, 'workflow')""",
+            (wf_id, wf_id, wf_id, yaml_text, checksum, now, now),
+        )
+        conn.commit()
 
 
 async def _wait_for_terminal(
@@ -470,78 +471,6 @@ async def test_e2e_conditional_dag(engine, working_path):
     print(f"  workflow_id: {wf_id}")
     print(f"  run_id: {run_id}")
     print(f"  node_statuses: {[(nr['dag_node_id'], nr['status']) for nr in node_runs]}")
-
-
-# ── Test 6: Kanban Dispatcher Integration ─────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_e2e_kanban_dispatcher_wiring():
-    """
-    E2E TEST 6: Kanban dispatcher receives node_completed event with
-    kanban_task_request, POSTs to kanban endpoint, patches node_run.
-    """
-    request_payload = {
-        "title": "E2E Kanban Task",
-        "body": "Created by E2E test",
-        "assignee": "worker-1",
-        "priority": 2,
-        "skills": ["python"],
-    }
-
-    event = {
-        "run_id": "run-kanban-e2e",
-        "event_type": "node_completed",
-        "node_run_id": "nr-kanban-e2e",
-        "data": {
-            "node_id": "triage",
-            "output": {"kanban_task_request": request_payload},
-        },
-    }
-
-    class FakeBus:
-        async def subscribe(self):
-            yield event
-
-    run_store = MagicMock()
-    engine_mock = MagicMock()
-    engine_mock._bus = FakeBus()
-    engine_mock._run_store = run_store
-
-    dispatcher = KanbanDispatcher(
-        engine_mock, kanban_url="http://127.0.0.1:8642/api/plugins/kanban/tasks"
-    )
-
-    fake_resp = MagicMock()
-    fake_resp.raise_for_status = MagicMock()
-    fake_resp.json = MagicMock(return_value={"task": {"id": "kt-e2e-001"}})
-
-    fake_client = AsyncMock()
-    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
-    fake_client.__aexit__ = AsyncMock(return_value=False)
-    fake_client.post = AsyncMock(return_value=fake_resp)
-
-    with patch("engine.dispatcher.kanban.httpx.AsyncClient", return_value=fake_client):
-        await dispatcher.run_forever()
-
-    # Verify POST was called
-    fake_client.post.assert_awaited_once()
-    posted_url = fake_client.post.await_args[0][0]
-    posted_json = fake_client.post.await_args[1]["json"]
-
-    assert posted_url == "http://127.0.0.1:8642/api/plugins/kanban/tasks"
-    assert posted_json["title"] == "E2E Kanban Task"
-    assert posted_json["assignee"] == "worker-1"
-    assert "run-kanban-e2e" in posted_json["body"]  # run_id injected
-
-    # Verify node_run patched with kanban_task_id
-    run_store.update_node_run.assert_called_once_with(
-        "nr-kanban-e2e", {"kanban_task_id": "kt-e2e-001"}
-    )
-
-    print(f"\n[E2E-6] PASS — Kanban Dispatcher")
-    print(f"  posted_url: {posted_url}")
-    print(f"  kanban_task_id: kt-e2e-001")
-    print(f"  node_run_patched: nr-kanban-e2e")
 
 
 # ── Test 7: Definition CRUD and Discovery ─────────────────────────────────────

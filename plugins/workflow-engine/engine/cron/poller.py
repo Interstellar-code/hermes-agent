@@ -16,6 +16,8 @@ import json
 import logging
 from typing import Any, Dict, List, Optional
 
+from engine.store.run_store import STORE_LOCK  # noqa: E402
+
 logger = logging.getLogger("workflow.cron-poller")
 
 POLL_INTERVAL_S: float = 10.0
@@ -55,24 +57,26 @@ async def _fetch_jobs() -> List[Dict[str, Any]]:
 
 def _get_last_fired_at(conn: Any, job_id: str) -> Optional[str]:
     """Read last_fired_at from workflow_cron_jobs table."""
-    row = conn.execute(
-        "SELECT last_fired_at FROM workflow_cron_jobs WHERE cron_job_id = ?",
-        (job_id,),
-    ).fetchone()
+    with STORE_LOCK:
+        row = conn.execute(
+            "SELECT last_fired_at FROM workflow_cron_jobs WHERE cron_job_id = ?",
+            (job_id,),
+        ).fetchone()
     return row["last_fired_at"] if row else None
 
 
 def _upsert_last_fired_at(conn: Any, job_id: str, fired_at: str) -> None:
     """Insert or update last_fired_at for a cron job."""
-    conn.execute(
-        """
-        INSERT INTO workflow_cron_jobs (cron_job_id, last_fired_at)
-        VALUES (?, ?)
-        ON CONFLICT(cron_job_id) DO UPDATE SET last_fired_at = excluded.last_fired_at
-        """,
-        (job_id, fired_at),
-    )
-    conn.commit()
+    with STORE_LOCK:
+        conn.execute(
+            """
+            INSERT INTO workflow_cron_jobs (cron_job_id, last_fired_at)
+            VALUES (?, ?)
+            ON CONFLICT(cron_job_id) DO UPDATE SET last_fired_at = excluded.last_fired_at
+            """,
+            (job_id, fired_at),
+        )
+        conn.commit()
 
 
 class CronPoller:
@@ -145,6 +149,11 @@ class CronPoller:
             return
 
         last_run_at: Optional[str] = job.get("last_run_at")
+        last_fired_at = _get_last_fired_at(conn, job_id)
+        if last_fired_at is None:
+            # First sighting: seed the cursor so a historical tick isn't replayed.
+            _upsert_last_fired_at(conn, job_id, last_run_at or "")
+            return
         if not last_run_at:
             return
 
@@ -154,7 +163,6 @@ class CronPoller:
             return
 
         # Idempotency check
-        last_fired_at = _get_last_fired_at(conn, job_id)
         if last_fired_at == last_run_at:
             return  # already fired for this cron tick
 

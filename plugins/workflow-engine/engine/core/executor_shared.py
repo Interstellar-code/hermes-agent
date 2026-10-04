@@ -7,14 +7,133 @@ variable substitution, node output ref substitution.
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import json
 import logging
+import os
 import re
+import signal
 from typing import Any, Dict, Optional
 
 from engine.schemas.workflow_run import NodeOutput
 
 logger = logging.getLogger("workflow.executor-shared")
+
+
+# ── Subprocess helpers (bash / script / loop until_bash) ────────────────────
+
+_WF_VAR_ENV = {
+    "workflow_id": "WORKFLOW_ID",
+    "user_message": "USER_MESSAGE",
+    "artifacts_dir": "ARTIFACTS_DIR",
+    "base_branch": "BASE_BRANCH",
+    "docs_dir": "DOCS_DIR",
+}
+
+
+NODE_OUTPUT_REF_RE = re.compile(
+    r"\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?"
+)
+
+
+def node_output_env_name(node_id: str) -> str:
+    """Env var carrying a node's output to script nodes: NODE_<ID>_OUTPUT."""
+    return "NODE_" + re.sub(r"\W", "_", node_id).upper() + "_OUTPUT"
+
+
+_RESERVED_ENV = {"PATH", "PYTHONPATH", "HOME", "SHELL", "IFS", "BASH_ENV", "ENV"}
+_RESERVED_PREFIXES = ("LD_", "DYLD_", "HERMES_", "PYTHON", "NODE_")
+
+
+def reserved_input_name(name: str) -> bool:
+    """Input names that would hijack the subprocess env (PATH, LD_PRELOAD, …)."""
+    up = name.upper()
+    return up in _RESERVED_ENV or up.startswith(_RESERVED_PREFIXES)
+
+
+def workflow_env(ctx: Any, node_outputs: Optional[Dict[str, NodeOutput]] = None) -> Dict[str, str]:
+    """Subprocess env: host env + workflow inputs + workflow vars (+ node outputs).
+
+    Inputs are exported under their own names so bodies read ``"$repo_path"``
+    (bash) or ``os.environ["repo_path"]`` (script) — never source-interpolated.
+    """
+    env = dict(os.environ)
+    wf_vars = getattr(ctx, "workflow_vars", None) or {}
+    for key, value in (wf_vars.get("inputs") or {}).items():
+        if isinstance(key, str) and key.isidentifier() and value is not None \
+                and not reserved_input_name(key):
+            env[key] = value if isinstance(value, str) else json.dumps(value)
+    for key, name in _WF_VAR_ENV.items():
+        if wf_vars.get(key):
+            env[name] = str(wf_vars[key])
+    for node_id, out in (node_outputs or {}).items():
+        if getattr(out, "state", None) == "completed":
+            env[node_output_env_name(node_id)] = out.output or ""
+    return env
+
+
+def substitute_inputs(text: str, inputs: Dict[str, Any]) -> str:
+    """Replace ``$<input_name>`` in LLM prompt text (never in code bodies —
+    bash/script read inputs from env)."""
+    if not inputs:
+        return text
+
+    def repl(m: re.Match) -> str:
+        if m.group(1) not in inputs:
+            return m.group(0)
+        v = inputs[m.group(1)]
+        return v if isinstance(v, str) else json.dumps(v)
+
+    # One pass, and never touch `$x.output` refs, so neither an input name
+    # nor a substituted value can rewrite node-output references.
+    return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)\b(?![.-]?[A-Za-z0-9_-]*\.output)", repl, text)
+
+
+def subprocess_cwd(ctx: Any) -> Optional[str]:
+    cwd = getattr(ctx, "cwd", None)
+    return cwd if cwd and os.path.isdir(cwd) else None
+
+
+# Process groups of node subprocesses still running. start_new_session puts
+# them outside the host's group, so a gateway restart would orphan them;
+# kill whatever is left at interpreter exit.
+_LIVE_PGIDS: set = set()
+
+
+@atexit.register
+def _kill_live_groups() -> None:
+    killpg = getattr(os, "killpg", None)
+    for pgid in list(_LIVE_PGIDS):
+        try:
+            if killpg is not None:
+                killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
+        except OSError:
+            pass
+
+
+async def communicate_or_kill(proc: "asyncio.subprocess.Process", timeout: float):
+    """communicate() with timeout; on timeout/cancel kill the whole process group.
+
+    Spawn with ``start_new_session=True`` so the group is the child's own.
+    Re-raises TimeoutError / CancelledError after the child is reaped.
+    """
+    _LIVE_PGIDS.add(proc.pid)
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except BaseException:
+        killpg = getattr(os, "killpg", None)
+        try:
+            if killpg is not None:
+                killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+        await proc.wait()
+        raise
+    finally:
+        _LIVE_PGIDS.discard(proc.pid)
 
 # ── Error Classification ─────────────────────────────────────────────────────
 
@@ -239,8 +358,4 @@ def substitute_node_output_refs(
             )
             return "''" if escaped_for_bash else ""
 
-    return re.sub(
-        r"\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.([a-zA-Z_][a-zA-Z0-9_]*))?",
-        replacer,
-        prompt,
-    )
+    return NODE_OUTPUT_REF_RE.sub(replacer, prompt)

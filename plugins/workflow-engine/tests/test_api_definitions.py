@@ -4,6 +4,7 @@ Tests for GET/POST /definitions and GET /definitions/{id}/parsed.
 from __future__ import annotations
 
 import pytest
+from engine.store.run_store import STORE_LOCK
 pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
@@ -160,13 +161,14 @@ nodes:
     prompt: Say hello
 """
     engine = client.app.state.workflow_engine
-    engine._def_store._conn.execute(
-        """INSERT INTO workflow_definitions
-             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
-           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
-        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
-    )
-    engine._def_store._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._def_store._conn.execute(
+            """INSERT INTO workflow_definitions
+                 (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+               VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+            ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+        )
+        engine._def_store._conn.commit()
 
     r = client.get("/definitions?source=user")
     assert r.status_code == 200
@@ -187,13 +189,14 @@ nodes:
     prompt: Say hello
 """
     engine = client.app.state.workflow_engine
-    engine._def_store._conn.execute(
-        """INSERT INTO workflow_definitions
-             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
-           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
-        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
-    )
-    engine._def_store._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._def_store._conn.execute(
+            """INSERT INTO workflow_definitions
+                 (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+               VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+            ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+        )
+        engine._def_store._conn.commit()
 
     r = client.get("/definitions?source=system")
     assert r.status_code == 200
@@ -218,13 +221,14 @@ nodes:
     prompt: Say hello
 """
     engine = client.app.state.workflow_engine
-    engine._def_store._conn.execute(
-        """INSERT INTO workflow_definitions
-             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
-           VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
-        ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
-    )
-    engine._def_store._conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        engine._def_store._conn.execute(
+            """INSERT INTO workflow_definitions
+                 (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+               VALUES (?, ?, ?, 'bundled', ?, 'test', 1, 1, 'workflow')""",
+            ("bundled-flow", "Bundled Flow", "Bundled Flow", bundled_yaml),
+        )
+        engine._def_store._conn.commit()
 
     r = client.get("/definitions?source=all")
     assert r.status_code == 200

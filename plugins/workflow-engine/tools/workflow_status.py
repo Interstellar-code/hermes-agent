@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 
 SCHEMA: Dict[str, Any] = {
@@ -19,6 +20,7 @@ SCHEMA: Dict[str, Any] = {
     },
 }
 
+logger = logging.getLogger(__name__)
 _MAX_EVENTS = 50
 
 
@@ -40,14 +42,11 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]: 
     if run is None:
         return {"error": f"Run '{run_id}' not found.", "ok": False}
 
-    # Fetch recent events (best-effort; engine may not expose list_events yet)
     events: list = []
     try:
-        events = await engine.list_events(run_id=run_id, limit=_MAX_EVENTS)
-    except (AttributeError, Exception):
-        # Engine version without list_events, or transient error — events
-        # silently degrade to [].  Acceptable for v0.1; add logging if needed.
-        pass
+        events = await engine.list_recent_workflow_events(run_id, limit=_MAX_EVENTS)
+    except Exception:
+        logger.exception("workflow_status: failed to load events for %s", run_id)
 
     return {
         "run_id": run.get("id"),

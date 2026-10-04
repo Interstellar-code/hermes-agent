@@ -5,12 +5,42 @@ All methods synchronous. Caller owns transaction commit where noted.
 """
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
+
+# One sqlite connection is shared by the engine-loop thread, dashboard
+# threads, tool threads and the cron poller. Python's sqlite3 has one implicit
+# transaction per connection, so an unguarded commit on one thread can commit
+# (or a rollback discard) another thread's half-done multi-statement write.
+# ponytail: one process-wide RLock around every store method; per-connection
+# locks if several engines in one process ever need real parallelism.
+STORE_LOCK = threading.RLock()
+
+
+def locked(cls):
+    """Class decorator: run every public method under STORE_LOCK."""
+    for name, fn in list(vars(cls).items()):
+        if isinstance(fn, type(locked)) and not name.startswith("_"):
+            def wrap(f):
+                @functools.wraps(f)
+                def inner(*a, **kw):
+                    with STORE_LOCK:
+                        return f(*a, **kw)
+                return inner
+            setattr(cls, name, wrap(fn))
+    return cls
+
+# A run's owning process refreshes last_heartbeat every HEARTBEAT_S; a
+# pending/running run whose heartbeat is older than STALE_MS has lost its
+# owner (process died) and is reaped by any engine's crash recovery.
+HEARTBEAT_S = 30.0
+STALE_MS = 5 * 60 * 1000
 
 
 def _now_ms() -> int:
@@ -66,6 +96,7 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
     return d
 
 
+@locked
 class RunStore:
     """CRUD for runs, node_runs and events."""
 
@@ -87,8 +118,14 @@ class RunStore:
         priority: int = 0,
         max_runtime_s: Optional[int] = None,
         scheduled_for: Optional[str] = None,
+        inputs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
+        meta: Dict[str, Any] = {}
+        if trigger:
+            meta["trigger"] = trigger
+        if inputs:
+            meta["inputs"] = inputs  # read back by runner.resume
         now = _now_ms()
         self._conn.execute(
             """
@@ -104,7 +141,7 @@ class RunStore:
                 conversation_id,
                 working_path,
                 user_message,
-                json.dumps({"trigger": trigger} if trigger else {}),
+                json.dumps(meta),
                 now,
                 now,
                 priority,
@@ -299,48 +336,56 @@ class RunStore:
         )
         self._conn.commit()
 
-    def mark_crashed_runs(self, *, boot_pid: Optional[int] = None) -> int:
-        """Mark stale pending/running runs as crashed (resume policy: no auto-resume).
+    def heartbeat_runs(self, run_ids: List[str]) -> None:
+        """Refresh last_heartbeat for the live runs this process owns."""
+        if not run_ids:
+            return
+        marks = ",".join("?" * len(run_ids))
+        self._conn.execute(
+            f"UPDATE workflow_runs SET last_heartbeat = ? "
+            f"WHERE id IN ({marks}) AND status IN ('pending', 'running')",
+            (_now_ms(), *run_ids),
+        )
+        self._conn.commit()
 
-        Distinguishes a genuine process restart from an in-process plugin
-        re-initialization. The boot PID is persisted in ``schema_meta``; when
-        the current PID matches the stored one, the plugin was re-initialized
-        inside the *same* process (gateway session compression, tool-loop
-        protection, new agent session). The fire-and-forget asyncio run tasks
-        are still alive on the shared event loop and will finalize themselves,
-        so leaving their rows ``running`` is correct — marking them crashed
-        produces the false failures in #49.
+    def mark_crashed_runs(self, *, stale_ms: int = STALE_MS) -> int:
+        """Fail pending/running runs whose owner stopped heartbeating.
 
-        Only a different (or first-seen) PID means the prior process died,
-        taking its in-flight tasks with it; those rows are the real crashes.
-        When ``boot_pid`` is None the legacy unconditional behaviour applies.
+        Every engine heartbeats the runs it is executing (``heartbeat_runs``),
+        so a stale heartbeat means the owning process is gone. Live runs owned
+        by *other* processes keep fresh heartbeats and are left alone (L2-02).
+        No auto-resume.
         """
         now = _now_ms()
-        if boot_pid is not None:
-            row = self._conn.execute(
-                "SELECT value FROM schema_meta WHERE key = 'boot_pid'"
-            ).fetchone()
-            prev_pid = row[0] if row else None
-            # Record current PID for the next boot regardless of outcome.
-            self._conn.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('boot_pid', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(boot_pid),),
-            )
-            if prev_pid is not None and prev_pid == str(boot_pid):
-                # Same process — in-process reinit, live tasks still running.
-                self._conn.commit()
-                return 0
         result = self._conn.execute(
             """
             UPDATE workflow_runs
-               SET status = 'failed', error = 'crashed: plugin restarted', completed_at = ?
-             WHERE status IN ('pending', 'running')
+               SET status = 'failed', error = 'crashed: owner process stopped', completed_at = ?
+             WHERE status IN ('pending', 'running') AND last_heartbeat < ?
             """,
-            (now,),
+            (now, now - stale_ms),
         )
         self._conn.commit()
         return result.rowcount
+
+    def delete_terminal_runs_older_than(self, days: int) -> int:
+        """Retention sweep: drop terminal runs (and, via CASCADE, their
+        node_runs / events / transitions) completed more than ``days`` ago."""
+        cutoff = _now_ms() - days * 86_400_000
+        cur = self._conn.execute(
+            "DELETE FROM workflow_runs WHERE status IN ('completed', 'failed', 'cancelled') "
+            "AND completed_at IS NOT NULL AND completed_at < ?",
+            (cutoff,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def set_owner_session(self, run_id: str, session_id: str) -> None:
+        self._conn.execute(
+            "UPDATE workflow_runs SET owner_session = ? WHERE id = ?",
+            (session_id, run_id),
+        )
+        self._conn.commit()
 
     def cancel_workflow_run(self, run_id: str) -> bool:
         """Mark a run cancelled if it isn't already terminal.
@@ -381,6 +426,7 @@ class RunStore:
         *,
         status: str,
         error: Optional[str] = None,
+        from_statuses: tuple = ("running",),
     ) -> bool:
         """Atomic compare-and-set finaliser.
 
@@ -398,14 +444,15 @@ class RunStore:
         if status not in ("completed", "failed", "cancelled"):
             raise ValueError(f"non-terminal status not allowed here: {status}")
         now = _now_ms()
+        marks = ",".join("?" * len(from_statuses))
         cur = self._conn.execute(
-            """
+            f"""
             UPDATE workflow_runs
                SET status = ?, completed_at = ?, last_heartbeat = ?,
                    error = COALESCE(?, error)
-             WHERE id = ? AND status = 'running'
+             WHERE id = ? AND status IN ({marks})
             """,
-            (status, now, now, error, run_id),
+            (status, now, now, error, run_id, *from_statuses),
         )
         self._conn.commit()
         return cur.rowcount == 1
@@ -423,20 +470,22 @@ class RunStore:
         now = _now_ms()
         cur = self._conn.execute(
             "UPDATE workflow_runs SET status = 'paused', last_heartbeat = ?, "
-            "metadata = COALESCE(?, metadata) "
+            "metadata = json_set(COALESCE(metadata, '{}'), '$.pause', json(?)) "
             "WHERE id = ? AND status = 'running'",
-            (now, json.dumps(metadata) if metadata else None, run_id),
+            (now, json.dumps(metadata or {}), run_id),
         )
         self._conn.commit()
         return cur.rowcount == 1
 
-    def resume_workflow_run(self, run_id: str) -> None:
+    def resume_workflow_run(self, run_id: str) -> bool:
+        """CAS paused → running. Returns True when this call flipped it."""
         now = _now_ms()
-        self._conn.execute(
+        cur = self._conn.execute(
             "UPDATE workflow_runs SET status = 'running', last_heartbeat = ? WHERE id = ? AND status = 'paused'",
             (now, run_id),
         )
         self._conn.commit()
+        return cur.rowcount == 1
 
     # ------------------------------------------------------------------ #
     # Node Runs                                                           #
@@ -774,23 +823,3 @@ class RunStore:
             ),
         )
         self._conn.commit()
-
-    def try_claim_approval_for_resume(
-        self,
-        node_run_id: str,
-        decision: Literal["approved", "rejected"],
-        approval_response: str,
-    ) -> Dict[str, Any]:
-        """Atomic CAS matching TS tryClaimApprovalForResume. Returns {claimed, terminalStatus}."""
-        terminal_status = "completed" if decision == "approved" else "failed"
-        now = _now_ms()
-        result = self._conn.execute(
-            """
-            UPDATE node_runs
-               SET status = ?, approval_response = ?, completed_at = ?
-             WHERE id = ? AND status = 'paused'
-            """,
-            (terminal_status, approval_response, now, node_run_id),
-        )
-        self._conn.commit()
-        return {"claimed": result.rowcount > 0, "terminalStatus": terminal_status}

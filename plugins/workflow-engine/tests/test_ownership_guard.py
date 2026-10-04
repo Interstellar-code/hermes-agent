@@ -17,7 +17,7 @@ def fake_engine(monkeypatch):
     })
     engine.approve = AsyncMock()
     engine.cancel_run = AsyncMock()
-    monkeypatch.setattr("plugins.workflow_engine._shared._engine", engine)
+    monkeypatch.setattr("plugins.workflow_engine._shared.get_engine", lambda: engine)
     return engine
 
 
@@ -33,12 +33,12 @@ def no_approve_any(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_approve_denied_when_no_session_key(fake_engine):
-    """#85B: _session_key=None, approve_any=False, owner_session set -> DENIED (was allowed before)."""
+    """#85B: session_id=None, approve_any=False, owner_session set -> DENIED (was allowed before)."""
     from plugins.workflow_engine.tools.approve_workflow import _handler_impl
 
     result = await _handler_impl(
         {"run_id": "run-1", "node_id": "n1", "decision": "approve"},
-        _session_key=None,
+        session_id=None,
     )
     assert result["ok"] is False
     assert "approve_any" in result["error"]
@@ -50,7 +50,7 @@ async def test_cancel_denied_when_no_session_key(fake_engine):
     """Same default-deny inversion applied to workflow_cancel."""
     from plugins.workflow_engine.tools.cancel_workflow import _handler_impl
 
-    result = await _handler_impl({"run_id": "run-1"}, _session_key=None)
+    result = await _handler_impl({"run_id": "run-1"}, session_id=None)
     assert result["ok"] is False
     assert "approve_any" in result["error"]
     fake_engine.cancel_run.assert_not_called()
@@ -63,7 +63,7 @@ async def test_approve_allowed_when_owner_matches(fake_engine):
 
     result = await _handler_impl(
         {"run_id": "run-1", "node_id": "n1", "decision": "approve"},
-        _session_key="session-owner-123",
+        session_id="session-owner-123",
     )
     assert result["ok"] is True
     fake_engine.approve.assert_called_once()

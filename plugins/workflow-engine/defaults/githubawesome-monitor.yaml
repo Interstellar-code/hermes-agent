@@ -137,7 +137,7 @@ nodes:
           })
 
       # Write the full payload to ARTIFACTS_DIR so downstream nodes can read
-      # it without triple-quote/JSON-escape hell when inlining via $node.output.
+      # it without triple-quote/JSON-escape hell when inlining node output into source.
       import os as _os
       artifacts = _os.environ.get("ARTIFACTS_DIR", "/tmp")
       with open(f"{artifacts}/new_posts.json", "w") as f:

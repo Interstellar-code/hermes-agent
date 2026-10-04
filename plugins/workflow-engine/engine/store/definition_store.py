@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow import WorkflowDefinition, WorkflowSource
 from engine.discovery.validator import validate_workflow_yaml
+from engine.store.run_store import locked
 
 logger = logging.getLogger("workflow.definition-store")
 
@@ -35,6 +36,7 @@ class ConflictError(Exception):
     """Raised when a compare-and-swap write detects a concurrent modification."""
 
 
+@locked
 class DefinitionStore:
     """CRUD operations over workflow_definitions."""
 

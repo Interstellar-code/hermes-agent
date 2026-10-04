@@ -11,7 +11,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from typing import Optional, Any
+from typing import Optional
 
 from engine.db.client import open_db
 from engine.db.migrate import ensure_schema
@@ -35,10 +35,12 @@ def _resolve_db_path(db_path: Optional[str]) -> str:
     return db_path or os.environ.get("WORKFLOW_DB_PATH") or get_default_db_path()
 
 
-def __getattr__(name: str) -> Any:
-    if name == "_DEFAULT_DB_PATH":
-        return get_default_db_path()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _retention_days() -> int:
+    try:
+        from hermes_cli.config import load_config  # noqa: PLC0415
+        return int(load_config().get("workflow", {}).get("retention_days", 30))
+    except Exception:
+        return 30
 
 
 def create_engine(
@@ -47,6 +49,7 @@ def create_engine(
     seed_bundled: bool = True,
     write_manifest: bool = True,
     crash_recovery: bool = True,
+    retention_days: Optional[int] = None,
 ) -> "WorkflowEngine":  # noqa: F821
     """
     Open DB, ensure schema, wire all components, return WorkflowEngine.
@@ -78,7 +81,8 @@ def create_engine(
     run_store = RunStore(conn)
     def_store = DefinitionStore(conn)
     bus = EventBus(run_store=run_store)
-    runner = WorkflowRunner(run_store, def_store, bus)
+    runs_dir = None if path == ":memory:" else str(Path(path).parent / "workflow-runs")
+    runner = WorkflowRunner(run_store, def_store, bus, runs_dir=runs_dir)
     manifest_writer = ManifestWriter(def_store)
 
     # Boot sequence
@@ -86,6 +90,10 @@ def create_engine(
 
     if crash_recovery:
         boot["crashed_runs"] = mark_crashed_runs(run_store)
+        # L2-22: events/transitions/node_runs go with their run (CASCADE).
+        days = retention_days if retention_days is not None else _retention_days()
+        if days > 0:
+            boot["pruned_runs"] = run_store.delete_terminal_runs_older_than(days)
 
     if seed_bundled:
         seed_result = seed_defaults(def_store)
@@ -107,7 +115,3 @@ def create_engine(
     logger.info("wiring: engine ready (boot=%s)", boot)
     return engine
 
-
-def dev_context(db_path: str = ":memory:") -> dict:
-    """Return a minimal context dict for smoke-test use."""
-    return {"db_path": db_path}

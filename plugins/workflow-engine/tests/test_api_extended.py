@@ -129,10 +129,10 @@ def test_resume_run_not_found(client):
     assert r.status_code == 404
 
 
-def test_resume_run_success(client, run_id):
+def test_resume_run_not_paused_conflict(client, run_id):
+    # fresh run is not paused -> 409 (route no longer fakes a resume)
     r = client.post(f"/runs/{run_id}/resume")
-    assert r.status_code == 200
-    assert "run" in r.json()
+    assert r.status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -272,35 +272,11 @@ def test_list_phase_transitions_run_not_found(client):
 # POST /runs/{run_id}/approval-claim
 # ---------------------------------------------------------------------------
 
-def test_approval_claim_missing_fields(client, run_id):
+def test_approval_claim_deprecated(client, run_id):
     r = client.post(f"/runs/{run_id}/approval-claim", json={"decision": "approved"})
+    assert r.status_code == 410
+
+
+def test_append_event_rejects_foreign_node_run(client, run_id):
+    r = client.post(f"/runs/{run_id}/events", json={"event_type": "x", "node_run_id": "nope"})
     assert r.status_code == 400
-
-
-def test_approval_claim_invalid_decision(client, run_id):
-    r = client.post(f"/runs/{run_id}/approval-claim", json={
-        "nodeRunId": "some-node-run-id",
-        "decision": "maybe",
-    })
-    assert r.status_code == 400
-
-
-def test_approval_claim_node_not_paused(client, run_id):
-    # node_run_id doesn't exist — claimed=False
-    r = client.post(f"/runs/{run_id}/approval-claim", json={
-        "nodeRunId": "nonexistent-node-run",
-        "decision": "approved",
-        "approvalResponse": "lgtm",
-    })
-    assert r.status_code == 200
-    body = r.json()
-    assert body["claimed"] is False
-    assert body["terminalStatus"] == "completed"
-
-
-def test_approval_claim_run_not_found(client):
-    r = client.post("/runs/no-such/approval-claim", json={
-        "nodeRunId": "x",
-        "decision": "approved",
-    })
-    assert r.status_code == 404

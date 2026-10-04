@@ -2,11 +2,11 @@
 
 Version: `0.1.0`
 
-A DAG workflow engine for [hermes-agent](https://github.com/Interstellar-code/hermes-agent), ported from the Switch UI TypeScript implementation. It runs YAML-defined multi-node workflows with conditional branching, parallel execution, bash nodes, approval gates, cron polling, and Kanban task dispatch.
+A DAG workflow engine for [hermes-agent](https://github.com/Interstellar-code/hermes-agent), ported from the Switch UI TypeScript implementation. It runs YAML-defined multi-node workflows with conditional branching, parallel execution, bash nodes, approval gates, and cron-triggered runs.
 
 ## What it is
 
-The workflow-engine plugin exposes a REST API plus Hermes agent tools for defining, triggering, monitoring, approving, and cancelling DAG-based workflows. Each workflow is a YAML definition describing nodes (steps), dependencies, providers (`claude`, `codex`, `hermes-kanban`), and conditional edges. The engine stores state in SQLite, emits SSE events for live progress, and integrates with the Hermes Kanban dispatcher for agent task routing.
+The workflow-engine plugin exposes a REST API plus Hermes agent tools for defining, triggering, monitoring, approving, and cancelling DAG-based workflows. Each workflow is a YAML definition describing nodes (steps), dependencies, and conditional edges. The engine stores state in SQLite and emits SSE events for live progress.
 
 ## Install
 
@@ -34,7 +34,7 @@ plugins:
 ### Environment variables currently read by the engine
 
 - `WORKFLOW_DB_PATH`
-  - Default: `~/.hermes/switchui-workflows.db`
+  - Default: `$HERMES_HOME/switchui-workflows.db` (profile-scoped; `~/.hermes` only for the default profile)
   - Purpose: SQLite database path.
 - `TOOL_CATALOG_ROOT`
   - Default: unset
@@ -51,16 +51,16 @@ The following env vars are **mentioned historically but are not currently read b
 Do **not** rely on them. Today the daemon CLI supports only:
 
 ```bash
-hermes workflow daemon --interval 60 --pidfile /tmp/hermes-workflow.pid
+hermes workflow daemon --interval 60 [--pidfile PATH]
 ```
 
 There are currently **no** `--defaults-dir` or `--yaml-dir` daemon flags.
 
 ### Paths
 
-- DB location: `~/.hermes/switchui-workflows.db` (SQLite, auto-migrated on startup)
+- DB location: `$HERMES_HOME/switchui-workflows.db` (SQLite, auto-migrated on first engine use)
 - Bundled defaults source: `plugins/workflow-engine/defaults/`
-- User workflow store: `~/.hermes/switchui/workflows/`
+- Workflow definitions live in the DB (seeded from the bundled defaults); no on-disk user workflow directory is read.
 
 ## API endpoints
 
@@ -70,10 +70,10 @@ All plugin API routes are mounted by the Hermes dashboard server under:
 /api/plugins/workflow-engine
 ```
 
-If the dashboard is running on the default port, the base URL is typically:
+The routes live on the **dashboard** (default port 9119, not the gateway's 8642, which returns 404). The dashboard requires its session auth token (an unauthenticated request gets 401):
 
 ```text
-http://localhost:8642/api/plugins/workflow-engine
+http://localhost:9119/api/plugins/workflow-engine
 ```
 
 ### Route summary
@@ -93,13 +93,13 @@ http://localhost:8642/api/plugins/workflow-engine
 | `GET` | `/runs/{run_id}` | Get run details |
 | `POST` | `/runs/{run_id}/approve` | Approve a paused approval node |
 | `POST` | `/runs/{run_id}/cancel` | Cancel a run |
-| `POST` | `/runs/{run_id}/resume` | Resume a paused run |
+| `POST` | `/runs/{run_id}/resume` | Resume a paused run (409 if not resumable: not paused, or waiting on an approval/loop gate) |
 | `GET` | `/runs/{run_id}/nodes` | List node-runs for a run |
 | `POST` | `/runs/{run_id}/events` | Append run event (internal) |
 | `GET` | `/runs/{run_id}/events` | List stored run events |
 | `POST` | `/runs/{run_id}/phase-transitions` | Record phase transition (internal) |
 | `GET` | `/runs/{run_id}/phase-transitions` | List phase transitions |
-| `POST` | `/runs/{run_id}/approval-claim` | Claim approval gate |
+| `POST` | `/runs/{run_id}/approval-claim` | Deprecated (410) — use the `workflow_approve` tool |
 | `GET` | `/node-runs/active` | List active node-runs |
 | `GET` | `/node-runs/{node_run_id}` | Get one node-run |
 | `GET` | `/events` | SSE stream for live workflow events |
@@ -179,47 +179,39 @@ hermes workflow daemon --interval 60
 Optional PID file support:
 
 ```bash
-hermes workflow daemon --interval 60 --pidfile /tmp/hermes-workflow.pid
+hermes workflow daemon --interval 60 [--pidfile PATH]
 ```
 
-The daemon runs three long-lived tasks:
+The daemon runs two long-lived tasks:
 
 - `CronPoller`
-- `KanbanDispatcher`
 - `run_scheduler_tick_loop`
 
 Lifecycle notes:
 
 - the daemon owns its own `asyncio.run()` loop
 - `SIGINT` / `SIGTERM` trigger clean shutdown
-- `--pidfile` writes a PID file on start and removes it on clean exit
+- the lock file is held for the process lifetime and released on exit
 - the daemon does **not** auto-restart itself; use systemd / launchd / another supervisor in production
 
 ## Cron integration
 
-The plugin ships a built-in cron poller (`engine/cron/poller.py`). Workflows with a `cron:` field are triggered automatically by the daemon process.
+`engine/cron/poller.py` polls Hermes cron jobs (in-process `cron.jobs.list_jobs`, HTTP fallback). A Hermes cron job whose `payload.switchui_workflow_id` names a workflow starts a run (trigger `{"kind": "cron", "cron_job_id": ...}`) each time the job's `last_run_at` advances. Create the cron job through Hermes cron, not via a `cron:` field in the workflow YAML (that field is not read). The cursor is stored in `workflow_cron_jobs`; a job seen for the first time only seeds the cursor and does not fire.
 
-Example:
+## Runtime conventions
 
-```yaml
-name: my-workflow
-cron: "0 * * * *"
-nodes: ...
-```
+- Declared workflow inputs are exported as env vars (`"$name"` in bash, `os.environ["name"]` in scripts). Node outputs reach scripts via `NODE_<ID>_OUTPUT`; inline `$node.output` in script bodies is refused.
+- Run logs/artifacts: `<db dir>/workflow-runs/<run_id>/`.
+- Crash recovery uses a per-run heartbeat; runs stale for more than 5 minutes are failed.
+- Config `workflow.retention_days` (default 30): terminal runs older than this are deleted at boot.
 
-## Kanban integration
+## Ownership
 
-Nodes with `provider: hermes-kanban` (and the related routed providers `claude` / `codex` used by the workflow engine) are dispatched through the daemon's `KanbanDispatcher`.
+`workflow_run` records the calling session as the run's owner. `workflow_approve` / `workflow_cancel` require the caller's session to match the owner unless `workflow.approve_any=true`; a caller with no session is denied.
 
-High-level lifecycle:
+## Logs
 
-1. a workflow node resolves to a Kanban-dispatched provider
-2. the workflow engine writes a Kanban task to the Hermes Kanban DB
-3. the daemon's `KanbanDispatcher` promotes / dispatches it
-4. a Kanban worker picks up the task and executes it
-5. completion/failure state is reported back into the workflow run state and events stream
-
-This means Kanban dispatch is not a fire-and-forget side path — it is part of the workflow run lifecycle tracked by the engine.
+Daemon logs go to `$HERMES_HOME/logs/workflow-daemon.log` and `workflow-daemon-error.log` (see the launchd/systemd units).
 
 ## Bundled default workflows
 

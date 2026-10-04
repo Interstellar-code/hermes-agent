@@ -177,8 +177,8 @@ nodes:
       github_repo = os.environ.get("github_repo", "")
       max_issues = int(os.environ.get("max_issues", "15"))
 
-      # Read the LLM review output — it's in the previous node's output
-      llm_output = """$llm-review.output"""
+      # The LLM review output arrives via env (never spliced into source)
+      llm_output = os.environ.get("NODE_LLM_REVIEW_OUTPUT", "")
 
       # Try to extract JSON array from the LLM output
       findings = []

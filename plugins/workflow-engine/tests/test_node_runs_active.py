@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from engine.store.run_store import STORE_LOCK
 pytest.importorskip("fastapi")
 
 from fastapi import FastAPI
@@ -40,27 +41,28 @@ def test_node_runs_active_empty(client_and_engine):
 
 def _seed_run_and_node(engine, status: str = "running"):
     """Insert a workflow_run and a node_run directly via SQL for test setup."""
-    conn = engine._conn
-    conn.execute(
-        "INSERT INTO workflow_definitions "
-        "(id, name, source, yaml, checksum, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("wf-1", "WF1", "user", "id: wf-1\nname: WF1\nnodes: []\n", "x", 1, 1),
-    )
-    conn.execute(
-        "INSERT INTO workflow_runs "
-        "(id, workflow_id, conversation_id, working_path, user_message, "
-        "status, current_phase, started_at, last_heartbeat) "
-        "VALUES (?, ?, ?, ?, ?, 'running', 'plan', ?, ?)",
-        ("run-1", "wf-1", "c1", "/tmp", "go", 100, 100),
-    )
-    conn.execute(
-        "INSERT INTO node_runs "
-        "(id, workflow_run_id, dag_node_id, node_type, status, started_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        ("nr-1", "run-1", "node-a", "prompt", status, 200),
-    )
-    conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        conn = engine._conn
+        conn.execute(
+            "INSERT INTO workflow_definitions "
+            "(id, name, source, yaml, checksum, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("wf-1", "WF1", "user", "id: wf-1\nname: WF1\nnodes: []\n", "x", 1, 1),
+        )
+        conn.execute(
+            "INSERT INTO workflow_runs "
+            "(id, workflow_id, conversation_id, working_path, user_message, "
+            "status, current_phase, started_at, last_heartbeat) "
+            "VALUES (?, ?, ?, ?, ?, 'running', 'plan', ?, ?)",
+            ("run-1", "wf-1", "c1", "/tmp", "go", 100, 100),
+        )
+        conn.execute(
+            "INSERT INTO node_runs "
+            "(id, workflow_run_id, dag_node_id, node_type, status, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("nr-1", "run-1", "node-a", "prompt", status, 200),
+        )
+        conn.commit()
 
 
 def test_node_runs_active_populated(client_and_engine):

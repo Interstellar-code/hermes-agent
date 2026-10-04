@@ -17,8 +17,7 @@
   plist and rely on the gateway instead. Running both simultaneously is NOT
   supported.
 
-  IMPORTANT: If the daemon crashes and KeepAlive is true, launchd will restart
-  it automatically. On a dev laptop you may prefer KeepAlive false and run
+  IMPORTANT: The daemon is restarted only after a crash (KeepAlive SuccessfulExit=false). On a dev laptop you may prefer KeepAlive false and run
   `hermes workflow daemon` in the foreground instead.
 -->
 <plist version="1.0">
@@ -34,27 +33,31 @@
     <string>daemon</string>
     <string>--interval</string>
     <string>60</string>
-    <string>--pidfile</string>
-    <string>/tmp/hermes-workflow-dispatcher.pid</string>
   </array>
 
   <key>RunAtLoad</key>
   <true/>
 
+  <!-- Restart on crash only; a clean exit (status 0, e.g. another instance holds the lock) stays down. -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
-  <!-- Note: launchd does not expand ~ in plist values. Replace the path
-       below with your actual home directory or set HERMES_HOME appropriately.
-       Default assumes ~/.hermes/logs/ exists (created by hermes on first run). -->
+  <!-- launchd does not expand ~ or env vars: replace /Users/YOU/.hermes below
+       with your real HERMES_HOME (profile-scoped home for non-default profiles).
+       The daemon lock/pidfile defaults to $HERMES_HOME/workflow-daemon.pid. -->
   <key>StandardOutPath</key>
-  <string>/tmp/hermes-workflow-dispatcher.log</string>
+  <string>/Users/YOU/.hermes/logs/workflow-daemon.log</string>
 
   <key>StandardErrorPath</key>
-  <string>/tmp/hermes-workflow-dispatcher-error.log</string>
+  <string>/Users/YOU/.hermes/logs/workflow-daemon-error.log</string>
 
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HERMES_HOME</key>
+    <string>/Users/YOU/.hermes</string>
     <key>PATH</key>
     <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
   </dict>

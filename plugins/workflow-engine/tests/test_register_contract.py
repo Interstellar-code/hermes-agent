@@ -66,7 +66,7 @@ def test_register_tools_count(monkeypatch):
     # Patch get_engine so no real DB is opened during import
     fake_engine = MagicMock()
     monkeypatch.setattr(
-        "plugins.workflow_engine._shared._engine", fake_engine
+        "plugins.workflow_engine._shared.get_engine", lambda: fake_engine
     )
 
     ctx = FakeCtx()
@@ -84,7 +84,7 @@ def test_register_no_hooks(monkeypatch):
     """register() must not register any hooks."""
     fake_engine = MagicMock()
     monkeypatch.setattr(
-        "plugins.workflow_engine._shared._engine", fake_engine
+        "plugins.workflow_engine._shared.get_engine", lambda: fake_engine
     )
 
     ctx = FakeCtx()
@@ -101,7 +101,7 @@ def test_register_one_cli_command(monkeypatch):
     """register() must register exactly 1 CLI command named 'workflow'."""
     fake_engine = MagicMock()
     monkeypatch.setattr(
-        "plugins.workflow_engine._shared._engine", fake_engine
+        "plugins.workflow_engine._shared.get_engine", lambda: fake_engine
     )
 
     ctx = FakeCtx()
@@ -119,7 +119,7 @@ def test_register_no_include_router(monkeypatch):
     """register() must not call ctx.include_router (FakeCtx has none; no AttributeError = pass)."""
     fake_engine = MagicMock()
     monkeypatch.setattr(
-        "plugins.workflow_engine._shared._engine", fake_engine
+        "plugins.workflow_engine._shared.get_engine", lambda: fake_engine
     )
 
     ctx = FakeCtx()
@@ -137,18 +137,22 @@ def test_register_no_include_router(monkeypatch):
         ) from exc
 
 
-def test_register_wires_plugin_llm_into_engine(monkeypatch):
-    """register() should pass ctx.llm into the shared engine singleton."""
+def test_register_wires_plugin_llm_lazily(monkeypatch):
+    """register() builds no engine (L2-24); ctx.llm lands on the first one built."""
+    import plugins.workflow_engine._shared as shared  # noqa: PLC0415
     fake_engine = MagicMock()
-    monkeypatch.setattr(
-        "plugins.workflow_engine._shared._engine", fake_engine
-    )
+    create = MagicMock(return_value=fake_engine)
+    monkeypatch.setattr(shared, "create_engine", create)
+    monkeypatch.setattr(shared, "_engines", {})
+    monkeypatch.setattr(shared, "_llm", None)
 
     ctx = FakeCtx()
     import plugins.workflow_engine as we  # noqa: PLC0415
 
     we.register(ctx)
+    create.assert_not_called()
 
+    assert shared.get_engine() is fake_engine
     fake_engine.set_llm.assert_called_once_with(ctx.llm)
 
 

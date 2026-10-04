@@ -1,9 +1,5 @@
-# NOTE: A future upstream PR will add workflow.dispatch_in_gateway (mirroring
-# kanban.dispatch_in_gateway) so the scheduler runs inside the gateway process.
-# When that ships, disable this unit and rely on the gateway instead:
+# Standalone workflow daemon unit. Do not also run a gateway-embedded scheduler.
 #
-#     systemctl --user disable --now hermes-workflow-dispatcher.service
-#     # ensure a gateway is running (e.g. via hermes-gateway.service)
 #
 # This unit is the Option 2 standalone daemon; keep it for environments where
 # running a long-lived gateway process is not possible.
@@ -13,18 +9,19 @@
 # migrations only; double-dispatch is a logic error, not a crash).
 
 [Unit]
-Description=Hermes Workflow Engine dispatcher (standalone daemon — see workflow.dispatch_in_gateway for future gateway-embedded mode)
+Description=Hermes Workflow Engine daemon (cron poller + scheduled-run tick)
 Documentation=https://hermes-agent.nousresearch.com/docs/user-guide/features/workflow-engine
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env hermes workflow daemon --interval 60 --pidfile %t/hermes-workflow-dispatcher.pid
+ExecStart=/usr/bin/env hermes workflow daemon --interval 60
 Restart=on-failure
 RestartSec=5
-# Log to the journal via stdout/stderr
-StandardOutput=journal
-StandardError=journal
+# Profile-scoped home; edit for non-default profiles. Logs live under $HERMES_HOME/logs.
+Environment=HERMES_HOME=%h/.hermes
+StandardOutput=append:%h/.hermes/logs/workflow-daemon.log
+StandardError=append:%h/.hermes/logs/workflow-daemon-error.log
 
 [Install]
 WantedBy=default.target

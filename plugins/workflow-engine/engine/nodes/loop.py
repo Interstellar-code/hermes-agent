@@ -21,12 +21,19 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_node_output_refs, substitute_workflow_variables
+from engine.core.executor_shared import (
+    communicate_or_kill,
+    subprocess_cwd,
+    substitute_inputs,
+    substitute_node_output_refs,
+    substitute_workflow_variables,
+    workflow_env,
+)
 
 logger = logging.getLogger("workflow.nodes.loop")
 
 
-async def _run_until_bash(script: str, cwd: Optional[str] = None) -> bool:
+async def _run_until_bash(script: str, cwd: Optional[str] = None, env=None) -> bool:
     """Run until_bash script; returns True if exit code == 0 (complete)."""
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -34,15 +41,12 @@ async def _run_until_bash(script: str, cwd: Optional[str] = None) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=env,
+            start_new_session=True,
         )
         try:
-            await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            await communicate_or_kill(proc, 30.0)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
             logger.warning("loop_node.until_bash_timeout script timed out after 30s")
             return False
         return proc.returncode == 0
@@ -100,11 +104,17 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
         return NodeExecutionResult(state="completed", output="")
 
     llm = getattr(ctx, "llm", None)
-    cwd = getattr(ctx, "cwd", None)
-    last_output = ""
+    cwd = subprocess_cwd(ctx)
+    wf_inputs = (getattr(ctx, "workflow_vars", None) or {}).get("inputs") or {}
+    # Resuming after an interactive gate: continue at the next iteration.
+    resume = (getattr(ctx, "loop_resume", None) or {}).get(node.id) or {}
+    start = int(resume.get("iteration") or 0)
+    last_output = resume.get("prev_output") or ""
     completion_detected = False
 
     for i, item in enumerate(items):
+        if i < start:
+            continue
         iter_start = time.monotonic()
         ctx.emit_event("loop_iteration_started", {
             "run_id": ctx.run_id,
@@ -113,7 +123,7 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
         })
 
         # Substitute refs and loop variables
-        prompt = substitute_node_output_refs(prompt_template, node_outputs)
+        prompt = substitute_inputs(substitute_node_output_refs(prompt_template, node_outputs), wf_inputs)
         item_str = str(item) if not isinstance(item, str) else item
         prompt = prompt.replace("$LOOP_ITEM", item_str)
         prompt = prompt.replace("$LOOP_INDEX", str(i))
@@ -167,7 +177,7 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
                 escaped_for_bash=True,
             )
             until_bash_script = substitute_node_output_refs(until_bash_script, node_outputs, escaped_for_bash=True)
-            bash_complete = await _run_until_bash(until_bash_script, cwd)
+            bash_complete = await _run_until_bash(until_bash_script, cwd, workflow_env(ctx))
 
         completion_detected = bool(signal_in_output or bash_complete)
 
@@ -198,14 +208,23 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
                 "iteration": i + 1,
             })
             try:
+                # iteration = index to resume at; prev_output restores
+                # $LOOP_PREV_OUTPUT for that iteration (L2-06).
                 await ctx.pause_run({
                     "type": "interactive_loop",
                     "node_id": node.id,
                     "message": rendered,
                     "iteration": i + 1,
+                    "prev_output": last_output,
                 })
             except Exception as exc:
                 logger.error("loop_node.pause_run_failed node=%s error=%s", node.id, exc)
+            # node_run → 'paused' so workflow_approve can claim it.
+            ctx.emit_event("node_paused", {
+                "run_id": ctx.run_id,
+                "node_id": node.id,
+                "message": rendered,
+            })
             # Return completed — between-layer status check sees 'paused' and halts
             return NodeExecutionResult(state="completed", output=last_output)
 

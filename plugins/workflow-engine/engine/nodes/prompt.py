@@ -29,7 +29,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_node_output_refs
+from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs
 
 logger = logging.getLogger("workflow.nodes.prompt")
 
@@ -68,7 +68,11 @@ async def execute_prompt_node(
 
     # Build messages — substitute $nodeId.output refs in prompt text
     raw_prompt = getattr(node, "prompt", "") or ""
-    final_prompt = substitute_node_output_refs(raw_prompt, node_outputs)
+    # Node refs first so an input value can't inject a `$x.output` ref.
+    final_prompt = substitute_inputs(
+        substitute_node_output_refs(raw_prompt, node_outputs),
+        (getattr(ctx, "workflow_vars", None) or {}).get("inputs") or {},
+    )
 
     messages: List[Dict[str, Any]] = []
     system_prompt = getattr(node, "system_prompt", None) or getattr(node, "system", None)
