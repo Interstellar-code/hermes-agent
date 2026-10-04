@@ -524,7 +524,10 @@ async def delete_definition(def_id: str) -> JSONResponse:
         return _json({"error": "not found"}, 404)
     if defn.get("source") == "bundled":
         return _json({"error": "bundled definitions are read-only"}, 403)
-    rows = await _engine().delete_definition(def_id)
+    try:
+        rows = await _engine().delete_definition(def_id)
+    except ConflictError as exc:
+        return _json({"error": str(exc)}, 409)
     if rows == 0:
         return _json({"error": "not found"}, 404)
     return _json({"ok": True})
