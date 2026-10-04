@@ -3,7 +3,7 @@
 Registers a callback with the canonical usage pipeline in
 ``agent/usage_pricing.py``. Every Anthropic / Codex / Chat-Completions
 response that flows through ``normalize_usage()`` is appended to a JSONL
-log at ``~/.hermes/mcp-lazy/cache-baseline.jsonl``.
+log at ``<HERMES_HOME>/mcp-lazy/cache-baseline.jsonl`` (rotated at 5 MB).
 
 The log feeds the Phase 0 decision (immediate vs deferred promotion)
 in ``.omc/plans/mcp-lazy-loading-v4.md`` — we need real cache hit-rate
@@ -28,8 +28,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_LOG_DIR_DEFAULT = Path.home() / ".hermes" / "mcp-lazy"
-_LOG_FILE = _LOG_DIR_DEFAULT / "cache-baseline.jsonl"
+def _log_file() -> Path:
+    from hermes_constants import get_hermes_home  # noqa: PLC0415
+    return get_hermes_home() / "mcp-lazy" / "cache-baseline.jsonl"
+
+
+# ponytail: one-shot truncate-to-.1 rotation; upgrade if analysis needs full history.
+_MAX_BYTES = 5 * 1024 * 1024
 
 # Toggle via env so we can disable in CI / tests without touching code.
 # Default ON — Phase 0's whole point is "always be logging until we
@@ -50,7 +55,13 @@ def _baseline_log(usage: "CanonicalUsage") -> None:
     if not _ENABLED:
         return
     try:
-        _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        log_file = _log_file()
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if log_file.stat().st_size > _MAX_BYTES:
+                log_file.replace(log_file.with_suffix(".jsonl.1"))
+        except FileNotFoundError:
+            pass
         row = {
             "ts": time.time(),
             "input_tokens": usage.input_tokens,
@@ -58,7 +69,7 @@ def _baseline_log(usage: "CanonicalUsage") -> None:
             "cache_read": usage.cache_read_tokens,
             "cache_creation": usage.cache_write_tokens,
         }
-        with _LOG_FILE.open("a", encoding="utf-8") as f:
+        with log_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
         # Logger may itself be broken; never let baseline breakage

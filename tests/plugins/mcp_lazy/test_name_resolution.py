@@ -149,3 +149,13 @@ def test_promote_tools_resolves_double_underscore_native_names():
     assert promoted == ["mcp_lifeplan42_list_inbox"]
     pool = get_pool("sess-promote-direct")
     assert "mcp_lifeplan42_list_inbox" in pool.snapshot()
+
+
+def test_derive_servers_and_synth_label_core_and_legacy_names():
+    from plugins.mcp_lazy.server_stubs import derive_servers_from_tools, synth_server_description
+
+    tools = [{"function": {"name": n}} for n in ("mcp__github__create_issue", "mcp_trek_search")]
+    assert derive_servers_from_tools(tools) == {
+        "github": ["mcp__github__create_issue"], "trek": ["mcp_trek_search"]}
+    assert synth_server_description(["mcp__github__create_issue"]) == "1 tools: create issue"
+    assert synth_server_description(["mcp_trek_search"]) == "1 tools: search"
