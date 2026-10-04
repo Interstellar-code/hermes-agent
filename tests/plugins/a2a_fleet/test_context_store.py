@@ -215,7 +215,7 @@ def test_server_generates_context_id_when_omitted(fleet_home):
         "method": "SendMessage",
         "params": {"message": {"role": "user", "parts": [{"text": "hi"}]}},
     }
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         resp = client.post("/jsonrpc", json=body)
     assert resp.status_code == 200
     msg = resp.json()["result"]["message"]

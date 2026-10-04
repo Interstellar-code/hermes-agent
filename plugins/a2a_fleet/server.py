@@ -11,8 +11,13 @@ Routes:
 * ``POST /jsonrpc``                     — A2A JSON-RPC 2.0 SendMessage endpoint
 * ``GET  /health``                      — diagnostic
 
-Security note: ``auth_required`` defaults to ``True`` in fleet_config so that
-newly-created profiles opt into bearer-token protection automatically.  Sending
+Security note: ``auth_required`` defaults to ``True`` when the key is absent
+(fleet_config) and the first-enable scaffold writes ``auth_required: true``.
+Every route rejects a ``Host`` that is not loopback / the configured bind_host
+(DNS rebinding); ``/jsonrpc`` additionally rejects any ``Origin`` header (A2A
+peers are not browsers) and non-``application/json`` bodies (blocks CSRF
+"simple requests").  ``start_server`` refuses a non-loopback bind unless a
+bearer token resolves (fail closed).  Sending
 a plaintext bearer token over a non-loopback HTTP connection is inadvisable;
 operators binding to a non-loopback address should terminate TLS in front of
 this server.  The ``/jsonrpc`` endpoint checks the token via a constant-time
@@ -22,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -148,6 +155,54 @@ def _check_bearer(request: Request, cfg: Dict[str, Any]) -> Optional[JSONRespons
     return None
 
 
+_LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+_WILDCARD_HOSTS = {"0.0.0.0", "::", ""}
+
+
+def _is_loopback(host: str) -> bool:
+    if host.lower() in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _auth_enforced(cfg: Dict[str, Any]) -> bool:
+    self_block = cfg["self"]
+    return bool(self_block.get("auth_required") and self_block.get("token"))
+
+
+def _check_host(request: Request, cfg: Dict[str, Any]) -> Optional[JSONResponse]:
+    """403 unless Host is loopback or the configured bind_host (DNS rebinding)."""
+    try:
+        host = urlsplit("//" + request.headers.get("host", "")).hostname or ""
+    except ValueError:  # malformed Host (e.g. unbalanced IPv6 bracket)
+        host = ""
+    bind = str(cfg["self"].get("bind_host") or "").lower()
+    if _is_loopback(host) or host == bind:
+        return None
+    # ponytail: a wildcard bind accepts any Host (peers use LAN names/IPs); it is
+    # only allowed with a bearer token (start_server), which defeats rebinding.
+    # Add an explicit allowed_hosts list if per-name pinning is ever needed.
+    if bind in _WILDCARD_HOSTS and _auth_enforced(cfg):
+        return None
+    return JSONResponse({"error": "forbidden host"}, status_code=403)
+
+
+def _check_jsonrpc_request(request: Request, cfg: Dict[str, Any]) -> Optional[JSONResponse]:
+    """Browser-CSRF guards for POST /jsonrpc: no Origin, JSON content type, Host."""
+    if request.headers.get("origin") is not None:
+        return JSONResponse({"error": "browser origins are not allowed"}, status_code=403)
+    host_err = _check_host(request, cfg)
+    if host_err is not None:
+        return host_err
+    ctype = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if ctype != "application/json":
+        return JSONResponse({"error": "Content-Type must be application/json"}, status_code=415)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app factory
 # ---------------------------------------------------------------------------
@@ -169,13 +224,20 @@ def build_app() -> FastAPI:
     # misleading and unnecessary on this surface.
 
     @app.get("/.well-known/agent-card.json")
-    async def agent_card() -> JSONResponse:
+    async def agent_card(request: Request) -> JSONResponse:
         # PUBLIC — no bearer required. Capability discovery must be anonymous.
-        return JSONResponse(_build_agent_card(load_fleet()))
+        cfg = load_fleet()
+        host_err = _check_host(request, cfg)
+        if host_err is not None:
+            return host_err
+        return JSONResponse(_build_agent_card(cfg))
 
     @app.get("/health")
-    async def health() -> Dict[str, Any]:
+    async def health(request: Request) -> Any:
         cfg = load_fleet()
+        host_err = _check_host(request, cfg)
+        if host_err is not None:
+            return host_err
         return {
             "ok": True,
             "version": "0.1.0",
@@ -185,6 +247,9 @@ def build_app() -> FastAPI:
     @app.post("/jsonrpc")
     async def jsonrpc(request: Request) -> JSONResponse:
         cfg = load_fleet()
+        guard_err = _check_jsonrpc_request(request, cfg)
+        if guard_err is not None:
+            return guard_err
         auth_err = _check_bearer(request, cfg)
         if auth_err is not None:
             return auth_err
@@ -314,6 +379,14 @@ async def start_server(timeout: float = 5.0) -> Dict[str, Any]:
     cfg = load_fleet()
     host = cfg["self"]["bind_host"]
     port = cfg["self"]["bind_port"]
+    if not _is_loopback(str(host)) and not _auth_enforced(cfg):
+        # Fail closed: an off-loopback listener without a bearer token would let
+        # anyone on the network drive the real agent.
+        raise A2AServerStartError(
+            f"refusing to bind a2a_fleet on non-loopback {host}:{port} without auth: "
+            "set fleet.server.auth_required: true and export the env var named by "
+            "fleet.server.token_env (or bind 127.0.0.1)"
+        )
     app = build_app()
     config = uvicorn.Config(
         app=app,

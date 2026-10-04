@@ -249,7 +249,7 @@ class TestBridgeNotReady:
 
         from a2a_fleet.server import build_app
 
-        with TestClient(build_app()) as client:
+        with TestClient(build_app(), base_url="http://127.0.0.1") as client:
             response = client.post("/jsonrpc", json=_send_body("hello"))
 
         assert response.status_code == 200
@@ -281,7 +281,7 @@ class TestServerAgentModeHappyPath:
         try:
             from a2a_fleet.server import build_app
 
-            with TestClient(build_app()) as client:
+            with TestClient(build_app(), base_url="http://127.0.0.1") as client:
                 response = client.post("/jsonrpc", json=_send_body("what is the answer?"))
 
             assert response.status_code == 200
@@ -312,7 +312,7 @@ class TestServerAgentModeHappyPath:
         try:
             from a2a_fleet.server import build_app
 
-            with TestClient(build_app()) as client:
+            with TestClient(build_app(), base_url="http://127.0.0.1") as client:
                 response = client.post("/jsonrpc", json=_send_body("hello"))
 
             assert response.status_code == 200
@@ -336,7 +336,7 @@ class TestEchoLlmRegression:
         # fleet_home defaults to response_handler: echo
         from a2a_fleet.server import build_app
 
-        with TestClient(build_app()) as client:
+        with TestClient(build_app(), base_url="http://127.0.0.1") as client:
             response = client.post("/jsonrpc", json=_send_body("ping"))
         assert response.status_code == 200
         body = response.json()
@@ -345,7 +345,7 @@ class TestEchoLlmRegression:
     def test_echo_verbatim_unchanged(self, fleet_home: Path) -> None:
         from a2a_fleet.server import build_app
 
-        with TestClient(build_app()) as client:
+        with TestClient(build_app(), base_url="http://127.0.0.1") as client:
             response = client.post("/jsonrpc", json=_send_body("hello fleet"))
         assert response.status_code == 200
         body = response.json()

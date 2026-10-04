@@ -37,7 +37,7 @@ including straight into the real Hermes agent via a platform adapter.
 
 Hermes can deploy a repo-scoped **managed executor** into a target repo: a
 standalone receiver in `<repo>/.hermes/` that spawns a real CLI agent with the
-repo's harness and POSTs replies back to the Hermes node on `:9219`. Four modes
+repo's harness and POSTs replies back to the Hermes node on its `fleet.server.bind_port` (default `:9219`). Four modes
 ship, each with a deploy/status/stop tool trio. `deploy_*_receiver`
 **auto-upserts its peer into `fleet.yaml`** (surgical, comment-preserving ruamel
 round-trip) — you do NOT hand-edit it.
@@ -260,8 +260,10 @@ fleet:
 ### Key config facts
 
 - **`bind_port` is required** — `FleetConfigError` if missing. No default.
-- **`auth_required` defaults to `true`.** Newly-created profiles opt into bearer
-  protection automatically.
+- **`auth_required` defaults to `true` when the key is absent**, and the
+  first-enable scaffold writes `auth_required: true` + `token_env:
+  <SELF>_A2A_TOKEN`. An existing `fleet.yaml` that says `auth_required: false`
+  stays unauthenticated — but then it must bind loopback (see Auth behavior).
 - **`response_handler` must be `echo`, `llm`, or `agent`.** Any other value
   raises `FleetConfigError` at load time.
 - Peer `url` must be `http`/`https` with a real host or load fails.
@@ -298,6 +300,18 @@ deployed receiver's peer entry:
   (misconfig; does not leak the `token_env` name).
 - Missing/malformed `Authorization: Bearer ...` → **HTTP 401**.
 - Bearer comparison uses `hmac.compare_digest` (constant-time).
+- **Browser / DNS-rebinding guards (all routes, auth on or off):** a `Host`
+  header that is not loopback (`127.0.0.1` / `localhost` / `::1`, any port) or
+  the configured `bind_host` → **403** (a wildcard bind accepts any Host only
+  when a bearer token is enforced). `POST /jsonrpc` with any `Origin` header →
+  **403** (A2A peers are not browsers); non-`application/json` Content-Type →
+  **415**.
+- **Fail closed off-loopback:** the server refuses to start on a non-loopback
+  `bind_host` unless `auth_required: true` and the `token_env` var resolves.
+- **Executor replies on an auth-on node:** `deploy_*_receiver` defaults
+  `hermes_auth_token_env` to this node's `server.token_env`, and the reply URL
+  follows `server.bind_port` (fallback 9219). Boot-reconcile redeploys keep the
+  receiver's pinned model / sandbox / `hermes_auth_token_env`.
 - Sending plaintext bearer tokens over non-loopback HTTP is inadvisable —
   terminate TLS in front of the server when binding to a public address.
 

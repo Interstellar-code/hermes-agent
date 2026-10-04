@@ -95,6 +95,8 @@ A2A_ROLE_TEXT = (
 
 DEFAULT_BIND_PORT = 9300
 DEFAULT_HERMES_URL = "http://127.0.0.1:9219/jsonrpc"
+# Literal in A2A_ROLE_TEXT, rewritten at deploy to the real fleet bind_port (L1-03).
+_ROLE_HERMES_BASE = "http://127.0.0.1:9219"
 PID_FILENAME = "cc_receiver.pid"
 RECEIVER_FILENAME = "cc_receiver.py"
 CONFIG_FILENAME = "a2a_receiver.json"
@@ -284,6 +286,7 @@ def build_receiver_config(
     model: Optional[str],
     auth_token_env: str = "",
     hermes_auth_token_env: str = "",
+    hermes_url: str = DEFAULT_HERMES_URL,
 ) -> Dict[str, Any]:
     """Build the ``a2a_receiver.json`` payload matching cc_receiver's load_config.
 
@@ -301,7 +304,7 @@ def build_receiver_config(
         "repo_path": str(repo_path),  # canonical, pinned cwd for claude
         "bind_host": "127.0.0.1",
         "bind_port": int(bind_port),
-        "hermes_url": DEFAULT_HERMES_URL,
+        "hermes_url": hermes_url,
         "role_file": f".hermes/{ROLE_FILENAME}",
         "idle_timeout_s": 1800,
         "max_concurrent_turns": 3,
@@ -619,6 +622,12 @@ async def deploy_cc_receiver_handler(
         model = _p.get("model") or model
         no_auth = bool(_p.get("no_auth", no_auth))
         hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
+    # L1-03/L1-04: replies go to THIS node's fleet.server.bind_port, and an
+    # auth-on node's own inbound token_env is the default outbound reply bearer.
+    from .fleet_config import hermes_reply_target  # noqa: PLC0415,WPS433
+
+    _hermes_base, _self_token_env = hermes_reply_target()
+    hermes_auth_token_env = hermes_auth_token_env or _self_token_env
     warnings: List[str] = []
 
     # 1. Validate + canonicalize.
@@ -662,7 +671,7 @@ async def deploy_cc_receiver_handler(
 
     # 4. Write the executor role text.
     try:
-        _atomic_write_text(role_dest, A2A_ROLE_TEXT)
+        _atomic_write_text(role_dest, A2A_ROLE_TEXT.replace(_ROLE_HERMES_BASE, _hermes_base))
     except OSError as exc:
         return {"error": f"cannot write {role_dest}: {exc}"}
 
@@ -694,6 +703,7 @@ async def deploy_cc_receiver_handler(
             repo, bind_port, model,
             auth_token_env=receiver_token_env,
             hermes_auth_token_env=hermes_auth_token_env,
+            hermes_url=_hermes_base + "/jsonrpc",
         )
         _atomic_write_text(config_dest, json.dumps(cfg, indent=2) + "\n")
     except OSError as exc:
@@ -1017,24 +1027,41 @@ def _read_managed_pid(repo: Path, mode: str) -> Optional[int]:
     return _read_pid(repo / ".hermes" / pid_filename)
 
 
+# mode -> (deploy handler attr, on-disk model key, on-disk sandbox key)
+_MANAGED_DEPLOY_SPEC = {
+    "claude_code": ("deploy_cc_receiver_handler", "claude_model", None),
+    "opencode": ("deploy_oc_receiver_handler", "opencode_model", None),
+    "codex": ("deploy_codex_receiver_handler", "codex_model", "codex_sandbox"),
+    "agy": ("deploy_agy_receiver_handler", None, "agy_sandbox"),
+}
+
+
 def _deploy_managed_receiver(mode: str, repo: Path, port: int) -> Dict[str, Any]:
+    """Redeploy a managed receiver, PRESERVING the operator's pinned fields
+    (model / sandbox / hermes_auth_token_env) from its existing on-disk config —
+    a boot-reconcile must not silently reset them to defaults (L1-04)."""
     import asyncio
 
-    if mode == "claude_code":
-        return asyncio.run(deploy_cc_receiver_handler(str(repo), bind_port=port))
-    if mode == "opencode":
-        from . import oc_deploy  # noqa: PLC0415,WPS433
-
-        return asyncio.run(oc_deploy.deploy_oc_receiver_handler(str(repo), bind_port=port))
-    if mode == "codex":
-        from . import codex_deploy  # noqa: PLC0415,WPS433
-
-        return asyncio.run(codex_deploy.deploy_codex_receiver_handler(str(repo), bind_port=port))
-    if mode == "agy":
-        from . import agy_deploy  # noqa: PLC0415,WPS433
-
-        return asyncio.run(agy_deploy.deploy_agy_receiver_handler(str(repo), bind_port=port))
-    raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+    if mode not in _MANAGED_DEPLOY_SPEC:
+        raise ValueError(f"unsupported managed receiver mode: {mode!r}")
+    handler_name, model_key, sandbox_key = _MANAGED_DEPLOY_SPEC[mode]
+    module = _managed_receiver_module(mode)
+    try:
+        prev = json.loads(
+            (repo / ".hermes" / str(module.CONFIG_FILENAME)).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        prev = {}
+    if not isinstance(prev, dict):
+        prev = {}
+    kwargs: Dict[str, Any] = {"bind_port": port}
+    if prev.get("hermes_auth_token_env"):
+        kwargs["hermes_auth_token_env"] = str(prev["hermes_auth_token_env"])
+    if model_key and prev.get(model_key):
+        kwargs["model"] = str(prev[model_key])
+    if sandbox_key and sandbox_key in prev:
+        kwargs["sandbox"] = prev[sandbox_key]
+    return asyncio.run(getattr(module, handler_name)(str(repo), **kwargs))
 
 
 def _receiver_port(repo: Path, default: int = DEFAULT_BIND_PORT) -> int:

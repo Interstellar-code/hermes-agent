@@ -13,7 +13,7 @@ def test_agent_card_public_and_well_formed(fleet_home) -> None:
     from a2a_fleet.server import build_app
 
     app = build_app()
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.get("/.well-known/agent-card.json")
     assert response.status_code == 200, "Agent Card must be reachable without auth"
 
@@ -38,7 +38,7 @@ def test_agent_card_ignores_bearer_header(fleet_home) -> None:
     from a2a_fleet.server import build_app
 
     app = build_app()
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         response = client.get(
             "/.well-known/agent-card.json",
             headers={"authorization": "Bearer wrong-token"},

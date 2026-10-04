@@ -24,7 +24,7 @@ def _send_message_body(text: str = "ping"):
 def test_ping_returns_pong_message(fleet_home: Path) -> None:
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post("/jsonrpc", json=_send_message_body("ping"))
     assert response.status_code == 200
     body = response.json()
@@ -38,7 +38,7 @@ def test_ping_returns_pong_message(fleet_home: Path) -> None:
 def test_arbitrary_text_is_echoed(fleet_home: Path) -> None:
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post("/jsonrpc", json=_send_message_body("hello world"))
     assert response.json()["result"]["message"]["parts"][0]["text"] == "hello world"
 
@@ -46,7 +46,7 @@ def test_arbitrary_text_is_echoed(fleet_home: Path) -> None:
 def test_malformed_body_returns_parse_error(fleet_home: Path) -> None:
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/jsonrpc",
             content=b"{not json",
@@ -60,7 +60,7 @@ def test_unknown_method_returns_method_not_found(fleet_home: Path) -> None:
     from a2a_fleet.server import build_app
 
     body = {"jsonrpc": "2.0", "id": "x", "method": "tasks.get", "params": {}}
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post("/jsonrpc", json=body)
     assert response.status_code == 200
     assert response.json()["error"]["code"] == -32601
@@ -75,7 +75,7 @@ def test_message_send_alias_returns_same_envelope(fleet_home: Path) -> None:
         "method": "message/send",
         "params": {"message": {"role": "user", "parts": [{"text": "ping"}]}},
     }
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post("/jsonrpc", json=body)
     assert response.status_code == 200
     result = response.json()
@@ -88,7 +88,7 @@ def test_message_stream_returns_not_implemented(fleet_home: Path) -> None:
     from a2a_fleet.server import build_app
 
     body = {"jsonrpc": "2.0", "id": "stream-1", "method": "message/stream", "params": {}}
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post("/jsonrpc", json=body)
     assert response.status_code == 200
     assert response.json()["error"]["code"] == -32601
@@ -102,7 +102,7 @@ def test_bearer_enforced_when_auth_required(fleet_home: Path) -> None:
 
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         # No bearer
         r1 = client.post("/jsonrpc", json=_send_message_body("ping"))
         assert r1.status_code == 401

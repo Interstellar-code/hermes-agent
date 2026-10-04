@@ -77,6 +77,8 @@ DEFAULT_BIND_PORT = 9320
 DEFAULT_HERMES_URL = (
     f"http://127.0.0.1:{_os.environ.get('HERMES_A2A_PORT', '9219')}/jsonrpc"
 )
+# Literal in A2A_ROLE_TEXT, rewritten at deploy to the real fleet bind_port (L1-03).
+_ROLE_HERMES_BASE = "http://127.0.0.1:9219"
 PID_FILENAME = "codex_receiver.pid"
 RECEIVER_FILENAME = "codex_receiver.py"
 CONFIG_FILENAME = "codex_receiver.json"
@@ -202,13 +204,14 @@ def build_receiver_config(
     sandbox: str = DEFAULT_SANDBOX,
     auth_token_env: str = "",
     hermes_auth_token_env: str = "",
+    hermes_url: str = DEFAULT_HERMES_URL,
 ) -> Dict[str, Any]:
     cfg: Dict[str, Any] = {
         "repo_path": str(repo_path),
         "bind_host": "127.0.0.1",
         "bind_port": int(bind_port),
-        "hermes_url": DEFAULT_HERMES_URL,
-        "role_prompt": A2A_ROLE_TEXT.strip(),
+        "hermes_url": hermes_url,
+        "role_prompt": A2A_ROLE_TEXT.replace(_ROLE_HERMES_BASE, hermes_url.removesuffix("/jsonrpc")).strip(),
         "role_file": f".hermes/{ROLE_FILENAME}",
         "poll_interval_s": 2.0,
         "codex_timeout_s": 300,
@@ -461,6 +464,12 @@ async def deploy_codex_receiver_handler(
         sandbox = _p.get("sandbox") or sandbox
         no_auth = bool(_p.get("no_auth", no_auth))
         hermes_auth_token_env = _p.get("hermes_auth_token_env") or hermes_auth_token_env
+    # L1-03/L1-04: replies go to THIS node's fleet.server.bind_port, and an
+    # auth-on node's own inbound token_env is the default outbound reply bearer.
+    from .fleet_config import hermes_reply_target  # noqa: PLC0415,WPS433
+
+    _hermes_base, _self_token_env = hermes_reply_target()
+    hermes_auth_token_env = hermes_auth_token_env or _self_token_env
     warnings: List[str] = []
     try:
         repo, err = canonicalize_repo_path(repo_path)
@@ -501,7 +510,7 @@ async def deploy_codex_receiver_handler(
             return {"error": f"cannot copy receiver template into {hermes_dir}: {exc}"}
 
         try:
-            _atomic_write_text(role_dest, A2A_ROLE_TEXT)
+            _atomic_write_text(role_dest, A2A_ROLE_TEXT.replace(_ROLE_HERMES_BASE, _hermes_base))
         except OSError as exc:
             return {"error": f"cannot write {role_dest}: {exc}"}
 
@@ -529,6 +538,7 @@ async def deploy_codex_receiver_handler(
                 sandbox=sandbox or DEFAULT_SANDBOX,
                 auth_token_env=receiver_token_env,
                 hermes_auth_token_env=hermes_auth_token_env,
+                hermes_url=_hermes_base + "/jsonrpc",
             )
             _atomic_write_text(config_dest, json.dumps(cfg, indent=2) + "\n")
         except OSError as exc:
