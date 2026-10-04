@@ -113,6 +113,14 @@ def usage_payload(result: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def complete_with_usage(llm: Any, messages: Any, **kw: Any) -> Any:
+    """``llm.complete`` + ``usage_payload`` in one blocking call, for
+    run_in_executor: pricing may hit the network, so keep it off the loop.
+    Returns ``(result, usage)``."""
+    result = llm.complete(messages, **kw)
+    return result, usage_payload(result)
+
+
 def add_usage(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Sum two usage payloads (loop iterations). Cost is None if either is unknown."""
     if not a or not b:

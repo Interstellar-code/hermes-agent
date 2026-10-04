@@ -107,7 +107,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
                 r"^\s*PRAGMA\s+\S.*?;\s*", "", sql, flags=re.MULTILINE | re.IGNORECASE
             )
 
-            conn.executescript(sql_for_exec)
+            _exec_script(conn, sql_for_exec)
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -122,6 +122,25 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         except Exception:
             pass
         raise
+
+
+def _exec_script(conn: sqlite3.Connection, sql: str) -> None:
+    """Run *sql* statement by statement inside the caller's transaction
+    (executescript would COMMIT it). ADD COLUMN that already exists is
+    skipped so half-applied DBs converge."""
+    buf = ""
+    for line in sql.splitlines(keepends=True):
+        buf += line
+        if not sqlite3.complete_statement(buf):
+            continue
+        stmt, buf = buf.strip(), ""
+        if not stmt or not re.sub(r"--.*", "", stmt).strip():
+            continue
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
 
 
 def _read_current_version(conn: sqlite3.Connection) -> int:

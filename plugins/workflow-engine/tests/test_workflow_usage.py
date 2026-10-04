@@ -202,3 +202,38 @@ def test_resolve_inputs_three_shapes():
     assert _resolve_inputs(mixed, {"a": "x"}) == {"a": "x", "b": 2}
     with pytest.raises(ValueError, match="reserved"):
         _resolve_inputs("inputs:\n  PATH: {}\n", {})
+
+
+def test_run_cost_unknown_if_any_token_row_lacks_cost():
+    from engine.store.run_store import RunStore
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        conn.execute("INSERT INTO workflow_definitions (id,name,source,yaml,checksum,created_at,updated_at)"
+                     " VALUES ('w','w','user','x','x',1,1)")
+        conn.execute("INSERT INTO workflow_runs (id,workflow_id,conversation_id,working_path,user_message,"
+                     "status,current_phase,started_at,last_heartbeat) VALUES ('r','w','c','/','m','running','p',1,1)")
+        for i, cost in enumerate((0.5, None)):
+            conn.execute("INSERT INTO node_runs (id,workflow_run_id,dag_node_id,node_type,status,started_at,"
+                         "input_tokens,output_tokens,total_tokens,cost_usd) VALUES (?,?,?,?,?,?,1,1,2,?)",
+                         (f"n{i}", "r", f"d{i}", "prompt", "completed", 1, cost))
+        conn.commit()
+        store = RunStore(conn)
+        assert store.get_workflow_run("r")["usage"]["cost_usd"] is None
+        conn.execute("UPDATE node_runs SET cost_usd = 0.25 WHERE id = 'n1'")
+        conn.commit()
+        assert store.get_workflow_run("r")["usage"]["cost_usd"] == pytest.approx(0.75)
+
+
+def test_migration_007_half_applied_converges():
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        conn.execute("ALTER TABLE node_runs DROP COLUMN provider")
+        conn.execute("ALTER TABLE node_runs DROP COLUMN model")
+        conn.execute("UPDATE schema_meta SET value='6' WHERE key='schema_version'")
+        conn.commit()
+        # simulate half-applied: some 007 columns present, version still 6
+        ensure_schema(conn)
+        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "7"
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(node_runs)")}
+        assert {"input_tokens", "model", "provider"} <= cols
+

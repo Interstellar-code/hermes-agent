@@ -18,7 +18,7 @@ import time
 from typing import Dict
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs, usage_payload
+from engine.core.executor_shared import complete_with_usage, substitute_inputs, substitute_node_output_refs
 
 logger = logging.getLogger("workflow.nodes.command")
 
@@ -58,15 +58,15 @@ async def execute_command_node(node, node_outputs: Dict[str, NodeOutput], ctx) -
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: llm.complete(
-                        [{"role": "user", "content": prompt}],
+                    lambda: complete_with_usage(
+                        llm, [{"role": "user", "content": prompt}],
                         purpose=f"workflow-command:{node.id}",
                     ),
                 ),
                 timeout=timeout,
             )
+            result, usage = result
             output = result.text or ""
-            usage = usage_payload(result)
         except asyncio.TimeoutError:
             err = f"Command node '{node.id}' timed out after {timeout}s"
             logger.error("dag_node_failed node=%s type=command error=%s", node.id, err)

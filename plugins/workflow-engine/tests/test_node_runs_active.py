@@ -99,3 +99,16 @@ def test_literal_active_does_not_match_dynamic_route(client_and_engine):
     # And the dynamic route still resolves for an unknown id.
     r2 = c.get("/node-runs/some-unknown-id")
     assert r2.status_code == 404
+
+
+def test_node_runs_active_excludes_loop_iterations(client_and_engine):
+    c, engine = client_and_engine
+    _seed_run_and_node(engine, status="running")
+    with STORE_LOCK:
+        engine._conn.execute(
+            "INSERT INTO node_runs (id, workflow_run_id, dag_node_id, node_type, status, "
+            "started_at, loop_iteration, loop_parent_node_run_id) "
+            "VALUES ('nr-it', 'run-1', 'node-a', 'loop', 'running', 201, 1, 'nr-1')")
+        engine._conn.commit()
+    ids = [n["nodeRunId"] for n in c.get("/node-runs/active").json()["nodeRuns"]]
+    assert ids == ["nr-1"]

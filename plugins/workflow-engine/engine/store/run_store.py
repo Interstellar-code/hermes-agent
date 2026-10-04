@@ -59,7 +59,9 @@ def _ms_to_dt(ms: Optional[int]) -> Optional[str]:
 _RUN_USAGE_SQL = """
     (SELECT CASE WHEN SUM(n.total_tokens) IS NULL THEN NULL ELSE json_object(
         'input_tokens', SUM(n.input_tokens), 'output_tokens', SUM(n.output_tokens),
-        'total_tokens', SUM(n.total_tokens), 'cost_usd', SUM(n.cost_usd)) END
+        'total_tokens', SUM(n.total_tokens),
+        'cost_usd', CASE WHEN COUNT(n.total_tokens) > COUNT(n.cost_usd)
+                         THEN NULL ELSE SUM(n.cost_usd) END) END
        FROM node_runs n
       WHERE n.workflow_run_id = workflow_runs.id AND n.loop_iteration IS NULL) AS usage
 """
@@ -281,6 +283,7 @@ class RunStore:
               FROM node_runs nr
               JOIN workflow_runs wr ON wr.id = nr.workflow_run_id
              WHERE nr.status IN ('running', 'waiting')
+               AND nr.loop_iteration IS NULL
              ORDER BY nr.started_at ASC
             """,
         ).fetchall()
@@ -345,6 +348,7 @@ class RunStore:
             vals.append(error)
         if metadata is not None:
             # Merge, never replace: trigger/inputs/pause live side by side.
+            # RFC 7396 json_patch: a null value DELETES that key.
             cols.append("metadata = json_patch(COALESCE(metadata, '{}'), json(?))")
             vals.append(json.dumps(metadata))
         vals.append(run_id)

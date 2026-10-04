@@ -627,11 +627,15 @@ class WorkflowRunner:
                 node_id = payload.get("node_id", "")
                 iteration = payload.get("iteration")
                 try:
-                    nr = run_store.find_node_run(run_id, node_id, iteration)
-                    if event_type == "loop_iteration_started":
+                    # No iteration → never resolve to the wrapper row.
+                    nr = run_store.find_node_run(run_id, node_id, iteration) if iteration is not None else None
+                    if iteration is None:
+                        pass
+                    elif event_type == "loop_iteration_started":
                         if nr is not None:  # loop retried / resumed: reuse
                             run_store.update_node_run(nr["id"], {
-                                "status": "running", "completed_at": None, "error": None,
+                                "status": "running", "started_at": int(time.time() * 1000),
+                                "completed_at": None, "error": None,
                             })
                         else:
                             parent = run_store.find_node_run(run_id, node_id)
@@ -651,7 +655,11 @@ class WorkflowRunner:
                                 payload.get("output" if done else "error"),
                         })
                         if payload.get("usage"):
+                            # Wrapper = sum of iterations, added here (not on
+                            # the wrapper's node_* events) so it survives a crash.
                             run_store.add_node_usage(nr["id"], payload["usage"])
+                            if nr.get("loop_parent_node_run_id"):
+                                run_store.add_node_usage(nr["loop_parent_node_run_id"], payload["usage"])
                     if nr is not None:
                         node_run_id = nr["id"]
                 except Exception as e:

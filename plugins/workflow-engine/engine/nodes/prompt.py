@@ -29,7 +29,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs, usage_payload
+from engine.core.executor_shared import complete_with_usage, substitute_inputs, substitute_node_output_refs
 
 logger = logging.getLogger("workflow.nodes.prompt")
 
@@ -88,16 +88,16 @@ async def execute_prompt_node(
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: llm.complete(
-                messages,
+            lambda: complete_with_usage(
+                llm, messages,
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 purpose=f"workflow-node:{node.id}",
             ),
         )
+        result, usage = result
         output_text = result.text or ""
-        usage = usage_payload(result)
     except Exception as exc:
         err = f"Prompt node '{node.id}' failed: {exc}"
         logger.error("dag_node_failed node=%s error=%s", node.id, exc)

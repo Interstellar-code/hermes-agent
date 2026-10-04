@@ -62,3 +62,10 @@ def _reset_host_llm():
     prev = getattr(engine_pkg, "HOST_LLM", None)
     yield
     engine_pkg.HOST_LLM = prev
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hermes_home(tmp_path, monkeypatch):
+    """Default DB / migrate lock / manifest resolve under HERMES_HOME; never
+    let any test (or spawned worker, which inherits env) touch ~/.hermes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))

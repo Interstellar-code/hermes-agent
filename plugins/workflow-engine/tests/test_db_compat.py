@@ -260,6 +260,3 @@ def test_ensure_schema_concurrent_process_race():
         lock_path = db_path + ".migrate.lock"
         if os.path.exists(lock_path):
             os.unlink(lock_path)
-        # Remove the canonical lock file too
-        canonical = Path.home() / ".hermes" / "switchui-workflows.db.migrate.lock"
-        # Don't remove production lock — it may be in use
