@@ -14,7 +14,8 @@ Provides:
 
 The REST API (dashboard/plugin_api.py) auto-mounts at /api/plugins/personas/.
 
-#140-safe injection contract (agent/conversation_loop.py:722-739):
+#140-safe injection contract (agent/turn_context.py _collect_pre_llm_call_context
++ build_api_messages):
   target in ("system","developer")  -> appended to effective_system (trusted)
   target absent / "user_message"    -> injected into the USER message (UNTRUSTED)
 Persona text is identity-shaping; it MUST use target="developer". Never return a
@@ -55,14 +56,15 @@ def _read_persona_ref() -> Optional[str]:
     """Read the active profile's agent.persona_ref from config (best-effort).
 
     Returns None when unset or config is unavailable — the common path that
-    keeps the cached system prefix byte-stable.
+    keeps the cached system prefix byte-stable. load_config_readonly is the
+    mtime-cached, no-deepcopy read keyed on get_hermes_home() (profile-scoped).
     """
     try:
-        from hermes_cli.config import cfg_get, load_config  # type: ignore[import]
+        from hermes_cli.config import cfg_get, load_config_readonly  # type: ignore[import]
     except Exception:
         return None
     try:
-        ref = cfg_get(load_config(), "agent", "persona_ref", default="")
+        ref = cfg_get(load_config_readonly(), "agent", "persona_ref", default="")
     except Exception:
         return None
     ref = str(ref or "").strip()
@@ -119,13 +121,16 @@ def _tool_persona_list(args: dict, **kwargs) -> dict:
 
 
 def _tool_persona_get(args: dict, **kwargs) -> dict:
-    """Return the full persona (incl. system_prompt) by id."""
+    """Return the persona by id: full system_prompt, or metadata + 280-char preview
+    when ``preview`` is true (system prompts run a few KB each)."""
     persona_id = str(args.get("persona_id", "")).strip()
     if not persona_id:
         return {"error": "persona_id is required"}
     persona = _library.get_persona(persona_id)
     if persona is None:
         return {"error": f"persona '{persona_id}' not found"}
+    if args.get("preview") is True:
+        return {"persona": _library._metadata(persona)}
     return {"persona": persona}
 
 
@@ -188,6 +193,10 @@ def register(ctx) -> None:  # noqa: ANN001
             "type": "object",
             "properties": {
                 "persona_id": {"type": "string", "description": "Persona id, e.g. engineering-security-engineer."},
+                "preview": {
+                    "type": "boolean",
+                    "description": "Return metadata + a 280-char system_prompt preview instead of the full prompt (a few KB).",
+                },
             },
             "required": ["persona_id"],
             "additionalProperties": False,

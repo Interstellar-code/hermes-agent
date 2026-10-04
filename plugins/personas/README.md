@@ -52,22 +52,38 @@ This plugin makes the backend `library/` the single source of truth.
 ### 1. Runtime tools (toolset `personas`)
 
 - **`persona_list(category?)`** — persona metadata only (no full prompt). Optional category filter.
-- **`persona_get(persona_id)`** — full persona including the `system_prompt` overlay text.
+- **`persona_get(persona_id, preview?)`** — full persona including the `system_prompt` overlay
+  text (a few KB each). `preview: true` returns metadata + a 280-char `system_prompt_preview`
+  instead. The on-disk file path is never returned.
 - **`persona_apply(persona_id, target="delegate")`** — composed overlay + metadata formatted
   for a `delegate_task` goal/context block (the ephemeral T3 path). Does **not** mutate config.
 
 ### 2. `persona_ref` binding hook
 
 A *promoted* profile sets `agent.persona_ref: <persona-id>` in its `config.yaml`. The
-`pre_llm_call` hook resolves it and injects the overlay as **trusted, developer-tier**
-context (`{"context": ..., "target": "developer"}`) appended to the effective system prompt —
-**never the user message** (the #140-safe contract). With no `persona_ref` set the hook returns
-`None`, so the cached system prefix stays byte-stable.
+`pre_llm_call` hook resolves it (via the mtime-cached `load_config_readonly`, scoped to the
+active `HERMES_HOME`) and returns `{"context": ..., "target": "developer"}`. Core routes
+`target: "system"|"developer"` results in `agent/turn_context.py`: the overlay is appended to
+the effective system prompt **after** the cached session prompt, at API-call time only —
+**never the user message** (the #140-safe contract) and never persisted. The cached prefix is
+untouched, and a stable persona overlay is byte-identical across turns. With no `persona_ref`
+set the hook returns `None`.
+
+This routing is a fork-only core seam (fork commit 9d75ee0504). It was silently dropped in the
+0.19 migration — during that window overlays landed in the user message — and was restored in
+the 2026-10 plugin review. `scripts/check_fork_drops.py --seams-only` now guards it.
+
+**Rename:** `leadership-morpheus-cmo` was renamed to `leadership-cmo` (a199da58d9). A profile
+still set to the old id resolves to nothing: the hook logs a `not found in library` warning
+and injects no overlay. Update `persona_ref` to `leadership-cmo`.
 
 ### 3. REST API
 
 Auto-mounts at `/api/plugins/personas/` (driven by `dashboard/manifest.json`'s `"api"` key).
-All routes require auth.
+All routes require dashboard auth: `_require_auth` delegates to
+`hermes_cli.web_server._require_token` (honoring `request.state.token_authenticated`) and fails
+closed with 503 if that helper cannot be imported. Responses never include the persona's file
+path.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -112,7 +128,9 @@ venv/bin/python -m pytest plugins/personas/tests/ -q
 ```
 
 Covers library parity (20 files / 8 categories), register contract (3 tools + 1 hook),
-the `pre_llm_call` trusted-target invariant, and the REST routes.
+the `pre_llm_call` trusted-target invariant, an end-to-end check (config `persona_ref` → real
+core collector → system-prompt placement), and the REST routes (incl. 401 when unauthenticated).
+Core routing is also covered by `tests/agent/test_pre_llm_trusted_routing.py`.
 
 ---
 
@@ -121,5 +139,5 @@ the `pre_llm_call` trusted-target invariant, and the REST routes.
 Build 1 (this plugin) ships the store, tools, hook, and read API. Tracked by issue #143.
 
 Deferred: refactor the SwitchUI wizard to consume `/list` + `/get`, write `agent.persona_ref`
-on promotion (consuming the dormant hook), implement real `POST /promote`, and delete
+on promotion (no live profile sets `persona_ref` yet), implement real `POST /promote`, and delete
 SwitchUI's `assets/personas/curated/` copy.

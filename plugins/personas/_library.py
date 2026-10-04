@@ -38,8 +38,10 @@ _REQUIRED_KEYS = ("id", "category", "glyph", "name")
 # ^---\n(yaml)\n---\n(body)$  — tolerant of CRLF, mirrors the TS regex.
 _FRONTMATTER_RE = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n?(.*)$", re.DOTALL)
 
-# Module-level cache. First load populates; subsequent calls reuse.
+# Module-level cache, invalidated when the library dir's mtime changes (file
+# add/remove/rename; in-place edits of an existing file need reload()).
 _cache: Optional[Dict[str, Dict[str, Any]]] = None
+_cache_mtime: Optional[float] = None
 _cache_lock = threading.Lock()
 
 
@@ -141,12 +143,21 @@ def _load(library_dir: Path = _LIBRARY_DIR) -> Dict[str, Dict[str, Any]]:
     return personas
 
 
+def _library_mtime() -> Optional[float]:
+    try:
+        return _LIBRARY_DIR.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _get_cache() -> Dict[str, Dict[str, Any]]:
-    global _cache
-    if _cache is None:
+    global _cache, _cache_mtime
+    mtime = _library_mtime()
+    if _cache is None or mtime != _cache_mtime:
         with _cache_lock:
-            if _cache is None:
+            if _cache is None or mtime != _cache_mtime:
                 _cache = _load()
+                _cache_mtime = mtime
     return _cache
 
 
@@ -184,9 +195,14 @@ def list_personas(category: Optional[str] = None) -> List[Dict[str, Any]]:
 
 
 def get_persona(persona_id: str) -> Optional[Dict[str, Any]]:
-    """Return the full persona (incl. system_prompt) by id, or None if unknown."""
+    """Return the full persona (incl. system_prompt) by id, or None if unknown.
+
+    The on-disk ``path`` is internal (duplicate-id logging) and never leaves the
+    library — it would leak the install location via persona_get / GET /get."""
     p = _get_cache().get(persona_id)
-    return dict(p) if p is not None else None
+    if p is None:
+        return None
+    return {k: v for k, v in p.items() if k != "path"}
 
 
 def count() -> int:

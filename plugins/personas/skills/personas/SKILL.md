@@ -13,7 +13,7 @@ Engineer" are personas applied on top of the same underlying agent.
 ## Runtime tools
 
 - `persona_list(category?)` — persona metadata (id, name, category, tags, suggested model/mcps/toolsets). Optional category filter.
-- `persona_get(persona_id)` — full persona including the `system_prompt` overlay text.
+- `persona_get(persona_id, preview?)` — full persona including the `system_prompt` overlay text; `preview: true` returns metadata + a 280-char preview (cheaper when just browsing).
 - `persona_apply(persona_id, target="delegate")` — composed overlay + metadata, formatted for injection into a `delegate_task` goal/context block (the ephemeral T3 path). Does **not** mutate config.
 
 ## persona_ref binding (promoted profiles)

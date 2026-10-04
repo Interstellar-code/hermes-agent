@@ -504,6 +504,7 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
         setattr(agent, name, value)
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
+    agent._plugin_trusted_context = ""  # pre_llm_call trusted overlay; set by the collector
     agent._tool_guardrails.reset_for_turn()
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
@@ -664,9 +665,16 @@ def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
 ) -> str:
-    """Run ``pre_llm_call`` plugins; their context is injected into the user message
-    (never the system prompt). Oversized per-hook context is spilled to disk so a
-    runaway plugin can't inflate every subsequent turn's prompt."""
+    """Run ``pre_llm_call`` plugins and return the user-message context.
+
+    Bare strings and target-less dicts go to the current user message (oversized
+    pieces spilled to disk so a runaway plugin can't inflate every turn). Dicts with
+    ``target in ("system", "developer")`` are trusted overlays: they are stashed on
+    ``agent._plugin_trusted_context`` and appended to the effective system prompt by
+    :func:`build_api_messages` at API-call time only (never persisted, never spilled)."""
+    # ponytail: per-turn agent attr (like ephemeral_system_prompt) instead of threading
+    # a new field through _LoopState/assemble_api_request; reset every turn here.
+    agent._plugin_trusted_context = ""
     if getattr(agent, "_persist_disabled", False):
         return ""
     try:
@@ -695,8 +703,12 @@ def _collect_pre_llm_call_context(
             _spill_if_oversized = None  # type: ignore[assignment]
             _spill_config_cached = None
         _ctx_parts: list[str] = []
+        _trusted_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
+                if r.get("target") in ("system", "developer"):
+                    _trusted_parts.append(str(r["context"]))
+                    continue
                 _piece = str(r["context"])
             elif isinstance(r, str) and r.strip():
                 _piece = r
@@ -711,6 +723,7 @@ def _collect_pre_llm_call_context(
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
             _ctx_parts.append(_piece)
+        agent._plugin_trusted_context = "\n\n".join(_trusted_parts)
         return "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
@@ -1132,11 +1145,16 @@ def build_api_messages(
         api_messages.append(api_msg)
 
     # Final system message = cached prompt + ephemeral additions (API-time only).
-    # Plugin/recall context goes into the user message, never the system prompt: the
-    # prompt is built ONCE per session and replayed verbatim (stable cache prefix).
+    # Recall context and untargeted plugin context go into the user message; the cached
+    # prompt is built ONCE per session and replayed verbatim. Trusted pre_llm_call context
+    # (target="system"/"developer") is appended after it, like ephemeral_system_prompt, so
+    # the cached prefix is untouched and a stable overlay stays byte-stable across turns.
     effective_system = active_system_prompt or ""
     if agent.ephemeral_system_prompt:
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    _trusted = getattr(agent, "_plugin_trusted_context", "")
+    if _trusted:
+        effective_system = (effective_system + "\n\n" + _trusted).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system

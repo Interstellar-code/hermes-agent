@@ -30,20 +30,18 @@ MAX_BODY_BYTES = 32 * 1024
 
 
 def _require_auth(request: Request) -> None:
-    """Raise 401 if request is not authenticated.
+    """Defense-in-depth behind the global dashboard auth middleware.
 
-    Reuses hermes_cli.web_server._is_authenticated (session cookie / token).
-    No-ops gracefully when web_server is not importable (test / standalone context).
+    Delegates to web_server._require_token; fails CLOSED if it cannot be imported.
+    Honors the token-auth seam (request.state.token_authenticated).
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     try:
-        from hermes_cli.web_server import _is_authenticated  # type: ignore[import]
-    except (ImportError, AttributeError):
-        return  # web_server not importable (test/standalone) — auth no-ops
-    # Import guard is separate from the auth call: an AttributeError (or any
-    # error) raised *inside* _is_authenticated must NOT be swallowed into an
-    # open-auth bypass — let it surface as a 500.
-    if not _is_authenticated(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        from hermes_cli.web_server import _require_token
+    except ImportError:
+        raise HTTPException(status_code=503, detail="auth backend unavailable")
+    _require_token(request)
 
 
 router = APIRouter()

@@ -112,6 +112,9 @@ VALID_HOOKS: Set[str] = {
     "transform_tools",
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
+    # pre_llm_call: return a string / {"context": ...} -> current user message; or (FORK-ONLY,
+    # 9d75ee0504) {"context": ..., "target": "system"|"developer"} -> appended to the effective
+    # system prompt at API-call time only. Routed in agent/turn_context.py; never persisted.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.

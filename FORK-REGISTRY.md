@@ -279,7 +279,8 @@ v0.21.3 adopt's silent drops. Run once per adopt+replay, after the replay is bel
 `python scripts/check_fork_drops.py --before <pre-adopt-ref> --fork-base <merge-base>`. It diffs
 fork commits for added defs/classes/constants and distinctive log strings, then flags any that no
 longer exist anywhere in `--after` (default `HEAD`). Exit 1 lists drops; allowlist intentional ones
-(renames, sunsets, convergence) in `scripts/fork_drops_allowlist.txt` with a reason.
+(renames, sunsets, convergence) in `scripts/fork_drops_allowlist.txt` with a reason. Use `--seams-only`
+to verify that pinned fork-only core seams still exist (with `--after <worktree>` to check an uncommitted tree).
 
 **Upgrade checklist (run all three before merging an upgrade).**
 1. *Missing-parts check* — `scripts/check_fork_drops.py` (above). Takes ~15 min.
