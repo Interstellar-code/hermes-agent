@@ -253,7 +253,7 @@ class WorkflowRunner:
             # 'paused' is the approval-gate's own row — it's about to be
             # re-executed on resume, which will overwrite the status to
             # 'completed' once the gate accepts the decision.
-            if nr.get("status") in ("completed", "skipped"):
+            if nr.get("status") in ("completed", "skipped") and nr.get("loop_iteration") is None:
                 prior_completed[nr["dag_node_id"]] = nr.get("summary") or ""
 
         working_path = run.get("working_path", "/tmp")
@@ -607,11 +607,55 @@ class WorkflowRunner:
                         # it's waiting on a human decision. Will be patched to
                         # completed/failed once the run is resumed.
                         patch["status"] = "paused"
+                        patch["approval_message"] = payload.get("message") or "Approval required"
                     if patch:
                         try:
                             run_store.update_node_run(nr["id"], patch)
                         except Exception as e:
                             logger.debug("update_node_run failed: %s", e)
+                    if payload.get("usage"):
+                        try:
+                            run_store.add_node_usage(nr["id"], payload["usage"])
+                        except Exception as e:
+                            logger.debug("add_node_usage failed: %s", e)
+            elif event_type in (
+                "loop_iteration_started",
+                "loop_iteration_completed",
+                "loop_iteration_failed",
+            ):
+                # One node_run per loop iteration, child of the wrapper row.
+                node_id = payload.get("node_id", "")
+                iteration = payload.get("iteration")
+                try:
+                    nr = run_store.find_node_run(run_id, node_id, iteration)
+                    if event_type == "loop_iteration_started":
+                        if nr is not None:  # loop retried / resumed: reuse
+                            run_store.update_node_run(nr["id"], {
+                                "status": "running", "completed_at": None, "error": None,
+                            })
+                        else:
+                            parent = run_store.find_node_run(run_id, node_id)
+                            nr = run_store.create_node_run(
+                                workflow_run_id=run_id,
+                                dag_node_id=node_id,
+                                node_type="loop",
+                                loop_iteration=iteration,
+                                loop_parent_node_run_id=parent["id"] if parent else None,
+                            )
+                    elif nr is not None:
+                        done = event_type == "loop_iteration_completed"
+                        run_store.update_node_run(nr["id"], {
+                            "status": "completed" if done else "failed",
+                            "completed_at": int(time.time() * 1000),
+                            ("summary" if done else "error"):
+                                payload.get("output" if done else "error"),
+                        })
+                        if payload.get("usage"):
+                            run_store.add_node_usage(nr["id"], payload["usage"])
+                    if nr is not None:
+                        node_run_id = nr["id"]
+                except Exception as e:
+                    logger.debug("loop iteration node_run skipped: %s", e)
 
             bus.emit(
                 run_id=run_id,
@@ -679,13 +723,27 @@ def _resolve_inputs(yaml_text: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
     substitutions) so a caller can't inject e.g. PATH or PYTHONPATH.
     """
     try:
-        declared = (yaml.safe_load(yaml_text) or {}).get("inputs") or []
+        doc = yaml.safe_load(yaml_text) or {}
     except yaml.YAMLError:
-        declared = []
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    # Three authoring shapes (same as SwitchUI's parsed route): `inputs:` list
+    # of {name, ...}, `inputs:` mapping name -> {default, ...}, and top-level
+    # required_inputs / optional_inputs name lists.
+    raw = doc.get("inputs") or []
+    declared: List[Dict[str, Any]] = (
+        [{**(v if isinstance(v, dict) else {}), "name": k} for k, v in raw.items()]
+        if isinstance(raw, dict) else [d for d in raw if isinstance(d, dict)]
+    )
+    for key in ("required_inputs", "optional_inputs"):
+        names = doc.get(key)
+        if isinstance(names, list):
+            declared += [{"name": n} for n in names if isinstance(n, str)]
     out: Dict[str, Any] = {}
     for d in declared:
-        name = d.get("name") if isinstance(d, dict) else None
-        if not name:
+        name = d.get("name")
+        if not isinstance(name, str) or not name:
             continue
         if reserved_input_name(name):
             raise ValueError(

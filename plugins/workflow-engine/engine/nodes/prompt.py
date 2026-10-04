@@ -29,7 +29,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs
+from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs, usage_payload
 
 logger = logging.getLogger("workflow.nodes.prompt")
 
@@ -97,6 +97,7 @@ async def execute_prompt_node(
             ),
         )
         output_text = result.text or ""
+        usage = usage_payload(result)
     except Exception as exc:
         err = f"Prompt node '{node.id}' failed: {exc}"
         logger.error("dag_node_failed node=%s error=%s", node.id, exc)
@@ -111,5 +112,6 @@ async def execute_prompt_node(
         "output": output_text,
         "duration_ms": duration_ms,
         "type": "prompt",
+        "usage": usage,
     })
     return NodeExecutionResult(state="completed", output=output_text)

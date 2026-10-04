@@ -137,3 +137,24 @@ def test_list_runs_filter_by_status(client):
     assert r.status_code == 200
     body = r.json()
     assert "runs" in body
+
+
+def test_run_payloads_carry_usage(client):
+    """Migration 007: run.usage (null until a node reports tokens) and per-node usage columns."""
+    import plugins.workflow_engine.dashboard.plugin_api as api_mod
+    run_id = client.post("/runs", json={
+        "workflow_id": "hello-world", "conversation_id": "conv-u", "user_message": "go",
+    }).json()["run"]["id"]
+    store = api_mod._engine()._run_store
+    nr = store.create_node_run(workflow_run_id=run_id, dag_node_id="x", node_type="prompt")
+    store.add_node_usage(nr["id"], {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7,
+                                    "cost_usd": 0.25, "model": "m", "provider": "p"})
+    body = client.get(f"/runs/{run_id}").json()
+    assert body["run"]["usage"] == {"input_tokens": 3, "output_tokens": 4,
+                                    "total_tokens": 7, "cost_usd": 0.25}
+    node = next(n for n in body["nodeRuns"] if n["id"] == nr["id"])
+    assert (node["total_tokens"], node["cost_usd"], node["model"], node["provider"]) == (7, 0.25, "m", "p")
+    listed = next(r for r in client.get("/runs").json()["runs"] if r["id"] == run_id)
+    assert listed["usage"]["total_tokens"] == 7
+    nodes = client.get(f"/runs/{run_id}/nodes").json()["nodeRuns"]
+    assert any(n.get("total_tokens") == 7 for n in nodes)

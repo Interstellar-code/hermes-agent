@@ -54,8 +54,21 @@ def _ms_to_dt(ms: Optional[int]) -> Optional[str]:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
 
 
+# Run-level token usage: sum over top-level node rows only (loop iteration
+# rows are already summed into their wrapper row).
+_RUN_USAGE_SQL = """
+    (SELECT CASE WHEN SUM(n.total_tokens) IS NULL THEN NULL ELSE json_object(
+        'input_tokens', SUM(n.input_tokens), 'output_tokens', SUM(n.output_tokens),
+        'total_tokens', SUM(n.total_tokens), 'cost_usd', SUM(n.cost_usd)) END
+       FROM node_runs n
+      WHERE n.workflow_run_id = workflow_runs.id AND n.loop_iteration IS NULL) AS usage
+"""
+
+
 def _row_to_run(row: sqlite3.Row) -> Dict[str, Any]:
     d = dict(row)
+    if "usage" in d:
+        d["usage"] = json.loads(d["usage"]) if d["usage"] else None
     d["started_at"] = _ms_to_dt(d.get("started_at"))
     d["completed_at"] = _ms_to_dt(d.get("completed_at"))
     d["last_heartbeat"] = _ms_to_dt(d.get("last_heartbeat"))
@@ -281,7 +294,7 @@ class RunStore:
 
     def get_workflow_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
-            "SELECT * FROM workflow_runs WHERE id = ?", (run_id,)
+            f"SELECT *, {_RUN_USAGE_SQL} FROM workflow_runs WHERE id = ?", (run_id,)
         ).fetchone()
         return _row_to_run(row) if row else None
 
@@ -303,7 +316,7 @@ class RunStore:
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         rows = self._conn.execute(
-            f"SELECT * FROM workflow_runs {where} ORDER BY started_at DESC LIMIT ?",
+            f"SELECT *, {_RUN_USAGE_SQL} FROM workflow_runs {where} ORDER BY started_at DESC LIMIT ?",
             params,
         ).fetchall()
         return [_row_to_run(r) for r in rows]
@@ -331,7 +344,8 @@ class RunStore:
             cols.append("error = ?")
             vals.append(error)
         if metadata is not None:
-            cols.append("metadata = ?")
+            # Merge, never replace: trigger/inputs/pause live side by side.
+            cols.append("metadata = json_patch(COALESCE(metadata, '{}'), json(?))")
             vals.append(json.dumps(metadata))
         vals.append(run_id)
         self._conn.execute(
@@ -507,6 +521,7 @@ class RunStore:
         model_hint: Optional[str] = None,
         parent_subgraph_node_run_id: Optional[str] = None,
         loop_iteration: Optional[int] = None,
+        loop_parent_node_run_id: Optional[str] = None,
         approval_message: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -517,9 +532,9 @@ class RunStore:
             INSERT OR IGNORE INTO node_runs
               (id, workflow_run_id, dag_node_id, node_type, status,
                agent_profile_hint, skills, model_hint,
-               parent_subgraph_node_run_id, loop_iteration,
+               parent_subgraph_node_run_id, loop_iteration, loop_parent_node_run_id,
                approval_message, metadata, started_at)
-            VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 nr_id,
@@ -531,6 +546,7 @@ class RunStore:
                 model_hint,
                 parent_subgraph_node_run_id,
                 loop_iteration,
+                loop_parent_node_run_id,
                 approval_message,
                 json.dumps(metadata) if metadata else None,
                 now,
@@ -575,6 +591,7 @@ class RunStore:
             "status", "error", "summary", "completed_at", "started_at",
             "kanban_task_id", "assigned_agent", "approval_response",
             "artifact_refs", "metadata", "skip_reason", "retries",
+            "approval_message",
         }
         cols: List[str] = []
         vals: List[Any] = []
@@ -591,6 +608,33 @@ class RunStore:
         self._conn.execute(
             f"UPDATE node_runs SET {', '.join(cols)} WHERE id = ?",
             vals,
+        )
+        self._conn.commit()
+
+    def add_node_usage(self, node_run_id: str, usage: Dict[str, Any]) -> None:
+        """Add a usage payload to a node_run (additive: retries and loop
+        iterations accumulate). Unknown cost leaves cost_usd untouched."""
+        cost = usage.get("cost_usd")
+        self._conn.execute(
+            """
+            UPDATE node_runs
+               SET input_tokens  = COALESCE(input_tokens, 0) + ?,
+                   output_tokens = COALESCE(output_tokens, 0) + ?,
+                   total_tokens  = COALESCE(total_tokens, 0) + ?,
+                   cost_usd      = CASE WHEN ? IS NULL THEN cost_usd
+                                        ELSE COALESCE(cost_usd, 0) + ? END,
+                   model         = COALESCE(?, model),
+                   provider      = COALESCE(?, provider)
+             WHERE id = ?
+            """,
+            (
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+                int(usage.get("total_tokens") or 0),
+                cost, cost,
+                usage.get("model"), usage.get("provider"),
+                node_run_id,
+            ),
         )
         self._conn.commit()
 

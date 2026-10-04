@@ -73,6 +73,59 @@ def workflow_env(ctx: Any, node_outputs: Optional[Dict[str, NodeOutput]] = None)
     return env
 
 
+def _num(obj: Any, name: str) -> Optional[float]:
+    v = getattr(obj, name, None)
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def usage_payload(result: Any) -> Optional[Dict[str, Any]]:
+    """Token usage of a ``ctx.llm.complete()`` result as a node event payload.
+
+    ``cost_usd`` is the provider's figure, else estimated from the host
+    pricing table, else None (unknown pricing). None when no tokens reported.
+    """
+    u = getattr(result, "usage", None)
+    inp, out = int(_num(u, "input_tokens") or 0), int(_num(u, "output_tokens") or 0)
+    total = int(_num(u, "total_tokens") or inp + out)
+    if not total:
+        return None
+    model = getattr(result, "model", None)
+    provider = getattr(result, "provider", None)
+    model = model if isinstance(model, str) and model else None
+    provider = provider if isinstance(provider, str) and provider else None
+    cost = _num(u, "cost_usd")
+    if cost is None and model:
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+            cr, cw = int(_num(u, "cache_read_tokens") or 0), int(_num(u, "cache_write_tokens") or 0)
+            # ponytail: assumes OpenAI-shaped input_tokens (cache included);
+            # PluginLlmUsage doesn't say which shape it got.
+            amount = estimate_usage_cost(model, CanonicalUsage(
+                input_tokens=max(0, inp - cr - cw), output_tokens=out,
+                cache_read_tokens=cr, cache_write_tokens=cw,
+            ), provider=provider).amount_usd
+            cost = float(amount) if amount is not None else None
+        except Exception as exc:  # pricing is best-effort, never fails a node
+            logger.debug("usage_payload.cost_estimate_failed model=%s error=%s", model, exc)
+    return {
+        "input_tokens": inp, "output_tokens": out, "total_tokens": total,
+        "cost_usd": cost, "model": model, "provider": provider,
+    }
+
+
+def add_usage(a: Optional[Dict[str, Any]], b: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Sum two usage payloads (loop iterations). Cost is None if either is unknown."""
+    if not a or not b:
+        return a or b
+    return {
+        **{k: a[k] + b[k] for k in ("input_tokens", "output_tokens", "total_tokens")},
+        "cost_usd": a["cost_usd"] + b["cost_usd"]
+        if a["cost_usd"] is not None and b["cost_usd"] is not None else None,
+        "model": b["model"] or a["model"],
+        "provider": b["provider"] or a["provider"],
+    }
+
+
 def substitute_inputs(text: str, inputs: Dict[str, Any]) -> str:
     """Replace ``$<input_name>`` in LLM prompt text (never in code bodies —
     bash/script read inputs from env)."""

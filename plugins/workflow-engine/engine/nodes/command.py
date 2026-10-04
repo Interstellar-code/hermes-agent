@@ -18,7 +18,7 @@ import time
 from typing import Dict
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs
+from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs, usage_payload
 
 logger = logging.getLogger("workflow.nodes.command")
 
@@ -51,6 +51,7 @@ async def execute_command_node(node, node_outputs: Dict[str, NodeOutput], ctx) -
     # HIGH 7: timeout is in ms — convert to seconds
     timeout = (timeout_raw / 1000.0) if timeout_raw else COMMAND_DEFAULT_TIMEOUT
 
+    usage = None
     if llm is not None:
         try:
             loop = asyncio.get_event_loop()
@@ -65,6 +66,7 @@ async def execute_command_node(node, node_outputs: Dict[str, NodeOutput], ctx) -
                 timeout=timeout,
             )
             output = result.text or ""
+            usage = usage_payload(result)
         except asyncio.TimeoutError:
             err = f"Command node '{node.id}' timed out after {timeout}s"
             logger.error("dag_node_failed node=%s type=command error=%s", node.id, err)
@@ -84,5 +86,6 @@ async def execute_command_node(node, node_outputs: Dict[str, NodeOutput], ctx) -
     ctx.emit_event("node_completed", {
         "run_id": ctx.run_id, "node_id": node.id,
         "output": output, "duration_ms": duration_ms, "type": "command",
+        "usage": usage,
     })
     return NodeExecutionResult(state="completed", output=output)

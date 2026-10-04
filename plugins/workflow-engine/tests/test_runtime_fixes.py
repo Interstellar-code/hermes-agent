@@ -163,7 +163,9 @@ async def test_interactive_loop_gate_pause_and_resume(tmp_path):
         run = await eng.start_run("iloop", {}, {})
         run = await _settle(eng, run["id"])
         assert run["status"] == "paused"
-        assert [n["status"] for n in await eng.list_node_runs(run["id"])] == ["paused"]
+        nrs = await eng.list_node_runs(run["id"])
+        assert [n["status"] for n in nrs if n["loop_iteration"] is None] == ["paused"]
+        assert [(n["loop_iteration"], n["status"]) for n in nrs if n["loop_iteration"]] == [(1, "completed")]
         await eng.approve(run["id"], "l", "approve")
         run = await _settle(eng, run["id"])
         assert run["status"] == "paused"  # second gate, after iteration index 1
@@ -173,8 +175,12 @@ async def test_interactive_loop_gate_pause_and_resume(tmp_path):
         await eng.approve(run["id"], "l", "approve")
         run = await _settle(eng, run["id"])
         assert run["status"] == "completed", run
-        loop_nr = next(n for n in await eng.list_node_runs(run["id"]) if n["dag_node_id"] == "l")
+        nrs = await eng.list_node_runs(run["id"])
+        loop_nr = next(n for n in nrs if n["dag_node_id"] == "l" and n["loop_iteration"] is None)
         assert loop_nr["summary"].startswith("iter 2 prev=iter 1")
+        iters = sorted((n for n in nrs if n["loop_iteration"]), key=lambda n: n["loop_iteration"])
+        assert [(n["loop_iteration"], n["status"]) for n in iters] == [(1, "completed"), (2, "completed"), (3, "completed")]
+        assert all(n["loop_parent_node_run_id"] == loop_nr["id"] and n["completed_at"] for n in iters)
     finally:
         await eng.shutdown()
 

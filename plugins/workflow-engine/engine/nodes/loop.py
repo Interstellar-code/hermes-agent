@@ -22,11 +22,13 @@ from typing import Any, Dict, List, Optional
 
 from engine.schemas.workflow_run import NodeOutput
 from engine.core.executor_shared import (
+    add_usage,
     communicate_or_kill,
     subprocess_cwd,
     substitute_inputs,
     substitute_node_output_refs,
     substitute_workflow_variables,
+    usage_payload,
     workflow_env,
 )
 
@@ -111,6 +113,7 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
     start = int(resume.get("iteration") or 0)
     last_output = resume.get("prev_output") or ""
     completion_detected = False
+    total_usage: Optional[Dict[str, Any]] = None  # spend so far, reported on every exit
 
     for i, item in enumerate(items):
         if i < start:
@@ -142,14 +145,22 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
                     ),
                 )
                 iteration_output = result.text or ""
+                iter_usage = usage_payload(result)
             except Exception as exc:
                 err = f"Loop node '{node.id}' iteration {i + 1} failed: {exc}"
                 logger.error("loop_node.iteration_failed node=%s iter=%d error=%s", node.id, i + 1, exc)
-                ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
+                ctx.emit_event("loop_iteration_failed", {
+                    "run_id": ctx.run_id, "node_id": node.id, "iteration": i + 1, "error": err,
+                })
+                ctx.emit_event("node_failed", {
+                    "run_id": ctx.run_id, "node_id": node.id, "error": err, "usage": total_usage,
+                })
                 return NodeExecutionResult(state="failed", error=err)
         else:
             # No LLM — test mode: return prompt as output
             iteration_output = prompt
+            iter_usage = None
+        total_usage = add_usage(total_usage, iter_usage)
 
         last_output = iteration_output
         iter_duration_ms = int((time.monotonic() - iter_start) * 1000)
@@ -159,6 +170,7 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
             "iteration": i + 1,
             "output": iteration_output,
             "duration_ms": iter_duration_ms,
+            "usage": iter_usage,
         })
 
         # Check completion signal in AI output
@@ -224,6 +236,7 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
                 "run_id": ctx.run_id,
                 "node_id": node.id,
                 "message": rendered,
+                "usage": total_usage,
             })
             # Return completed — between-layer status check sees 'paused' and halts
             return NodeExecutionResult(state="completed", output=last_output)
@@ -235,12 +248,15 @@ async def execute_loop_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
             f"without completion signal '{until_signal}'"
         )
         logger.error("loop_node.max_iterations_exceeded node=%s max=%d signal=%s", node.id, max_iterations, until_signal)
-        ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})
+        ctx.emit_event("node_failed", {
+            "run_id": ctx.run_id, "node_id": node.id, "error": err, "usage": total_usage,
+        })
         return NodeExecutionResult(state="failed", error=err)
 
     duration_ms = int((time.monotonic() - node_start) * 1000)
     ctx.emit_event("node_completed", {
         "run_id": ctx.run_id, "node_id": node.id,
         "output": last_output, "duration_ms": duration_ms, "type": "loop",
+        "usage": total_usage,
     })
     return NodeExecutionResult(state="completed", output=last_output)
