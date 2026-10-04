@@ -9,6 +9,7 @@ import os
 import re
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -368,12 +369,125 @@ async def test_conflict_409_fails(home, sleeps):
 @pytest.mark.asyncio
 async def test_non_loopback_gateway_url_fatal(home):
     gw = Gateway()
-    for url in ("http://10.0.0.5:8642", "http://127.0.0.1.evil.example:8642", "ftp://127.0.0.1"):
+    for url in ("http://10.0.0.5:8642", "http://127.0.0.1.evil.example:8642", "ftp://127.0.0.1",
+                "http://localhost:8642", "http://[::1"):
         write_cfg(home, enabled=True, allowed_profiles=["neo"], gateway_url=url)
         res, _ = await run(gw, home)
         assert res.state == "failed" and classify_error(res.error) == "FATAL", url
         assert "misconfigured" in res.error
     assert gw.requests == []
+
+
+async def _retry_all(home, gw, **kw):
+    calls = []
+
+    async def dispatch(n, outs, ctx):
+        calls.append(1)
+        return await agent_session.execute_agent_session_node(n, outs, ctx, transport=gw.transport())
+
+    ctx, _ = make_ctx(home)
+    n = node(**kw)
+    n.retry = SimpleNamespace(max_attempts=2, delay_ms=1, on_error="all")
+    res = await _execute_node_with_retry(n, 0, False, {}, ctx, dispatch)
+    return res, calls
+
+
+# 16 ─ read/write timeout on dispatch: may have started, never DAG-retried
+@pytest.mark.asyncio
+async def test_dispatch_read_timeout_not_retried(home, sleeps):
+    gw = Gateway(posts=[httpx.ReadTimeout("slow")])
+    res, calls = await _retry_all(home, gw)
+    assert res.state == "failed" and "may have started" in res.error
+    assert "connection refused" not in res.error and classify_error(res.error) != "TRANSIENT"
+    assert len(gw.runs_posts()) == 4 and calls == [1]
+    assert len({r.headers["Idempotency-Key"] for r in gw.runs_posts()}) == 1
+
+
+# 17 ─ non-retryable routed failures survive on_error: all
+@pytest.mark.asyncio
+async def test_no_retry_failures_ignore_on_error_all(home, sleeps, clock):
+    def tick():
+        clock[0] += 100
+    for gw, kw in (
+        (Gateway(polls=[{"status": "running"}], on_get=tick), {"timeout_s": 300}),
+        (Gateway(posts=[httpx.Response(401)]), {}),
+        (Gateway(polls=[500]), {}),
+    ):
+        res, calls = await _retry_all(home, gw, **kw)
+        assert res.state == "failed" and calls == [1], res.error
+    # gateway-down stays retryable under on_error: all
+    res, calls = await _retry_all(home, Gateway(posts=[httpx.ConnectError("x")]))
+    assert len(calls) == 3
+
+
+# 18 ─ non-JSON bodies: poll parse error counts as poll error; dispatch parse error aborts
+@pytest.mark.asyncio
+async def test_non_json_bodies(home, sleeps):
+    class NonJsonPolls(Gateway):
+        def __call__(self, request):
+            if request.method == "GET":
+                self.requests.append(request)
+                return httpx.Response(200, content=b"<html>")
+            return super().__call__(request)
+
+    gw = NonJsonPolls()
+    res, _ = await run(gw, home)
+    assert res.state == "failed" and "lost contact" in res.error
+    assert len(gw.stops()) == 1
+
+    gw = Gateway(posts=[httpx.Response(202, content=b"nope")])
+    res, _ = await run(gw, home)
+    assert res.state == "failed" and "no run_id" in res.error
+
+
+# 19 ─ unexpected exception after dispatch → stop + non-retryable abort
+@pytest.mark.asyncio
+async def test_unexpected_exception_aborts_and_stops(home, sleeps):
+    def boom():
+        raise RuntimeError("kaboom")
+    gw = Gateway(on_get=boom)
+    res, calls = await _retry_all(home, gw)
+    assert res.state == "failed" and res.error == "routed run on 'neo' aborted: RuntimeError"
+    assert len(gw.stops()) == 1 and calls == [1]
+
+
+# 20 ─ Retry-After: non-finite / negative / huge → sane delay
+@pytest.mark.asyncio
+async def test_retry_after_sanitised(home, sleeps):
+    for ra, want in (("nan", 1), ("inf", 1), ("-5", 0.0), ("999", 30.0), ("junk", 1)):
+        sleeps.clear()
+        gw = Gateway(posts=[httpx.Response(429, headers={"Retry-After": ra}),
+                            httpx.Response(202, json={"run_id": "run_abc"})])
+        res, _ = await run(gw, home)
+        assert res.state == "completed" and sleeps[0] == want, ra
+
+
+# 21 ─ node_started on an existing node_run clears the previous attempt's session
+@pytest.mark.asyncio
+async def test_node_started_reuse_clears_session(home, sleeps, monkeypatch):
+    gw = Gateway(posts=[httpx.Response(202, json={"run_id": "run_1"}),
+                        httpx.Response(202, json={"run_id": "run_2"})],
+                 polls=[{"status": "failed", "error": "timeout upstream", "session_id": "run_1"},
+                        {"status": "running", "session_id": "run_2"}])
+    monkeypatch.setattr(agent_session, "execute_agent_session_node", functools.partial(
+        agent_session.execute_agent_session_node, transport=gw.transport()))
+    eng = create_engine(db_path=str(home / "wf.db"), seed_bundled=False,
+                        write_manifest=False, crash_recovery=False)
+    eng.set_llm(MagicMock())
+    await eng.upsert_definition("routed", (
+        "name: routed\ndescription: d\nnodes:\n"
+        "  - id: step\n    prompt: 'x'\n    hermes_task: {profile: neo}\n"
+        "    retry: {max_attempts: 1, delay_ms: 1000, on_error: all}\n"))
+    run_id = (await eng.start_run("routed", {}, {}))["id"]
+    end = time.monotonic() + 10
+    while len(gw.runs_posts()) < 2:
+        assert time.monotonic() < end
+        await asyncio.sleep(0.01)
+    # attempt 2 dispatched: its node_started already reset the row to attempt 1's leftovers -> None
+    (nr,) = await eng.list_node_runs(run_id)
+    assert nr["gateway_run_id"] in (None, "run_2") and nr["gateway_run_id"] != "run_1"
+    assert nr["session_id"] != "run_1"
+    await eng.cancel_run(run_id)
 
 
 # 14 ─ key never in logs, events or errors

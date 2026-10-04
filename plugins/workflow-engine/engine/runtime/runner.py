@@ -563,7 +563,11 @@ class WorkflowRunner:
                     # not dedupe, so a fresh insert would leave a zombie.
                     nr = run_store.find_node_run(run_id, node_id)
                     if nr is not None:
-                        run_store.update_node_run(nr["id"], {"status": "running", "completed_at": None})
+                        run_store.update_node_run(nr["id"], {
+                            "status": "running", "completed_at": None,
+                            # a retried routed node must not show the old attempt's run
+                            "session_id": None, "gateway_run_id": None,
+                        })
                     else:
                         nr = run_store.create_node_run(
                             workflow_run_id=run_id,

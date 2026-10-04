@@ -117,6 +117,7 @@ class NodeExecutionResult:
     state: str  # "completed" | "failed" | "skipped"
     output: str = ""
     error: Optional[str] = None
+    no_retry: bool = False  # failure must never be re-dispatched, even with on_error: all
 
 
 # ── Retry Config ──────────────────────────────────────────────────────────────
@@ -758,6 +759,7 @@ async def _execute_node_with_retry(
 
         should_retry = (
             not is_fatal
+            and not result.no_retry
             and attempt < max_retries
             and (on_error == "all" or is_transient)
         )

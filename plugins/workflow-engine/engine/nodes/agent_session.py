@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 import uuid
@@ -43,7 +44,7 @@ DEFAULT_TIMEOUT_S = 1800
 MAX_POLL_ERRORS = 30
 RATE_LIMIT_BACKOFF_S = (1, 2, 4, 8, 16)
 CONNECT_ATTEMPTS = 4  # first try + 3 with the same idempotency key
-LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOOPBACK_HOSTS = {"127.0.0.1", "::1"}
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _TERMINAL_FAILED = {"failed", "cancelled", "interrupted"}
 
@@ -81,8 +82,13 @@ def routing_config(home: Optional[Any]) -> Dict[str, Any]:
 
 def _policy_error(profile: str, cfg: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
     """(error, api_key). Every error contains "forbidden" → FATAL."""
-    url = urlsplit(cfg["gateway_url"])
-    if url.scheme not in ("http", "https") or url.hostname not in LOOPBACK_HOSTS:
+    try:
+        url = urlsplit(cfg["gateway_url"])
+        host = url.hostname
+    except ValueError:
+        host = None
+        url = None
+    if url is None or url.scheme not in ("http", "https") or host not in LOOPBACK_HOSTS:
         return "routing forbidden: workflow.routing.gateway_url is misconfigured (must be a loopback http(s) URL)", None
     if profile not in cfg["allowed_profiles"]:
         return f"routing to profile '{profile}' forbidden: not in workflow.routing.allowed_profiles", None
@@ -121,17 +127,17 @@ async def execute_agent_session_node(
 
     usage: Optional[Dict[str, Any]] = None
 
-    def fail(err: str) -> "NodeExecutionResult":
+    def fail(err: str, no_retry: bool = False) -> "NodeExecutionResult":
         logger.error("dag_node_failed node=%s profile=%s error=%s", node.id, profile, err)
         payload: Dict[str, Any] = {"run_id": ctx.run_id, "node_id": node.id, "error": err}
         if usage:
             payload["usage"] = usage
         ctx.emit_event("node_failed", payload)
-        return NodeExecutionResult(state="failed", error=err)
+        return NodeExecutionResult(state="failed", error=err, no_retry=no_retry)
 
     err, api_key = _policy_error(profile, cfg)
     if err:
-        return fail(err)
+        return fail(err, True)
 
     raw_prompt = getattr(node, "prompt", "") or ""
     final_prompt = substitute_inputs(
@@ -170,19 +176,29 @@ async def execute_agent_session_node(
                         base, headers=headers,
                         json={"input": final_prompt, "instructions": instructions},
                     )
-                except (httpx.ConnectError, httpx.TimeoutException):
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                    # Nothing was sent: safe to replay and to retry at DAG level.
                     connect_failures += 1
                     if connect_failures >= CONNECT_ATTEMPTS:
-                        return fail(f"routed run to '{profile}': gateway unreachable (connection refused)")
+                        return fail(f"routed run to '{profile}': gateway temporarily unavailable "
+                                    f"({type(e).__name__}, request not sent)")
+                    await _sleep(connect_failures)
+                    continue
+                except (httpx.ReadTimeout, httpx.WriteTimeout):
+                    # Request may have been delivered: replay with the same key, never DAG-retry.
+                    connect_failures += 1
+                    if connect_failures >= CONNECT_ATTEMPTS:
+                        return fail(f"routed run to '{profile}': gateway did not answer dispatch (may have started)", True)
                     await _sleep(connect_failures)
                     continue
                 if resp.status_code == 429:
                     if rate_limited >= len(RATE_LIMIT_BACKOFF_S):
                         return fail(f"routed run to '{profile}': gateway rate limit (429), concurrency exhausted")
                     try:
-                        delay = min(float(resp.headers.get("Retry-After", "")), 30.0)
+                        delay = float(resp.headers.get("Retry-After", ""))
                     except ValueError:
-                        delay = RATE_LIMIT_BACKOFF_S[rate_limited]
+                        delay = float("nan")
+                    delay = min(max(delay, 0.0), 30.0) if math.isfinite(delay) else RATE_LIMIT_BACKOFF_S[rate_limited]
                     rate_limited += 1
                     await _sleep(delay)
                     continue
@@ -190,10 +206,13 @@ async def execute_agent_session_node(
             if resp.status_code == 409:
                 return fail(f"routed run to '{profile}' rejected: idempotency conflict (HTTP 409)")
             if resp.status_code in (401, 403):
-                return fail(f"routed run to '{profile}' rejected: unauthorized (HTTP {resp.status_code})")
+                return fail(f"routed run to '{profile}' rejected: unauthorized (HTTP {resp.status_code})", True)
             if resp.status_code != 202:
                 return fail(f"routed run to '{profile}' rejected by gateway (HTTP {resp.status_code})")
-            gw_run_id = str(resp.json().get("run_id") or "")
+            try:
+                gw_run_id = str(resp.json().get("run_id") or "")
+            except ValueError:
+                gw_run_id = ""
             if not gw_run_id:
                 return fail(f"routed run to '{profile}': gateway returned no run_id")
             logger.info("dag_node_routed node=%s profile=%s gateway_run_id=%s", node.id, profile, gw_run_id)
@@ -205,24 +224,28 @@ async def execute_agent_session_node(
             while True:
                 if _monotonic() - node_start > timeout_s:
                     await stop()
-                    return fail(f"routed run on '{profile}' exceeded its time limit ({timeout_s}s)")
+                    return fail(f"routed run on '{profile}' exceeded its time limit ({timeout_s}s)", True)
+                status: Any = None
                 try:
                     resp = await client.get(f"{base}/{gw_run_id}", headers=headers)
-                except httpx.TransportError:
+                    if resp.status_code == 200:
+                        status = resp.json()
+                        if not isinstance(status, dict):
+                            raise ValueError("non-object status body")
+                except (httpx.TransportError, ValueError):
                     resp = None
                 if resp is not None and resp.status_code == 404:
                     return fail(f"routed run vanished (profile '{profile}', gateway run {gw_run_id})")
-                if resp is None or resp.status_code != 200:
+                if resp is None or status is None:
                     poll_errors += 1
                     if poll_errors > MAX_POLL_ERRORS:
                         # Run may still be live: stop it, and word the error
                         # so the DAG does not re-dispatch a duplicate.
                         await stop()
-                        return fail(f"routed run on '{profile}': lost contact with gateway")
+                        return fail(f"routed run on '{profile}': lost contact with gateway", True)
                     await _sleep(POLL_S)
                     continue
                 poll_errors = 0
-                status = resp.json()
                 if isinstance(status.get("usage"), dict):
                     usage = {**status["usage"], "cost_usd": None, "model": None, "provider": None}
                 if not announced:
@@ -246,7 +269,7 @@ async def execute_agent_session_node(
                     approval_since = approval_since if approval_since is not None else _monotonic()
                     if _monotonic() - approval_since > cfg["approval_wait_s"]:
                         await stop()
-                        return fail(f"routed run on '{profile}' approval wait exceeded")
+                        return fail(f"routed run on '{profile}' approval wait exceeded", True)
                 else:
                     approval_since = None
                 await _sleep(POLL_S)
@@ -254,6 +277,10 @@ async def execute_agent_session_node(
             if gw_run_id:
                 await stop()
             raise
+        except Exception as e:
+            if gw_run_id:
+                await stop()
+            return fail(f"routed run on '{profile}' aborted: {type(e).__name__}", True)
 
     output_text = status.get("output") or ""
     duration_ms = int((_monotonic() - node_start) * 1000)
