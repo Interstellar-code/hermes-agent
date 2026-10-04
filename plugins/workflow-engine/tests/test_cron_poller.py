@@ -37,6 +37,10 @@ def _make_conn() -> sqlite3.Connection:
     return conn
 
 
+def _seed(conn, job_id="job-1"):
+    _upsert_last_fired_at(conn, job_id, "")
+
+
 def _make_engine(conn: sqlite3.Connection, start_run_result: Optional[Dict] = None) -> MagicMock:
     engine = MagicMock()
     engine._conn = conn
@@ -73,6 +77,8 @@ def _make_job(
 async def test_poller_fires_due_job():
     """Poller calls start_run for a job that has not been fired yet."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -93,6 +99,8 @@ async def test_poller_fires_due_job():
 async def test_poller_skips_already_fired_job():
     """Poller does NOT call start_run if last_fired_at == last_run_at."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     _upsert_last_fired_at(conn, "job-1", "2026-05-19T10:00:00Z")
     engine = _make_engine(conn)
     poller = CronPoller(engine)
@@ -108,6 +116,8 @@ async def test_poller_skips_already_fired_job():
 async def test_poller_skips_job_without_switchui_workflow_id():
     """Jobs without switchui_workflow_id are ignored."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -122,6 +132,8 @@ async def test_poller_skips_job_without_switchui_workflow_id():
 async def test_poller_skips_errored_job_and_advances_cursor():
     """Jobs with last_status=error do not fire but cursor advances."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -137,6 +149,8 @@ async def test_poller_skips_errored_job_and_advances_cursor():
 async def test_poller_advances_cursor_on_start_run_failure():
     """Cursor advances even when start_run raises, preventing infinite retry."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     engine.start_run = AsyncMock(side_effect=RuntimeError("boom"))
     poller = CronPoller(engine)
@@ -152,6 +166,8 @@ async def test_poller_advances_cursor_on_start_run_failure():
 async def test_poller_passes_inputs():
     """Inputs from payload are forwarded to start_run."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -170,6 +186,8 @@ async def test_poller_passes_inputs():
 async def test_poller_fires_new_run_after_cursor_advances():
     """Second tick with a new last_run_at fires a second run."""
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -191,6 +209,8 @@ async def test_poller_json_string_payload():
     import json
 
     conn = _make_conn()
+    _seed(conn)
+    _seed(conn, 'job-3')
     engine = _make_engine(conn)
     poller = CronPoller(engine)
 
@@ -206,3 +226,22 @@ async def test_poller_json_string_payload():
     engine.start_run.assert_awaited_once()
     args = engine.start_run.await_args[0]
     assert args[0] == "json-workflow"
+
+
+@pytest.mark.asyncio
+async def test_poller_first_seen_job_seeds_cursor_without_firing():
+    conn = _make_conn()
+    engine = _make_engine(conn)
+    with patch("engine.cron.poller._fetch_jobs", new=AsyncMock(return_value=[_make_job()])):
+        await CronPoller(engine).tick()
+    engine.start_run.assert_not_awaited()
+    assert _get_last_fired_at(conn, "job-1") == "2026-05-19T10:00:00Z"
+
+
+def test_migrated_db_has_workflow_cron_jobs():
+    from engine.db.client import open_db
+    from engine.db.migrate import ensure_schema
+
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        conn.execute("SELECT cron_job_id, last_fired_at FROM workflow_cron_jobs")

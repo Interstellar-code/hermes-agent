@@ -1,4 +1,4 @@
-"""hermes workflow daemon — runs CronPoller + KanbanDispatcher.
+"""hermes workflow daemon — runs CronPoller + scheduled-run tick.
 
 Start via:
     hermes workflow daemon --interval 60
@@ -29,12 +29,10 @@ log = logging.getLogger("workflow.daemon")
 async def _main(args: Any) -> int:
     from ._shared import get_engine  # noqa: PLC0415
     from engine.cron.poller import CronPoller  # noqa: PLC0415
-    from engine.dispatcher.kanban import KanbanDispatcher  # noqa: PLC0415
     from engine.runtime.scheduler_tick import run_scheduler_tick_loop  # noqa: PLC0415
 
     engine = get_engine()
     poller = CronPoller(engine, poll_interval_s=args.interval)
-    dispatcher = KanbanDispatcher(engine)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -59,7 +57,6 @@ async def _main(args: Any) -> int:
 
     tasks = [
         asyncio.create_task(poller.run_forever(), name="wf-cron-poller"),
-        asyncio.create_task(dispatcher.run_forever(), name="wf-kanban-dispatcher"),
         asyncio.create_task(
             run_scheduler_tick_loop(engine), name="wf-scheduler-tick",
         ),
@@ -72,16 +69,32 @@ async def _main(args: Any) -> int:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Write/clear pidfile if requested
-    if args.pidfile:
-        try:
-            import os  # noqa: PLC0415
-            os.unlink(args.pidfile)
-        except OSError:
-            pass
-
     log.info("workflow daemon: clean exit")
     return 0
+
+
+def _acquire_single_instance_lock(pidfile: Any) -> Any:
+    """flock a profile-scoped file (HERMES_HOME) so two daemons can't double-fire.
+
+    Returns the open file (keep referenced for process life) or None if held.
+    """
+    import fcntl  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+    from hermes_constants import get_hermes_home  # noqa: PLC0415
+
+    path = Path(pidfile) if pidfile else get_hermes_home() / "workflow-daemon.pid"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a+", encoding="utf-8")  # noqa: SIM115 — held for process life
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    f.seek(0)
+    f.truncate()
+    f.write(str(__import__("os").getpid()))
+    f.flush()
+    return f
 
 
 def _setup(sub: argparse.ArgumentParser) -> None:
@@ -94,7 +107,7 @@ def _setup(sub: argparse.ArgumentParser) -> None:
 
     daemon_sub = subs.add_parser(
         "daemon",
-        help="Run the workflow scheduler (cron poller + kanban dispatcher).",
+        help="Run the workflow scheduler (cron poller + scheduled-run tick).",
     )
     daemon_sub.add_argument(
         "--interval",
@@ -107,7 +120,7 @@ def _setup(sub: argparse.ArgumentParser) -> None:
         "--pidfile",
         default=None,
         metavar="PATH",
-        help="Write PID to this file on start; remove on clean exit.",
+        help="Lock/PID file (default: $HERMES_HOME/workflow-daemon.pid).",
     )
 
     def _run(ns: argparse.Namespace) -> None:
@@ -115,11 +128,10 @@ def _setup(sub: argparse.ArgumentParser) -> None:
             level=logging.INFO,
             format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
         )
-        # Write pidfile before entering loop
-        if ns.pidfile:
-            import os  # noqa: PLC0415
-            with open(ns.pidfile, "w", encoding="utf-8") as f:
-                f.write(str(os.getpid()))
+        lock = _acquire_single_instance_lock(ns.pidfile)
+        if lock is None:
+            log.error("workflow daemon: another instance holds the lock; exiting")
+            sys.exit(0)  # clean exit: supervisors must not respawn a duplicate
         sys.exit(asyncio.run(_main(ns)))
 
     daemon_sub.set_defaults(func=_run)

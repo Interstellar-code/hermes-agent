@@ -40,7 +40,7 @@ This plugin replaces MCP tool schemas with lightweight stubs (~80 tokens each, n
                                                        │
                                                        ▼
                                           calls load_mcp_tools(
-                                            tool_names=["mcp_trek_search_files"]
+                                            tool_names=["mcp__trek__search_files"]
                                           )
                                                        │
         ┌──────────────────────────────────────────────┘
@@ -66,7 +66,7 @@ This plugin replaces MCP tool schemas with lightweight stubs (~80 tokens each, n
                                                        │
                                                        ▼
                                           model calls
-                                          mcp_trek_search_files(
+                                          mcp__trek__search_files(
                                             pattern="**/*.py", ...
                                           ) with proper params
                                                        │
@@ -113,11 +113,11 @@ First non-empty list returned by any plugin wins. Failures are exception-isolate
 
 Pools live in a module-level `weakref.WeakValueDictionary`, anchored by the agent's `_mcp_lazy_pool` attribute. When a session ends (`/new` or `/reset`), the agent reassigns and the old pool drops naturally.
 
-Cross-session isolation is enforced: session A promoting `mcp_trek_search` does NOT cause session B to see the full schema.
+Cross-session isolation is enforced: session A promoting `mcp__trek__search` does NOT cause session B to see the full schema.
 
 ### Schema-level stub detection
 
-Hermes canonicalizes empty tool args to `"{}"` at `agent/conversation_loop.py:3103-3105`. That makes "empty args = stub call" indistinguishable from real zero-arg MCP tools like `mcp_zai_web_search_search`. To avoid that collision, the sentinel lives in the **schema** we registered, not the model's call:
+Hermes canonicalizes empty tool args to `"{}"` at `agent/conversation_loop.py:3103-3105`. That makes "empty args = stub call" indistinguishable from real zero-arg MCP tools like `mcp__zai__web_search_search`. To avoid that collision, the sentinel lives in the **schema** we registered, not the model's call:
 
 ```python
 LAZY_SENTINEL = "__lazy_stub__"
@@ -196,6 +196,10 @@ mcp_servers:
 
 `mcp_servers.<name>.description` supplies the text shown in that server's `mcp_server_<name>` stub when `discovery_mode` is `server` or `both`.
 
+### Relation to core Tool Search
+
+Core ships its own progressive disclosure, `tools/tool_search.py` (config `tool_search.*`): MCP/plugin tools are replaced by three bridge tools (`tool_search` / `tool_describe` / `tool_call`) over a catalog rebuilt each assembly. `mcp_lazy` is an independent, older mechanism: it keeps per-tool (or per-server) stubs in the tool list and promotes via `load_mcp_tools` / `load_mcp_server`. Both defer the same MCP schemas, so running both stacks two disclosure layers; enable one (`tool_search.enabled: off` or `mcp.lazy_loading: false`). `mcp_lazy` needs the fork-only `transform_tools` seam, which core Tool Search does not.
+
 ### Phase 0 baseline logger toggle
 
 ```bash
@@ -203,7 +207,7 @@ mcp_servers:
 HERMES_MCP_LAZY_BASELINE=0       # disable the baseline cache hit-rate logger
 ```
 
-The baseline logger runs independently of `mcp.lazy_loading` — it's passive telemetry that appends one JSONL row per API call to `~/.hermes/mcp-lazy/cache-baseline.jsonl`.
+The baseline logger runs independently of `mcp.lazy_loading` — it's passive telemetry that appends one JSONL row per API call to `<HERMES_HOME>/mcp-lazy/cache-baseline.jsonl` (profile-scoped; rotated to `.jsonl.1` at 5 MB).
 
 ---
 
@@ -233,8 +237,8 @@ Returns JSON:
 ```json
 {
   "ok": true,
-  "promoted": ["mcp_trek_search_files", "mcp_dart_get_task"],
-  "rejected": ["mcp_typo_name"],
+  "promoted": ["mcp__trek__search_files", "mcp__dart__get_task"],
+  "rejected": ["mcp__typo__name"],
   "note": "Full schemas will be visible on the next turn..."
 }
 ```
@@ -410,7 +414,7 @@ grep -E "load_mcp_tools|load_mcp_server|mcp_lazy|tool .*(completed|started)" \
 
 You should see:
 - `tool load_mcp_tools completed (Xms, Y chars)` — model promoted tools
-- `tool mcp_<server>_<tool> completed (...)` next turn — promoted tool actually invoked
+- `tool mcp__<server>__<tool> completed (...)` next turn — promoted tool actually invoked
 
 ### Check cache hit rate
 
@@ -446,7 +450,7 @@ Handled by the `pre_tool_call` hook (CRITICAL #1). When the model calls a stubbe
 A real MCP server named `server` produces concrete tools (`mcp_server_foo`) whose names start with `mcp_server_`, colliding with synthetic server-stub names. The plugin checks `valid_tool_names` membership — names present there are real tools and fall through to normal per-tool handling; names absent are treated as discovery stubs.
 
 ### Calling a server stub after the server is already promoted
-If the model calls `mcp_server_<name>` after that server was promoted, `pre_tool_call` blocks with a message listing the concrete `mcp_<server>_<tool>` names to use instead (stale-stub guard, #31).
+If the model calls `mcp_server_<name>` after that server was promoted, `pre_tool_call` blocks with a message listing the concrete `mcp__<server>__<tool>` names to use instead (stale-stub guard, #31).
 
 ### Mid-session `discovery_mode` flip
 If `discovery_mode` changes while a session is live, `transform_tools` logs a WARNING and preserves promoted-server state. The previous mode is tracked on the pool (`_prev_mode`) so it clears on session evict — no module-level leak (#29).

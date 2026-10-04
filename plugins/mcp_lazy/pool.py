@@ -12,7 +12,7 @@ schema. The pool registry keys on session_id and uses a weak-value
 dictionary so finished sessions get garbage-collected naturally.
 
 Session-end events (``/new`` and its ``/reset`` alias both route to
-``new_session()`` in ``hermes_cli/cli.py``) fire a ``pre_session_reset``
+``new_session()`` in ``hermes_cli/cli.py``) fire a ``on_session_reset``
 hook that calls :func:`evict` explicitly — belt for the GC suspenders.
 """
 from __future__ import annotations
@@ -220,7 +220,7 @@ def get_pool(session_id: str) -> DeferredToolPool:
 def evict(session_id: str) -> None:
     """Drop the pool for ``session_id`` immediately.
 
-    Called from the ``pre_session_reset`` hook at ``cli.py:5900``
+    Called from the ``on_session_reset`` hook
     before the old session's ``end_session()`` fires.
     """
     pool = _pools.pop(session_id, None)

@@ -105,8 +105,13 @@ def test_approve_node_run_wrong_run(client):
     run_id_1 = r1.json()["run"]["id"]
 
     # GET run detail to find any node_runs
-    detail = client.get(f"/runs/{run_id_1}").json()
-    node_runs = detail.get("nodeRuns", [])
+    # The run executes on the engine loop thread; give it a moment.
+    import time
+    for _ in range(100):
+        node_runs = client.get(f"/runs/{run_id_1}").json().get("nodeRuns", [])
+        if node_runs:
+            break
+        time.sleep(0.02)
 
     if not node_runs:
         pytest.skip("No node_runs created (DAG may have completed instantly)")

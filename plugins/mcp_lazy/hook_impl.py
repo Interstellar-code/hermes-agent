@@ -23,13 +23,18 @@ logger = logging.getLogger(__name__)
 # never cleaned up on evict().  See Interstellar-code/hermes-agent#29.
 
 
-def _load_config() -> Dict[str, Any]:
-    """Read ``mcp`` config block; tolerate missing config."""
+def _load_root() -> Dict[str, Any]:
+    """Read the whole config once (no deepcopy); tolerate missing config."""
     try:
-        from hermes_cli.config import load_config  # noqa: PLC0415
-        return load_config().get("mcp", {}) or {}
+        from hermes_cli.config import load_config_readonly  # noqa: PLC0415
+        return load_config_readonly() or {}
     except Exception:
         return {}
+
+
+def _load_config() -> Dict[str, Any]:
+    """Read ``mcp`` config block; tolerate missing config."""
+    return _load_root().get("mcp", {}) or {}
 
 
 def _lazy_mode(cfg: Dict[str, Any]) -> str:
@@ -59,7 +64,7 @@ def _schema_tokens(schema: Dict[str, Any]) -> int:
         return 0
 
 
-def _eligible_servers() -> Optional[Set[str]]:
+def _eligible_servers(mcp_servers: Optional[Dict[str, Any]] = None) -> Optional[Set[str]]:
     """Return the set of MCP server names that should be stubbed.
 
     Reads the top-level ``mcp_servers`` config block (the real shape
@@ -68,11 +73,8 @@ def _eligible_servers() -> Optional[Set[str]]:
     which the caller interprets as "stub every MCP tool regardless
     of server" (the safest default for the master-toggle case).
     """
-    try:
-        from hermes_cli.config import load_config  # noqa: PLC0415
-        mcp_servers = load_config().get("mcp_servers", {}) or {}
-    except Exception:
-        return None
+    if mcp_servers is None:
+        mcp_servers = _load_root().get("mcp_servers", {}) or {}
     if not mcp_servers:
         return None
     eligible: Set[str] = set()
@@ -89,13 +91,10 @@ def _eligible_servers() -> Optional[Set[str]]:
     return eligible
 
 
-def _server_descriptions() -> Dict[str, str]:
+def _server_descriptions(mcp_servers: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
     """Return configured per-server descriptions (may be empty dict)."""
-    try:
-        from hermes_cli.config import load_config  # noqa: PLC0415
-        mcp_servers = load_config().get("mcp_servers", {}) or {}
-    except Exception:
-        return {}
+    if mcp_servers is None:
+        mcp_servers = _load_root().get("mcp_servers", {}) or {}
     result: Dict[str, str] = {}
     for name, spec in mcp_servers.items():
         if isinstance(spec, dict):
@@ -117,8 +116,10 @@ def transform_tools(
     the original ``tools`` list unchanged (fail-open).
     """
     try:
-        cfg = _load_config()
-        logger.info(
+        root = _load_root()  # once per request; passed down below
+        cfg = root.get("mcp", {}) or {}
+        mcp_servers = root.get("mcp_servers", {}) or {}
+        logger.debug(
             "mcp_lazy: transform_tools called — lazy_loading=%r session_id=%r tool_count=%d",
             cfg.get("lazy_loading"),
             getattr(agent, "session_id", None) if agent is not None else None,
@@ -126,12 +127,12 @@ def transform_tools(
         )
         mode = _lazy_mode(cfg)
         if mode == "off":
-            logger.info("mcp_lazy: skipping — lazy_loading is off")
+            logger.debug("mcp_lazy: skipping — lazy_loading is off")
             return None  # master toggle off
 
         session_id = getattr(agent, "session_id", None) if agent is not None else None
         if not session_id:
-            logger.info("mcp_lazy: skipping — no session_id on agent")
+            logger.debug("mcp_lazy: skipping — no session_id on agent")
             return None
 
         pool = get_pool(session_id)
@@ -154,7 +155,7 @@ def transform_tools(
 
         pool.tick()
 
-        eligible = _eligible_servers()
+        eligible = _eligible_servers(mcp_servers)
 
         if mode == "auto":
             # Pass through when the stub-eligible MCP schemas are too small
@@ -169,7 +170,7 @@ def transform_tools(
             threshold = int(cfg.get("lazy_auto_threshold_tokens", 4000) or 4000)
             if candidate_cost < threshold:
                 pool._lazy_active = False
-                logger.info(
+                logger.debug(
                     "mcp_lazy: auto mode pass-through — eligible MCP cost %d tok < threshold %d",
                     candidate_cost, threshold,
                 )
@@ -224,7 +225,7 @@ def transform_tools(
         sample = next((t for t in tools if t.get("function", {}).get("name", "").startswith("mcp_")), None)
         if sample is None:
             sample = tools[0] if tools else None
-        logger.info(
+        logger.debug(
             "mcp_lazy: eligible_servers=%r discovery_mode=%r mcp_tools_detected=%d sample_keys=%r",
             eligible,
             discovery_mode,
@@ -232,7 +233,7 @@ def transform_tools(
             list(sample.keys()) if sample else None,
         )
 
-        server_descs = _server_descriptions() if discovery_mode != "tool" else {}
+        server_descs = _server_descriptions(mcp_servers) if discovery_mode != "tool" else {}
 
         result = mix_full_and_stubs(
             tools,
@@ -252,7 +253,7 @@ def transform_tools(
             and not is_stub_schema(t)
             and not is_server_stub_schema(t)
         )
-        logger.info(
+        logger.debug(
             "mcp_lazy: stubbed tool list — in=%d out=%d tool_stubs=%d server_stubs=%d full_mcp=%d",
             len(tools), len(result), stub_count, server_stub_count, full_mcp,
         )
@@ -322,9 +323,10 @@ def pre_tool_call(
                 # promoted vs unpromoted cases explicitly.
                 server_name = tool_name[len("mcp_server_"):].strip()
                 if server_name and pool.is_server_promoted(server_name):
-                    prefix = f"mcp_{server_name}_"
+                    from tools.mcp_tool_schema import mcp_prefixed_tool_name  # noqa: PLC0415
+                    prefix = mcp_prefixed_tool_name(server_name, "")
                     concrete = sorted(t for t in valid if t.startswith(prefix))
-                    hint = ", ".join(concrete[:8]) or "(use the mcp_{server}_<tool> names from the tool list)"
+                    hint = ", ".join(concrete[:8]) or "(use the mcp__<server>__<tool> names from the tool list)"
                     logger.info(
                         "mcp_lazy: pre_tool_call rejected stale server stub %r — server already promoted",
                         tool_name,

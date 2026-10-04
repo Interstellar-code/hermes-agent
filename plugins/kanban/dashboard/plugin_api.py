@@ -27,6 +27,7 @@ from fastapi import (
     APIRouter, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect,
     status as http_status)
 from fastapi.responses import FileResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
@@ -36,7 +37,6 @@ from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
-from hermes_cli import kanban_templates
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
 
 log = logging.getLogger(__name__)
@@ -1731,16 +1731,23 @@ async def stream_events(ws: WebSocket):
 
 # --- Templates (list/get/create/update/delete/instantiate, board->template) --
 
-def _template_error_to_http(exc: kanban_templates.TemplateError) -> HTTPException:
+def _kt():
+    # fork: lazy import so a broken kanban_templates doesn't take down the whole kanban dashboard.
+    from hermes_cli import kanban_templates
+    return kanban_templates
+
+
+def _template_error_to_http(exc: "kt.TemplateError") -> HTTPException:
     """Map ``TemplateError`` subclasses to the correct HTTP status code.
 
     Messages are user-safe by contract (``TemplateError`` docstring); never leaks tracebacks.
     """
-    if isinstance(exc, kanban_templates.TemplateNotFound):
+    kt = _kt()
+    if isinstance(exc, kt.TemplateNotFound):
         return HTTPException(status_code=404, detail=str(exc))
-    if isinstance(exc, kanban_templates.TemplateValidationError):
+    if isinstance(exc, kt.TemplateValidationError):
         return HTTPException(status_code=422, detail=str(exc))
-    if isinstance(exc, kanban_templates.InstantiationRefused):
+    if isinstance(exc, kt.InstantiationRefused):
         return HTTPException(status_code=409, detail=str(exc))
     return HTTPException(status_code=400, detail=str(exc))  # base TemplateError + future subclasses
 
@@ -1748,45 +1755,56 @@ def _template_error_to_http(exc: kanban_templates.TemplateError) -> HTTPExceptio
 @router.get("/templates")
 def list_templates_endpoint():
     """Return all installed templates as a list."""
+    kt = _kt()
     try:
-        templates = kanban_templates.list_templates()
-    except kanban_templates.TemplateError as exc:
+        templates = kt.list_templates()
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to list templates: {exc}")
+    except Exception:
+        log.exception("failed to list templates")
+        raise HTTPException(status_code=500, detail="failed to list templates")
     return {"templates": templates}
 
 
 @router.get("/templates/{slug}")
 def get_template_endpoint(slug: str):
     """Return the full template dict for *slug*."""
+    kt = _kt()
     try:
-        return kanban_templates.load_template(slug)
-    except kanban_templates.TemplateError as exc:
+        return kt.load_template(slug)
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to load template: {exc}")
+    except Exception:
+        log.exception("failed to load template")
+        raise HTTPException(status_code=500, detail="failed to load template")
+
+
+async def _read_capped_body(request: Request) -> bytes:
+    """Read the request body; 413 above ``MAX_TEMPLATE_BYTES``."""
+    raw: bytes = await request.body()
+    if len(raw) > _kt().MAX_TEMPLATE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"request body exceeds maximum template size of {_kt().MAX_TEMPLATE_BYTES} bytes ({len(raw)} bytes received)")
+    return raw
 
 
 async def _read_template_body(request: Request, slug_override: Optional[str] = None) -> tuple[str, str]:
     """Read/validate a POST or PUT template body.
 
     Accepts Content-Type ``text/yaml``/``application/x-yaml`` (raw YAML) or ``application/json``
-    (``{"slug": ..., "yaml": ...}``). Enforces ``kanban_templates.MAX_TEMPLATE_BYTES`` BEFORE
+    (``{"slug": ..., "yaml": ...}``). Enforces ``kt.MAX_TEMPLATE_BYTES`` BEFORE
     parsing (413). Returns ``(slug, yaml_text)``; *slug_override* (path param) wins over any
     slug in the body.
     """
-    raw: bytes = await request.body()
-    if len(raw) > kanban_templates.MAX_TEMPLATE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f"request body exceeds maximum template size of "
-                f"{kanban_templates.MAX_TEMPLATE_BYTES} bytes ({len(raw)} bytes received)"))
+    raw = await _read_capped_body(request)
 
     content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
     if content_type in ("text/yaml", "application/x-yaml"):
-        yaml_text = raw.decode("utf-8", errors="replace")
+        try:
+            yaml_text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=422, detail=f"body is not valid UTF-8: {exc}")
         if slug_override:
             slug = slug_override
         else:
@@ -1794,18 +1812,21 @@ async def _read_template_body(request: Request, slug_override: Optional[str] = N
             try:
                 import yaml as _yaml
                 parsed = _yaml.safe_load(yaml_text)
-                slug = (parsed.get("slug") or "") if isinstance(parsed, dict) else ""
+                slug = parsed.get("slug") if isinstance(parsed, dict) else ""
+                slug = slug if isinstance(slug, str) else ""
             except Exception:
                 slug = ""
     else:
         try:
             body = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:  # JSONDecodeError + UnicodeDecodeError
             raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}")
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="body must be a JSON object")
         yaml_text = body.get("yaml") or ""
         slug = slug_override or body.get("slug") or ""
+        if not isinstance(yaml_text, str) or not isinstance(slug, str):
+            raise HTTPException(status_code=422, detail="'yaml' and 'slug' must be strings")
 
     if not yaml_text:
         raise HTTPException(status_code=422, detail="missing YAML content")
@@ -1815,13 +1836,15 @@ async def _read_template_body(request: Request, slug_override: Optional[str] = N
 @router.post("/templates", status_code=201)
 async def create_template_endpoint(request: Request):
     """Create a new template. Body: raw YAML, or JSON ``{"slug": ..., "yaml": ...}``."""
+    kt = _kt()
     slug, yaml_text = await _read_template_body(request)
     try:
-        tmpl = kanban_templates.save_template(slug, yaml_text)
-    except kanban_templates.TemplateError as exc:
+        tmpl = await run_in_threadpool(kt.save_template, slug, yaml_text)
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to save template: {exc}")
+    except Exception:
+        log.exception("failed to save template")
+        raise HTTPException(status_code=500, detail="failed to save template")
     return {"template": tmpl}
 
 
@@ -1829,32 +1852,36 @@ async def create_template_endpoint(request: Request):
 async def update_template_endpoint(slug: str, request: Request):
     """Update an existing template (path *slug* wins over any body slug); 404 if unknown
     (verified before writing so PUT is never a silent create)."""
+    kt = _kt()
     try:
-        kanban_templates.load_template(slug)
-    except kanban_templates.TemplateNotFound as exc:
+        await run_in_threadpool(kt.load_template, slug)
+    except kt.TemplateNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
-    except kanban_templates.TemplateError as exc:
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
 
     _, yaml_text = await _read_template_body(request, slug_override=slug)
     try:
-        tmpl = kanban_templates.save_template(slug, yaml_text)
-    except kanban_templates.TemplateError as exc:
+        tmpl = await run_in_threadpool(kt.save_template, slug, yaml_text)
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to update template: {exc}")
+    except Exception:
+        log.exception("failed to update template")
+        raise HTTPException(status_code=500, detail="failed to update template")
     return {"template": tmpl}
 
 
 @router.delete("/templates/{slug}")
 def delete_template_endpoint(slug: str):
     """Delete the template identified by *slug*; 404 if missing."""
+    kt = _kt()
     try:
-        kanban_templates.delete_template(slug)
-    except kanban_templates.TemplateError as exc:
+        kt.delete_template(slug)
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to delete template: {exc}")
+    except Exception:
+        log.exception("failed to delete template")
+        raise HTTPException(status_code=500, detail="failed to delete template")
     return {"ok": True}
 
 
@@ -1873,17 +1900,14 @@ async def instantiate_template_endpoint(slug: str, request: Request):
     auto_dispatch? (default false), tenant?}``. Errors: 404 (not found), 409 (instantiation
     refused), 422 (validation).
     """
-    raw: bytes = await request.body()
-    if len(raw) > kanban_templates.MAX_TEMPLATE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"request body exceeds {kanban_templates.MAX_TEMPLATE_BYTES} byte cap ({len(raw)} bytes received)")
+    kt = _kt()
+    raw = await _read_capped_body(request)
 
     payload = InstantiateBody()
     if raw.strip():
         try:
             body = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        except ValueError as exc:  # JSONDecodeError + UnicodeDecodeError
             raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}")
         try:
             payload = InstantiateBody(**body)
@@ -1891,13 +1915,14 @@ async def instantiate_template_endpoint(slug: str, request: Request):
             raise HTTPException(status_code=422, detail=f"invalid body fields: {exc}")
 
     try:
-        result = kanban_templates.instantiate(
-            slug, variables=payload.variables, board_slug=payload.board_slug,
+        result = await run_in_threadpool(
+            kt.instantiate, slug, variables=payload.variables, board_slug=payload.board_slug,
             auto_dispatch=payload.auto_dispatch, tenant=payload.tenant)
-    except kanban_templates.TemplateError as exc:
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"instantiation failed: {exc}")
+    except Exception:
+        log.exception("instantiation failed")
+        raise HTTPException(status_code=500, detail="instantiation failed")
     return {
         "ok": True, "board_slug": result["board_slug"], "instance_id": result["instance_id"],
         "task_ids": result["task_ids"], "created": result["created"], "skipped": result["skipped"]}
@@ -1912,12 +1937,14 @@ class SaveAsTemplateBody(BaseModel):
 @router.post("/boards/{slug}/save-as-template")
 def save_board_as_template_endpoint(slug: str, payload: SaveAsTemplateBody):
     """Snapshot a live board as a reusable template."""
+    kt = _kt()
     try:
-        tmpl = kanban_templates.save_board_as_template(
+        tmpl = kt.save_board_as_template(
             board_slug=slug, template_slug=payload.template_slug,
             name=payload.name, reset_status=payload.reset_status)
-    except kanban_templates.TemplateError as exc:
+    except kt.TemplateError as exc:
         raise _template_error_to_http(exc)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to save board as template: {exc}")
+    except Exception:
+        log.exception("failed to save board as template")
+        raise HTTPException(status_code=500, detail="failed to save board as template")
     return {"ok": True, "template": tmpl}

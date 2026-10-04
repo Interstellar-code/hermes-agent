@@ -8,7 +8,14 @@ import time
 from typing import Dict
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_node_output_refs, format_subprocess_failure, substitute_workflow_variables
+from engine.core.executor_shared import (
+    communicate_or_kill,
+    format_subprocess_failure,
+    subprocess_cwd,
+    substitute_node_output_refs,
+    substitute_workflow_variables,
+    workflow_env,
+)
 
 logger = logging.getLogger("workflow.nodes.bash")
 
@@ -56,19 +63,18 @@ async def execute_bash_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
     timeout = (timeout_raw / 1000.0) if timeout_raw else BASH_DEFAULT_TIMEOUT
 
     try:
+        # Inputs are exported as env vars ("$repo_path" expands in bash).
         proc = await asyncio.create_subprocess_exec(
             "bash", "-c", final_script,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=subprocess_cwd(ctx),
+            env=workflow_env(ctx),
+            start_new_session=True,
         )
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_b, stderr_b = await communicate_or_kill(proc, timeout)
         except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
             err_msg = f"Bash node '{node.id}' timed out after {timeout}s"
             logger.error("dag_node_failed node=%s type=bash error=%s", node.id, err_msg)
             ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err_msg})

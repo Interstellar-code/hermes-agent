@@ -57,7 +57,14 @@ from typing import Dict, List, Tuple
 
 
 # Default test discovery roots.
-_DEFAULT_ROOTS = ["tests"]
+# Plugin-local suites are globbed so new plugin test dirs are picked up;
+# plugins/memory/* is skipped (the matrix-memory submodule keeps its own runner).
+_PLUGINS_DIR = Path(__file__).resolve().parent.parent / "plugins"
+_DEFAULT_ROOTS = ["tests"] + sorted(
+    p.relative_to(_PLUGINS_DIR.parent).as_posix()
+    for p in (*_PLUGINS_DIR.glob("*/tests"), *_PLUGINS_DIR.glob("*/*/tests"))
+    if p.is_dir() and "memory" not in p.relative_to(_PLUGINS_DIR).parts
+)
 
 # Directories to skip during discovery — these suites require real
 # external services (a model gateway, a docker daemon with a prebuilt

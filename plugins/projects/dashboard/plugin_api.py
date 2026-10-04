@@ -7,7 +7,10 @@ per-profile ``projects.db`` store through the existing REST plugin surface.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
+from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -51,22 +54,22 @@ class _Request(BaseModel):
 
 
 class CreateProjectRequest(_Request):
-    name: str
-    slug: str | None = None
-    folders: list[str] = Field(default_factory=list)
-    primary_path: str | None = None
-    description: str | None = None
-    icon: str | None = None
-    color: str | None = None
-    board_slug: str | None = None
+    name: str = Field(max_length=200)
+    slug: str | None = Field(None, max_length=100)
+    folders: list[Annotated[str, Field(max_length=4096)]] = Field(default_factory=list, max_length=100)
+    primary_path: str | None = Field(None, max_length=4096)
+    description: str | None = Field(None, max_length=10_000)
+    icon: str | None = Field(None, max_length=100)
+    color: str | None = Field(None, max_length=100)
+    board_slug: str | None = Field(None, max_length=100)
 
 
 class UpdateProjectRequest(_Request):
-    name: str | None = None
-    description: str | None = None
-    icon: str | None = None
-    color: str | None = None
-    board_slug: str | None = None
+    name: str | None = Field(None, max_length=200)
+    description: str | None = Field(None, max_length=10_000)
+    icon: str | None = Field(None, max_length=100)
+    color: str | None = Field(None, max_length=100)
+    board_slug: str | None = Field(None, max_length=100)
 
     @model_validator(mode="after")
     def reject_explicit_nulls(self):
@@ -77,13 +80,13 @@ class UpdateProjectRequest(_Request):
 
 
 class FolderRequest(_Request):
-    path: str
-    label: str | None = None
+    path: str = Field(max_length=4096)
+    label: str | None = Field(None, max_length=200)
     is_primary: bool = False
 
 
 class PathRequest(_Request):
-    path: str
+    path: str = Field(max_length=4096)
 
 
 class SessionBindRequest(_Request):
@@ -114,6 +117,8 @@ def _require_path(path: str) -> str:
     path = path.strip()
     if not path:
         raise HTTPException(status_code=400, detail="folder path must not be empty")
+    if os.path.abspath(os.path.expanduser(path)) in (os.path.abspath(os.sep), str(Path.home())):  # matches every session; never a meaningful project folder
+        raise HTTPException(status_code=400, detail="folder path too broad")
     return path
 
 
@@ -131,15 +136,22 @@ def _project_payload(project) -> dict:
     return response
 
 
-def _projects_payload() -> dict:
+def _projects_payload(include_archived: bool = True) -> dict:
     with projects_db.connect_closing() as conn:
-        projects = projects_db.list_projects(conn, include_archived=True)
+        projects = projects_db.list_projects(conn, include_archived=include_archived)
         active_id = projects_db.get_active_id(conn)
     enriched, errors = enrich_projects(projects, active_id)
     response = {"projects": enriched, "active_id": active_id}
     if errors:
         response["enrichment_errors"] = errors
     return response
+
+
+def _list_and_project(project) -> dict:
+    """List payload + the one project, enriching once (archive/restore responses)."""
+    response = _projects_payload()
+    match = next((p for p in response["projects"] if p["id"] == project.id), None)
+    return {**response, "project": match} if match else {**response, **_project_payload(project)}
 
 
 def _project_or_404(project_id_or_slug: str):
@@ -169,14 +181,7 @@ def list_projects(
     include_archived: bool = Query(False, description="Include archived projects"),
 ) -> dict:
     """Return projects and the active-project pointer for the current profile."""
-    with projects_db.connect_closing() as conn:
-        projects = projects_db.list_projects(conn, include_archived=include_archived)
-        active_id = projects_db.get_active_id(conn)
-    enriched, errors = enrich_projects(projects, active_id)
-    response = {"projects": enriched, "active_id": active_id}
-    if errors:
-        response["enrichment_errors"] = errors
-    return response
+    return _projects_payload(include_archived)
 
 
 @router.post("")
@@ -262,7 +267,7 @@ def archive_project(project_id_or_slug: str) -> dict:
         project_id_or_slug,
         lambda conn, project: projects_db.archive_project(conn, project.id),
     )
-    return {**_projects_payload(), **_project_payload(project)}
+    return _list_and_project(project)
 
 
 @router.post("/{project_id_or_slug}/restore")
@@ -271,7 +276,7 @@ def restore_project(project_id_or_slug: str) -> dict:
         project_id_or_slug,
         lambda conn, project: projects_db.restore_project(conn, project.id),
     )
-    return {**_projects_payload(), **_project_payload(project)}
+    return _list_and_project(project)
 
 
 @router.post("/{project_id_or_slug}/active")
@@ -280,6 +285,8 @@ def set_active_project(project_id_or_slug: str) -> dict:
         project = projects_db.get_project(conn, project_id_or_slug)
         if project is None:
             raise HTTPException(status_code=404, detail="project not found")
+        if project.archived:
+            raise HTTPException(status_code=409, detail="cannot activate an archived project")
         projects_db.set_active(conn, project.id)
     return _projects_payload()
 
@@ -290,12 +297,8 @@ def delete_project(project_id_or_slug: str) -> dict:
         project = projects_db.get_project(conn, project_id_or_slug)
         if project is None:
             raise HTTPException(status_code=404, detail="project not found")
-        if not project.archived:
-            raise HTTPException(status_code=409, detail="only archived projects can be deleted")
-        deleted = projects_db.delete_project(conn, project.id)
-        if not deleted:
-            current = projects_db.get_project(conn, project.id)
-            if current is None:
+        if not projects_db.delete_project(conn, project.id, only_archived=True):
+            if projects_db.get_project(conn, project.id) is None:
                 raise HTTPException(status_code=404, detail="project not found")
             raise HTTPException(status_code=409, detail="only archived projects can be deleted")
     return _projects_payload()
@@ -333,14 +336,7 @@ def get_project_activity(
 @router.get("/{project_id_or_slug}")
 def get_project(project_id_or_slug: str) -> dict:
     """Return one project, resolving either its stable id or slug."""
-    project = _project_or_404(project_id_or_slug)
-    with projects_db.connect_closing() as conn:
-        active_id = projects_db.get_active_id(conn)
-    enriched, errors = enrich_projects([project], active_id)
-    response = {"project": enriched[0]}
-    if errors:
-        response["enrichment_errors"] = errors
-    return response
+    return _project_payload(_project_or_404(project_id_or_slug))
 
 
 # ---------------------------------------------------------------------------

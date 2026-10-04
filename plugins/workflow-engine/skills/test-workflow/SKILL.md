@@ -18,26 +18,26 @@ order of operations, preconditions, pitfalls, and what success looks like.
 - **API base path is `/api/plugins/workflow-engine/`**, NOT `/api/workflows/`.
   The Hermes dashboard mounts plugin routers under `/api/plugins/<name>/`.
 - The dashboard gateway and the **background daemon are separate processes**.
-  Cron-triggered and Kanban-dispatched workflows only advance when the daemon
+  Cron-triggered and scheduled runs only fire when the daemon
   (`hermes workflow daemon`) is running. Manually-triggered runs via
   `workflow_run` advance through the engine regardless.
-- DB lives at `~/.hermes/switchui-workflows.db`; bundled defaults are copied to
-  `~/.hermes/switchui/workflows/` on first enable (27 bundled workflows).
+- DB lives at `$HERMES_HOME/switchui-workflows.db` (profile-scoped); the 27 bundled
+  workflows are seeded into it lazily on first engine use.
 - There is **no Workflows tab** in the Hermes dashboard sidebar
   (`tab.hidden: true`). The UI lives in the separate Switch UI app.
 
 ## Preconditions
 
 1. Plugin enabled: `hermes plugins enable workflow-engine` and gateway restarted.
-2. Confirm the API is live (substitute the dashboard port, default 8642):
+2. Confirm the API is live (dashboard port, default 9119; needs the dashboard auth token — 401 without it, and 404 on the gateway's 8642):
    ```bash
-   curl -s http://localhost:8642/api/plugins/workflow-engine/health
+   curl -s http://localhost:9119/api/plugins/workflow-engine/health
    # → {"ok": true, "version": "0.1.0"}
    ```
    A 404 here almost always means you used the wrong base path.
-3. If the workflow uses `cron:` or `provider: hermes-kanban` / `claude` /
-   `codex` nodes, confirm the daemon is running (systemd/launchd or
-   `hermes workflow daemon --interval 60`). Pure prompt/bash DAGs do not need it.
+3. If the workflow is triggered by a Hermes cron job (`payload.switchui_workflow_id`),
+   confirm the daemon is running (systemd/launchd or `hermes workflow daemon --interval 60`).
+   Runs started with `workflow_run` do not need it.
 
 ## Procedure
 
@@ -52,11 +52,11 @@ order of operations, preconditions, pitfalls, and what success looks like.
    defaults to 5 — repeated test runs in one session can hit the rate gate.
 4. **Monitor** — poll `workflow_status` (or `GET /runs/{run_id}` +
    `GET /runs/{run_id}/nodes`) until terminal. Watch node states transition
-   `pending → running → succeeded/failed`. For live progress use the SSE stream
+   `pending → running → completed/failed`. For live progress use the SSE stream
    at `GET /api/plugins/workflow-engine/events`.
 5. **Approval gates** — if a node enters a paused/awaiting-approval state, call
    `workflow_approve` (run id + approve/reject). `approve_any` defaults to false,
-   so only the owning session can approve unless config says otherwise.
+   so only the session that started the run (the recorded owner) can approve or cancel it unless config says otherwise.
 6. **Cancel** — to abort, `workflow_cancel` with the run id. Verify the run
    moves to a cancelled terminal state via `workflow_status`.
 
@@ -64,16 +64,15 @@ order of operations, preconditions, pitfalls, and what success looks like.
 
 - Health endpoint returned `{"ok": true}` at the correct base path.
 - `workflow_run` returned a `run_id`.
-- `workflow_status` reached a terminal state (`succeeded` / `failed` /
-  `cancelled`) — not stuck in `running` (a stall on a kanban/cron node usually
-  means the daemon is not running).
+- `workflow_status` reached a terminal state (`completed` / `failed` /
+  `cancelled`) — not stuck in `running`.
 - Each node's final state matches expectation; approval gates resolved as intended.
 
 ## Common pitfalls
 
 - **404 on every call** → wrong base path (`/api/workflows/` vs
   `/api/plugins/workflow-engine/`).
-- **Run never advances past a kanban/cron node** → daemon process not running.
+- **Cron-triggered run never starts** → daemon process not running.
 - **"No Workflows tab in dashboard"** → expected; the tab is hidden by design.
 - **Rate-limit rejection** → `run_rate_per_session` (default 5) exceeded;
   start a new session or raise the limit in config.

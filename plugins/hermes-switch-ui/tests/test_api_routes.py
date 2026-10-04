@@ -53,11 +53,13 @@ def _load_api_module(state_path: Path):
     return mod
 
 
-def _make_client(state_path: Path) -> TestClient:
+def _make_client(state_path: Path, authed: bool = True) -> TestClient:
     """Return a TestClient wrapping the plugin router mounted at /."""
     api_mod = _load_api_module(state_path)
     app = FastAPI()
     app.include_router(api_mod.router)
+    if authed:
+        app.dependency_overrides[api_mod._require_auth] = lambda: None
     return TestClient(app, raise_server_exceptions=False)
 
 
@@ -268,3 +270,25 @@ def test_heartbeat_refreshes_running(tmp_path):
 
     # Now running must be True
     assert c.get("/status").json()["running"] is True
+
+
+def test_require_auth_rejects_unauthenticated(tmp_path):
+    """L3-01: the real dependency (no override) must 401, not no-op."""
+    c = _make_client(tmp_path / "state.json", authed=False)
+    for method, path in [("get", "/connection"), ("get", "/status"), ("post", "/heartbeat"),
+                         ("post", "/register"), ("post", "/settings"), ("get", "/project-map")]:
+        assert getattr(c, method)(path).status_code == 401, path
+
+
+def test_require_auth_fails_closed_without_web_server(tmp_path, monkeypatch):
+    import builtins
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name == "hermes_cli.web_server":
+            raise ImportError(name)
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake)
+    c = _make_client(tmp_path / "state.json", authed=False)
+    assert c.get("/status").status_code == 503

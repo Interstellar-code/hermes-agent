@@ -5,13 +5,14 @@
    `tab.hidden: true`, so **no Workflows entry appears in the dashboard sidebar**.
    The workflows UI lives in the separate **hermes-switchui** app. Enabling the
    plugin only gives you the backend API below.
-3. Verify the health endpoint:
+3. Verify the health endpoint (on the dashboard, port 9119 — the gateway's 8642
+   returns 404; the dashboard needs its session auth token, a bare curl gets 401):
    ```bash
-   curl http://127.0.0.1:8642/api/plugins/workflow-engine/health
+   curl http://127.0.0.1:9119/api/plugins/workflow-engine/health
    # → {"ok":true,"version":"0.1.0"}
    ```
-4. Place workflow YAML files in `~/.hermes/switchui/workflows/` (created
-   automatically on first enable from the bundled `defaults/`).
+4. Bundled workflows are seeded into the profile DB (`$HERMES_HOME/switchui-workflows.db`)
+   on first engine use; the engine initialises lazily on first tool/API call.
 
 No environment variables are required for Phase 1.
 
@@ -19,7 +20,7 @@ No environment variables are required for Phase 1.
 
 ## Background scheduler (daemon) — Phase 4
 
-The workflow cron poller and kanban dispatcher run in a standalone daemon
+The workflow cron poller and scheduled-run tick run in a standalone daemon
 process (`hermes workflow daemon`). Choose one install method:
 
 ### Linux (systemd user unit)
@@ -41,9 +42,10 @@ launchctl load -w ~/Library/LaunchAgents/ai.hermes.workflow-dispatcher.plist
 launchctl list | grep hermes-workflow
 ```
 
-The plist logs to `/tmp/hermes-workflow-dispatcher.log` by default. Edit the
-`StandardOutPath` / `StandardErrorPath` keys to redirect to `~/.hermes/logs/`
-(note: launchd does not expand `~` in plist values — use the full absolute path).
+Both units set `HERMES_HOME` (default `~/.hermes`; edit for another profile) and log to
+`$HERMES_HOME/logs/workflow-daemon.log` / `workflow-daemon-error.log`. launchd does not
+expand `~` — replace `/Users/YOU` in the plist. The daemon takes a single-instance lock at
+`$HERMES_HOME/workflow-daemon.pid`; launchd restarts it only after a crash.
 
 ### Foreground / dev mode (no supervisor)
 

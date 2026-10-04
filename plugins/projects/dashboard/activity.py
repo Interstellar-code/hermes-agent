@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path
 
 from hermes_cli import kanban_db, projects_db
+from plugins.projects.dashboard.enrichment import iter_board_paths, iter_session_pages
 # connect() is NOT re-exported from kanban_db any more: that path is a
 # plugin-compat shim whose stated removal date (2026-09-14) has already
 # passed. Import it from the module that actually owns it.
@@ -36,25 +37,12 @@ def decode_cursor(value: str | None) -> tuple[str, int, str] | None:
         raise ValueError("invalid activity cursor") from exc
 
 
-def _task_activity(project_id: str) -> tuple[list[dict], list[str]]:
+def _task_activity(project_id: str, after_ts: int = 2**62) -> tuple[list[dict], list[str]]:
     items: list[dict] = []
     errors: list[str] = []
-    try:
-        boards = kanban_db.list_boards(include_archived=True)
-    except Exception as exc:
-        return [], [f"boards: {exc}"]
-
-    seen: set[str] = set()
-    for board in boards:
-        slug = str(board.get("slug") or kanban_db.DEFAULT_BOARD)
-        raw_path = board.get("db_path")
+    for slug, path in iter_board_paths(errors, kanban_db.DEFAULT_BOARD):
         conn: sqlite3.Connection | None = None
         try:
-            path = Path(raw_path).expanduser() if raw_path else kanban_db.kanban_db_path(slug)
-            resolved = str(path.resolve())
-            if resolved in seen:
-                continue
-            seen.add(resolved)
             conn = kanban_db_connect.connect(db_path=path)
             rows = conn.execute(
                 """
@@ -67,8 +55,9 @@ def _task_activity(project_id: str) -> tuple[list[dict], list[str]]:
              LEFT JOIN task_events e ON e.task_id = t.id
                  WHERE t.project_id = ? AND t.status != 'archived'
               GROUP BY t.id
+                HAVING occurred_at <= ?
                 """,
-                (project_id,),
+                (project_id, after_ts),
             ).fetchall()
             for row in rows:
                 items.append(
@@ -112,17 +101,7 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
                 [project.to_dict()] if project.id in active_project_ids else []
             )
             items: list[dict] = []
-            offset = 0
-            while True:
-                rows = db.list_sessions_rich(
-                    limit=2_000,
-                    offset=offset,
-                    order_by_last_active=True,
-                    min_message_count=1,
-                    include_children=False,
-                    exclude_sources=["cron"],
-                    include_archived=False,
-                )
+            for rows in iter_session_pages(db):
                 explicit_owners = projects_db.get_session_projects(
                     projects_conn, (row["id"] for row in rows)
                 )
@@ -151,9 +130,6 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
                             "cwd": row.get("cwd"),
                         }
                     )
-                if len(rows) < 2_000:
-                    break
-                offset += len(rows)
         finally:
             if projects_conn is not None:
                 projects_conn.close()
@@ -167,7 +143,7 @@ def _session_activity(project: projects_db.Project) -> tuple[list[dict], list[st
 def project_activity(
     project: projects_db.Project, *, limit: int, after: tuple[int, str] | None
 ) -> dict:
-    tasks, errors = _task_activity(project.id)
+    tasks, errors = _task_activity(project.id, after[0] if after else 2**62)
     sessions, session_errors = _session_activity(project)
     errors.extend(session_errors)
 

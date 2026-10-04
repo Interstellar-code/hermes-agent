@@ -162,3 +162,43 @@ def test_registered_handlers_return_json_strings():
     data_apply = json.loads(res_apply)
     assert data_apply["target"] == "delegate"
 
+
+
+def test_persona_ref_e2e_lands_in_system_prompt(tmp_path, monkeypatch):
+    """L4-12: real config.yaml persona_ref -> real _read_persona_ref -> real core
+    collector -> build_api_messages puts the overlay in SYSTEM, not the user turn."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from agent.turn_context import _collect_pre_llm_call_context, build_api_messages
+
+    (tmp_path / "config.yaml").write_text("agent:\n  persona_ref: engineering-security-engineer\n")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin = _load_plugin()
+    agent = SimpleNamespace(
+        api_mode="chat_completions", ephemeral_system_prompt=None, _compression_warning=None,
+        _current_turn_timestamp=0.0, _persist_disabled=False, session_id="s", model="m",
+        platform="cli", _copy_reasoning_content_for_api=lambda *_: None,
+        _should_sanitize_tool_calls=lambda: False,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    with patch("hermes_cli.lifecycle.invoke_hook",
+               side_effect=lambda _name, **kw: [plugin._pre_llm_call(**kw)]):
+        user_ctx = _collect_pre_llm_call_context(
+            agent, effective_task_id="t", turn_id="u", original_user_message="hi",
+            messages=messages, conversation_history=[],
+        )
+    api_messages, system = build_api_messages(
+        agent, messages, current_turn_user_idx=0, ext_prefetch_cache="",
+        plugin_user_context=user_ctx, moa_config=None, active_system_prompt="BASE",
+    )
+    assert "Active persona lens" in system and system.startswith("BASE")
+    assert "Active persona lens" not in str(api_messages[-1]["content"])
+
+
+def test_get_persona_hides_path_and_preview():
+    plugin = _load_plugin()
+    full = plugin._tool_persona_get({"persona_id": "engineering-security-engineer"})["persona"]
+    assert "path" not in full
+    prev = plugin._tool_persona_get({"persona_id": "engineering-security-engineer", "preview": True})["persona"]
+    assert "system_prompt" not in prev and "path" not in prev

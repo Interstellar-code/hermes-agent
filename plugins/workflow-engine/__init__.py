@@ -22,7 +22,7 @@ def register(ctx) -> None:  # noqa: ANN001
     Does NOT call asyncio.create_task — background scheduling is owned
     by the standalone daemon process (hermes workflow daemon).
     """
-    from ._shared import get_engine  # noqa: PLC0415 — lazy import keeps load cheap
+    from ._shared import bind_register_home, set_llm  # noqa: PLC0415 — lazy import keeps load cheap
     from .tools.list_workflows import handler as list_handler, SCHEMA as list_schema, check as list_check  # noqa: PLC0415,E501
     from .tools.run_workflow import handler as run_handler, SCHEMA as run_schema, check as run_check  # noqa: PLC0415,E501
     from .tools.workflow_status import handler as status_handler, SCHEMA as status_schema, check as status_check  # noqa: PLC0415,E501
@@ -30,16 +30,13 @@ def register(ctx) -> None:  # noqa: ANN001
     from .tools.cancel_workflow import handler as cancel_handler, SCHEMA as cancel_schema, check as cancel_check  # noqa: PLC0415,E501
     from .daemon import _setup as daemon_setup  # noqa: PLC0415
 
-    # Wire the host-owned PluginLlm facade so prompt/command nodes can execute.
-    # Engine is initialized lazily on first tool call via get_engine(); we only
-    # call get_engine() here when there is an LLM to wire in, avoiding SQLite
-    # migrations and manifest I/O at import time.
+    # Stash the host-owned PluginLlm; it is applied when the engine is first
+    # built by get_engine() (first tool call / dashboard request / daemon), so
+    # plugin load itself runs no migrations, seeding or crash recovery.
     llm = getattr(ctx, "llm", None)
     if llm is not None:
-        try:
-            get_engine().set_llm(llm)
-        except Exception:
-            logger.exception("workflow-engine: failed to wire ctx.llm into engine")
+        set_llm(llm)
+    bind_register_home()  # engine binds the loader's profile, built lazily
 
     for name, schema, handler, is_async, check_fn in (
         ("workflow_list",    list_schema,    list_handler,    True, list_check),
@@ -64,7 +61,7 @@ def register(ctx) -> None:  # noqa: ANN001
         name="workflow",
         help="Workflow engine subcommands (run daemon, etc.)",
         setup_fn=daemon_setup,
-        description="Run the workflow scheduler (cron poller + kanban dispatcher).",
+        description="Run the workflow scheduler (cron poller + scheduled-run tick).",
     )
 
     # Plugin-scoped skill: end-to-end procedure for running/verifying a workflow.
@@ -86,12 +83,3 @@ def register(ctx) -> None:  # noqa: ANN001
         "background scheduler: hermes workflow daemon"
     )
 
-
-def disable() -> None:
-    """Called by the plugin loader on hot-reload or shutdown.
-
-    No-op for now — the engine singleton (_shared._engine) is stateless between
-    runs.  If in-process run tracking is added in future, call engine.shutdown()
-    here to drain active runs before the loader unloads this module.
-    """
-    logger.info("workflow-engine plugin disabled")

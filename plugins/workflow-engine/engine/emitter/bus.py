@@ -26,6 +26,9 @@ _STOP = object()
 class _Subscriber:
     queue: asyncio.Queue
     run_id: Optional[str]  # None = all runs
+    # Consumer's loop. emit() runs on the engine-loop thread; asyncio.Queue
+    # is not thread-safe, so cross-loop puts go through call_soon_threadsafe.
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 class EventBus:
@@ -78,26 +81,36 @@ class EventBus:
             "node_run_id": node_run_id,
             "data": data or {},
         }
-        dead: List[_Subscriber] = []
+        try:
+            here = asyncio.get_running_loop()
+        except RuntimeError:
+            here = None
         for sub in list(self._subscribers):
             if sub.run_id is not None and sub.run_id != run_id:
                 continue
+            if sub.loop is None or sub.loop is here:
+                self._deliver(sub, payload)
+            else:
+                try:
+                    sub.loop.call_soon_threadsafe(self._deliver, sub, payload)
+                except RuntimeError:  # consumer loop closed
+                    self._unsubscribe(sub)
+
+    def _deliver(self, sub: _Subscriber, payload: Dict[str, Any]) -> None:
+        """put_nowait on the consumer's loop; drop oldest when full."""
+        try:
+            sub.queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                sub.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
             try:
                 sub.queue.put_nowait(payload)
-            except asyncio.QueueFull:
-                # Drop oldest, then put new
-                try:
-                    sub.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
-                try:
-                    sub.queue.put_nowait(payload)
-                except Exception:
-                    dead.append(sub)
             except Exception:
-                dead.append(sub)
-        for d in dead:
-            self._unsubscribe(d)
+                self._unsubscribe(sub)
+        except Exception:
+            self._unsubscribe(sub)
 
     def _unsubscribe(self, sub: _Subscriber) -> None:
         try:
@@ -106,7 +119,10 @@ class EventBus:
             pass
         # Signal the async generator to stop
         try:
-            sub.queue.put_nowait(_STOP)
+            if sub.loop is not None and not sub.loop.is_closed():
+                sub.loop.call_soon_threadsafe(sub.queue.put_nowait, _STOP)
+            else:
+                sub.queue.put_nowait(_STOP)
         except Exception:
             pass
 
@@ -118,7 +134,7 @@ class EventBus:
         breaks or the generator is garbage-collected.
         """
         queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-        sub = _Subscriber(queue=queue, run_id=run_id)
+        sub = _Subscriber(queue=queue, run_id=run_id, loop=asyncio.get_running_loop())
         self._subscribers.append(sub)
 
         try:

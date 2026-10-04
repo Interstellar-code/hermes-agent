@@ -7,9 +7,11 @@ Phase 3: real handlers delegating to WorkflowEngine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
+import sqlite3
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import APIRouter, Request
@@ -474,33 +476,44 @@ async def events(request: Request) -> StreamingResponse:
             return
 
         HEARTBEAT_INTERVAL = 15.0
-        last_heartbeat = asyncio.get_event_loop().time()
+        it = _engine().subscribe_events(run_id).__aiter__()
+        pending: Optional["asyncio.Future"] = None
 
         try:
-            async for evt in _engine().subscribe_events(run_id):
-                # Check client disconnect
+            while True:
                 if await request.is_disconnected():
                     break
+                if pending is None:
+                    pending = asyncio.ensure_future(it.__anext__())
+                # asyncio.wait (unlike wait_for) leaves the pending read alive on timeout
+                done, _ = await asyncio.wait({pending}, timeout=HEARTBEAT_INTERVAL)
+                if not done:
+                    yield "event: ping\ndata: {}\n\n"
+                    continue
+                try:
+                    evt = pending.result()
+                except StopAsyncIteration:
+                    break
+                finally:
+                    pending = None
 
                 kind = evt.get("event_type", "event")
-                # Serialize removing non-serializable items
                 try:
                     data = json.dumps(evt)
                 except (TypeError, ValueError):
                     data = json.dumps({"raw": str(evt)})
-
                 yield f"event: {kind}\ndata: {data}\n\n"
-
-                # Heartbeat
-                now = asyncio.get_event_loop().time()
-                if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                    yield "event: ping\ndata: {}\n\n"
-                    last_heartbeat = now
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             log.warning("SSE stream error: %s", exc)
             yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+        finally:
+            if pending is not None:
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pending
+            await it.aclose()
 
     return StreamingResponse(
         _generate(),
@@ -546,27 +559,37 @@ def _get_bundled_defaults_dir():
     return _P(__file__).resolve().parent.parent / "defaults"
 
 
+_factory_cache: Dict[str, Any] = {"key": None, "items": []}
+
+
 def _find_factory_yaml(def_id: str):
     """Locate the factory YAML file for def_id in the bundled defaults dir.
 
-    Re-derives the id from each file's parsed workflow or stem to match how
-    seed_bundled() computes ids.  Returns (path, content) or (None, None).
+    Parsed ids are cached keyed on the files' mtimes (was: re-parse every
+    file per call).  Returns (path, content) or (None, None).
     """
     from engine.discovery.validator import validate_workflow_yaml as _vwf
     defaults_dir = _get_bundled_defaults_dir()
     if not defaults_dir.exists():
         return None, None
-    for yaml_file in sorted(defaults_dir.glob("*.yaml")):
-        try:
-            content = yaml_file.read_text(encoding="utf-8")
-            workflow, error = _vwf(content, yaml_file.name)
-            if error or not workflow:
+    files = sorted(defaults_dir.glob("*.yaml"))
+    key = tuple((f.name, f.stat().st_mtime_ns) for f in files)
+    if _factory_cache["key"] != key:
+        items = []
+        for yaml_file in files:
+            try:
+                content = yaml_file.read_text(encoding="utf-8")
+                workflow, error = _vwf(content, yaml_file.name)
+                if error or not workflow:
+                    continue
+                fid = workflow.id if workflow.id else yaml_file.stem.lower().replace(" ", "-")
+                items.append((fid, yaml_file, content))
+            except Exception:
                 continue
-            fid = workflow.id if workflow.id else yaml_file.stem.lower().replace(" ", "-")
-            if fid == def_id:
-                return yaml_file, content
-        except Exception:
-            continue
+        _factory_cache.update(key=key, items=items)
+    for fid, yaml_file, content in _factory_cache["items"]:
+        if fid == def_id:
+            return yaml_file, content
     return None, None
 
 
@@ -600,7 +623,12 @@ async def resume_run(run_id: str) -> JSONResponse:
     run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
-    updated = await _engine().resume_run(run_id)
+    if run.get("status") != "paused":
+        return _json({"error": f"run is {run.get('status')}, not paused"}, 409)
+    try:
+        updated = await _engine().resume_run(run_id)
+    except ValueError as exc:
+        return _json({"error": str(exc)}, 409)
     return _json({"run": updated})
 
 
@@ -671,7 +699,15 @@ async def append_event(run_id: str, request: Request) -> JSONResponse:
     if not isinstance(body.get("event_type"), str) or not body["event_type"]:
         return _json({"error": "event_type is required"}, 400)
     body["workflow_run_id"] = run_id
-    await _engine().append_workflow_event(body)
+    nr_id = body.get("node_run_id")
+    if nr_id is not None:
+        nr = await _engine().find_node_run_by_id(nr_id)
+        if nr is None or nr.get("workflow_run_id") != run_id:
+            return _json({"error": "node_run_id not found for this run"}, 400)
+    try:
+        await _engine().append_workflow_event(body)
+    except sqlite3.IntegrityError as exc:
+        return _json({"error": f"invalid event: {exc}"}, 400)
     return _json({"ok": True})
 
 
@@ -746,22 +782,7 @@ async def list_phase_transitions(run_id: str) -> JSONResponse:
 
 
 @router.post("/runs/{run_id}/approval-claim")
-async def try_claim_approval_for_resume(run_id: str, request: Request) -> JSONResponse:
-    run = await _engine().get_run(run_id)
-    if run is None:
-        return _json({"error": "not found"}, 404)
-    try:
-        body: Dict[str, Any] = await request.json()
-    except Exception:
-        return _json({"error": "Invalid JSON body"}, 400)
-    node_run_id = body.get("nodeRunId") or body.get("node_run_id")
-    decision = body.get("decision")
-    approval_response = body.get("approvalResponse") or body.get("approval_response") or ""
-    if not isinstance(node_run_id, str) or not node_run_id:
-        return _json({"error": "nodeRunId is required"}, 400)
-    if decision not in ("approved", "rejected"):
-        return _json({"error": "decision must be 'approved' or 'rejected'"}, 400)
-    result = await _engine().try_claim_approval_for_resume(
-        node_run_id, decision, approval_response  # type: ignore[arg-type]
-    )
-    return _json(result)
+async def try_claim_approval_for_resume(run_id: str) -> JSONResponse:
+    # ponytail: the raw claim never resumed the run and skipped ownership
+    # checks (stuck runs). Approvals go through the workflow_approve tool.
+    return _json({"error": "deprecated: use the workflow_approve tool"}, 410)

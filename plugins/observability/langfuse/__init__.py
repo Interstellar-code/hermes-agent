@@ -860,21 +860,23 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
                      session_id: str = "", tool_call_id: str = "",
                      turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
-    client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
-    if client is None:
-        return
-    with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
-        if state is None:
+    with _failsafe(f"pre_tool_call ({tool_name})"):
+        client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
+        if client is None:
             return
-        observation = None
-        with _failsafe(f"start tool observation ({tool_name})"):
-            observation = _start_child_observation(state, name=f"Tool: {tool_name}", as_type="tool", input_value=_capture_content(args),
-                                                   metadata={"tool_name": tool_name, "tool_call_id": tool_call_id})
-        if tool_call_id:
-            state.tools[tool_call_id] = observation
-        else:
-            state.pending_tools_by_name.setdefault(tool_name, []).append(observation)
+        with _STATE_LOCK:
+            state = _TRACE_STATE.get(task_key)
+            if state is None:
+                return
+            observation = _start_child_observation(
+                state, name=f"Tool: {tool_name}", as_type="tool", input_value=_capture_content(args),
+                metadata={"tool_name": tool_name, "tool_call_id": tool_call_id})
+            if observation is None:
+                return
+            if tool_call_id:
+                state.tools[tool_call_id] = observation
+            else:
+                state.pending_tools_by_name.setdefault(tool_name, []).append(observation)
 
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,

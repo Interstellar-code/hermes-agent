@@ -102,6 +102,12 @@ class DagRunContext:
     log_dir: Optional[str] = None
     # Map of node_id → output for nodes already completed in a prior run (resume)
     prior_completed: Optional[Dict[str, str]] = None
+    # workflow_id / user_message / artifacts_dir / base_branch / inputs
+    workflow_vars: Dict[str, Any] = field(default_factory=dict)
+    # Subprocess working directory (the run's working_path when it exists)
+    cwd: Optional[str] = None
+    # node_id → interactive-loop pause meta ({"iteration", "prev_output"})
+    loop_resume: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

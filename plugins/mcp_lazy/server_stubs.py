@@ -108,9 +108,11 @@ def derive_servers_from_tools(tools: List[Dict[str, Any]]) -> Dict[str, List[str
         name = tool.get("function", {}).get("name", "")
         if not isinstance(name, str) or not name.startswith("mcp_"):
             continue
-        rest = name[4:]  # strip leading "mcp_"
-        # First underscore-delimited segment is the server name.
-        parts = rest.split("_", 1)
+        from .stubs import _strip_mcp_prefix  # noqa: PLC0415
+        rest = _strip_mcp_prefix(name)
+        # Core ``mcp__srv__tool``: server ends at the first "__"; legacy
+        # ``mcp_srv_tool`` (no "__"): first "_" segment.
+        parts = rest.split("__", 1) if "__" in rest else rest.split("_", 1)
         server = parts[0] if parts else rest
         servers.setdefault(server, []).append(name)
     return servers
@@ -126,11 +128,13 @@ def synth_server_description(tool_names: List[str], max_chars: int = 150) -> str
     n = len(tool_names)
     if n == 0:
         return "0 tools"
-    # Humanise: strip the mcp_{server}_ prefix, replace underscores with spaces.
+    # Humanise: strip the mcp__{server}__ prefix, replace underscores with spaces.
+    from .stubs import _strip_mcp_prefix  # noqa: PLC0415
     humanised = []
     for t in tool_names:
-        parts = t.split("_", 2)  # mcp, server, rest
-        label = parts[2] if len(parts) == 3 else t
+        rest = _strip_mcp_prefix(t)
+        parts = rest.split("__", 1) if "__" in rest else rest.split("_", 1)
+        label = parts[1] if len(parts) == 2 else t
         humanised.append(label.replace("_", " "))
     sample = humanised[:3]
     base = f"{n} tools: {', '.join(sample)}"

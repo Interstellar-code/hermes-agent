@@ -7,6 +7,7 @@ check_fn enforces:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections import defaultdict
@@ -14,6 +15,8 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 SCHEMA: Dict[str, Any] = {
     "name": "workflow_run",
@@ -143,7 +146,7 @@ async def handler(args: Dict[str, Any], **kwargs: Any) -> str:
     """Start a workflow run.
 
     registry.dispatch passes (args_dict, **kwargs); extract params from args.
-    _session_key may arrive via kwargs when the registry forwards session context.
+    session_id arrives via kwargs (registry.dispatch forwards it).
     """
     return json.dumps(await _handler_impl(args, **kwargs), ensure_ascii=False, default=str)
 
@@ -153,7 +156,7 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     working_path: Optional[str] = args.get("working_path")
     inputs: Optional[Dict[str, Any]] = args.get("inputs")
     conversation_id: Optional[str] = args.get("conversation_id")
-    _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")
+    _session_key: Optional[str] = kwargs.get("session_id")
     # working_path validation
     path_err = _check_working_path(working_path)
     if path_err:
@@ -197,16 +200,12 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
 
     run_id = run.get("id")
 
-    # Patch owner_session onto the run row (best-effort; schema may be pre-migration)
+    # Record the owning session (migration 003 column) via the facade.
     if _session_key and run_id:
         try:
-            engine.conn.execute(
-                "UPDATE workflow_runs SET owner_session=? WHERE id=?",
-                (_session_key, run_id),
-            )
-            engine.conn.commit()
+            engine.set_owner_session(run_id, _session_key)
         except Exception:
-            pass
+            logger.exception("workflow_run: failed to set owner_session for %s", run_id)
 
     # Block until the run settles. Without this the runner's background
     # asyncio task is orphaned the instant we return — the agent's

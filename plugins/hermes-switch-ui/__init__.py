@@ -27,10 +27,11 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 import _knowledge  # noqa: E402 — must come after sys.path injection
+import _version_compat  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-_VERSION = "0.2.0"
+_VERSION = _version_compat.PLUGIN_VERSION
 
 # ---------------------------------------------------------------------------
 # Per-turn nudge (injected once per session on first LLM call)

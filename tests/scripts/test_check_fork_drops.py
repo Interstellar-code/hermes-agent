@@ -72,3 +72,11 @@ def test_drop_detected_and_allowlist_suppresses_it(tmp_path):
     result = _run(repo, before, after, fork_base, allowlist)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "No unexplained fork drops found." in result.stdout
+
+
+def test_pinned_seams_present_in_worktree():
+    """Pass 3: fork-only inline seams (trusted pre_llm_call routing, transform_tools,
+    register_usage_observer) must exist in this repo's working tree."""
+    r = subprocess.run([sys.executable, str(SCRIPT), "--seams-only", "--after", "WORKTREE"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr

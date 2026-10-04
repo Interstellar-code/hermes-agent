@@ -376,14 +376,19 @@ def set_primary(conn: sqlite3.Connection, project_id: str, path: str) -> bool:
 
 
 def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    return _execute_rowcount(conn, "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)) > 0
+    """Archive a project; clears the active pointer if it names it (same txn)."""
+    with write_txn(conn):
+        cur = conn.execute("UPDATE projects SET archived = 1 WHERE id = ?", (project_id,))
+        if cur.rowcount > 0 and _get_meta(conn, _ACTIVE_META_KEY) == project_id:
+            conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
+    return cur.rowcount > 0
 
 
 def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
     return _execute_rowcount(conn, "UPDATE projects SET archived = 0 WHERE id = ?", (project_id,)) > 0
 
 
-def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
+def delete_project(conn: sqlite3.Connection, project_id: str, *, only_archived: bool = False) -> bool:
     """Hard-delete a project and its folders (cascade).
 
     Also clears the active-project pointer when it names this project.
@@ -393,10 +398,11 @@ def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
     garbage. Both statements share one transaction so a crash between them
     cannot leave the pointer orphaned.
     """
+    sql = "DELETE FROM projects WHERE id = ?" + (" AND archived = 1" if only_archived else "")
     with write_txn(conn):
-        if _get_meta(conn, _ACTIVE_META_KEY) == project_id:
+        cur = conn.execute(sql, (project_id,))
+        if cur.rowcount > 0 and _get_meta(conn, _ACTIVE_META_KEY) == project_id:
             conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
-        cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
 
 
@@ -421,6 +427,9 @@ def set_active(conn: sqlite3.Connection, project_id: Optional[str]) -> None:
         if project_id is None:
             conn.execute("DELETE FROM project_meta WHERE key = ?", (_ACTIVE_META_KEY,))
         else:
+            row = conn.execute("SELECT archived FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if row is not None and row["archived"]:
+                raise ValueError("cannot activate an archived project")
             _upsert_meta_locked(conn, _ACTIVE_META_KEY, project_id)
 
 

@@ -20,12 +20,19 @@ Two passes, both scoped to fork commits (`--fork-base..--before`, no merges):
   absent from --after. This catches logic dropped from inside a function that
   still exists (so pass 1's "still defined" check would miss it).
 
+  Pass 3 (pinned seams): fork-only core seams that are pure inline logic (no
+  new def, no log string) so passes 1-2 cannot see them -- e.g. 9d75ee0504's
+  trusted pre_llm_call routing, dropped in the 0.19 migration. Each SEAMS
+  entry is a (path, literal) that must exist at --after. Not allowlistable:
+  if a seam is intentionally retired, delete its entry here.
+
 Intentional drops go in scripts/fork_drops_allowlist.txt (`name  # reason`,
 one per line). Anything left unclassified is reported but NOT allowlisted --
 treat it as a possible real drop.
 
 Run: python scripts/check_fork_drops.py --before <pre-adopt-ref> --fork-base <merge-base> [--after HEAD]
-Exit 1 if any unexplained drop remains, 0 otherwise.
+     python scripts/check_fork_drops.py --seams-only [--after HEAD|WORKTREE]   # pass 3 only
+Exit 1 if any unexplained drop or missing seam remains, 0 otherwise.
 """
 from __future__ import annotations
 
@@ -48,6 +55,34 @@ CALL_STRING_RE = re.compile(
     r"(?:logger\.\w+|logging\.\w+|raise\s+\w*(?:Exception|Error)|print|HTTPException|_set_fatal_error)"
     r"\s*\([^)]*?[\"']([^\"']{28,})[\"']"
 )
+
+
+# (path, literal, why) -- fork-only core seams; a plugin depends on each.
+SEAMS = [
+    ("agent/turn_context.py", 'r.get("target") in ("system", "developer")',
+     "trusted pre_llm_call routing (9d75ee0504; personas overlay -> system prompt)"),
+    ("agent/turn_context.py", 'agent._plugin_trusted_context = "\\n\\n".join(_trusted_parts)',
+     "trusted pre_llm_call context stashed on the agent by the collector"),
+    ("agent/turn_context.py", 'getattr(agent, "_plugin_trusted_context", "")',
+     "trusted pre_llm_call context appended to effective_system"),
+    ("agent/turn_api_request.py", '"transform_tools"', "transform_tools hook invocation (mcp_lazy)"),
+    ("hermes_cli/plugins.py", '"transform_tools"', "transform_tools in VALID_HOOKS (mcp_lazy)"),
+    ("agent/usage_pricing.py", "def register_usage_observer(", "usage observer registry (mcp_lazy)"),
+    ("agent/usage_pricing.py", "_notify_usage_observers(usage)", "usage observer notify call (mcp_lazy)"),
+]
+
+
+def missing_seams(after: str) -> list[tuple[str, str, str]]:
+    missing = []
+    for path, text, why in SEAMS:
+        ref = [] if after == "WORKTREE" else [after]  # WORKTREE = uncommitted tree
+        r = subprocess.run(["git", "grep", "-q", "-F", text, *ref, "--", path],
+                           cwd=REPO, capture_output=True, text=True)
+        if r.returncode not in (0, 1):
+            raise RuntimeError(f"git grep failed: {r.stderr.strip()}")
+        if r.returncode == 1:
+            missing.append((path, text, why))
+    return missing
 
 
 def git(*args: str) -> str:
@@ -188,16 +223,31 @@ def find_drops(before: str, after: str, fork_base: str) -> dict[str, dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--before", required=True, help="pre-adopt tree ref")
+    ap.add_argument("--before", help="pre-adopt tree ref (required unless --seams-only)")
     ap.add_argument("--after", default="HEAD", help="post-adopt tree ref (default: HEAD)")
-    ap.add_argument("--fork-base", required=True, help="merge-base with upstream")
+    ap.add_argument("--fork-base", help="merge-base with upstream (required unless --seams-only)")
+    ap.add_argument("--seams-only", action="store_true", help="only run pass 3 (pinned seams)")
     ap.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
     ap.add_argument("--repo", type=Path, default=ROOT, help="repo to inspect (default: this repo)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    if not args.seams_only and not (args.before and args.fork_base):
+        ap.error("--before and --fork-base are required unless --seams-only")
+    if not args.seams_only and args.after == "WORKTREE":
+        ap.error("--after WORKTREE is only valid with --seams-only (passes 1-2 need a git ref)")
+
     global REPO
     REPO = args.repo
+
+    # SEAMS name paths in THIS repo; a throwaway --repo (tests) has none of them.
+    seams = missing_seams(args.after) if REPO.resolve() == ROOT else []
+    if args.seams_only:
+        for path, text, why in seams:
+            print(f"missing seam: {path}: {text!r}  ({why})")
+        if not seams:
+            print(f"All {len(SEAMS)} pinned fork seams present.")
+        return 1 if seams else 0
 
     report = find_drops(args.before, args.after, args.fork_base)
     allowed = load_allowlist(args.allowlist)
@@ -210,8 +260,10 @@ def main() -> int:
             unexplained[sha] = {"subject": data["subject"], "symbols": syms, "strings": strs}
 
     if args.json:
-        print(json.dumps(unexplained, indent=2))
+        print(json.dumps({"drops": unexplained, "missing_seams": seams}, indent=2))
     else:
+        for path, text, why in seams:
+            print(f"missing seam: {path}: {text!r}  ({why})")
         if not unexplained:
             print("No unexplained fork drops found.")
         for sha, data in unexplained.items():
@@ -221,7 +273,7 @@ def main() -> int:
             for s in data["strings"]:
                 print(f"  string: {s}")
 
-    return 1 if unexplained else 0
+    return 1 if unexplained or seams else 0
 
 
 if __name__ == "__main__":

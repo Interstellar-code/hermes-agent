@@ -90,9 +90,9 @@ def test_clear_resets_eviction_state():
 # -------------------------------------------------------- transform_tools
 
 def _patch_cfg(monkeypatch, cfg):
-    monkeypatch.setattr(hook_impl, "_load_config", lambda: cfg)
-    monkeypatch.setattr(hook_impl, "_eligible_servers", lambda: None)
-    monkeypatch.setattr(hook_impl, "_server_descriptions", lambda: {})
+    monkeypatch.setattr(hook_impl, "_load_root", lambda *a, **k: {"mcp": cfg})
+    monkeypatch.setattr(hook_impl, "_eligible_servers", lambda *a: None)
+    monkeypatch.setattr(hook_impl, "_server_descriptions", lambda *a: {})
 
 
 def test_auto_mode_passthrough_below_threshold(monkeypatch):

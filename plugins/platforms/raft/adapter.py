@@ -242,7 +242,12 @@ def _raft_hook(fn):
     """Run the hook body only for Raft sessions."""
     @functools.wraps(fn)
     def wrapper(**kwargs: Any) -> None:
-        if _is_raft_context(**kwargs):
+        try:
+            is_raft = _is_raft_context(**kwargs)
+        except Exception:
+            logger.debug("raft context check failed", exc_info=True)
+            return
+        if is_raft:
             fn(**kwargs)
     return wrapper
 

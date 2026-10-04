@@ -65,7 +65,7 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     node_id: str = args.get("node_id", "")
     decision: Literal["approve", "reject"] = args.get("decision", "approve")  # type: ignore[assignment]
     note: Optional[str] = args.get("note")
-    _session_key: Optional[str] = kwargs.get("_session_key") or kwargs.get("session_key")
+    _session_key: Optional[str] = kwargs.get("session_id")
     from .._shared import get_engine  # noqa: PLC0415
 
     engine = get_engine()

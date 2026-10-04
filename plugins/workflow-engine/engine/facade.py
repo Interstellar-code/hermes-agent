@@ -2,11 +2,22 @@
 WorkflowEngine facade — single object the API layer (Phase 3) calls.
 
 All methods are async. Phase 3 wires these 1:1 to HTTP endpoints.
+
+Engine loop (L2-07): every async method runs on ONE long-lived event loop
+owned by the engine (a daemon thread). Callers — agent tools on throwaway
+per-call loops, the dashboard's uvicorn loop, the daemon — just await; the
+coroutine is marshalled with run_coroutine_threadsafe. Run tasks therefore
+outlive the tool call that started them, and sqlite I/O never runs on the
+caller's loop (L2-11). Store access from other threads is serialized by
+engine.store.run_store.STORE_LOCK (L2-12).
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import logging
 import sqlite3
+import threading
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 from engine.store.run_store import RunStore
@@ -17,6 +28,19 @@ from engine.runtime.manifest import ManifestWriter
 from engine.discovery.loader import parse_workflow
 
 logger = logging.getLogger("workflow.engine")
+
+
+def _on_engine_loop(fn):
+    """Run the wrapped coroutine method on the engine's own loop."""
+    @functools.wraps(fn)
+    async def wrapper(self: "WorkflowEngine", *args: Any, **kwargs: Any) -> Any:
+        coro = fn(self, *args, **kwargs)
+        if asyncio.get_running_loop() is self._loop:
+            return await coro
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(coro, self._loop)
+        )
+    return wrapper
 
 
 class WorkflowEngine:
@@ -51,6 +75,16 @@ class WorkflowEngine:
         self._runner = runner
         self._manifest_writer = manifest_writer
         self.boot = boot
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._loop.run_forever, name="workflow-engine-loop", daemon=True,
+        )
+        self._thread.start()
+        asyncio.run_coroutine_threadsafe(self._runner.heartbeat_forever(), self._loop)
+
+    def set_owner_session(self, run_id: str, session_id: str) -> None:
+        """Record the session that started ``run_id`` (approve/cancel ownership)."""
+        self._run_store.set_owner_session(run_id, session_id)
 
     def set_llm(self, llm: Any) -> None:
         """Inject the host-owned PluginLlm facade into the workflow runner."""
@@ -60,12 +94,15 @@ class WorkflowEngine:
     # Definitions                                                         #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def list_definitions(self, *, source: Optional[str] = None) -> List[Dict[str, Any]]:
         return self._def_store.list_definitions(source=source)
 
+    @_on_engine_loop
     async def get_definition(self, definition_id: str) -> Optional[Dict[str, Any]]:
         return self._def_store.get_definition(definition_id)
 
+    @_on_engine_loop
     async def upsert_definition(
         self,
         definition_id: str,
@@ -85,6 +122,7 @@ class WorkflowEngine:
         self._manifest_writer.write()
         return row
 
+    @_on_engine_loop
     async def parse_definition(self, definition_id: str) -> Optional[Dict[str, Any]]:
         defn = self._def_store.get_definition(definition_id)
         if defn is None:
@@ -108,6 +146,7 @@ class WorkflowEngine:
     # Runs                                                                #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def list_runs(
         self,
         *,
@@ -119,9 +158,11 @@ class WorkflowEngine:
             limit=limit,
         )
 
+    @_on_engine_loop
     async def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         return self._run_store.get_workflow_run(run_id)
 
+    @_on_engine_loop
     async def start_run(
         self,
         workflow_id: str,
@@ -136,6 +177,7 @@ class WorkflowEngine:
             priority=priority, max_runtime_s=max_runtime_s,
         )
 
+    @_on_engine_loop
     async def schedule_run(
         self,
         workflow_id: str,
@@ -180,9 +222,11 @@ class WorkflowEngine:
             raise NotImplementedError("cron schedule not yet supported")
         raise ValueError(f"unknown schedule.type: {sched_type!r}")
 
+    @_on_engine_loop
     async def list_active_node_runs(self) -> List[Dict[str, Any]]:
         return self._run_store.list_active_node_runs()
 
+    @_on_engine_loop
     async def fire_due_scheduled_runs(self) -> int:
         """Scheduler-tick helper: claim+fire due rows. Returns count fired."""
         from datetime import datetime, timezone
@@ -210,6 +254,7 @@ class WorkflowEngine:
                 self._run_store.mark_scheduled_failed(row["id"])
         return fired
 
+    @_on_engine_loop
     async def wait_for_run(
         self,
         run_id: str,
@@ -236,6 +281,7 @@ class WorkflowEngine:
         await self._runner.wait_for(run_id, timeout=timeout)
         return self._run_store.get_workflow_run(run_id)
 
+    @_on_engine_loop
     async def cancel_run(self, run_id: str) -> None:
         await self._runner.cancel(run_id)
 
@@ -243,6 +289,7 @@ class WorkflowEngine:
     # Approvals                                                           #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def approve(
         self,
         run_id: str,
@@ -294,23 +341,17 @@ class WorkflowEngine:
                 await self._runner.resume(run_id)
             except Exception as exc:
                 logger.exception("approve: runner.resume failed run=%s: %s", run_id, exc)
-                self._run_store.update_workflow_run(
-                    run_id,
-                    status="failed",
-                    error=f"Resume failed: {exc}",
-                )
-                self._bus.emit(
-                    run_id=run_id,
-                    event_type="workflow_failed",
-                    data={"error": f"Resume failed: {exc}"},
-                )
+                self._fail_run(run_id, f"Resume failed: {exc}", ("running", "paused"))
         else:
-            # Reject → fail the run
-            self._run_store.update_workflow_run(
+            # Reject → fail the run (CAS: never clobber a run that already
+            # finished or was cancelled meanwhile).
+            if not self._fail_run(
                 run_id,
-                status="failed",
-                error=f"Rejected at node {node_id}: {comment or 'no comment'}",
-            )
+                f"Rejected at node {node_id}: {comment or 'no comment'}",
+                ("paused",),
+                emit=False,
+            ):
+                return
             self._bus.emit(
                 run_id=run_id,
                 event_type="workflow_failed",
@@ -320,10 +361,24 @@ class WorkflowEngine:
                 },
             )
 
+    def _fail_run(self, run_id: str, error: str, from_statuses: tuple, emit: bool = True) -> bool:
+        won = self._run_store.finish_workflow_run_if_running(
+            run_id, status="failed", error=error, from_statuses=from_statuses,
+        )
+        if won:
+            self._run_store.record_phase_transition(
+                run_id=run_id, to_phase="failed", decided_by="user",
+                decision_data={"error": error},
+            )
+            if emit:
+                self._bus.emit(run_id=run_id, event_type="workflow_failed", data={"error": error})
+        return won
+
     # ------------------------------------------------------------------ #
     # Extended definitions                                                #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def mark_user_edit(
         self,
         definition_id: str,
@@ -337,6 +392,7 @@ class WorkflowEngine:
         self._manifest_writer.write()
         return row
 
+    @_on_engine_loop
     async def reset_to_factory(
         self,
         definition_id: str,
@@ -347,6 +403,7 @@ class WorkflowEngine:
         self._manifest_writer.write()
         return row
 
+    @_on_engine_loop
     async def delete_definition(self, definition_id: str) -> int:
         """Delete a non-bundled definition. Returns rows deleted."""
         rows = self._def_store.delete_definition(definition_id)
@@ -358,23 +415,46 @@ class WorkflowEngine:
     # Extended runs                                                        #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def find_run_by_conversation_id(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         return self._run_store.find_run_by_conversation_id(conversation_id)
 
+    @_on_engine_loop
     async def get_active_run_by_path(self, scope_path: str) -> Optional[Dict[str, Any]]:
         return self._run_store.get_active_run_by_path(scope_path)
 
+    @_on_engine_loop
     async def resume_run(self, run_id: str) -> Optional[Dict[str, Any]]:
-        self._run_store.resume_workflow_run(run_id)
+        """Resume a paused run for real (L2-09): CAS paused→running, then
+        restart the DAG via the runner.
+
+        Raises ValueError when the run is not paused, or when it is paused at
+        an approval / interactive-loop gate — those need an explicit
+        ``approve`` decision (workflow_approve), never a silent bypass.
+        """
+        gate = next(
+            (nr for nr in self._run_store.list_node_runs(run_id) if nr.get("status") == "paused"),
+            None,
+        )
+        if gate is not None:
+            raise ValueError(
+                f"run {run_id} is waiting on approval at node '{gate['dag_node_id']}'; "
+                "use workflow_approve"
+            )
+        if not self._run_store.resume_workflow_run(run_id):
+            raise ValueError(f"run {run_id} is not paused")
+        await self._runner.resume(run_id)
         return self._run_store.get_workflow_run(run_id)
 
     # ------------------------------------------------------------------ #
     # Extended node runs                                                  #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def list_node_runs(self, run_id: str) -> List[Dict[str, Any]]:
         return self._run_store.list_node_runs(run_id)
 
+    @_on_engine_loop
     async def find_node_run_by_id(self, node_run_id: str) -> Optional[Dict[str, Any]]:
         return self._run_store.find_node_run_by_id(node_run_id)
 
@@ -382,6 +462,7 @@ class WorkflowEngine:
     # Extended events                                                      #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def append_workflow_event(self, event: Dict[str, Any]) -> None:
         self._run_store.append_workflow_event(
             workflow_run_id=event["workflow_run_id"],
@@ -394,6 +475,7 @@ class WorkflowEngine:
             created_at=event.get("created_at"),
         )
 
+    @_on_engine_loop
     async def list_recent_workflow_events(self, run_id: str, limit: int = 200) -> List[Dict[str, Any]]:
         return self._run_store.list_recent_events(run_id, limit=limit)
 
@@ -401,6 +483,7 @@ class WorkflowEngine:
     # Extended phase transitions                                           #
     # ------------------------------------------------------------------ #
 
+    @_on_engine_loop
     async def record_phase_transition(
         self,
         *,
@@ -416,22 +499,9 @@ class WorkflowEngine:
             decision_data=decision_data,
         )
 
+    @_on_engine_loop
     async def list_phase_transitions(self, run_id: str) -> List[Dict[str, Any]]:
         return self._run_store.list_phase_transitions(run_id)
-
-    # ------------------------------------------------------------------ #
-    # Extended approvals                                                   #
-    # ------------------------------------------------------------------ #
-
-    async def try_claim_approval_for_resume(
-        self,
-        node_run_id: str,
-        decision: Literal["approved", "rejected"],
-        approval_response: str,
-    ) -> Dict[str, Any]:
-        return self._run_store.try_claim_approval_for_resume(
-            node_run_id, decision, approval_response
-        )
 
     # ------------------------------------------------------------------ #
     # Events / SSE                                                        #
@@ -451,8 +521,20 @@ class WorkflowEngine:
     # ------------------------------------------------------------------ #
 
     async def shutdown(self) -> None:
-        """Close event bus and DB connection."""
+        """Cancel engine-loop tasks, stop the loop thread, close the DB."""
         self._bus.close_all()
+
+        async def _drain() -> None:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if self._loop.is_running() and threading.current_thread() is not self._thread:
+            await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(_drain(), self._loop))
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            await asyncio.to_thread(self._thread.join, 5)
+            self._loop.close()
         try:
             self._conn.close()
         except Exception:

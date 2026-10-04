@@ -15,12 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import subprocess
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import yaml
+
 from engine.core.dag_executor import DagRunContext, execute_dag
+from engine.core.executor_shared import reserved_input_name
 from engine.discovery.loader import parse_workflow
-from engine.store.run_store import RunStore
+from engine.store.run_store import HEARTBEAT_S, RunStore
 from engine.store.definition_store import DefinitionStore
 from engine.emitter.bus import EventBus
 
@@ -44,11 +51,15 @@ class WorkflowRunner:
         def_store: DefinitionStore,
         bus: EventBus,
         llm: Any = None,
+        runs_dir: Optional[str] = None,
     ) -> None:
         self._run_store = run_store
         self._def_store = def_store
         self._bus = bus
         self._llm = llm
+        # Per-run artifacts + run logs live here, never in the user's
+        # working_path (L2-01).
+        self._runs_dir = Path(runs_dir or Path(tempfile.gettempdir()) / "hermes-workflow-runs")
         self._tasks: Dict[str, asyncio.Task] = {}  # run_id → Task
 
     def set_llm(self, llm: Any) -> None:
@@ -89,6 +100,8 @@ class WorkflowRunner:
         if node_errors:
             raise ValueError(f"Workflow node validation errors: {node_errors}")
 
+        resolved_inputs = _resolve_inputs(yaml_text, inputs)  # raises on reserved names
+
         # 3. Create run row
         conversation_id = trigger.get("conversation_id", f"trigger-{workflow_id}")
         working_path = trigger.get("working_path", "/tmp")
@@ -101,6 +114,7 @@ class WorkflowRunner:
             trigger=trigger,
             priority=priority,
             max_runtime_s=max_runtime_s,
+            inputs=inputs,
         )
         run_id = run["id"]
 
@@ -126,7 +140,8 @@ class WorkflowRunner:
         # 5. Fire and forget
         task = asyncio.create_task(
             self._execute(
-                run_id, workflow_id, dag_nodes, inputs, working_path,
+                run_id, workflow_id, dag_nodes,
+                resolved_inputs, working_path,
                 max_runtime_s=max_runtime_s,
             ),
             name=f"run-{run_id}",
@@ -238,10 +253,20 @@ class WorkflowRunner:
             # re-executed on resume, which will overwrite the status to
             # 'completed' once the gate accepts the decision.
             if nr.get("status") in ("completed", "skipped"):
-                prior_completed[nr["dag_node_id"]] = nr.get("output") or ""
+                prior_completed[nr["dag_node_id"]] = nr.get("summary") or ""
 
         working_path = run.get("working_path", "/tmp")
-        inputs: Dict[str, Any] = {}
+        meta = run.get("metadata") or {}
+        inputs = _resolve_inputs(defn["yaml"], meta.get("inputs") or {})
+
+        # Interactive loop gate (L2-06): re-run the loop node from the
+        # iteration after the one that paused, instead of skipping it (its
+        # node_run was claimed 'completed' by approve) or restarting at 0.
+        loop_resume: Dict[str, Dict[str, Any]] = {}
+        pause = meta.get("pause") or {}
+        if pause.get("type") == "interactive_loop" and pause.get("node_id"):
+            prior_completed.pop(pause["node_id"], None)
+            loop_resume[pause["node_id"]] = pause
 
         # Reset to running in case the caller didn't already (idempotent).
         self._run_store.resume_workflow_run(run_id)
@@ -259,6 +284,7 @@ class WorkflowRunner:
                 inputs,
                 working_path,
                 prior_completed=prior_completed,
+                loop_resume=loop_resume,
             ),
             name=f"resume-{run_id}",
         )
@@ -341,10 +367,28 @@ class WorkflowRunner:
         working_path: str,
         prior_completed: Optional[Dict[str, str]] = None,
         max_runtime_s: Optional[int] = None,
+        loop_resume: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         start_ms = int(time.time() * 1000)
         try:
+            run_row = self._run_store.get_workflow_run(run_id) or {}
+            cwd = working_path if os.path.isdir(working_path) else None
+            base_branch = str(inputs.get("base_branch") or "") or await asyncio.to_thread(
+                _detect_base_branch, cwd,
+            )
+            artifacts_dir = self._runs_dir / run_id / "artifacts"
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
             ctx = self._build_ctx(run_id, working_path, prior_completed)
+            ctx.cwd = cwd
+            ctx.log_dir = str(self._runs_dir / run_id)
+            ctx.loop_resume = loop_resume or {}
+            ctx.workflow_vars = {
+                "workflow_id": workflow_id,
+                "user_message": run_row.get("user_message") or "",
+                "artifacts_dir": str(artifacts_dir),
+                "base_branch": base_branch,
+                "inputs": inputs,
+            }
             if max_runtime_s is not None and max_runtime_s > 0:
                 node_outputs = await asyncio.wait_for(
                     execute_dag(dag_nodes, ctx), timeout=float(max_runtime_s),
@@ -512,12 +556,19 @@ class WorkflowRunner:
                 node_type = payload.get("node_type", "prompt")
                 provided_nr_id = payload.get("node_run_id_hint")
                 try:
-                    nr = run_store.create_node_run(
-                        workflow_run_id=run_id,
-                        dag_node_id=node_id,
-                        node_type=node_type,
-                        node_run_id=provided_nr_id,
-                    )
+                    # Re-executed node (loop resumed after its gate, retry):
+                    # reuse its row — UNIQUE(.., loop_iteration NULL) does
+                    # not dedupe, so a fresh insert would leave a zombie.
+                    nr = run_store.find_node_run(run_id, node_id)
+                    if nr is not None:
+                        run_store.update_node_run(nr["id"], {"status": "running", "completed_at": None})
+                    else:
+                        nr = run_store.create_node_run(
+                            workflow_run_id=run_id,
+                            dag_node_id=node_id,
+                            node_type=node_type,
+                            node_run_id=provided_nr_id,
+                        )
                     node_run_id = nr["id"]
                 except Exception as e:
                     logger.debug("create_node_run skipped: %s", e)
@@ -534,6 +585,7 @@ class WorkflowRunner:
                     patch: Dict[str, Any] = {}
                     if event_type == "node_completed":
                         patch["status"] = "completed"
+                        patch["summary"] = payload.get("output")
                         patch["completed_at"] = int(time.time() * 1000)
                     elif event_type == "node_failed":
                         patch["status"] = "failed"
@@ -603,6 +655,60 @@ class WorkflowRunner:
             send_message=send_message,
             get_subgraph_yaml=get_subgraph_yaml,
             llm=self._llm,
-            log_dir=working_path,
             prior_completed=prior_completed,
         )
+
+    async def heartbeat_forever(self, interval_s: float = HEARTBEAT_S) -> None:
+        """Keep this process's live runs fresh so other engines' crash
+        recovery (stale-heartbeat reaper) leaves them alone (L2-02)."""
+        from engine.runtime.resume import mark_crashed_runs
+        while True:
+            try:
+                self._run_store.heartbeat_runs(list(self._tasks))
+                mark_crashed_runs(self._run_store)
+            except Exception:
+                logger.exception("heartbeat tick failed")
+            await asyncio.sleep(interval_s)
+
+
+def _resolve_inputs(yaml_text: str, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Declared workflow inputs only, caller value else YAML ``default``.
+
+    Only author-declared names are exported (as env vars / prompt
+    substitutions) so a caller can't inject e.g. PATH or PYTHONPATH.
+    """
+    try:
+        declared = (yaml.safe_load(yaml_text) or {}).get("inputs") or []
+    except yaml.YAMLError:
+        declared = []
+    out: Dict[str, Any] = {}
+    for d in declared:
+        name = d.get("name") if isinstance(d, dict) else None
+        if not name:
+            continue
+        if reserved_input_name(name):
+            raise ValueError(
+                f"workflow input name '{name}' is reserved (would override the "
+                "subprocess env: PATH, PYTHONPATH, HOME, LD_*, DYLD_*, HERMES_*, ...); rename it"
+            )
+        value = inputs.get(name, d.get("default"))
+        if value is not None:
+            out[name] = value
+    if "base_branch" in inputs:  # engine var, shell-quoted / script-guarded
+        out.setdefault("base_branch", inputs["base_branch"])
+    return out
+
+
+def _detect_base_branch(cwd: Optional[str]) -> str:
+    """origin/HEAD's branch in cwd, '' when unknown ($BASE_BRANCH then errors)."""
+    if not cwd:
+        return ""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "origin/HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    ref = out.stdout.strip() if out.returncode == 0 else ""
+    return ref.split("/", 1)[1] if ref.startswith("origin/") else ""

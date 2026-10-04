@@ -18,7 +18,7 @@ import time
 from typing import Dict
 
 from engine.schemas.workflow_run import NodeOutput
-from engine.core.executor_shared import substitute_node_output_refs
+from engine.core.executor_shared import substitute_inputs, substitute_node_output_refs
 
 logger = logging.getLogger("workflow.nodes.command")
 
@@ -37,7 +37,11 @@ async def execute_command_node(node, node_outputs: Dict[str, NodeOutput], ctx) -
     })
 
     # Substitute $nodeId.output refs in the command string
-    final_command = substitute_node_output_refs(node.command, node_outputs)
+    # Node refs first so an input value can't inject a `$x.output` ref.
+    final_command = substitute_inputs(
+        substitute_node_output_refs(node.command, node_outputs),
+        (getattr(ctx, "workflow_vars", None) or {}).get("inputs") or {},
+    )
 
     # Format as a slash-command-style prompt (mirrors TS: "/" + command)
     prompt = f"/{final_command}"

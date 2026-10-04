@@ -1,8 +1,8 @@
 """test_api_routes.py — personas REST router: list / get / promote-stub.
 
 Loads plugin_api flat (spec_from_file_location) and drives the router via
-FastAPI TestClient. Auth no-ops in standalone test context (_require_auth swallows
-ImportError when web_server is absent).
+FastAPI TestClient. _require_auth fails closed, so the client sends the real
+web_server session token header.
 """
 from __future__ import annotations
 
@@ -27,16 +27,28 @@ def _load_api() -> Any:
     return mod
 
 
-def _client():
-    fastapi = pytest.importorskip("fastapi")
+def _client(authed: bool = True):
+    pytest.importorskip("fastapi")
     pytest.importorskip("starlette")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+    from hermes_cli import web_server
 
     api = _load_api()
     app = FastAPI()
     app.include_router(api.router, prefix="/api/plugins/personas")
-    return TestClient(app)
+    headers = {web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN} if authed else {}
+    return TestClient(app, headers=headers)
+
+
+def test_unauthenticated_rejected():
+    r = _client(authed=False).get("/api/plugins/personas/list")
+    assert r.status_code == 401
+
+
+def test_get_omits_path():
+    r = _client().get("/api/plugins/personas/get", params={"id": "engineering-security-engineer"})
+    assert r.status_code == 200 and "path" not in r.json()["persona"]
 
 
 def test_list_returns_all():

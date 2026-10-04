@@ -75,7 +75,7 @@ def test_transform_tools_sets_the_contextvar_pre_tool_call_reads(monkeypatch):
         tools: list = []
 
     agent = _Agent()
-    monkeypatch.setattr(hook_impl, "_load_config", lambda *a, **k: {"lazy_loading": True})
+    monkeypatch.setattr(hook_impl, "_load_root", lambda *a, **k: {"mcp": {"lazy_loading": True}})
     hook_impl.transform_tools(tools=[{"name": "t"}], agent=agent, api_messages=[])
 
     assert hook_impl._current_agent_var.get(None) is agent, \

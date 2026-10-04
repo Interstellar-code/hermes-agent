@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
-from typing import Optional, Any
+from typing import Optional
 
 _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
@@ -35,12 +35,6 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 def get_default_lock_path() -> Path:
     """Return default lock path evaluated dynamically at call time."""
     return get_hermes_home() / "switchui-workflows.db.migrate.lock"
-
-
-def __getattr__(name: str) -> Any:
-    if name == "_DEFAULT_LOCK_PATH":
-        return get_default_lock_path()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _migration_version(filename: str) -> int:

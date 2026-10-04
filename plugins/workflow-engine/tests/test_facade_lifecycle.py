@@ -11,6 +11,7 @@ import asyncio
 import time
 
 import pytest
+from engine.store.run_store import STORE_LOCK
 
 from engine.wiring import create_engine
 
@@ -55,16 +56,17 @@ nodes:
 def _seed_def(engine, wf_id: str, yaml_text: str) -> None:
     """Directly insert a workflow_definitions row for testing."""
     import hashlib, time as t
-    conn = engine._conn
-    now = int(t.time() * 1000)
-    checksum = hashlib.sha256(yaml_text.encode()).hexdigest()
-    conn.execute(
-        """INSERT OR IGNORE INTO workflow_definitions
-             (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
-           VALUES (?, ?, ?, 'bundled', ?, ?, ?, ?, 'workflow')""",
-        (wf_id, wf_id, wf_id, yaml_text, checksum, now, now),
-    )
-    conn.commit()
+    with STORE_LOCK:  # heartbeat thread shares this conn
+        conn = engine._conn
+        now = int(t.time() * 1000)
+        checksum = hashlib.sha256(yaml_text.encode()).hexdigest()
+        conn.execute(
+            """INSERT OR IGNORE INTO workflow_definitions
+                 (id, name, description, source, yaml, checksum, created_at, updated_at, kind)
+               VALUES (?, ?, ?, 'bundled', ?, ?, ?, ?, 'workflow')""",
+            (wf_id, wf_id, wf_id, yaml_text, checksum, now, now),
+        )
+        conn.commit()
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────

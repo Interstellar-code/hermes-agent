@@ -1990,6 +1990,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
     effective_system = agent._cached_system_prompt or ""
     if agent.ephemeral_system_prompt:
         effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    _trusted = getattr(agent, "_plugin_trusted_context", "")  # pre_llm_call target=system/developer
+    if _trusted:
+        effective_system = (effective_system + "\n\n" + _trusted).strip()
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     for idx, pfm in enumerate(agent.prefill_messages or ()):

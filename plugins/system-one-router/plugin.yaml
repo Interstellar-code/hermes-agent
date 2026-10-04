@@ -1,0 +1,26 @@
+name: system-one-router
+version: "0.1.0"
+# Two independent enable gates (finding 15), both fail-closed:
+#   1. plugins.enabled in config.yaml must include this plugin (or the loader's
+#      default set must allow it) — the discovery-level gate.
+#   2. plugins.system-one-router.enabled: true — the plugin-level gate, checked
+#      by every tool's check_fn. Either gate false → tools hidden, no network.
+# Gate #1 is a platform-wide kill switch (also gates ALL other plugins); gate
+# #2 is this plugin's own switch. Both must be true for any Jev call to fire.
+description: >-
+  Advisory routing decisions via the hosted Jev decision API (typed
+  Choice/Score/Noul). Fail-closed; dormant until BOTH plugins.enabled includes
+  this plugin AND plugins.system-one-router.enabled is true (two independent
+  gates, see comment above).
+kind: standalone
+# NOTE (finding 15): this is a paid third-party vendor integration in-tree,
+# against the upstream plugins/AGENTS.md policy ("no new third-party-product
+# plugins in-tree"). Accepted deliberately for this personal fork; expected to
+# be rejected upstream and to move out-of-tree if this fork is ever rebased
+# onto stock upstream.
+provides_tools:
+  - system_one_status
+  - system_one_route
+  - system_one_decide
+provides_skills:
+  - system-one-routing

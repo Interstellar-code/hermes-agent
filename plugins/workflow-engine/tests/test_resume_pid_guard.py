@@ -1,8 +1,7 @@
-"""Resume policy PID guard — regression test for #49.
+"""Crash recovery by per-run heartbeat (#49, L2-02).
 
-mark_crashed_runs must distinguish a genuine process restart (PID differs from
-the one persisted in schema_meta) from an in-process plugin re-initialization
-(same PID), where live asyncio run tasks are still finalising themselves.
+mark_crashed_runs fails only runs whose owner stopped heartbeating; runs live
+in this or another process (fresh heartbeat) are left alone.
 """
 from __future__ import annotations
 
@@ -40,35 +39,46 @@ def _running_run(run_store: RunStore) -> str:
     return run["id"]
 
 
-def test_first_boot_marks_running_as_crashed():
-    """No prior PID recorded → treat in-flight rows as a real crash."""
-    store = RunStore(_make_conn())
-    run_id = _running_run(store)
-    assert store.mark_crashed_runs(boot_pid=4242) == 1
-    assert store.get_workflow_run(run_id)["status"] == "failed"
+def _age(store: RunStore, run_id: str, ms: int) -> None:
+    store._conn.execute(
+        "UPDATE workflow_runs SET last_heartbeat = last_heartbeat - ? WHERE id = ?", (ms, run_id)
+    )
+    store._conn.commit()
 
 
-def test_same_pid_reinit_leaves_runs_running():
-    """Second boot with the same PID = in-process reinit → do not crash."""
+def test_live_run_owned_elsewhere_left_running():
+    """A fresh heartbeat (another process's live run) is never reaped."""
     store = RunStore(_make_conn())
-    store.mark_crashed_runs(boot_pid=4242)  # records boot_pid
     run_id = _running_run(store)
-    assert store.mark_crashed_runs(boot_pid=4242) == 0
+    assert store.mark_crashed_runs() == 0
     assert store.get_workflow_run(run_id)["status"] == "running"
 
 
-def test_different_pid_marks_crashed():
-    """Boot under a new PID = real process restart → crash in-flight rows."""
-    store = RunStore(_make_conn())
-    store.mark_crashed_runs(boot_pid=4242)
-    run_id = _running_run(store)
-    assert store.mark_crashed_runs(boot_pid=9999) == 1
-    assert store.get_workflow_run(run_id)["status"] == "failed"
-
-
-def test_legacy_no_pid_marks_crashed():
-    """boot_pid=None preserves the unconditional legacy behaviour."""
+def test_stale_heartbeat_marks_crashed():
     store = RunStore(_make_conn())
     run_id = _running_run(store)
+    _age(store, run_id, 10 * 60 * 1000)
     assert store.mark_crashed_runs() == 1
     assert store.get_workflow_run(run_id)["status"] == "failed"
+
+
+def test_heartbeat_keeps_run_alive():
+    store = RunStore(_make_conn())
+    run_id = _running_run(store)
+    _age(store, run_id, 10 * 60 * 1000)
+    store.heartbeat_runs([run_id])
+    assert store.mark_crashed_runs() == 0
+
+
+def test_retention_sweep_drops_old_terminal_runs_only():
+    store = RunStore(_make_conn())
+    old = _running_run(store)
+    live = _running_run(store)
+    store.update_workflow_run(old, status="completed")
+    store._conn.execute(
+        "UPDATE workflow_runs SET completed_at = completed_at - ? WHERE id = ?",
+        (31 * 86_400_000, old),
+    )
+    assert store.delete_terminal_runs_older_than(30) == 1
+    assert store.get_workflow_run(old) is None
+    assert store.get_workflow_run(live) is not None
