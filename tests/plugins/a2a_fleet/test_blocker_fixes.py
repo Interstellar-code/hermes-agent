@@ -188,7 +188,7 @@ def test_auth_required_without_token_env_returns_jsonrpc_envelope(
     # Wipe the token env so token resolves to None.
     monkeypatch.delenv("SWITCH_A2A_TOKEN", raising=False)
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         response = client.post(
             "/jsonrpc",
             json={"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {}},

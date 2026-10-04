@@ -243,7 +243,7 @@ def test_llm_handler_failing_client_returns_jsonrpc_error(
 
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         resp = client.post("/jsonrpc", json=_send_body("hello"))
 
     assert resp.status_code == 200
@@ -277,7 +277,7 @@ def test_unknown_handler_falls_back_to_echo(tmp_path: Path, monkeypatch: pytest.
 
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         resp = client.post("/jsonrpc", json=_send_body("ping"))
 
     body = resp.json()
@@ -297,7 +297,7 @@ def test_config_hotswap_echo_then_llm(tmp_path: Path, monkeypatch: pytest.Monkey
 
     from a2a_fleet.server import build_app
 
-    with TestClient(build_app()) as client:
+    with TestClient(build_app(), base_url="http://127.0.0.1") as client:
         # First request: echo handler.
         r1 = client.post("/jsonrpc", json=_send_body("ping"))
         assert r1.json()["result"]["message"]["parts"][0]["text"] == "pong"

@@ -228,6 +228,10 @@ def register(ctx) -> None:
                     "type": "string",
                     "description": "Optional claude model to pin (e.g. 'sonnet', 'opus').",
                 },
+                "hermes_auth_token_env": {
+                    "type": "string",
+                    "description": "Env var name holding the outbound bearer token for replies to Hermes. Defaults to this node's fleet.server.token_env when auth_required.",
+                },
             },
             "required": ["repo_path"],
         },
@@ -297,6 +301,10 @@ def register(ctx) -> None:
                 "model": {
                     "type": "string",
                     "description": "Optional OpenCode model to pin.",
+                },
+                "hermes_auth_token_env": {
+                    "type": "string",
+                    "description": "Env var name holding the outbound bearer token for replies to Hermes. Defaults to this node's fleet.server.token_env when auth_required.",
                 },
             },
             "required": ["repo_path"],

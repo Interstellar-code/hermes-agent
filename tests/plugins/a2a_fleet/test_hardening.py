@@ -103,7 +103,7 @@ def test_health_does_not_leak_names(fleet_home: Path) -> None:
     app = build_app()
 
     async def _get_health() -> dict:
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
             resp = await client.get("/health")
             assert resp.status_code == 200
             return resp.json()
