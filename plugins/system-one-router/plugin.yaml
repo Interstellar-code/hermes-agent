@@ -12,7 +12,7 @@ description: >-
   Choice/Score/Noul). Fail-closed; dormant until BOTH plugins.enabled includes
   this plugin AND plugins.system-one-router.enabled is true (two independent
   gates, see comment above).
-kind: general
+kind: standalone
 # NOTE (finding 15): this is a paid third-party vendor integration in-tree,
 # against the upstream plugins/AGENTS.md policy ("no new third-party-product
 # plugins in-tree"). Accepted deliberately for this personal fork; expected to
