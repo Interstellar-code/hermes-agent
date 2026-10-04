@@ -41,7 +41,7 @@ SCHEMA: Dict[str, Any] = {
             },
             "conversation_id": {
                 "type": "string",
-                "description": "Conversation id to associate with the run (optional).",
+                "description": "Conversation id to associate with the run (optional; defaults to the calling session).",
             },
         },
         "required": ["id"],
@@ -180,6 +180,9 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
     trigger: Dict[str, Any] = {"type": "agent", "source": "workflow_run_tool"}
     if working_path:
         trigger["working_path"] = working_path
+    # Default to the invoking session so the run links back to its chat
+    # (otherwise the runner falls back to the synthetic "trigger-<wf>").
+    conversation_id = conversation_id or _session_key
     if conversation_id:
         trigger["conversation_id"] = conversation_id
 

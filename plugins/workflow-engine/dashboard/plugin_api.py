@@ -674,6 +674,212 @@ async def list_node_runs(run_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Linked sessions — GET /runs/{run_id}/sessions
+# Read-only view into each profile's state.db: the owning chat session plus,
+# per node, the agent session, its sub-agents and async delegations.
+# ---------------------------------------------------------------------------
+
+_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+_SESSION_CAP = 200
+
+
+def _profile_home(profile: str) -> Optional[Path]:
+    if not _PROFILE_RE.match(profile or ""):
+        return None
+    from hermes_constants import get_default_hermes_root  # noqa: PLC0415
+    root = get_default_hermes_root()
+    return root if profile == "default" else root / "profiles" / profile
+
+
+def _open_state_db(home: Optional[Path]) -> Optional[sqlite3.Connection]:
+    db = home / "state.db" if home else None
+    if db is None or not db.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=1)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
+
+
+def _session_info(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    cost = d.get("actual_cost_usd")
+    return {
+        "id": d.get("id"),
+        "title": d.get("title"),
+        "model": d.get("model"),
+        "source": d.get("source"),
+        "input_tokens": d.get("input_tokens") or 0,
+        "output_tokens": d.get("output_tokens") or 0,
+        "cost": cost if cost is not None else d.get("estimated_cost_usd"),
+        "started_at": d.get("started_at"),
+        "ended_at": d.get("ended_at"),
+        "end_reason": d.get("end_reason"),
+        "last_activity_description": d.get("last_activity_description"),
+    }
+
+
+class _SessionWalker:
+    """Walks one profile's state.db; every visited session lands in ``seen`` (totals + cap)."""
+
+    def __init__(self, conn: sqlite3.Connection, seen: Dict[tuple, Dict[str, Any]], profile: str):
+        self.conn, self.seen, self.profile = conn, seen, profile
+        self.has_deleg = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='async_delegations'"
+        ).fetchone() is not None
+
+    def _visit(self, row: sqlite3.Row) -> Optional[Dict[str, Any]]:
+        k = (self.profile, row["id"])
+        if k in self.seen or len(self.seen) >= _SESSION_CAP:
+            return None
+        info = self.seen[k] = _session_info(row)
+        return info
+
+    def session(self, sid: str) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if row is None:
+            return None
+        return self.seen.get((self.profile, sid)) or self._visit(row)
+
+    def delegations(self, sid: str) -> List[Dict[str, Any]]:
+        if not self.has_deleg:
+            return []
+        out = []
+        for r in self.conn.execute(
+            "SELECT * FROM async_delegations WHERE parent_session_id = ? OR origin_session = ?"
+            " ORDER BY dispatched_at",
+            (sid, sid),
+        ):
+            d = dict(r)
+            try:
+                goal = (json.loads(d.get("task_json") or "{}") or {}).get("goal")
+            except (ValueError, AttributeError):
+                goal = None
+            out.append({
+                "id": d.get("delegation_id"),
+                "state": d.get("state"),
+                "goal": goal,
+                "dispatched_at": d.get("dispatched_at"),
+                "completed_at": d.get("completed_at"),
+            })
+        return out
+
+    def tree(self, sid: str, source: Optional[str]) -> tuple:
+        """(children, delegations) of sid. A same-source child is a compression
+        continuation of sid itself, so its subtree is folded in transparently."""
+        children: List[Dict[str, Any]] = []
+        delegs = self.delegations(sid)
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY started_at", (sid,)
+        ).fetchall()
+        for row in rows:
+            info = self._visit(row)
+            if info is None:
+                continue
+            # subagent check first: a sub-agent's own sub-agent shares its source
+            if row["source"] == source and source != "subagent":
+                c, dl = self.tree(row["id"], source)
+                children += c
+                delegs += dl
+            else:
+                c, dl = self.tree(row["id"], row["source"])
+                children.append({
+                    **info,
+                    "kind": "subagent" if row["source"] == "subagent" else "child",
+                    "children": c,
+                    "delegations": dl,
+                })
+        return children, delegs
+
+
+def _collect_run_sessions(
+    run: Dict[str, Any], node_runs: List[Dict[str, Any]], run_profile: str,
+) -> Dict[str, Any]:
+    conns: List[sqlite3.Connection] = []
+    walkers: Dict[str, Optional[_SessionWalker]] = {}
+    seen: Dict[tuple, Dict[str, Any]] = {}
+
+    def walker(profile: str) -> Optional[_SessionWalker]:
+        if profile not in walkers:
+            walkers[profile] = None
+            conn = _open_state_db(_profile_home(profile))
+            if conn is not None:
+                conns.append(conn)
+                try:
+                    walkers[profile] = _SessionWalker(conn, seen, profile)
+                except sqlite3.Error:
+                    pass
+        return walkers[profile]
+
+    def safe(fn, default):
+        try:
+            return fn()
+        except sqlite3.Error:
+            return default
+
+    try:
+        owner = None
+        if run.get("owner_session"):
+            w = walker(run_profile)
+            owner = safe(lambda: w.session(run["owner_session"]), None) if w else None
+
+        nodes = []
+        for nr in node_runs:
+            meta = nr.get("metadata") if isinstance(nr.get("metadata"), dict) else {}
+            sid = nr.get("session_id") or meta.get("session_id")
+            if not sid:
+                continue
+            profile = nr.get("assigned_agent") or meta.get("profile") or run_profile
+            w = walker(profile)
+            info = safe(lambda: w.session(sid), None) if w else None
+            children, delegs = (
+                safe(lambda: w.tree(sid, info["source"]), ([], [])) if info else ([], [])
+            )
+            nodes.append({
+                "node_run_id": nr.get("id"),
+                "dag_node_id": nr.get("dag_node_id"),
+                "profile": profile,
+                "session_id": sid,
+                "gateway_run_id": nr.get("gateway_run_id") or meta.get("gateway_run_id"),
+                "session": info,
+                "children": children,
+                "delegations": delegs,
+            })
+    finally:
+        for c in conns:
+            c.close()
+
+    all_s = list(seen.values())
+    costs = [s["cost"] for s in all_s if s["cost"] is not None]
+    return {
+        "owner": owner,
+        "nodes": nodes,
+        "totals": {
+            "sessions": len(all_s),
+            "subagents": sum(1 for s in all_s if s["source"] == "subagent"),
+            "tokens": sum(s["input_tokens"] + s["output_tokens"] for s in all_s),
+            "cost_usd": round(sum(costs), 6) if costs else None,
+        },
+    }
+
+
+@router.get("/runs/{run_id}/sessions")
+async def list_run_sessions(run_id: str) -> JSONResponse:
+    run = await _engine().get_run(run_id)
+    if run is None:
+        return _json({"error": "not found"}, 404)
+    node_runs = await _engine().list_node_runs(run_id)
+    from engine.runtime.scheduler_tick import profile_for_dir  # noqa: PLC0415
+    db_path = _engine().db_path
+    run_profile = (
+        profile_for_dir(Path(db_path).parent) if db_path and db_path != ":memory:" else "default"
+    )
+    return _json(await asyncio.to_thread(_collect_run_sessions, run, node_runs, run_profile))
+
+
+# ---------------------------------------------------------------------------
 # Node runs — GET /node-runs/active   MUST be before /node-runs/{node_run_id}
 # ---------------------------------------------------------------------------
 
