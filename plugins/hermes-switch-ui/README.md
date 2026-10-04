@@ -98,8 +98,11 @@ TTL-derived `running` flag. Runtime fields are **best-effort / nullable** —
 ## Sync API — endpoints
 
 The router is mounted at `/api/plugins/hermes-switch-ui/`. All endpoints
-require authentication (session cookie or bearer token via
-`hermes_cli.web_server._is_authenticated`).
+require authentication: the global dashboard auth middleware, plus a per-route
+`_require_auth` dependency that delegates to `hermes_cli.web_server._require_token`
+(fails closed with 503 if it cannot be imported). State lives at
+`~/.hermes/switchui/state.json` (machine-wide, NOT per-profile: one SwitchUI front-end;
+override with `SWITCHUI_STATE_PATH`).
 
 | Method | Path | Direction | Purpose |
 |--------|------|-----------|---------|

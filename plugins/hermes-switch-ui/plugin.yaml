@@ -1,6 +1,6 @@
 name: hermes-switch-ui
 version: "0.2.0"
-description: "Backend awareness of SwitchUI frontend + bidirectional config sync. Injects per-turn nudge, exposes switchui_info/switchui_status tools, config-sync API at /api/plugins/hermes-switch-ui/."
+description: "Backend awareness of the SwitchUI frontend + bidirectional config sync: per-turn nudge, switchui_info/switchui_status tools, and a config-sync API (connection/register/settings/status/heartbeat/project-map) at /api/plugins/hermes-switch-ui/."
 author: Interstellar-code
 
 kind: standalone

@@ -168,6 +168,12 @@ curl -s -H "Authorization: Bearer <TOKEN>" \
 
 `running` is `true` when `(now − last_heartbeat) < 90 s`.
 
+### GET /project-map — all projects + session bindings in one call
+
+`GET /api/plugins/hermes-switch-ui/project-map?profile=<name|current>` returns
+`{version, projects: [{id,slug,name,icon,color,archived,board_slug}], sessions: {session_id: project_id}}`.
+Read-only (a missing `projects.db` yields an empty map); supports ETag / `If-None-Match` (304).
+
 ### POST /heartbeat — explicit liveness ping
 
 ```bash

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -24,28 +25,56 @@ def _empty_task_counts() -> dict[str, int]:
     return {status: 0 for status in sorted(kanban_db.VALID_STATUSES - {"archived"})}
 
 
-def _board_enrichment(project_ids: set[str]) -> tuple[dict[str, dict], list[str], bool]:
-    """Aggregate linked tasks/events once per shared board."""
-    totals: dict[str, dict] = {}
-    errors: list[str] = []
+def iter_board_paths(errors: list[str], default_slug: str = ""):
+    """Yield (slug, db_path) once per distinct kanban board DB; list failures into ``errors``."""
     try:
         boards = kanban_db.list_boards(include_archived=True)
     except Exception as exc:
-        return {}, [f"boards: {exc}"], False
-
-    seen_paths: set[str] = set()
+        errors.append(f"boards: {exc}")
+        return
+    seen: set[str] = set()
     for board in boards:
-        slug = str(board.get("slug") or "")
+        slug = str(board.get("slug") or default_slug)
         if not slug:
             continue
-        raw_path = board.get("db_path")
+        try:
+            raw_path = board.get("db_path")
+            path = Path(raw_path).expanduser() if raw_path else kanban_db.kanban_db_path(slug)
+            resolved = str(path.resolve())
+        except Exception as exc:
+            errors.append(f"board {slug}: {exc}")
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield slug, path
+
+
+def iter_session_pages(db):
+    """Yield listable session pages (newest first) until exhausted."""
+    offset = 0
+    while True:
+        rows = db.list_sessions_rich(
+            limit=_SESSION_PAGE_SIZE,
+            offset=offset,
+            order_by_last_active=True,
+            min_message_count=1,
+            include_children=False,
+            exclude_sources=["cron"],
+            include_archived=False,
+        )
+        yield rows
+        if len(rows) < _SESSION_PAGE_SIZE:
+            return
+        offset += len(rows)
+
+
+def _board_enrichment(project_ids: set[str], boards: list, errors: list[str]) -> tuple[dict[str, dict], list[str], bool]:
+    """Aggregate linked tasks/events once per shared board."""
+    totals: dict[str, dict] = {}
+    for slug, db_path in boards:
         conn: sqlite3.Connection | None = None
         try:
-            db_path = Path(raw_path).expanduser() if raw_path else kanban_db.kanban_db_path(slug)
-            resolved_path = str(db_path.resolve())
-            if resolved_path in seen_paths:
-                continue
-            seen_paths.add(resolved_path)
             conn = kanban_db_connect.connect(db_path=db_path)
             rows = conn.execute(
                 """
@@ -110,17 +139,7 @@ def _session_activity(projects: list[projects_db.Project]) -> tuple[dict[str, di
             }
             index = project_tree._FolderIndex(project_dicts)
             activity: dict[str, dict] = {}
-            offset = 0
-            while True:
-                sessions = db.list_sessions_rich(
-                    limit=_SESSION_PAGE_SIZE,
-                    offset=offset,
-                    order_by_last_active=True,
-                    min_message_count=1,
-                    include_children=False,
-                    exclude_sources=["cron"],
-                    include_archived=False,
-                )
+            for sessions in iter_session_pages(db):
                 explicit_owners = projects_db.get_session_projects(
                     projects_conn, (session["id"] for session in sessions)
                 )
@@ -141,9 +160,6 @@ def _session_activity(projects: list[projects_db.Project]) -> tuple[dict[str, di
                     item["session_count"] += 1
                     if at:
                         item["last_activity"] = max(item["last_activity"] or 0, at)
-                if len(sessions) < _SESSION_PAGE_SIZE:
-                    break
-                offset += len(sessions)
         finally:
             if projects_conn is not None:
                 projects_conn.close()
@@ -169,12 +185,56 @@ def _bound_board(slug: str | None) -> dict | None:
         return None
 
 
+_CACHE_TTL = 5.0
+_cache: dict = {}
+
+
+def _stat_sig(paths) -> tuple:
+    sig = []
+    for p in paths:
+        for suffix in ("", "-wal"):
+            try:
+                st = Path(str(p) + suffix).stat()
+                sig.append((str(p) + suffix, st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
+    return tuple(sig)
+
+
+def _cached_aggregates(rows: list[projects_db.Project]):
+    """Board + session aggregates, memoised for a few seconds.
+
+    Key = home + project folder layout + mtimes of every DB the aggregates read, so any
+    write invalidates it. ponytail: mtime check is O(boards) stats; TTL caps staleness for
+    git-probe-derived ownership.
+    """
+    home = get_hermes_home()
+    paths = [home / "state.db", projects_db.projects_db_path()]
+    probe: list[str] = []
+    boards = list(iter_board_paths(probe))
+    paths += [p for _, p in boards]
+    key = (
+        str(home),
+        tuple((p.id, p.archived, p.board_slug, tuple(f.path for f in p.folders)) for p in rows),
+        _stat_sig(paths),
+    )
+    hit = _cache.get(key)
+    if hit and time.monotonic() - hit[0] < _CACHE_TTL and not probe:
+        return hit[1]
+    board = _board_enrichment({p.id for p in rows}, boards, probe)
+    sess = _session_activity(rows)
+    result = (board, sess)
+    _cache.clear()
+    _cache[key] = (time.monotonic(), result)
+    return result
+
+
 def enrich_projects(projects: Iterable[projects_db.Project], active_id: str | None) -> tuple[list[dict], list[str]]:
     """Add frontend fields without changing ``Project.to_dict()``."""
     rows = list(projects)
     project_ids = {p.id for p in rows}
-    board_data, errors, boards_available = _board_enrichment(project_ids)
-    session_data, session_errors = _session_activity(rows)
+    (board_data, errors, boards_available), (session_data, session_errors) = _cached_aggregates(rows)
+    errors = list(errors)
     sessions_available = not session_errors
     errors.extend(session_errors)
 

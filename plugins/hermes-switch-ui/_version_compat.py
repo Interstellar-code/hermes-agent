@@ -16,6 +16,8 @@ log = logging.getLogger(__name__)
 
 # Mirrored from plugin.yaml: compatible_switchui
 PLUGIN_RANGE: str = ">=1.0.0,<3.0.0"
+# Single plugin-version source (plugin.yaml / manifest.json mirror it).
+PLUGIN_VERSION: str = "0.2.0"
 
 
 # ---------------------------------------------------------------------------

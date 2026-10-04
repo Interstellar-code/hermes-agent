@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import _version_compat
+
 log = logging.getLogger(__name__)
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
@@ -28,6 +30,13 @@ _CAPABILITY_PATH = _PLUGIN_DIR / "capability.md"
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _gateway_port() -> int:
+    try:
+        return int(_os.environ.get("HERMES_GATEWAY_PORT", "8642"))
+    except ValueError:
+        return 8642
+
 
 def _load_capability_text() -> str:
     """Read capability.md from disk."""
@@ -60,9 +69,12 @@ def _fetch_remote_docs(url: str) -> Optional[str]:
 
     All errors are swallowed.  Returns None on any failure.
     """
+    if not url.lower().startswith(("http://", "https://")):
+        log.debug("hermes-switch-ui: refusing non-http(s) docs url")
+        return None
     try:
         import urllib.request  # stdlib only — no requests dependency
-        req = urllib.request.Request(url, headers={"User-Agent": "hermes-switch-ui/0.1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": f"hermes-switch-ui/{_version_compat.PLUGIN_VERSION}"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             raw = resp.read(65536)  # cap at 64 KB
             return raw.decode("utf-8", errors="replace")
@@ -85,7 +97,7 @@ def get_info(refresh: bool = False) -> Dict[str, Any]:
     info: Dict[str, Any] = {
         "source": "capability.md",
         "capability": _load_capability_text(),
-        "gateway_port": int(_os.environ.get("HERMES_GATEWAY_PORT", "8642")),
+        "gateway_port": _gateway_port(),
         "dashboard_port": 9119,
         "frontend_port": 3002,
         "repo": "https://github.com/Interstellar-code/hermes-switchui",
@@ -119,7 +131,7 @@ def connection_info() -> Dict[str, Any]:
     BEST-EFFORT / NULLABLE — None on any failure.
     """
     result: Dict[str, Any] = {
-        "gateway_port": int(_os.environ.get("HERMES_GATEWAY_PORT", "8642")),
+        "gateway_port": _gateway_port(),
         "dashboard_port": 9119,
         "frontend_port": 3002,
         "active_profile": None,
@@ -156,9 +168,8 @@ def connection_info() -> Dict[str, Any]:
     # ACTUALLY serving — it beats both the config key and the disk file, which
     # only record intent and can diverge from the running gateway (disk said
     # "morpheus" while this gateway served hermes-switch sessions).
-    hermes_home = Path(
-        os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    )
+    from hermes_constants import get_hermes_home  # noqa: PLC0415
+    hermes_home = get_hermes_home()
     if hermes_home.parent.name == "profiles":
         result["active_profile"] = hermes_home.name
         result["active_profile_source"] = "runtime"

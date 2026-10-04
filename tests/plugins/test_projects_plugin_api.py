@@ -336,12 +336,13 @@ def test_lifecycle_active_and_archived_only_delete(client: TestClient) -> None:
     pid = _create_project()
     assert client.post(f"/api/plugins/projects/{pid}/active").json()["active_id"] == pid
 
-    # Active projects may be archived, and the pointer remains until deletion.
+    # Archiving the active project clears the pointer; archived projects can't be activated.
     archived = client.post(f"/api/plugins/projects/{pid}/archive")
     assert archived.status_code == 200
     assert archived.json()["project"]["archived"] is True
     assert archived.json()["projects"][0]["archived"] is True
-    assert client.get("/api/plugins/projects").json()["active_id"] == pid
+    assert client.get("/api/plugins/projects").json()["active_id"] is None
+    assert client.post(f"/api/plugins/projects/{pid}/active").status_code == 409
     assert client.delete(f"/api/plugins/projects/{pid}").status_code == 200
     assert client.get("/api/plugins/projects?include_archived=true").json() == {
         "projects": [],
@@ -357,6 +358,33 @@ def test_lifecycle_active_and_archived_only_delete(client: TestClient) -> None:
     assert restored.json()["project"]["archived"] is False
     assert client.post(f"/api/plugins/projects/{pid}/restore").json()["project"]["archived"] is False
     assert client.post("/api/plugins/projects/missing/active").status_code == 404
+
+
+def test_delete_is_atomic_on_archived_and_rejects_broad_paths(client: TestClient) -> None:
+    pid = _create_project()
+    with projects_db.connect_closing() as conn:
+        assert projects_db.delete_project(conn, pid, only_archived=True) is False
+        assert projects_db.get_project(conn, pid) is not None
+    assert client.post(f"/api/plugins/projects/{pid}/folders", json={"path": "/"}).status_code == 400
+    assert client.post(
+        f"/api/plugins/projects/{pid}/folders", json={"path": "x" * 5000}
+    ).status_code == 422
+
+
+def test_concurrent_profile_requests_stay_isolated(tmp_path: Path, client: TestClient) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    for name in ("a", "b"):
+        (tmp_path / "hermes_home" / "profiles" / name).mkdir(parents=True)
+        assert client.post(f"/api/plugins/projects?profile={name}", json={"name": f"P-{name}"}).status_code == 200
+
+    def names(profile):
+        r = client.get(f"/api/plugins/projects?profile={profile}")
+        return {p["name"] for p in r.json()["projects"]}
+
+    with ThreadPoolExecutor(8) as ex:
+        res = list(ex.map(names, ["a", "b"] * 16))
+    assert all(r == {"P-a"} for r in res[0::2]) and all(r == {"P-b"} for r in res[1::2])
 
 
 def test_write_route_table_contract() -> None:
@@ -420,3 +448,21 @@ def test_profile_query_scopes_all_project_routes(
     assert scoped.status_code == 200
     assert scoped.json()["project"]["name"] == "Scoped"
     assert client.get("/api/plugins/projects?profile=missing").status_code == 404
+
+
+def test_mounted_plugin_routes_reject_unauthenticated(monkeypatch, tmp_path: Path) -> None:
+    """L3-14: every projects + switch-ui route is 401 through the real middleware."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("SWITCHUI_STATE_PATH", str(tmp_path / "state.json"))
+    from hermes_cli import web_server
+
+    c = TestClient(web_server.app)
+    for method, path in [
+        ("get", "/api/plugins/projects"),
+        ("post", "/api/plugins/projects"),
+        ("get", "/api/plugins/hermes-switch-ui/connection"),
+        ("get", "/api/plugins/hermes-switch-ui/status"),
+        ("get", "/api/plugins/hermes-switch-ui/project-map"),
+        ("post", "/api/plugins/hermes-switch-ui/heartbeat"),
+    ]:
+        assert getattr(c, method)(path).status_code == 401, path
