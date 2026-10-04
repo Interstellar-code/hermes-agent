@@ -258,6 +258,8 @@ def _load_provider_from_entry_point(entry_point, *, register_skills: bool = True
     return provider
 
 
+_REGISTER_FAIL_LOGGED: set = set()  # fork: see register() failure log below
+
 def _load_provider_from_dir(provider_dir: Path, *, register_skills: bool = True) -> Optional["MemoryProvider"]:
     """Import a provider module; ``register(ctx)`` first, else a top-level subclass."""
     name = provider_dir.name
@@ -281,7 +283,10 @@ def _load_provider_from_dir(provider_dir: Path, *, register_skills: bool = True)
             if collector.provider is None:
                 # fork: bumped from debug to warning+exc_info so register() failures
                 # aren't silently swallowed (see Interstellar-code/hermes-agent#157).
-                logger.warning("register() failed for %s: %s", name, e, exc_info=True)
+                # ponytail: traceback once per provider per process; discovery re-runs repeatedly.
+                logger.warning("register() failed for %s: %s", name, e,
+                               exc_info=name not in _REGISTER_FAIL_LOGGED)
+                _REGISTER_FAIL_LOGGED.add(name)
             else:
                 logger.warning(
                     "Memory provider '%s' raised after registering (%s) — "

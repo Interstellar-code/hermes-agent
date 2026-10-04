@@ -312,3 +312,16 @@ class TestInstantiateTemplate:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 422
+
+
+class TestBodyValidation:
+    """L5-03/04: bad body types and non-UTF-8 are 422, not 500 / silent U+FFFD."""
+
+    def test_non_string_yaml_or_slug_is_422(self, client, template_home):
+        assert client.post("/templates", json={"slug": "x", "yaml": 5}).status_code == 422
+        assert client.post("/templates", json={"slug": 5, "yaml": _MINIMAL_YAML}).status_code == 422
+
+    def test_invalid_utf8_yaml_is_422(self, client, template_home):
+        r = client.post("/templates", content=b"name: \xff\xfe\n",
+                        headers={"content-type": "text/yaml"})
+        assert r.status_code == 422
