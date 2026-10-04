@@ -145,6 +145,8 @@ def test_register_wires_plugin_llm_lazily(monkeypatch):
     monkeypatch.setattr(shared, "create_engine", create)
     monkeypatch.setattr(shared, "_engines", {})
     monkeypatch.setattr(shared, "_llm", None)
+    import engine as engine_pkg  # noqa: PLC0415
+    monkeypatch.setattr(engine_pkg, "HOST_LLM", None, raising=False)  # restore after set_llm
 
     ctx = FakeCtx()
     import plugins.workflow_engine as we  # noqa: PLC0415

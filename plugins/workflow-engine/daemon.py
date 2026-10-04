@@ -21,6 +21,7 @@ import asyncio
 import logging
 import signal
 import sys
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("workflow.daemon")
@@ -30,9 +31,11 @@ async def _main(args: Any) -> int:
     from ._shared import get_engine  # noqa: PLC0415
     from engine.cron.poller import CronPoller  # noqa: PLC0415
     from engine.runtime.scheduler_tick import heartbeat_path, run_scheduler_tick_loop  # noqa: PLC0415
-    from ._shared import _home_key  # noqa: PLC0415
 
     engine = get_engine()
+    # Heartbeat lives next to the DB the engine opened so /health finds it by construction.
+    db_path = engine.db_path
+    heartbeat_file = heartbeat_path(Path(db_path).parent) if db_path else None
     poller = CronPoller(engine, poll_interval_s=args.interval)
 
     stop = asyncio.Event()
@@ -59,7 +62,7 @@ async def _main(args: Any) -> int:
     tasks = [
         asyncio.create_task(poller.run_forever(), name="wf-cron-poller"),
         asyncio.create_task(
-            run_scheduler_tick_loop(engine, heartbeat_file=heartbeat_path(_home_key())),
+            run_scheduler_tick_loop(engine, heartbeat_file=heartbeat_file),
             name="wf-scheduler-tick",
         ),
     ]

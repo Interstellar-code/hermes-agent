@@ -24,6 +24,12 @@ def heartbeat_path(home: Any) -> Path:
     return Path(home) / HEARTBEAT_FILENAME
 
 
+def profile_for_dir(directory: Any) -> str:
+    """Profile name for a profile-home dir: ``profiles/<name>`` -> name, else default."""
+    d = Path(directory)
+    return d.name if d.parent.name == "profiles" else "default"
+
+
 def write_heartbeat(path: Path, interval_s: float) -> None:
     """Atomically record "daemon alive now" (epoch ms + tick interval)."""
     tmp = path.with_name(path.name + ".tmp")
@@ -45,26 +51,37 @@ def read_heartbeat(path: Path) -> Tuple[bool, Optional[int]]:
     return (time.time() * 1000 - at) < 3 * interval * 1000, at
 
 
+def _beat(heartbeat_file: Optional[Path], interval_s: float) -> None:
+    if heartbeat_file is None:
+        return
+    try:
+        write_heartbeat(heartbeat_file, interval_s)
+    except OSError as exc:
+        logger.warning("heartbeat write failed: %s", exc)
+
+
 async def run_scheduler_tick_loop(
     engine: Any,
     interval_s: float = DEFAULT_INTERVAL_S,
     heartbeat_file: Optional[Path] = None,
 ) -> None:
-    """Run the scheduler-tick loop forever (until cancelled)."""
+    """Run the scheduler-tick loop forever (until cancelled).
+
+    Heartbeat is written before and after each tick; the interval recorded in it
+    is what /health uses for staleness. The daemon intentionally uses the default
+    tick interval, not ``--interval`` (that one paces the cron poller).
+    """
     logger.info("scheduler tick started (interval=%.0fs)", interval_s)
     try:
         while True:
-            if heartbeat_file is not None:
-                try:
-                    write_heartbeat(heartbeat_file, interval_s)
-                except OSError as exc:
-                    logger.warning("heartbeat write failed: %s", exc)
+            _beat(heartbeat_file, interval_s)
             try:
                 await engine.fire_due_scheduled_runs()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception("scheduler tick failed: %s", exc)
+            _beat(heartbeat_file, interval_s)
             await asyncio.sleep(interval_s)
     except asyncio.CancelledError:
         logger.info("scheduler tick stopped")

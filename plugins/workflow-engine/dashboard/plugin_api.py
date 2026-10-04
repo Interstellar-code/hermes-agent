@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import sqlite3
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, get_args
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -27,14 +27,15 @@ log = logging.getLogger(__name__)
 # and use absolute imports so this file works both as a package member and as
 # a standalone spec-loaded module.
 import sys as _sys
-from pathlib import Path as _Path
-_PLUGIN_DIR = _Path(__file__).resolve().parent.parent  # plugins/workflow-engine/
+from pathlib import Path
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent  # plugins/workflow-engine/
 if str(_PLUGIN_DIR) not in _sys.path:
     _sys.path.insert(0, str(_PLUGIN_DIR))
 del _sys
 
 from _shared import get_engine  # noqa: E402
 from engine import WorkflowEngine  # noqa: E402
+from engine.schemas.workflow_run import WorkflowRunStatus  # noqa: E402
 from engine.store.definition_store import ConflictError  # noqa: E402
 
 # Engine is initialized lazily on first request via get_engine(); do not call
@@ -68,15 +69,21 @@ def _json(body: Any, status: int = 200) -> JSONResponse:
 
 @router.get("/health")
 async def health() -> dict:
-    from engine.runtime.scheduler_tick import heartbeat_path, read_heartbeat  # noqa: PLC0415
-    from _shared import _home_key  # noqa: PLC0415
+    from engine.runtime.scheduler_tick import (  # noqa: PLC0415
+        heartbeat_path, profile_for_dir, read_heartbeat,
+    )
 
-    home = _Path(_home_key())
-    alive, at = read_heartbeat(heartbeat_path(home))
+    db_path = _engine().db_path
+    if db_path:
+        home = Path(db_path).parent
+        alive, at = read_heartbeat(heartbeat_path(home))
+        profile = profile_for_dir(home)
+    else:  # :memory: engine has no daemon
+        alive, at, profile = False, None, "default"
     return {
         "ok": True,
         "version": _VERSION,
-        "profile": home.name if home.parent.name == "profiles" else "default",
+        "profile": profile,
         "scheduler_alive": alive,
         "scheduler_heartbeat_at": at,
     }
@@ -222,7 +229,12 @@ async def list_runs(request: Request) -> JSONResponse:
     params = request.query_params
     workflow_id: Optional[str] = params.get("workflow_id") or None
     status_csv: Optional[str] = params.get("status") or None
-    statuses: Optional[List[str]] = [x for x in status_csv.split(",") if x] if status_csv else None
+    statuses: Optional[List[str]] = None
+    if status_csv:
+        known = get_args(WorkflowRunStatus)
+        statuses = sorted({s.strip() for s in status_csv.split(",")} & set(known))
+        if not statuses:
+            return _json({"error": f"status must be one of {'|'.join(known)}"}, 400)
 
     try:
         limit = int(params.get("limit", 50))

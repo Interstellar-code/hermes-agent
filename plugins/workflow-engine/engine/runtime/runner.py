@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -654,7 +655,7 @@ class WorkflowRunner:
             cancel_run=cancel_run,
             send_message=send_message,
             get_subgraph_yaml=get_subgraph_yaml,
-            llm=self._llm,
+            llm=self._llm or getattr(sys.modules.get("engine"), "HOST_LLM", None),
             prior_completed=prior_completed,
         )
 

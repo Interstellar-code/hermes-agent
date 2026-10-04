@@ -19,15 +19,14 @@ from engine.runtime.scheduler_tick import (
 
 @pytest.fixture()
 def env(tmp_path, monkeypatch):
-    engine = create_engine(db_path=":memory:", seed_bundled=False, write_manifest=False, crash_recovery=False)
+    home = tmp_path / "profiles" / "hermes-switch"
+    engine = create_engine(db_path=str(home / "switchui-workflows.db"), seed_bundled=False, write_manifest=False, crash_recovery=False)
     import plugins.workflow_engine.dashboard.plugin_api as api_mod
     monkeypatch.setattr(api_mod, "_engine", lambda: engine)
-    import _shared
-    monkeypatch.setattr(_shared, "_home_key", lambda: str(tmp_path / "profiles" / "hermes-switch"))
     app = FastAPI()
     app.include_router(api_mod.router)
     with TestClient(app) as c:
-        yield c, engine, tmp_path / "profiles" / "hermes-switch"
+        yield c, engine, home
 
 
 _YAML = "id: wf\nname: WF\nnodes:\n  - id: a\n    prompt: hi\n"
@@ -73,7 +72,6 @@ def test_health_scheduler_fields(env):
     body = c.get("/health").json()
     assert body["ok"] and body["profile"] == "hermes-switch"
     assert body["scheduler_alive"] is False and body["scheduler_heartbeat_at"] is None
-    home.mkdir(parents=True)
     write_heartbeat(heartbeat_path(home), 10.0)
     body = c.get("/health").json()
     assert body["scheduler_alive"] is True and body["scheduler_heartbeat_at"] > 0
@@ -117,3 +115,42 @@ def test_host_llm_visible_across_module_copies(monkeypatch):
     monkeypatch.setattr(_shared, "_home_key", lambda: ":memory:")
     monkeypatch.setenv("WORKFLOW_DB_PATH", ":memory:")
     assert _shared.get_engine()._runner._llm is sentinel
+
+
+def test_runs_status_filter_strips_and_validates(env):
+    c, engine, _ = env
+    _seed(engine, 2, lambda i: "failed" if i == 0 else "running")
+    assert len(c.get("/runs?status=running, failed").json()["runs"]) == 2
+    assert len(c.get("/runs?status=failed,bogus").json()["runs"]) == 1
+    assert c.get("/runs?status=bogus, ").status_code == 400
+
+
+def test_dashboard_flat_copy_health_without_home_patch(tmp_path, monkeypatch):
+    """web_server loads plugin_api flat; heartbeat/profile must follow WORKFLOW_DB_PATH."""
+    import importlib.util
+    from pathlib import Path
+    home = tmp_path / "profiles" / "hs"
+    monkeypatch.setenv("WORKFLOW_DB_PATH", str(home / "switchui-workflows.db"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import _shared
+    monkeypatch.setattr(_shared, "_engines", {})
+    path = Path(__file__).resolve().parent.parent / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location("flat_plugin_api", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    app = FastAPI()
+    app.include_router(mod.router)
+    with TestClient(app) as c:
+        assert c.get("/health").json()["scheduler_alive"] is False
+        write_heartbeat(heartbeat_path(home), 10.0)
+        body = c.get("/health").json()
+    assert body["profile"] == "hs" and body["scheduler_alive"] is True
+
+
+def test_runner_reads_host_llm_lazily(monkeypatch):
+    """Engine built before register() still gets the llm set later on the package."""
+    import engine as engine_pkg
+    eng = create_engine(db_path=":memory:", seed_bundled=False, write_manifest=False, crash_recovery=False)
+    sentinel = object()
+    monkeypatch.setattr(engine_pkg, "HOST_LLM", sentinel, raising=False)
+    assert eng._runner._build_ctx("r", "/tmp").llm is sentinel

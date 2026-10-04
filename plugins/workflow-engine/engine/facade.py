@@ -82,6 +82,11 @@ class WorkflowEngine:
         self._thread.start()
         asyncio.run_coroutine_threadsafe(self._runner.heartbeat_forever(), self._loop)
 
+    @property
+    def db_path(self) -> Optional[str]:
+        """File path of the opened DB (None for :memory:)."""
+        return self._conn.execute("PRAGMA database_list").fetchone()[2] or None
+
     def set_owner_session(self, run_id: str, session_id: str) -> None:
         """Record the session that started ``run_id`` (approve/cancel ownership)."""
         self._run_store.set_owner_session(run_id, session_id)
