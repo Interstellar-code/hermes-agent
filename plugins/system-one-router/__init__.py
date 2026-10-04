@@ -309,13 +309,21 @@ def _decide_handler(args: dict, **_injected):
         return {"status": "fallback", "reason": "handler_error"}
 
 
+def _json_result(fn):
+    """Registry contract: handlers must return str. Handlers stay dict-returning for tests."""
+    def _wrapper(*args, **kwargs):
+        return json.dumps(fn(*args, **kwargs), default=str)
+    _wrapper.__name__ = fn.__name__
+    return _wrapper
+
+
 def register(ctx) -> None:
     try:
         ctx.register_tool(
             name="system_one_status",
             toolset="system_one_router",
             schema={"type": "object", "properties": {}},
-            handler=_status_handler,
+            handler=_json_result(_status_handler),
             check_fn=_tool_gate,
             is_async=False,
             description=("Diagnostic: system-one-router config, key presence, decision-log stats."
@@ -338,7 +346,7 @@ def register(ctx) -> None:
                 },
                 "required": ["message"],
             },
-            handler=_route_handler,
+            handler=_json_result(_route_handler),
             check_fn=_tool_gate,
             is_async=False,
             description="Advisory routing suggestion (kind + lane + confidence) via the Jev decision API. Suggestion only — Switch decides.",
@@ -355,7 +363,7 @@ def register(ctx) -> None:
                 },
                 "required": ["state", "questions"],
             },
-            handler=_decide_handler,
+            handler=_json_result(_decide_handler),
             check_fn=_tool_gate,
             is_async=False,
             description="Generic typed decision (choice/score/noul) via the Jev decision API. Advisory; fail-closed.",

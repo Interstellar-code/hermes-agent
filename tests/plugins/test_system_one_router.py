@@ -108,6 +108,19 @@ def test_register_never_raises_and_registers(plugin):
         assert callable(ctx.tools[name].get("check_fn"))
 
 
+def test_registered_handlers_return_json_strings(plugin, monkeypatch):
+    # tools/registry.py rejects dict results ("unsupported result type: dict").
+    monkeypatch.setenv("SYSTEM_ONE_ROUTER_ENABLED", "0")
+    ctx = FakeCtx()
+    plugin.register(ctx)
+    for name, args in (("system_one_status", {}),
+                       ("system_one_route", {"message": "hi"}),
+                       ("system_one_decide", {"state": {}, "questions": {}})):
+        out = ctx.tools[name]["handler"](args)
+        assert isinstance(out, str), name
+        assert isinstance(json.loads(out), dict), name
+
+
 def test_register_exception_is_swallowed(plugin):
     class BoomCtx:
         def register_tool(self, **kw):
