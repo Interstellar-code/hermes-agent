@@ -6,6 +6,7 @@ Loaded flat via spec_from_file_location — NO relative imports. sys.path inject
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sys
@@ -16,14 +17,14 @@ if str(_PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_DIR))
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import _state
 import _knowledge
 import _version_compat
 
 log = logging.getLogger(__name__)
 _PLUGIN_NAME = "hermes-switch-ui"
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
 
 
 def _require_auth(request: Request) -> None:
@@ -130,3 +131,56 @@ async def heartbeat():
     """
     _state.touch_heartbeat()
     return JSONResponse({"ok": True})
+
+
+@router.get("/project-map", dependencies=[Depends(_require_auth)])
+def project_map(request: Request, profile: str | None = None):
+    """Return all projects + session->project bindings for one profile in one call.
+
+    Read-only: a missing projects.db yields an empty map (never created on read).
+    Response: { version, projects: [{id,slug,name,icon,color,archived,board_slug}],
+                sessions: {session_id: project_id} }; ETag + 304 on If-None-Match.
+    """
+    try:
+        from hermes_cli import projects_db
+        from hermes_cli.profiles import get_profile_dir, normalize_profile_name, profile_exists
+    except ImportError:
+        raise HTTPException(status_code=503, detail="projects backend unavailable")
+
+    name = (profile or "").strip()
+    if not name or name == "current":
+        db_path = projects_db.projects_db_path()
+    else:
+        try:
+            name = normalize_profile_name(name)
+            db_path = get_profile_dir(name) / "projects.db"  # ValueError on unsafe names
+            if not profile_exists(name):
+                raise HTTPException(status_code=404, detail=f"profile not found: {name}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    projects: list = []
+    sessions: dict = {}
+    if db_path.is_file():
+        with projects_db.connect_closing(db_path=db_path) as conn:
+            for r in conn.execute(
+                "SELECT id, slug, name, icon, color, archived, board_slug FROM projects "
+                "ORDER BY archived, name COLLATE NOCASE"
+            ):
+                projects.append({
+                    "id": r["id"], "slug": r["slug"], "name": r["name"], "icon": r["icon"],
+                    "color": r["color"], "archived": bool(r["archived"]), "board_slug": r["board_slug"],
+                })
+            sessions = {
+                r["session_id"]: r["project_id"]
+                for r in conn.execute("SELECT session_id, project_id FROM project_sessions")
+            }
+
+    payload = {"version": _VERSION, "projects": projects, "sessions": sessions}
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    etag = '"' + hashlib.sha1(body.encode()).hexdigest() + '"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    inm = request.headers.get("if-none-match", "")
+    if inm.strip() == "*" or etag in (t.strip().removeprefix("W/") for t in inm.split(",")):
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)

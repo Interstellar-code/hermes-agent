@@ -30,7 +30,7 @@ import _knowledge  # noqa: E402 — must come after sys.path injection
 
 log = logging.getLogger(__name__)
 
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
 
 # ---------------------------------------------------------------------------
 # Per-turn nudge (injected once per session on first LLM call)

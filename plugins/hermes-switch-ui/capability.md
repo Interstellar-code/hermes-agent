@@ -51,6 +51,12 @@ Workspace overrides can be set in `~/.hermes/workspace-overrides.json`.
 SwitchUI reaches the Hermes dashboard server at port `9119` via a proxy path:
 `/api/dashboard-proxy/$` — all dashboard API calls are routed through the BFF.
 
+## Project Map
+
+`GET /api/plugins/hermes-switch-ui/project-map?profile=<name>` returns every project and the
+session→project bindings for that profile in one call (`{version, projects, sessions}`), with an
+ETag; send `If-None-Match` to get `304` when unchanged. Read-only; missing `projects.db` → empty map.
+
 ## State File
 
 The plugin uses `~/.hermes/switchui/state.json` to persist frontend-reported metadata.

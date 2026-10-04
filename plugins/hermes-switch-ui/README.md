@@ -108,6 +108,7 @@ require authentication (session cookie or bearer token via
 | `POST` | `/settings`   | frontend → backend | SwitchUI reports its settings |
 | `GET`  | `/status`     | frontend polls     | TTL-derived running status |
 | `POST` | `/heartbeat`  | frontend → backend | Explicit liveness ping |
+| `GET`  | `/project-map?profile=` | frontend polls | All projects + session→project bindings for a profile (ETag/304) |
 
 ### `GET /connection`
 
