@@ -814,7 +814,7 @@ class RunStore:
 
     def find_run_by_conversation_id(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
-            "SELECT * FROM workflow_runs WHERE conversation_id = ? LIMIT 1",
+            "SELECT * FROM workflow_runs WHERE conversation_id = ? ORDER BY started_at DESC LIMIT 1",
             (conversation_id,),
         ).fetchone()
         return _row_to_run(row) if row else None

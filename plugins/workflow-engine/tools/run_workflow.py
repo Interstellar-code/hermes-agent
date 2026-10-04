@@ -3,6 +3,9 @@
 check_fn enforces:
   (a) working_path must resolve under an allowed root
   (b) per-session run-rate cap (workflow.run_rate_per_session, default 5/min)
+
+Note: execute_code / kernel calls pass only task_id (no session_id), so runs
+started that way get no owner session and no default conversation_id.
 """
 from __future__ import annotations
 

@@ -119,7 +119,9 @@ def test_owner_children_continuation_delegations(env):
     t = body["totals"]
     assert t["sessions"] == 6 and t["subagents"] == 3
     assert t["tokens"] == 110 + 55 + 10
-    assert t["cost_usd"] == pytest.approx(0.75)
+    assert t["cost_usd"] is None and t["truncated"] is False  # subagents carry no cost
+    assert node["session"]["cost_source"] == "actual"
+    assert node["children"][1]["cost_source"] is None
 
 
 def test_missing_db_and_session_never_500(env):
@@ -135,7 +137,8 @@ def test_missing_db_and_session_never_500(env):
     body = r.json()
     assert body["owner"] is None
     assert [n["session"] for n in body["nodes"]] == [None, None, None]
-    assert body["totals"] == {"sessions": 0, "subagents": 0, "tokens": 0, "cost_usd": None}
+    assert body["totals"] == {"sessions": 0, "subagents": 0, "tokens": 0, "cost_usd": None,
+                              "truncated": False}
 
 
 def test_unknown_run_404(env):
@@ -155,6 +158,28 @@ def test_session_cap(env, monkeypatch):
     body = c.get(f"/runs/{run_id}/sessions").json()
     assert body["totals"]["sessions"] == 3
     assert len(body["nodes"][0]["children"]) == 2
+    assert body["totals"]["truncated"] is True
+
+
+def test_fold_only_on_compression_and_full_cost(env):
+    c, engine, run_id, home = env
+    _state_db(home, [
+        {"id": "p", "source": "api_server", "started_at": 1.0, "actual_cost_usd": 0.5},
+        # NULL parent end_reason → sibling, not a continuation
+        {"id": "q", "source": "api_server", "parent_session_id": "p", "started_at": 2.0,
+         "estimated_cost_usd": 0.25},
+        {"id": "r", "source": "api_server", "started_at": 3.0, "end_reason": "session_reset",
+         "actual_cost_usd": 1.0},
+        {"id": "r2", "source": "api_server", "parent_session_id": "r", "started_at": 4.0,
+         "actual_cost_usd": 1.0},
+    ])
+    _add_node(engine, run_id, "n1", "p")
+    _add_node(engine, run_id, "n2", "r")
+    body = c.get(f"/runs/{run_id}/sessions").json()
+    n1, n2 = body["nodes"]
+    assert [(x["id"], x["kind"], x["cost_source"]) for x in n1["children"]] == [("q", "child", "estimated")]
+    assert [x["id"] for x in n2["children"]] == ["r2"]
+    assert body["totals"]["cost_usd"] == pytest.approx(2.75)
 
 
 # --- workflow_run: conversation_id defaults to the calling session --------

@@ -679,7 +679,7 @@ async def list_node_runs(run_id: str) -> JSONResponse:
 # per node, the agent session, its sub-agents and async delegations.
 # ---------------------------------------------------------------------------
 
-_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+_PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SESSION_CAP = 200
 
 
@@ -714,6 +714,10 @@ def _session_info(row: sqlite3.Row) -> Dict[str, Any]:
         "input_tokens": d.get("input_tokens") or 0,
         "output_tokens": d.get("output_tokens") or 0,
         "cost": cost if cost is not None else d.get("estimated_cost_usd"),
+        "cost_source": (
+            "actual" if cost is not None
+            else "estimated" if d.get("estimated_cost_usd") is not None else None
+        ),
         "started_at": d.get("started_at"),
         "ended_at": d.get("ended_at"),
         "end_reason": d.get("end_reason"),
@@ -726,13 +730,17 @@ class _SessionWalker:
 
     def __init__(self, conn: sqlite3.Connection, seen: Dict[tuple, Dict[str, Any]], profile: str):
         self.conn, self.seen, self.profile = conn, seen, profile
+        self.truncated = False
         self.has_deleg = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='async_delegations'"
         ).fetchone() is not None
 
     def _visit(self, row: sqlite3.Row) -> Optional[Dict[str, Any]]:
         k = (self.profile, row["id"])
-        if k in self.seen or len(self.seen) >= _SESSION_CAP:
+        if k in self.seen:
+            return None
+        if len(self.seen) >= _SESSION_CAP:
+            self.truncated = True
             return None
         info = self.seen[k] = _session_info(row)
         return info
@@ -748,14 +756,14 @@ class _SessionWalker:
             return []
         out = []
         for r in self.conn.execute(
-            "SELECT * FROM async_delegations WHERE parent_session_id = ? OR origin_session = ?"
+            "SELECT * FROM async_delegations WHERE parent_session_id = ?"
             " ORDER BY dispatched_at",
-            (sid, sid),
+            (sid,),
         ):
             d = dict(r)
             try:
                 goal = (json.loads(d.get("task_json") or "{}") or {}).get("goal")
-            except (ValueError, AttributeError):
+            except (ValueError, TypeError, AttributeError):
                 goal = None
             out.append({
                 "id": d.get("delegation_id"),
@@ -766,9 +774,9 @@ class _SessionWalker:
             })
         return out
 
-    def tree(self, sid: str, source: Optional[str]) -> tuple:
-        """(children, delegations) of sid. A same-source child is a compression
-        continuation of sid itself, so its subtree is folded in transparently."""
+    def tree(self, sid: str, end_reason: Optional[str]) -> tuple:
+        """(children, delegations) of sid. When sid ended by compression its child
+        is its continuation (hermes_state_compression.py), so it is folded in."""
         children: List[Dict[str, Any]] = []
         delegs = self.delegations(sid)
         rows = self.conn.execute(
@@ -778,13 +786,13 @@ class _SessionWalker:
             info = self._visit(row)
             if info is None:
                 continue
-            # subagent check first: a sub-agent's own sub-agent shares its source
-            if row["source"] == source and source != "subagent":
-                c, dl = self.tree(row["id"], source)
+            # a sub-agent is never a continuation, even of a compressed parent
+            if end_reason == "compression" and row["source"] != "subagent":
+                c, dl = self.tree(row["id"], row["end_reason"])
                 children += c
                 delegs += dl
             else:
-                c, dl = self.tree(row["id"], row["source"])
+                c, dl = self.tree(row["id"], row["end_reason"])
                 children.append({
                     **info,
                     "kind": "subagent" if row["source"] == "subagent" else "child",
@@ -835,7 +843,7 @@ def _collect_run_sessions(
             w = walker(profile)
             info = safe(lambda: w.session(sid), None) if w else None
             children, delegs = (
-                safe(lambda: w.tree(sid, info["source"]), ([], [])) if info else ([], [])
+                safe(lambda: w.tree(sid, info["end_reason"]), ([], [])) if info else ([], [])
             )
             nodes.append({
                 "node_run_id": nr.get("id"),
@@ -852,7 +860,7 @@ def _collect_run_sessions(
             c.close()
 
     all_s = list(seen.values())
-    costs = [s["cost"] for s in all_s if s["cost"] is not None]
+    costs = [s["cost"] for s in all_s]
     return {
         "owner": owner,
         "nodes": nodes,
@@ -860,7 +868,10 @@ def _collect_run_sessions(
             "sessions": len(all_s),
             "subagents": sum(1 for s in all_s if s["source"] == "subagent"),
             "tokens": sum(s["input_tokens"] + s["output_tokens"] for s in all_s),
-            "cost_usd": round(sum(costs), 6) if costs else None,
+            "cost_usd": (
+                round(sum(costs), 6) if costs and None not in costs else None
+            ),
+            "truncated": any(w.truncated for w in walkers.values() if w),
         },
     }
 

@@ -280,3 +280,17 @@ def test_approval_claim_deprecated(client, run_id):
 def test_append_event_rejects_foreign_node_run(client, run_id):
     r = client.post(f"/runs/{run_id}/events", json={"event_type": "x", "node_run_id": "nope"})
     assert r.status_code == 400
+
+
+def test_find_run_by_conversation_id_newest_first(client):
+    ids = [client.post("/runs", json={"workflow_id": "hello-world", "conversation_id": "conv-dup",
+                                      "user_message": "go"}).json()["run"]["id"] for _ in range(2)]
+    import plugins.workflow_engine.dashboard.plugin_api as api_mod
+    store = api_mod._engine()._run_store
+    store._conn.execute("UPDATE workflow_runs SET started_at = 100 WHERE id = ?", (ids[0],))
+    store._conn.execute("UPDATE workflow_runs SET started_at = 200 WHERE id = ?", (ids[1],))
+    store._conn.commit()
+    assert store.find_run_by_conversation_id("conv-dup")["id"] == ids[1]
+    store._conn.execute("UPDATE workflow_runs SET started_at = 300 WHERE id = ?", (ids[0],))
+    store._conn.commit()
+    assert store.find_run_by_conversation_id("conv-dup")["id"] == ids[0]
