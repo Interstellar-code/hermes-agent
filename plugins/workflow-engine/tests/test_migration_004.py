@@ -75,3 +75,67 @@ def test_idempotent_upgrade_preserves_rows():
         assert row["priority"] == 0
         assert row["max_runtime_s"] is None
         assert row["scheduled_for"] is None
+
+
+def _seed_def_run(conn, source="user", status="failed"):
+    conn.execute(
+        "INSERT INTO workflow_definitions "
+        "(id, name, source, yaml, checksum, created_at, updated_at) "
+        "VALUES ('w1', 'W1', ?, 'x', 'x', 1, 1)",
+        (source,),
+    )
+    conn.execute(
+        "INSERT INTO workflow_runs "
+        "(id, workflow_id, conversation_id, working_path, user_message, "
+        "status, current_phase, started_at, last_heartbeat) "
+        "VALUES ('r1', 'w1', 'c1', '/tmp', 'go', ?, 'plan', 1, 1)",
+        (status,),
+    )
+    conn.execute(
+        "INSERT INTO node_runs (id, workflow_run_id, dag_node_id, node_type, status, started_at) "
+        "VALUES ('nr1', 'r1', 'n', 'prompt', 'failed', 1)"
+    )
+    conn.commit()
+
+
+def _count(conn, t):
+    return conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+
+
+def test_delete_definition_with_run_history():
+    """#250: deleting a definition cascades runs/node_runs/scheduled_runs."""
+    from engine.store.definition_store import DefinitionStore
+
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        _seed_def_run(conn)
+        conn.execute(
+            "INSERT INTO scheduled_runs (id, workflow_id, inputs_json, trigger_json, run_at, created_at) "
+            "VALUES ('s1', 'w1', '{}', '{}', 'now', 'now')"
+        )
+        conn.commit()
+        assert DefinitionStore(conn).delete_definition("w1") == 1
+        for t in ("workflow_definitions", "workflow_runs", "node_runs", "scheduled_runs"):
+            assert _count(conn, t) == 0
+
+
+def test_delete_definition_refused_with_active_run():
+    import pytest
+    from engine.store.definition_store import ConflictError, DefinitionStore
+
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        _seed_def_run(conn, status="running")
+        with pytest.raises(ConflictError):
+            DefinitionStore(conn).delete_definition("w1")
+        assert _count(conn, "workflow_runs") == 1 and _count(conn, "workflow_definitions") == 1
+
+
+def test_delete_bundled_definition_noop():
+    from engine.store.definition_store import DefinitionStore
+
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        _seed_def_run(conn, source="bundled")
+        assert DefinitionStore(conn).delete_definition("w1") == 0
+        assert _count(conn, "workflow_runs") == 1 and _count(conn, "node_runs") == 1

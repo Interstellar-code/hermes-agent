@@ -312,13 +312,37 @@ class DefinitionStore:
     # ------------------------------------------------------------------
 
     def delete_definition(self, definition_id: str) -> int:
-        """Delete a non-bundled definition. Returns rows deleted (0 or 1)."""
-        result = self._conn.execute(
-            "DELETE FROM workflow_definitions WHERE id = ? AND source != 'bundled'",
-            (definition_id,),
-        )
-        self._conn.commit()
-        return result.rowcount
+        """Delete a non-bundled definition and its run history. Returns rows deleted (0 or 1).
+
+        workflow_runs.workflow_id has no ON DELETE action (001_init.sql), so runs
+        (node_runs/events/transitions cascade from them) and scheduled_runs are
+        removed first, in the same transaction.
+        """
+        try:
+            ok = self._conn.execute(
+                "SELECT 1 FROM workflow_definitions WHERE id = ? AND source != 'bundled'",
+                (definition_id,),
+            ).fetchone()
+            if not ok:
+                return 0
+            if self._conn.execute(
+                "SELECT 1 FROM workflow_runs WHERE workflow_id = ? "
+                "AND status IN ('pending', 'running', 'paused')",
+                (definition_id,),
+            ).fetchone():
+                raise ConflictError(
+                    f"definition {definition_id!r} has active runs; cancel them first"
+                )
+            self._conn.execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (definition_id,))
+            self._conn.execute("DELETE FROM scheduled_runs WHERE workflow_id = ?", (definition_id,))
+            result = self._conn.execute(
+                "DELETE FROM workflow_definitions WHERE id = ?", (definition_id,)
+            )
+            self._conn.commit()
+            return result.rowcount
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # seed bundled (Phase 2 — provenance-gated + CAS)
