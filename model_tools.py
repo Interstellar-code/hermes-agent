@@ -773,7 +773,10 @@ def _pre_dispatch_guards(function_name: str, function_args: Dict[str, Any], skip
             if modified_args is not None:
                 function_args = modified_args
         except Exception as _hook_err:
-            logger.debug("pre_tool_call hook error: %s", _hook_err)
+            # Fail closed, matching agent/tool_executor._pre_tool_block.
+            logger.warning("pre_tool_call dispatch for '%s' raised %s: %s", function_name,
+                           type(_hook_err).__name__, _hook_err, exc_info=True)
+            block_message = f"pre_tool_call dispatch raised {type(_hook_err).__name__}: {_hook_err}"
         if block_message is not None:
             return function_args, (tool_error(block_message), "plugin_block", block_message)
 

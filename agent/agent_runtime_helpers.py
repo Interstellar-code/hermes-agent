@@ -2216,7 +2216,7 @@ def switch_model(
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
-    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
+    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; dispatch failures fail closed."""
     try:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
         block_message, modified_args = _dispatch_pre_tool_call_hooks(
@@ -2227,8 +2227,9 @@ def _pre_tool_block_message(agent, function_name, function_args, effective_task_
             middleware_trace=list(middleware_trace),
         )
         return block_message, (modified_args if modified_args is not None else function_args)
-    except Exception:
-        return None, function_args
+    except Exception as exc:
+        logger.warning("pre_tool_call dispatch for '%s' raised %s: %s", function_name, type(exc).__name__, exc, exc_info=True)
+        return f"pre_tool_call dispatch raised {type(exc).__name__}: {exc}", function_args
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
