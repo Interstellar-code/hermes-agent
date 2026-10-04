@@ -523,6 +523,31 @@ def load_fleet(profile: str | None = None) -> Dict[str, Any]:
     }
 
 
+DEFAULT_HERMES_PORT = 9219
+
+
+def hermes_reply_target() -> tuple[str, str]:
+    """``(base_url, token_env)`` a local executor receiver uses to reply to THIS node.
+
+    Port follows ``fleet.server.bind_port`` (falls back to 9219 when fleet.yaml is
+    unusable). Host is the configured bind_host unless it is a wildcard, in which
+    case loopback (managed receivers run on this host). ``token_env`` is this
+    node's inbound ``server.token_env`` when ``auth_required``, else ``""``.
+    """
+    try:
+        self_block = load_fleet()["self"]
+    except Exception:  # noqa: BLE001 — no/bad fleet.yaml -> historical default.
+        port = os.environ.get("HERMES_A2A_PORT") or DEFAULT_HERMES_PORT
+        return f"http://127.0.0.1:{port}", ""
+    host = str(self_block.get("bind_host") or "")
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    elif ":" in host:
+        host = f"[{host}]"  # IPv6 literal
+    token_env = str(self_block.get("token_env") or "") if self_block.get("auth_required") else ""
+    return f"http://{host}:{self_block['bind_port']}", token_env
+
+
 def get_agent(name: str, profile: str | None = None) -> Dict[str, Any]:
     """Lookup a single peer by name. Raises KeyError if not configured."""
     cfg = load_fleet(profile)

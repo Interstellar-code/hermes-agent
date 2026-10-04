@@ -34,8 +34,12 @@ Two layers live here:
   thread), separate from the dashboard gateway. It does NOT mount on `:8642`.
 - `bind_port` is **required** in `fleet.yaml` — no default. Loader raises
   `FleetConfigError` if missing.
-- `auth_required` **defaults to `true`** — inbound `/jsonrpc` requires a bearer
-  token. Newly-created configs are protected by default.
+- `auth_required` **defaults to `true` when absent**, and the first-enable
+  scaffold writes `auth_required: true` + `token_env: <SELF>_A2A_TOKEN` (export
+  it). An explicit `auth_required: false` is honoured but only on a loopback bind
+  — the server refuses to start off-loopback without a resolved token.
+- Every route 403s a non-loopback/non-`bind_host` `Host` (DNS rebinding);
+  `/jsonrpc` 403s any `Origin` header and 415s non-`application/json` bodies.
 - `response_handler` selects how inbound is answered:
   `SUPPORTED_HANDLERS = {echo, llm, agent}` — anything else raises
   `FleetConfigError` at load. `echo` (`ping`→`pong`, else verbatim) is the
@@ -126,6 +130,10 @@ fleet:
 - **Cross-machine bearer over plain HTTP** → tokens travel in cleartext;
   terminate TLS in front when binding to a non-loopback address.
 - **No CORS** → expected; A2A is server-to-server, browsers are not clients.
+- **403 `forbidden host` / 415** → caller used a non-loopback hostname (add it as
+  `bind_host` or bind a wildcard with auth on) or sent a non-JSON Content-Type.
+- **"refusing to bind ... non-loopback"** → off-loopback `bind_host` with auth
+  off or the `token_env` var unset; fail-closed by design.
 - **`connection refused` mid-session** → a managed receiver self-tears-down
   after `idle_timeout_s` (default **1800s**) of no traffic; the next request hits
   a dead port until it is re-deployed. For a long interactive session, set
@@ -137,7 +145,8 @@ fleet:
 Beyond the `echo`/`llm`/`agent` inbound handlers above, Hermes can deploy a
 repo-scoped **managed executor** — a standalone receiver dropped into
 `<repo>/.hermes/` that spawns a real CLI agent (`claude` / `opencode` / `codex` /
-`agy`) with the repo's harness and POSTs replies back to this node on `:9219`.
+`agy`) with the repo's harness and POSTs replies back to this node on its
+`fleet.server.bind_port` (`:9219` if fleet.yaml is unusable).
 Each mode has a deploy/status/stop tool trio:
 
 | Tool trio | Mode | Port band | Default | Deploy params (beyond `repo_path`) | Transcript file | Session continuity |
@@ -160,7 +169,8 @@ Each mode has a deploy/status/stop tool trio:
 - `no_auth` (all) — loopback dev opt-out: receiver starts with NO inbound token
   and the auto-wired peer is a plain `url` entry. `hermes_auth_token_env` (all) —
   env var name holding the bearer the receiver presents on replies to an
-  auth-enabled Hermes.
+  auth-enabled Hermes; defaults to this node's `fleet.server.token_env` when
+  `auth_required`. Boot-reconcile keeps the pinned model / sandbox / this value.
 
 **Auto-wire (all modes):** each `deploy_*_receiver` **auto-upserts its peer into
 `fleet.yaml`** (surgical, comment-preserving ruamel round-trip; returned under

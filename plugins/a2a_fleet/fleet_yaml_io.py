@@ -60,6 +60,7 @@ def _example_fleet_yaml(self_name: str) -> str:
     port below). The peers map is empty — ``deploy_cc_receiver`` auto-wires a
     managed Claude Code peer here later; the commented block shows the shape.
     """
+    token_env = "".join(c if c.isalnum() else "_" for c in self_name).upper() + "_A2A_TOKEN"
     return f"""\
 # a2a_fleet config — Agent-to-Agent fleet membership.
 # Scaffolded by the a2a_fleet plugin on first enable. Edit freely: the plugin
@@ -79,8 +80,11 @@ fleet:
   server:
     bind_host: 127.0.0.1
     bind_port: 9219
-    auth_required: false
-    # token_env: {self_name.upper()}_A2A_TOKEN  # require Bearer inbound when auth_required: true
+    # Inbound /jsonrpc requires `Authorization: Bearer $<token_env>`. Export that
+    # env var for the gateway (unset -> every request is refused with 503).
+    # Managed executor receivers reuse this token_env for their replies.
+    auth_required: true
+    token_env: {token_env}
 
   self:
     name: {self_name}
