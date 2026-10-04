@@ -29,7 +29,8 @@ log = logging.getLogger("workflow.daemon")
 async def _main(args: Any) -> int:
     from ._shared import get_engine  # noqa: PLC0415
     from engine.cron.poller import CronPoller  # noqa: PLC0415
-    from engine.runtime.scheduler_tick import run_scheduler_tick_loop  # noqa: PLC0415
+    from engine.runtime.scheduler_tick import heartbeat_path, run_scheduler_tick_loop  # noqa: PLC0415
+    from ._shared import _home_key  # noqa: PLC0415
 
     engine = get_engine()
     poller = CronPoller(engine, poll_interval_s=args.interval)
@@ -58,7 +59,8 @@ async def _main(args: Any) -> int:
     tasks = [
         asyncio.create_task(poller.run_forever(), name="wf-cron-poller"),
         asyncio.create_task(
-            run_scheduler_tick_loop(engine), name="wf-scheduler-tick",
+            run_scheduler_tick_loop(engine, heartbeat_file=heartbeat_path(_home_key())),
+            name="wf-scheduler-tick",
         ),
     ]
 

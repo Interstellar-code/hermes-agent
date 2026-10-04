@@ -289,6 +289,7 @@ class RunStore:
         self,
         *,
         workflow_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
@@ -296,6 +297,9 @@ class RunStore:
         if workflow_id:
             clauses.append("workflow_id = ?")
             params.append(workflow_id)
+        if statuses:
+            clauses.append(f"status IN ({','.join('?' * len(statuses))})")
+            params.extend(statuses)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         rows = self._conn.execute(

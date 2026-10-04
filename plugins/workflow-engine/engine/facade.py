@@ -151,10 +151,12 @@ class WorkflowEngine:
         self,
         *,
         workflow_id: Optional[str] = None,
+        statuses: Optional[List[str]] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         return self._run_store.list_workflow_runs(
             workflow_id=workflow_id,
+            statuses=statuses,
             limit=limit,
         )
 

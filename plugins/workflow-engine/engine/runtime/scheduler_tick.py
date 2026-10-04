@@ -7,21 +7,58 @@ engine to claim+fire any due deferred runs.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Any
+import os
+import time
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger("workflow.scheduler-tick")
 
 DEFAULT_INTERVAL_S: float = 10.0
+HEARTBEAT_FILENAME = "workflow-daemon.heartbeat"
+
+
+def heartbeat_path(home: Any) -> Path:
+    return Path(home) / HEARTBEAT_FILENAME
+
+
+def write_heartbeat(path: Path, interval_s: float) -> None:
+    """Atomically record "daemon alive now" (epoch ms + tick interval)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(
+        json.dumps({"at": int(time.time() * 1000), "interval_s": interval_s, "pid": os.getpid()}),
+        encoding="utf-8",
+    )
+    os.replace(tmp, path)
+
+
+def read_heartbeat(path: Path) -> Tuple[bool, Optional[int]]:
+    """Return (alive, heartbeat_at_ms). Alive = younger than 3x the tick interval."""
+    try:
+        hb = json.loads(path.read_text(encoding="utf-8"))
+        at = int(hb["at"])
+        interval = float(hb.get("interval_s") or DEFAULT_INTERVAL_S)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False, None
+    return (time.time() * 1000 - at) < 3 * interval * 1000, at
 
 
 async def run_scheduler_tick_loop(
-    engine: Any, interval_s: float = DEFAULT_INTERVAL_S,
+    engine: Any,
+    interval_s: float = DEFAULT_INTERVAL_S,
+    heartbeat_file: Optional[Path] = None,
 ) -> None:
     """Run the scheduler-tick loop forever (until cancelled)."""
     logger.info("scheduler tick started (interval=%.0fs)", interval_s)
     try:
         while True:
+            if heartbeat_file is not None:
+                try:
+                    write_heartbeat(heartbeat_file, interval_s)
+                except OSError as exc:
+                    logger.warning("heartbeat write failed: %s", exc)
             try:
                 await engine.fire_due_scheduled_runs()
             except asyncio.CancelledError:

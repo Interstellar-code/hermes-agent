@@ -52,6 +52,10 @@ def set_llm(llm: Any) -> None:
     """Stash the host LLM; applied lazily so plugin load builds no engine (L2-24)."""
     global _llm
     _llm = llm
+    # dashboard/plugin_api.py loads a flat copy of this module, so this module's
+    # globals are invisible to it; the ``engine`` package is shared by both.
+    import engine as _engine_pkg  # noqa: PLC0415
+    _engine_pkg.HOST_LLM = llm
     with _engine_lock:
         for eng in _engines.values():
             eng.set_llm(llm)
@@ -73,7 +77,9 @@ def get_engine() -> WorkflowEngine:
             eng = _engines.get(key)
             if eng is None:
                 eng = create_engine(_db_path_for(key))
-                if _llm is not None:
-                    eng.set_llm(_llm)
+                import engine as _engine_pkg  # noqa: PLC0415
+                llm = _llm or getattr(_engine_pkg, "HOST_LLM", None)
+                if llm is not None:
+                    eng.set_llm(llm)
                 _engines[key] = eng
     return eng

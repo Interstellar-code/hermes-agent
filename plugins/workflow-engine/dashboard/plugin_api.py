@@ -31,7 +31,7 @@ from pathlib import Path as _Path
 _PLUGIN_DIR = _Path(__file__).resolve().parent.parent  # plugins/workflow-engine/
 if str(_PLUGIN_DIR) not in _sys.path:
     _sys.path.insert(0, str(_PLUGIN_DIR))
-del _sys, _Path
+del _sys
 
 from _shared import get_engine  # noqa: E402
 from engine import WorkflowEngine  # noqa: E402
@@ -68,7 +68,18 @@ def _json(body: Any, status: int = 200) -> JSONResponse:
 
 @router.get("/health")
 async def health() -> dict:
-    return {"ok": True, "version": _VERSION}
+    from engine.runtime.scheduler_tick import heartbeat_path, read_heartbeat  # noqa: PLC0415
+    from _shared import _home_key  # noqa: PLC0415
+
+    home = _Path(_home_key())
+    alive, at = read_heartbeat(heartbeat_path(home))
+    return {
+        "ok": True,
+        "version": _VERSION,
+        "profile": home.name if home.parent.name == "profiles" else "default",
+        "scheduler_alive": alive,
+        "scheduler_heartbeat_at": at,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +222,15 @@ async def list_runs(request: Request) -> JSONResponse:
     params = request.query_params
     workflow_id: Optional[str] = params.get("workflow_id") or None
     status_csv: Optional[str] = params.get("status") or None
-    statuses: Optional[List[str]] = status_csv.split(",") if status_csv else None
+    statuses: Optional[List[str]] = [x for x in status_csv.split(",") if x] if status_csv else None
 
-    rows = await _engine().list_runs(workflow_id=workflow_id)
-    if statuses:
-        rows = [r for r in rows if r.get("status") in statuses]
+    try:
+        limit = int(params.get("limit", 50))
+    except ValueError:
+        limit = 50
+    limit = max(1, min(limit, 500))
+
+    rows = await _engine().list_runs(workflow_id=workflow_id, statuses=statuses, limit=limit)
     return _json({"runs": rows})
 
 
