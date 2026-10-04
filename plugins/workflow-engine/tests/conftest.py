@@ -50,3 +50,15 @@ _register("plugins.workflow_engine.engine", _PLUGIN_DIR / "engine")
 # getattr chains. Ensure the attribute is set on the plugins namespace too.
 import plugins as _plugins_mod  # noqa: E402
 _plugins_mod.workflow_engine = sys.modules["plugins.workflow_engine"]
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_host_llm():
+    """register() tests call set_llm, which sets engine.HOST_LLM process-wide."""
+    import engine as engine_pkg
+    prev = getattr(engine_pkg, "HOST_LLM", None)
+    yield
+    engine_pkg.HOST_LLM = prev
