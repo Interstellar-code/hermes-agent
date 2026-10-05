@@ -76,7 +76,8 @@ async def run_scheduler_tick_loop(
         while True:
             _beat(heartbeat_file, interval_s)
             try:
-                await engine.fire_due_scheduled_runs()
+                # a 'firing' row older than 2 ticks belongs to a dead tick
+                await engine.fire_due_scheduled_runs(stale_firing_s=2 * interval_s)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

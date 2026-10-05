@@ -89,7 +89,7 @@ def test_heartbeat_goes_stale_after_3_intervals(tmp_path):
 
 def test_tick_loop_writes_heartbeat(tmp_path):
     class Eng:
-        async def fire_due_scheduled_runs(self):
+        async def fire_due_scheduled_runs(self, **kw):
             return 0
 
     hb = heartbeat_path(tmp_path)

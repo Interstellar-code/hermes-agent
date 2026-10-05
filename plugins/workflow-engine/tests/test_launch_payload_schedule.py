@@ -84,12 +84,15 @@ def test_schedule_at_returns_scheduled(client):
     assert "id" in body
 
 
-def test_schedule_cron_returns_501(client):
+def test_schedule_cron_returns_201(client):
+    # B6: native cron; legacy key cron_expr is accepted as an alias of cron.
     r = client.post("/runs", json=_base_payload(
         schedule={"type": "cron", "cron_expr": "*/5 * * * *"},
     ))
-    assert r.status_code == 501
-    assert "cron" in r.json()["error"].lower()
+    assert r.status_code == 201
+    body = r.json()["run"]
+    assert body["status"] == "scheduled" and body["cron"] == "*/5 * * * *"
+    assert body["next_run_at"] > datetime.now(tz=timezone.utc).isoformat()
 
 
 def test_schedule_at_requires_at_string(client):

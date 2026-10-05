@@ -111,6 +111,35 @@ def _row_to_event(row: sqlite3.Row) -> Dict[str, Any]:
     return d
 
 
+def _row_to_schedule(row: sqlite3.Row) -> Dict[str, Any]:
+    """API shape of a scheduled_runs row."""
+    d = dict(row)
+    try:
+        trigger = json.loads(d.pop("trigger_json") or "{}")
+    except Exception:
+        trigger = {}
+    try:
+        inputs = json.loads(d.pop("inputs_json") or "{}")
+    except Exception:
+        inputs = {}
+    return {
+        "id": d["id"],
+        "workflow_id": d["workflow_id"],
+        "kind": "cron" if d.get("cron_expr") else "at",
+        "cron": d.get("cron_expr"),
+        "tz": trigger.get("tz"),
+        "status": d["status"],
+        "enabled": d["status"] != "disabled",
+        "next_run_at": d["run_at"],
+        "last_error": trigger.get("last_error"),
+        "last_run_id": trigger.get("last_run_id"),
+        "inputs": inputs,
+        "priority": d.get("priority"),
+        "max_runtime_s": d.get("max_runtime_s"),
+        "created_at": d.get("created_at"),
+    }
+
+
 @locked
 class RunStore:
     """CRUD for runs, node_runs and events."""
@@ -265,14 +294,16 @@ class RunStore:
         return out
 
     def claim_scheduled_run(self, scheduled_id: str, now_iso: str) -> bool:
-        """Atomic CAS: claim a pending row if still due. True iff this caller won."""
+        """Atomic CAS: claim a pending row if still due. True iff this caller won.
+        Stamps ``trigger_json.claimed_at`` so a crashed claim can be reset."""
         cur = self._conn.execute(
             """
             UPDATE scheduled_runs
-               SET status = 'firing'
+               SET status = 'firing',
+                   trigger_json = json_set(trigger_json, '$.claimed_at', ?)
              WHERE id = ? AND status = 'pending' AND run_at <= ?
             """,
-            (scheduled_id, now_iso),
+            (now_iso, scheduled_id, now_iso),
         )
         self._conn.commit()
         return cur.rowcount == 1
@@ -290,6 +321,74 @@ class RunStore:
             (scheduled_id,),
         )
         self._conn.commit()
+
+    def reschedule_cron_row(
+        self,
+        scheduled_id: str,
+        run_at: str,
+        *,
+        last_error: Optional[str] = None,
+        last_run_id: Optional[str] = None,
+    ) -> bool:
+        """firing -> pending at the next occurrence; records the outcome in
+        trigger_json. CAS on 'firing' so a disable/delete mid-fire wins."""
+        cur = self._conn.execute(
+            """
+            UPDATE scheduled_runs
+               SET status = 'pending', run_at = ?,
+                   trigger_json = json_remove(json_set(trigger_json,
+                       '$.last_error', ?,
+                       '$.last_run_id', COALESCE(?, json_extract(trigger_json, '$.last_run_id'))),
+                       '$.claimed_at')
+             WHERE id = ? AND status = 'firing'
+            """,
+            (run_at, last_error, last_run_id, scheduled_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
+
+    def reset_stale_firing(self, cutoff_iso: str) -> int:
+        """Rows claimed before ``cutoff_iso`` whose firing never finished (the
+        ticking process died mid-fire) go back to 'pending'."""
+        cur = self._conn.execute(
+            """
+            UPDATE scheduled_runs
+               SET status = 'pending', trigger_json = json_remove(trigger_json, '$.claimed_at')
+             WHERE status = 'firing'
+               AND COALESCE(json_extract(trigger_json, '$.claimed_at'), run_at) < ?
+            """,
+            (cutoff_iso,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def get_scheduled_run(self, scheduled_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM scheduled_runs WHERE id = ?", (scheduled_id,)
+        ).fetchone()
+        return _row_to_schedule(row) if row else None
+
+    def list_schedules(self, workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Live schedules (pending / firing / disabled), soonest first."""
+        sql = "SELECT * FROM scheduled_runs WHERE status IN ('pending', 'firing', 'disabled')"
+        args: tuple = ()
+        if workflow_id:
+            sql += " AND workflow_id = ?"
+            args = (workflow_id,)
+        rows = self._conn.execute(sql + " ORDER BY run_at", args).fetchall()
+        return [_row_to_schedule(r) for r in rows]
+
+    def set_schedule_status(
+        self, scheduled_id: str, status: str, *, run_at: Optional[str] = None,
+    ) -> bool:
+        """Move a live schedule to ``status`` (optionally a new run_at)."""
+        cur = self._conn.execute(
+            "UPDATE scheduled_runs SET status = ?, run_at = COALESCE(?, run_at) "
+            "WHERE id = ? AND status IN ('pending', 'firing', 'disabled')",
+            (status, run_at, scheduled_id),
+        )
+        self._conn.commit()
+        return cur.rowcount == 1
 
     def list_active_node_runs(self) -> List[Dict[str, Any]]:
         """Return active node_runs across all workflow_runs.

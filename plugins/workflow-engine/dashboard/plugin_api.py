@@ -54,6 +54,7 @@ FEATURES: List[str] = [
     "definition_pin", "parent_run",
     "node_attempts", "approver", "node_retrying_event",
     "node_log", "events_query", "sse_db_tail", "cross_process_sse",
+    "cron_schedule", "schedules_api",
 ]
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
@@ -392,6 +393,37 @@ async def create_run(request: Request) -> JSONResponse:
         return _json({"error": str(exc)}, 400)
 
     return _json({"run": run}, 201)
+
+
+# ---------------------------------------------------------------------------
+# Schedules — native cron ("Repeat") + deferred "at" rows
+# ---------------------------------------------------------------------------
+
+
+@router.get("/schedules")
+async def list_schedules(workflow_id: Optional[str] = None) -> JSONResponse:
+    return _json({"schedules": await _engine().list_schedules(workflow_id or None)})
+
+
+@router.patch("/schedules/{schedule_id}")
+async def patch_schedule(schedule_id: str, request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return _json({"error": "Invalid JSON body"}, 400)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return _json({"error": "enabled (boolean) is required"}, 400)
+    row = await _engine().set_schedule_enabled(schedule_id, body["enabled"])
+    if row is None:
+        return _json({"error": "schedule not found"}, 404)
+    return _json({"schedule": row})
+
+
+@router.delete("/schedules/{schedule_id}")
+async def delete_schedule(schedule_id: str) -> JSONResponse:
+    if not await _engine().cancel_schedule(schedule_id):
+        return _json({"error": "schedule not found"}, 404)
+    return _json({"ok": True, "id": schedule_id, "status": "cancelled"})
 
 
 # ---------------------------------------------------------------------------

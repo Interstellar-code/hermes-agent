@@ -18,6 +18,7 @@ import functools
 import logging
 import sqlite3
 import threading
+import time
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 from engine.store.run_store import RunStore
@@ -237,7 +238,9 @@ class WorkflowEngine:
         ``schedule`` shapes::
             None | {"type": "now"}            → start_run immediately
             {"type": "at", "at": "<iso>"}     → insert into scheduled_runs
-            {"type": "cron", ...}             → raises NotImplementedError
+            {"type": "cron", "cron": "<expr>"} → recurring scheduled_runs row
+                (host-local TZ; ValueError when invalid, NotImplementedError
+                when croniter is missing)
         """
         sched_type = (schedule or {}).get("type") or "now"
         if sched_type == "now":
@@ -263,7 +266,30 @@ class WorkflowEngine:
                 "scheduled_for": at_iso,
             }
         if sched_type == "cron":
-            raise NotImplementedError("cron schedule not yet supported")
+            from engine.cron import schedule as cron  # noqa: PLC0415
+            expr = (schedule or {}).get("cron") or (schedule or {}).get("cron_expr")
+            try:
+                cron.validate_cron(expr)
+            except ImportError as exc:
+                raise NotImplementedError("cron schedules need croniter") from exc
+            expr = expr.strip()
+            next_iso = cron.to_iso(cron.next_fire(expr, time.time()))
+            row = self._run_store.insert_scheduled_run(
+                workflow_id=workflow_id,
+                inputs=inputs,
+                trigger={**trigger, "tz": cron.local_tz_name()},
+                run_at=next_iso,
+                priority=priority,
+                max_runtime_s=max_runtime_s,
+                cron_expr=expr,
+            )
+            return {
+                "id": row["id"],
+                "status": "scheduled",
+                "cron": expr,
+                "next_run_at": next_iso,
+                "scheduled_for": next_iso,
+            }
         raise ValueError(f"unknown schedule.type: {sched_type!r}")
 
     @_on_engine_loop
@@ -271,32 +297,100 @@ class WorkflowEngine:
         return self._run_store.list_active_node_runs()
 
     @_on_engine_loop
-    async def fire_due_scheduled_runs(self) -> int:
-        """Scheduler-tick helper: claim+fire due rows. Returns count fired."""
-        from datetime import datetime, timezone
-        now_iso = datetime.now(tz=timezone.utc).isoformat()
+    async def fire_due_scheduled_runs(
+        self, now_iso: Optional[str] = None, *, stale_firing_s: float = 20.0,
+    ) -> int:
+        """Scheduler-tick helper: claim+fire due rows. Returns count fired.
+
+        First resets rows left 'firing' for longer than ``stale_firing_s``
+        (2x the tick interval; a tick that died mid-fire). Cron rows are
+        always rescheduled to their next occurrence after now — on success and
+        on failure (``trigger_json.last_error``); they never end 'failed' and
+        missed occurrences are not backfilled.
+        """
+        from datetime import datetime, timedelta, timezone
+        from engine.cron import schedule as cron  # noqa: PLC0415
+        now_dt = datetime.fromisoformat(now_iso) if now_iso else datetime.now(tz=timezone.utc)
+        now_iso = now_dt.isoformat()
+        reset = self._run_store.reset_stale_firing(
+            (now_dt - timedelta(seconds=stale_firing_s)).isoformat()
+        )
+        if reset:
+            logger.warning("fire_due_scheduled_runs: reset %d stale 'firing' rows", reset)
         due = self._run_store.list_due_scheduled_runs(now_iso)
         fired = 0
         for row in due:
             if not self._run_store.claim_scheduled_run(row["id"], now_iso):
                 continue
+            expr = row.get("cron_expr")
+            trigger = row.get("trigger") or {}
+            if expr:
+                trigger = {
+                    k: v for k, v in trigger.items()
+                    if k not in ("last_error", "last_run_id", "claimed_at")
+                }
+                trigger.update(kind="cron", schedule_id=row["id"], cron_expr=expr)
+            run_id: Optional[str] = None
+            error: Optional[str] = None
             try:
-                await self.start_run(
+                run = await self.start_run(
                     row["workflow_id"],
                     row.get("inputs") or {},
-                    row.get("trigger") or {},
+                    trigger,
                     priority=row.get("priority") or 0,
                     max_runtime_s=row.get("max_runtime_s"),
                 )
-                self._run_store.mark_scheduled_fired(row["id"])
+                run_id = run.get("id") if isinstance(run, dict) else None
                 fired += 1
             except Exception as exc:
                 logger.exception(
                     "fire_due_scheduled_runs: start_run failed for %s: %s",
                     row["id"], exc,
                 )
-                self._run_store.mark_scheduled_failed(row["id"])
+                error = f"{type(exc).__name__}: {exc}"[:500]
+            if not expr:
+                if error is None:
+                    self._run_store.mark_scheduled_fired(row["id"])
+                else:
+                    self._run_store.mark_scheduled_failed(row["id"])
+                continue
+            try:
+                next_iso = cron.to_iso(cron.next_fire(expr, now_dt.timestamp()))
+            except Exception as exc:  # stored expr went bad: retry in an hour
+                error = error or f"next fire failed: {exc}"[:500]
+                next_iso = (now_dt + timedelta(hours=1)).isoformat()
+            self._run_store.reschedule_cron_row(
+                row["id"], next_iso, last_error=error, last_run_id=run_id,
+            )
         return fired
+
+    # ------------------------------------------------------------------ #
+    # Schedules (native cron + deferred "at")                             #
+    # ------------------------------------------------------------------ #
+
+    @_on_engine_loop
+    async def list_schedules(self, workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        return self._run_store.list_schedules(workflow_id)
+
+    @_on_engine_loop
+    async def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
+        """Disable, or re-enable (cron: run_at recomputed from now). None if
+        the schedule is missing or no longer live (fired / cancelled / failed)."""
+        row = self._run_store.get_scheduled_run(schedule_id)
+        if row is None or row["status"] not in ("pending", "firing", "disabled"):
+            return None
+        run_at = None
+        if enabled and row["cron"]:
+            from engine.cron import schedule as cron  # noqa: PLC0415
+            run_at = cron.to_iso(cron.next_fire(row["cron"], time.time()))
+        self._run_store.set_schedule_status(
+            schedule_id, "pending" if enabled else "disabled", run_at=run_at,
+        )
+        return self._run_store.get_scheduled_run(schedule_id)
+
+    @_on_engine_loop
+    async def cancel_schedule(self, schedule_id: str) -> bool:
+        return self._run_store.set_schedule_status(schedule_id, "cancelled")
 
     @_on_engine_loop
     async def wait_for_run(
