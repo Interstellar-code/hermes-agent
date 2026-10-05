@@ -94,6 +94,7 @@ def create_engine(
         days = retention_days if retention_days is not None else _retention_days()
         if days > 0:
             boot["pruned_runs"] = run_store.delete_terminal_runs_older_than(days)
+            runner.retention_days = days  # and daily after boot
 
     if seed_bundled:
         seed_result = seed_defaults(def_store)

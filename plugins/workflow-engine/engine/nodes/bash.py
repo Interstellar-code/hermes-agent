@@ -9,8 +9,9 @@ from typing import Dict
 
 from engine.schemas.workflow_run import NodeOutput
 from engine.core.executor_shared import (
-    communicate_or_kill,
     format_subprocess_failure,
+    node_log_emitter,
+    stream_subprocess,
     subprocess_cwd,
     substitute_node_output_refs,
     substitute_workflow_variables,
@@ -73,7 +74,7 @@ async def execute_bash_node(node, node_outputs: Dict[str, NodeOutput], ctx) -> "
             start_new_session=True,
         )
         try:
-            stdout_b, stderr_b = await communicate_or_kill(proc, timeout)
+            stdout_b, stderr_b = await stream_subprocess(proc, timeout, node_log_emitter(ctx, node.id))
         except asyncio.TimeoutError:
             err_msg = f"Bash node '{node.id}' timed out after {timeout}s"
             logger.error("dag_node_failed node=%s type=bash error=%s", node.id, err_msg)

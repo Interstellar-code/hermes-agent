@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import codecs
 import json
 import logging
 import os
 import re
 import signal
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from engine.schemas.workflow_run import NodeOutput
 
@@ -194,6 +195,110 @@ async def communicate_or_kill(proc: "asyncio.subprocess.Process", timeout: float
         await proc.wait()
         raise
     finally:
+        _LIVE_PGIDS.discard(proc.pid)
+
+
+NODE_LOG_MAX_BYTES = 256 * 1024  # live log emitted per node, then one truncated marker
+NODE_LOG_FLUSH_S = 0.25
+NODE_LOG_FLUSH_BYTES = 8 * 1024
+
+
+def node_log_emitter(ctx: Any, node_id: str) -> Callable[[Dict[str, Any]], None]:
+    """on_chunk for ``stream_subprocess``: each chunk becomes a node_log event."""
+    return lambda part: ctx.emit_event("node_log", {"run_id": ctx.run_id, "node_id": node_id, **part})
+
+
+async def stream_subprocess(
+    proc: "asyncio.subprocess.Process",
+    timeout: float,
+    on_chunk: Optional[Callable[[Dict[str, Any]], None]],
+):
+    """``communicate_or_kill`` + live output: same return / kill / raise contract.
+
+    Both pipes are drained concurrently (a full stderr pipe can't block a
+    stdout reader). Output is batched per stream and handed to ``on_chunk``
+    as ``{stream, text, seq_in_node}`` every 250ms or 8KB; after
+    NODE_LOG_MAX_BYTES one ``{stream, text: "", truncated: True}`` follows and
+    the rest is only returned, not streamed. ``WORKFLOW_NODE_LOG=0`` (read per
+    call) or no ``on_chunk`` falls back to plain ``communicate_or_kill``.
+    """
+    if on_chunk is None or os.environ.get("WORKFLOW_NODE_LOG", "1") == "0":
+        return await communicate_or_kill(proc, timeout)
+
+    bufs: Dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    pending: Dict[str, bytearray] = {"stdout": bytearray(), "stderr": bytearray()}
+    decoders = {s: codecs.getincrementaldecoder("utf-8")(errors="replace") for s in bufs}
+    state = {"emitted": 0, "seq": 0, "truncated": False}
+
+    def emit(part: Dict[str, Any]) -> None:
+        part["seq_in_node"] = state["seq"]
+        state["seq"] += 1
+        try:
+            on_chunk(part)
+        except Exception as exc:  # live log is best-effort, never fails a node
+            logger.debug("node_log on_chunk failed: %s", exc)
+
+    def flush(stream: str, final: bool = False) -> None:
+        data = bytes(pending[stream])
+        pending[stream].clear()
+        if state["truncated"] or not (data or final):
+            return
+        room = NODE_LOG_MAX_BYTES - state["emitted"]
+        cut = len(data) > room
+        data = data[:room] if cut else data
+        state["emitted"] += len(data)
+        text = decoders[stream].decode(data, final=final or cut)
+        if text:
+            emit({"stream": stream, "text": text})
+        if cut:
+            state["truncated"] = True
+            emit({"stream": stream, "text": "", "truncated": True})
+
+    async def reader(stream: str, pipe: Optional[asyncio.StreamReader]) -> None:
+        if pipe is None:
+            return
+        while True:
+            chunk = await pipe.read(65536)
+            if not chunk:
+                return
+            bufs[stream] += chunk
+            pending[stream] += chunk
+            if len(pending[stream]) >= NODE_LOG_FLUSH_BYTES:
+                flush(stream)
+
+    async def ticker() -> None:
+        while True:
+            await asyncio.sleep(NODE_LOG_FLUSH_S)
+            for s in pending:
+                flush(s)
+
+    _LIVE_PGIDS.add(proc.pid)
+    tasks = [
+        asyncio.ensure_future(reader("stdout", proc.stdout)),
+        asyncio.ensure_future(reader("stderr", proc.stderr)),
+    ]
+    tick = asyncio.ensure_future(ticker())
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, proc.wait()), timeout=timeout)
+        for s in pending:
+            flush(s, final=True)
+        return bytes(bufs["stdout"]), bytes(bufs["stderr"])
+    except BaseException:
+        killpg = getattr(os, "killpg", None)
+        try:
+            if killpg is not None:
+                killpg(proc.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+        for t in tasks:  # an escaped grandchild may hold the pipes open
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await proc.wait()
+        raise
+    finally:
+        tick.cancel()
         _LIVE_PGIDS.discard(proc.pid)
 
 # ── Error Classification ─────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 # One sqlite connection is shared by the engine-loop thread, dashboard
 # threads, tool threads and the cron poller. Python's sqlite3 has one implicit
@@ -716,10 +716,12 @@ class RunStore:
         event_id: Optional[str] = None,
         step_index: Optional[int] = None,
         step_name: Optional[str] = None,
-    ) -> str:
+    ) -> Tuple[str, int]:
+        """Persist one event; returns ``(id, seq)`` — seq is the row's rowid,
+        the cursor for ``list_events_after`` and the SSE dedupe key."""
         eid = event_id or str(uuid.uuid4())
         now = _now_ms()
-        self._conn.execute(
+        cur = self._conn.execute(
             """
             INSERT OR IGNORE INTO workflow_events
               (id, workflow_run_id, node_run_id, event_type, step_index, step_name, data, created_at)
@@ -737,7 +739,11 @@ class RunStore:
             ),
         )
         self._conn.commit()
-        return eid
+        if cur.rowcount:
+            return eid, cur.lastrowid
+        # duplicate id (INSERT OR IGNORE): report the existing row's seq
+        row = self._conn.execute("SELECT rowid FROM workflow_events WHERE id = ?", (eid,)).fetchone()
+        return eid, row[0]
 
     def list_events(
         self,
@@ -757,33 +763,81 @@ class RunStore:
         ).fetchall()
         return [_row_to_event(r) for r in rows]
 
+    @staticmethod
+    def _event_filter(
+        run_id: Optional[str],
+        node_run_id: Optional[str],
+        types: Optional[Sequence[str]],
+        exclude_types: Sequence[str],
+    ) -> Tuple[str, List[Any]]:
+        """WHERE clause: ``types`` (when given) wins over ``exclude_types``."""
+        clauses: List[str] = []
+        args: List[Any] = []
+        if run_id:
+            clauses.append("workflow_run_id = ?")
+            args.append(run_id)
+        if node_run_id:
+            clauses.append("node_run_id = ?")
+            args.append(node_run_id)
+        if types:
+            clauses.append(f"event_type IN ({','.join('?' * len(types))})")
+            args.extend(types)
+        elif exclude_types:
+            clauses.append(f"event_type NOT IN ({','.join('?' * len(exclude_types))})")
+            args.extend(exclude_types)
+        return " AND ".join(clauses) or "1", args
+
     def list_recent_events(
         self,
         run_id: Optional[str],
         *,
         limit: int = 50,
+        node_run_id: Optional[str] = None,
+        types: Optional[Sequence[str]] = None,
+        exclude_types: Sequence[str] = ("node_log",),
     ) -> List[Dict[str, Any]]:
-        """Return last N events for a run (or all runs if run_id is None)."""
-        if run_id:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM (
-                    SELECT * FROM workflow_events WHERE workflow_run_id = ?
-                    ORDER BY created_at DESC LIMIT ?
-                ) ORDER BY created_at ASC
-                """,
-                (run_id, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM (
-                    SELECT * FROM workflow_events ORDER BY created_at DESC LIMIT ?
-                ) ORDER BY created_at ASC
-                """,
-                (limit,),
-            ).fetchall()
+        """Last N events for a run (or all runs if run_id is None), ascending.
+
+        node_log is excluded by default: it is high-volume live output and
+        would crowd lifecycle events out of the replay / run-detail windows.
+        """
+        where, args = self._event_filter(run_id, node_run_id, types, exclude_types)
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM (
+                SELECT rowid AS seq, * FROM workflow_events WHERE {where}
+                ORDER BY created_at DESC, rowid DESC LIMIT ?
+            ) ORDER BY created_at ASC, seq ASC
+            """,
+            (*args, limit),
+        ).fetchall()
         return [_row_to_event(r) for r in rows]
+
+    def list_events_after(
+        self,
+        run_id: str,
+        after: int,
+        limit: int = 500,
+        *,
+        node_run_id: Optional[str] = None,
+        types: Optional[Sequence[str]] = None,
+        exclude_types: Sequence[str] = (),
+    ) -> List[Dict[str, Any]]:
+        """Events with seq (rowid) > ``after``, ascending by seq — cursor
+        paging and the cross-process SSE tail. Includes node_log by default."""
+        where, args = self._event_filter(run_id, node_run_id, types, exclude_types)
+        rows = self._conn.execute(
+            f"SELECT rowid AS seq, * FROM workflow_events WHERE {where} AND rowid > ? "
+            "ORDER BY rowid LIMIT ?",
+            (*args, after, limit),
+        ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def max_event_rowid(self, run_id: str) -> int:
+        row = self._conn.execute(
+            "SELECT MAX(rowid) FROM workflow_events WHERE workflow_run_id = ?", (run_id,)
+        ).fetchone()
+        return row[0] or 0
 
     # ------------------------------------------------------------------ #
     # Phase Transitions                                                    #

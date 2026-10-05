@@ -34,6 +34,8 @@ from engine.emitter.bus import EventBus
 
 logger = logging.getLogger("workflow.runner")
 
+RETENTION_SWEEP_S = 86_400.0  # daily retention sweep in long-lived engines
+
 
 class WorkflowRunner:
     """
@@ -62,6 +64,7 @@ class WorkflowRunner:
         # working_path (L2-01).
         self._runs_dir = Path(runs_dir or Path(tempfile.gettempdir()) / "hermes-workflow-runs")
         self._tasks: Dict[str, asyncio.Task] = {}  # run_id → Task
+        self.retention_days = 0  # >0: heartbeat_forever sweeps daily (wiring sets it)
 
     def set_llm(self, llm: Any) -> None:
         """Inject the host-owned PluginLlm facade used by prompt/command nodes."""
@@ -569,11 +572,20 @@ class WorkflowRunner:
         run_store = self._run_store
         bus = self._bus
         step_index_by_node = step_index_by_node or {}
+        log_node_runs: Dict[str, str] = {}  # node_id -> node_run_id for node_log
 
         def emit_event(event_type: str, payload: Dict[str, Any]) -> None:
             node_run_id = payload.pop("node_run_id", None)
+            if event_type == "node_log":
+                # High-volume live output: resolve the row once, never write it.
+                node_id = payload.get("node_id", "")
+                node_run_id = log_node_runs.get(node_id)
+                if node_run_id is None:
+                    nr = run_store.find_node_run(run_id, node_id)
+                    if nr:
+                        node_run_id = log_node_runs[node_id] = nr["id"]
             # Persist node_run row for node_started events
-            if event_type == "node_started":
+            elif event_type == "node_started":
                 node_id = payload.get("node_id", "")
                 node_type = payload.get("node_type", "prompt")
                 provided_nr_id = payload.get("node_run_id_hint")
@@ -769,12 +781,19 @@ class WorkflowRunner:
         """Keep this process's live runs fresh so other engines' crash
         recovery (stale-heartbeat reaper) leaves them alone (L2-02)."""
         from engine.runtime.resume import mark_crashed_runs
+        next_sweep = time.monotonic() + RETENTION_SWEEP_S  # boot already swept
         while True:
             try:
                 self._run_store.heartbeat_runs(list(self._tasks))
                 mark_crashed_runs(self._run_store)
             except Exception:
                 logger.exception("heartbeat tick failed")
+            if self.retention_days > 0 and time.monotonic() >= next_sweep:
+                next_sweep = time.monotonic() + RETENTION_SWEEP_S
+                try:  # bounds node_log growth: events go with their run (CASCADE)
+                    self._run_store.delete_terminal_runs_older_than(self.retention_days)
+                except Exception:
+                    logger.exception("retention sweep failed")
             await asyncio.sleep(interval_s)
 
 

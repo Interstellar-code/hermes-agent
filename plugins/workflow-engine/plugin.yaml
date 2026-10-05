@@ -1,5 +1,5 @@
 name: workflow-engine
-version: "0.2.0"
+version: "0.3.0"
 description: "DAG workflow engine — define, trigger, and monitor multi-step workflows from the Switch UI dashboard (cron-triggered runs via the standalone daemon)."
 author: Interstellar-code
 dashboard_manifest: dashboard/manifest.json

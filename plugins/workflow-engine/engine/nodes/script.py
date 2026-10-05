@@ -21,9 +21,10 @@ from typing import Dict, List, Optional
 from engine.schemas.workflow_run import NodeOutput
 from engine.core.executor_shared import (
     NODE_OUTPUT_REF_RE,
-    communicate_or_kill,
     format_subprocess_failure,
+    node_log_emitter,
     node_output_env_name,
+    stream_subprocess,
     subprocess_cwd,
     substitute_workflow_variables,
     workflow_env,
@@ -179,7 +180,7 @@ async def execute_script_node(node, node_outputs: Dict[str, NodeOutput], ctx) ->
             start_new_session=True,
         )
         try:
-            stdout_b, stderr_b = await communicate_or_kill(proc, timeout)
+            stdout_b, stderr_b = await stream_subprocess(proc, timeout, node_log_emitter(ctx, node.id))
         except asyncio.TimeoutError:
             err = f"Script node '{node.id}' timed out after {timeout}s"
             ctx.emit_event("node_failed", {"run_id": ctx.run_id, "node_id": node.id, "error": err})

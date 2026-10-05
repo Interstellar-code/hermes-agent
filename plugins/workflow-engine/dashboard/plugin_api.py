@@ -46,14 +46,19 @@ def _engine() -> WorkflowEngine:  # type: ignore[return]  # noqa: N802
 
 router = APIRouter()
 
-_VERSION = "0.2.0"
+_VERSION = "0.3.0"
 
 # Capability flags for clients (SwitchUI feature-detects on these, never on
 # _VERSION). Append-only; served by /health as ``features``.
 FEATURES: List[str] = [
     "definition_pin", "parent_run",
     "node_attempts", "approver", "node_retrying_event",
+    "node_log", "events_query", "sse_db_tail", "cross_process_sse",
 ]
+
+_SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
+_EVENTS_MAX_ROWS = 1000  # GET /runs/{id}/events row cap
+_NODE_LOG_TEXT_MAX = 8 * 1024  # per-row node_log text cap on the query
 
 # Validation patterns (mirror TS)
 _ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
@@ -547,7 +552,11 @@ async def events(request: Request) -> StreamingResponse:
             return
 
         HEARTBEAT_INTERVAL = 15.0
-        it = _engine().subscribe_events(run_id).__aiter__()
+        # Run-scoped streams also tail the DB: runs executed by the gateway or
+        # daemon emit on *their* bus, so only their persisted rows reach us.
+        it = _engine().subscribe_events(
+            run_id, tail_interval_s=_SSE_TAIL_S if run_id else None,
+        ).__aiter__()
         pending: Optional["asyncio.Future"] = None
 
         try:
@@ -1008,16 +1017,42 @@ async def append_event(run_id: str, request: Request) -> JSONResponse:
 
 @router.get("/runs/{run_id}/events")
 async def list_run_events(run_id: str, request: Request) -> JSONResponse:
+    """Run events, ascending by ``seq``.
+
+    Query: ``limit`` (1-1000, default 200); ``after`` (seq, exclusive) pages
+    forward, else the newest ``limit``; ``node_run_id``; ``type`` (csv).
+    node_log rows are only returned when ``type`` lists node_log, and then
+    each ``data.text`` is capped at 8KB. ``cursor`` = last row's seq (pass as
+    the next ``after``).
+    """
     run = await _engine().get_run(run_id)
     if run is None:
         return _json({"error": "not found"}, 404)
+    q = request.query_params
     try:
-        limit = int(request.query_params.get("limit", "200"))
+        limit = int(q.get("limit", "200"))
     except ValueError:
         limit = 200
-    limit = max(1, min(limit, 1000))
-    events_list = await _engine().list_recent_workflow_events(run_id, limit=limit)
-    return _json({"events": events_list})
+    limit = max(1, min(limit, _EVENTS_MAX_ROWS))
+    after: Optional[int] = None
+    if q.get("after") not in (None, ""):
+        try:
+            after = max(0, int(q["after"]))
+        except ValueError:
+            return _json({"error": "after must be an integer seq"}, 400)
+    types = [t for t in (q.get("type") or "").split(",") if t.strip()] or None
+    types = [t.strip() for t in types] if types else None
+    events_list = await _engine().query_workflow_events(
+        run_id, limit=limit, after=after,
+        node_run_id=q.get("node_run_id") or None, types=types,
+    )
+    for evt in events_list:
+        text = (evt.get("data") or {}).get("text") if evt.get("event_type") == "node_log" else None
+        if isinstance(text, str) and len(text) > _NODE_LOG_TEXT_MAX:
+            evt["data"]["text"] = text[:_NODE_LOG_TEXT_MAX]
+            evt["data"]["text_truncated"] = True
+    cursor = events_list[-1]["seq"] if events_list else after
+    return _json({"events": events_list, "cursor": cursor})
 
 
 # ---------------------------------------------------------------------------

@@ -526,6 +526,27 @@ class WorkflowEngine:
     async def list_recent_workflow_events(self, run_id: str, limit: int = 200) -> List[Dict[str, Any]]:
         return self._run_store.list_recent_events(run_id, limit=limit)
 
+    @_on_engine_loop
+    async def query_workflow_events(
+        self,
+        run_id: str,
+        *,
+        limit: int,
+        after: Optional[int] = None,
+        node_run_id: Optional[str] = None,
+        types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """``after`` given: forward page by seq; else the newest ``limit``.
+        node_log is only returned when listed in ``types``."""
+        if after is not None:
+            return self._run_store.list_events_after(
+                run_id, after, limit, node_run_id=node_run_id, types=types,
+                exclude_types=("node_log",),
+            )
+        return self._run_store.list_recent_events(
+            run_id, limit=limit, node_run_id=node_run_id, types=types,
+        )
+
     # ------------------------------------------------------------------ #
     # Extended phase transitions                                           #
     # ------------------------------------------------------------------ #
@@ -555,13 +576,15 @@ class WorkflowEngine:
     # ------------------------------------------------------------------ #
 
     def subscribe_events(
-        self, run_id: Optional[str] = None
+        self, run_id: Optional[str] = None, *, tail_interval_s: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Return an async iterator of events.
-        Replays last 50 DB events then streams live events.
+        Replays last 50 DB events then streams live events; with
+        ``tail_interval_s`` (run-scoped) also tails the DB for events
+        persisted by other processes.
         """
-        return self._bus.subscribe(run_id)
+        return self._bus.subscribe(run_id, tail_interval_s=tail_interval_s)
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
