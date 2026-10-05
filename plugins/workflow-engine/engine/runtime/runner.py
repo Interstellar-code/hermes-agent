@@ -366,7 +366,10 @@ class WorkflowRunner:
         self, run_id: str, dag_nodes: List[Any], rerun_from: Optional[str],
     ) -> List[str]:
         """Top-level node ids to re-run (failed / cancelled nodes, rerun_from,
-        and their descendants); resets their rows to pending. Sorted."""
+        and their descendants); resets their rows to pending — including a
+        prior approval decision (approval_response, metadata decided_at /
+        approved_by) so a re-run gate asks again. Token usage is kept: it
+        accumulates across attempts (it is what the run actually cost). Sorted."""
         rows = self._run_store.list_node_runs(run_id)
         seeds = {
             _top_node_id(nr["dag_node_id"], dag_nodes) for nr in rows
@@ -386,9 +389,12 @@ class WorkflowRunner:
                 stack.extend(children.get(nid, []))
         for nr in rows:
             if _top_node_id(nr["dag_node_id"], dag_nodes) in rerun:
+                meta = {k: v for k, v in (nr.get("metadata") or {}).items()
+                        if k not in ("decided_at", "approved_by")}
                 self._run_store.update_node_run(nr["id"], {
                     "status": "pending", "error": None, "skip_reason": None,
                     "summary": None, "completed_at": None, "retries": 0,
+                    "approval_response": None, "metadata": meta or None,
                 })
         return sorted(rerun)
 
@@ -472,8 +478,11 @@ class WorkflowRunner:
         loop_resume: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
         start_ms = int(time.time() * 1000)
+        epoch: Optional[int] = None
         try:
             run_row = self._run_store.get_workflow_run(run_id) or {}
+            # Ownership token: a retry elsewhere bumps it and this task stops.
+            epoch = run_row.get("retry_epoch")
             cwd = working_path if os.path.isdir(working_path) else None
             base_branch = str(inputs.get("base_branch") or "") or await asyncio.to_thread(
                 _detect_base_branch, cwd,
@@ -482,7 +491,7 @@ class WorkflowRunner:
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             ctx = self._build_ctx(
                 run_id, working_path, prior_completed,
-                {n.id: i for i, n in enumerate(dag_nodes)},
+                {n.id: i for i, n in enumerate(dag_nodes)}, epoch=epoch,
             )
             ctx.cwd = cwd
             ctx.home = str(self._runs_dir.parent)
@@ -527,7 +536,7 @@ class WorkflowRunner:
                     f"workflow failed because node '{first_failed_id}' failed"
                 )
                 won = self._run_store.finish_workflow_run_if_running(
-                    run_id, status="failed", error=error,
+                    run_id, status="failed", error=error, epoch=epoch,
                 )
                 if not won:
                     logger.info(
@@ -559,7 +568,7 @@ class WorkflowRunner:
                 return
 
             won = self._run_store.finish_workflow_run_if_running(
-                run_id, status="completed",
+                run_id, status="completed", epoch=epoch,
             )
             if not won:
                 logger.info(
@@ -587,7 +596,7 @@ class WorkflowRunner:
             # CAS path with a distinguished error string.
             logger.warning("Run %s exceeded max_runtime_s=%s", run_id, max_runtime_s)
             won = self._run_store.finish_workflow_run_if_running(
-                run_id, status="failed", error="max_runtime_exceeded",
+                run_id, status="failed", error="max_runtime_exceeded", epoch=epoch,
             )
             if not won:
                 return
@@ -610,7 +619,7 @@ class WorkflowRunner:
         except asyncio.CancelledError:
             # CAS so a concurrent resume / completion can't be
             # double-finalised by this branch.
-            won = self._run_store.cancel_workflow_run(run_id)
+            won = self._run_store.cancel_workflow_run(run_id, epoch=epoch)
             if won:
                 self._run_store.record_phase_transition(
                     run_id=run_id,
@@ -627,7 +636,7 @@ class WorkflowRunner:
         except Exception as exc:
             logger.exception("Run %s failed: %s", run_id, exc)
             won = self._run_store.finish_workflow_run_if_running(
-                run_id, status="failed", error=str(exc),
+                run_id, status="failed", error=str(exc), epoch=epoch,
             )
             if not won:
                 # Run already moved out of 'running' (paused, cancelled,
@@ -644,6 +653,12 @@ class WorkflowRunner:
                 event_type="workflow_failed",
                 data={"error": str(exc)},
             )
+        finally:
+            # Task ending: give up ownership so a retry needn't wait STALE_MS.
+            try:
+                self._run_store.release_run(run_id, epoch)
+            except Exception:
+                logger.exception("run %s: release_run failed", run_id)
 
     def _build_ctx(
         self,
@@ -651,6 +666,7 @@ class WorkflowRunner:
         working_path: str,
         prior_completed: Optional[Dict[str, str]] = None,
         step_index_by_node: Optional[Dict[str, int]] = None,
+        epoch: Optional[int] = None,
     ) -> DagRunContext:
         run_store = self._run_store
         bus = self._bus
@@ -838,17 +854,19 @@ class WorkflowRunner:
 
         async def get_run_status() -> Optional[str]:
             run = run_store.get_workflow_run(run_id)
+            if run and epoch is not None and run.get("retry_epoch") != epoch:
+                return "superseded"  # retried by another owner: stop here
             return run["status"] if run else None
 
         async def pause_run(meta: Dict[str, Any]) -> None:
-            run_store.pause_workflow_run(run_id, meta)
-            bus.emit(run_id=run_id, event_type="approval_requested", data=meta)
+            # approval_requested is emitted by the gate node itself.
+            run_store.pause_workflow_run(run_id, meta, epoch=epoch)
 
         async def cancel_run() -> None:
             # CAS-safe — returns False when the row was already
             # terminal (completed/failed/cancelled by a concurrent
             # path). No event emission here; that's the caller's job.
-            run_store.cancel_workflow_run(run_id)
+            run_store.cancel_workflow_run(run_id, epoch=epoch)
 
         async def send_message(msg: str) -> None:
             bus.emit(
@@ -893,21 +911,25 @@ class WorkflowRunner:
         recovery (stale-heartbeat reaper) leaves them alone (L2-02)."""
         from engine.runtime.resume import mark_crashed_runs
         next_sweep = time.monotonic() + RETENTION_SWEEP_S  # boot already swept
+        sweep: Optional[asyncio.Future] = None
         while True:
             try:
-                self._run_store.heartbeat_runs(list(self._tasks))
+                self._run_store.heartbeat_runs(
+                    [rid for rid, t in self._tasks.items() if not t.done()])
                 mark_crashed_runs(self._run_store)
             except Exception:
                 logger.exception("heartbeat tick failed")
-            if self.retention_days > 0 and time.monotonic() >= next_sweep:
+            if (self.retention_days > 0 and time.monotonic() >= next_sweep
+                    and (sweep is None or sweep.done())):
                 next_sweep = time.monotonic() + RETENTION_SWEEP_S
-                try:  # bounds node_log growth: events go with their run (CASCADE)
-                    # batched, off the engine loop
-                    await asyncio.to_thread(
-                        self._run_store.delete_terminal_runs_older_than, self.retention_days,
-                    )
-                except Exception:
-                    logger.exception("retention sweep failed")
+                # bounds node_log growth: events go with their run (CASCADE).
+                # Batched, in a thread, and not awaited: heartbeats keep ticking.
+                sweep = asyncio.ensure_future(asyncio.to_thread(
+                    self._run_store.delete_terminal_runs_older_than, self.retention_days,
+                ))
+                sweep.add_done_callback(
+                    lambda f: f.cancelled() or f.exception() is None
+                    or logger.error("retention sweep failed", exc_info=f.exception()))
             await asyncio.sleep(interval_s)
 
 

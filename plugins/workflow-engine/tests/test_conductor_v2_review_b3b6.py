@@ -122,7 +122,9 @@ def test_run_scoped_event_paging_uses_index_without_temp_btree(eng):
     assert "idx_we_run_seq" in plan and "TEMP B-TREE" not in plan
 
 
-def test_sse_tail_stops_after_terminal_event_and_restarts_on_retry(tmp_path):
+def test_sse_tail_stops_after_terminal_event_and_restarts_on_retry(tmp_path, monkeypatch):
+    import engine.emitter.bus as bus_mod
+    monkeypatch.setattr(bus_mod, "_TERMINAL_GRACE_S", 0.2)
     db = tmp_path / "db.sqlite"
     store, conn = _file_store(db)
     _seed_run(conn)
@@ -141,6 +143,8 @@ def test_sse_tail_stops_after_terminal_event_and_restarts_on_retry(tmp_path):
         await asyncio.sleep(0.05)
         bus.emit(run_id="run-1", event_type="workflow_failed")
         await asyncio.sleep(0.05)
+        other.insert_event(workflow_run_id="run-1", event_type="remote_in_grace")
+        await asyncio.sleep(0.4)
         other.insert_event(workflow_run_id="run-1", event_type="remote_after_end")
         await asyncio.sleep(0.4)
         missed = list(got)
@@ -153,9 +157,11 @@ def test_sse_tail_stops_after_terminal_event_and_restarts_on_retry(tmp_path):
         return missed, got
 
     missed, got = _arun(go())
-    assert missed == ["workflow_failed"]  # tail stopped
+    # a row committed just after the terminal event still arrives (grace);
+    # after the grace the tail is stopped
+    assert missed == ["workflow_failed", "remote_in_grace"]
     # tail back on: the next poll (cursor unchanged) picks up both remote rows
-    assert got[1:] == ["workflow_retried", "remote_after_end", "remote_after_retry"]
+    assert got[2:] == ["workflow_retried", "remote_after_end", "remote_after_retry"]
 
 
 # M3 ──────────────────────────────────────────────────────────────────────────

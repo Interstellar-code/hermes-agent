@@ -156,8 +156,8 @@ def test_crashed_run_retry_reexecutes_running_node(eng, abc, client):
     flag, _ = abc
     run_id = _failed_run(eng)
     # Simulate an owner that died mid-B: run still 'running' with a heartbeat
-    # older than 3x HEARTBEAT_S, B left 'running', C never started.
-    stale = int(time.time() * 1000) - 120_000
+    # older than STALE_MS (300s), B left 'running', C never started.
+    stale = int(time.time() * 1000) - 400_000
     with STORE_LOCK:
         eng._conn.execute(
             "UPDATE workflow_runs SET status='running', error=NULL, completed_at=NULL, "

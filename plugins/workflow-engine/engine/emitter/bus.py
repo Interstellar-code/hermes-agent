@@ -31,8 +31,10 @@ _TAIL_BATCH = 500  # rows per DB-tail poll
 # from the DB (still fanned out here) so the engine loop never stalls on it.
 _BEST_EFFORT_TYPES = ("node_log",)
 _BEST_EFFORT_WAIT_S = 0.05
-# The run-scoped DB tail stops after a terminal event and restarts on a retry.
+# The run-scoped DB tail stops _TERMINAL_GRACE_S after a terminal event (rows
+# another process commits just after it still arrive) and restarts on a retry.
 _TERMINAL_TYPES = ("workflow_completed", "workflow_failed", "workflow_cancelled")
+_TERMINAL_GRACE_S = 5.0
 
 
 def _row_payload(row: Dict[str, Any], run_id: Optional[str]) -> Dict[str, Any]:
@@ -196,6 +198,7 @@ class EventBus:
         self._subscribers.append(sub)
         tail_wanted = bool(tail_interval_s) and run_id is not None
         tail = tail_wanted
+        tail_until: Optional[float] = None  # set by a terminal event
         # Bounded seen-seq set. Evict the *smallest* seq: the tail cursor only
         # moves forward, so low seqs can't come back from the tail, while a
         # bus burst far ahead of the tail must stay remembered.
@@ -203,12 +206,13 @@ class EventBus:
         seen_heap: List[int] = []
 
         def unseen(evt: Dict[str, Any]) -> bool:
-            # Settled run: stop tailing; a retry reopens it.
-            nonlocal tail
+            # Settled run: stop tailing after a grace; a retry reopens it.
+            nonlocal tail, tail_until
             if evt.get("event_type") in _TERMINAL_TYPES:
-                tail = False
+                if tail and tail_until is None:
+                    tail_until = loop.time() + _TERMINAL_GRACE_S
             elif evt.get("event_type") == "workflow_retried":
-                tail = tail_wanted
+                tail, tail_until = tail_wanted, None
             seq = evt.get("seq")
             if seq is None:
                 return True
@@ -271,6 +275,8 @@ class EventBus:
                         evt = _row_payload(row, run_id)
                         if unseen(evt):
                             yield evt
+                    if tail_until is not None and loop.time() >= tail_until:
+                        tail = False
         finally:
             self._unsubscribe(sub)
 

@@ -5,6 +5,7 @@ All methods synchronous. Caller owns transaction commit where noted.
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import sqlite3
@@ -30,24 +31,35 @@ def unlocked(fn):
 
 
 def locked(cls):
-    """Class decorator: run every public method under STORE_LOCK."""
+    """Class decorator: run every public method under STORE_LOCK (except
+    ``@unlocked`` ones) and roll back on a sqlite error.
+
+    A failed statement (e.g. "database is locked" after busy_timeout) can
+    leave the implicit transaction open; on the shared connection every later
+    write would then run inside that stale transaction and fail or commit
+    someone else's half-done work. Rolling back keeps each method atomic."""
     for name, fn in list(vars(cls).items()):
-        if (
-            isinstance(fn, type(locked)) and not name.startswith("_")
-            and not getattr(fn, "unlocked", False)
-        ):
-            def wrap(f):
+        if isinstance(fn, type(locked)) and not name.startswith("_"):
+            def wrap(f, lock):
                 @functools.wraps(f)
-                def inner(*a, **kw):
-                    with STORE_LOCK:
-                        return f(*a, **kw)
+                def inner(self, *a, **kw):
+                    with STORE_LOCK if lock else contextlib.nullcontext():
+                        try:
+                            return f(self, *a, **kw)
+                        except sqlite3.Error:
+                            with STORE_LOCK, contextlib.suppress(sqlite3.Error):
+                                if self._conn.in_transaction:
+                                    self._conn.rollback()
+                            raise
                 return inner
-            setattr(cls, name, wrap(fn))
+            setattr(cls, name, wrap(fn, not getattr(fn, "unlocked", False)))
     return cls
 
-# A run's owning process refreshes last_heartbeat every HEARTBEAT_S; a
+# A run's owning process refreshes last_heartbeat every HEARTBEAT_S while its
+# task lives (any status) and zeroes it when the task ends (release_run). A
 # pending/running run whose heartbeat is older than STALE_MS has lost its
-# owner (process died) and is reaped by any engine's crash recovery.
+# owner (process died) and is reaped by any engine's crash recovery; retry
+# (reopen_run) needs the same staleness (0 = released) for every status.
 HEARTBEAT_S = 30.0
 _BUSY_TIMEOUT_MS = 5000  # engine.db.client.open_db's connection default
 STALE_MS = 5 * 60 * 1000
@@ -83,7 +95,7 @@ def _row_to_run(row: sqlite3.Row) -> Dict[str, Any]:
         d["usage"] = json.loads(d["usage"]) if d["usage"] else None
     d["started_at"] = _ms_to_dt(d.get("started_at"))
     d["completed_at"] = _ms_to_dt(d.get("completed_at"))
-    d["last_heartbeat"] = _ms_to_dt(d.get("last_heartbeat"))
+    d["last_heartbeat"] = _ms_to_dt(d.get("last_heartbeat") or None)  # 0 = released
     if d.get("metadata"):
         try:
             d["metadata"] = json.loads(d["metadata"])
@@ -387,8 +399,9 @@ class RunStore:
                    SET status = 'pending', run_at = COALESCE(?, run_at),
                        trigger_json = json_remove(trigger_json, '$.claimed_at')
                  WHERE id = ? AND status = 'firing'
+                   AND COALESCE(json_extract(trigger_json, '$.claimed_at'), run_at) < ?
                 """,
-                (run_at, row["id"]),
+                (run_at, row["id"], cutoff_iso),
             )
         self._conn.commit()
         return len(rows)
@@ -520,14 +533,27 @@ class RunStore:
         self._conn.commit()
 
     def heartbeat_runs(self, run_ids: List[str]) -> None:
-        """Refresh last_heartbeat for the live runs this process owns."""
+        """Refresh last_heartbeat for the runs this process has a live task
+        for, whatever their status: a run cancelled from another process is
+        still owned until its task ends, and must not look retryable."""
         if not run_ids:
             return
         marks = ",".join("?" * len(run_ids))
         self._conn.execute(
-            f"UPDATE workflow_runs SET last_heartbeat = ? "
-            f"WHERE id IN ({marks}) AND status IN ('pending', 'running')",
+            f"UPDATE workflow_runs SET last_heartbeat = ? WHERE id IN ({marks})",
             (_now_ms(), *run_ids),
+        )
+        self._conn.commit()
+
+    def release_run(self, run_id: str, epoch: Optional[int] = None) -> None:
+        """The owner's task ended: zero the heartbeat of a settled run
+        (paused / terminal) so retry need not wait out STALE_MS. ``epoch``
+        guards against a superseded owner releasing its successor's run."""
+        self._conn.execute(
+            "UPDATE workflow_runs SET last_heartbeat = 0 WHERE id = ? "
+            "AND status IN ('paused', 'completed', 'failed', 'cancelled') "
+            "AND (? IS NULL OR retry_epoch = ?)",
+            (run_id, epoch, epoch),
         )
         self._conn.commit()
 
@@ -606,7 +632,7 @@ class RunStore:
         )
         self._conn.commit()
 
-    def cancel_workflow_run(self, run_id: str) -> bool:
+    def cancel_workflow_run(self, run_id: str, epoch: Optional[int] = None) -> bool:
         """Mark a run cancelled if it isn't already terminal.
 
         Returns True when the workflow_run row was actually flipped to
@@ -615,7 +641,8 @@ class RunStore:
         records on the return value so a stray late cancel does not
         double-fire after the run already settled (completed/failed
         won the race) or after a prior cancel already recorded the
-        transition.
+        transition. ``epoch`` (an owner's own cancel) is a no-op once the
+        run was retried by someone else.
         """
         now = _now_ms()
         cur = self._conn.execute(
@@ -623,9 +650,12 @@ class RunStore:
             UPDATE workflow_runs
                SET status = 'cancelled', completed_at = ?
              WHERE id = ? AND status NOT IN ('completed', 'failed', 'cancelled')
+               AND (? IS NULL OR retry_epoch = ?)
             """,
-            (now, run_id),
+            (now, run_id, epoch, epoch),
         )
+        if cur.rowcount == 0 and epoch is not None:
+            return False  # superseded owner: leave the successor's node rows alone
         # Cancel any running/pending node_runs too — always safe, the
         # WHERE clause excludes already-terminal rows.
         self._conn.execute(
@@ -646,6 +676,7 @@ class RunStore:
         status: str,
         error: Optional[str] = None,
         from_statuses: tuple = ("running",),
+        epoch: Optional[int] = None,
     ) -> bool:
         """Atomic compare-and-set finaliser.
 
@@ -658,7 +689,8 @@ class RunStore:
         approval gate was re-resumed.
 
         ``status`` must be a terminal phase the schema accepts (completed,
-        failed, cancelled).
+        failed, cancelled). ``epoch``: the owner's retry_epoch; a superseded
+        owner (the run was retried meanwhile) never finalises its successor.
         """
         if status not in ("completed", "failed", "cancelled"):
             raise ValueError(f"non-terminal status not allowed here: {status}")
@@ -669,28 +701,32 @@ class RunStore:
             UPDATE workflow_runs
                SET status = ?, completed_at = ?, last_heartbeat = ?,
                    error = COALESCE(?, error)
-             WHERE id = ? AND status IN ({marks})
+             WHERE id = ? AND status IN ({marks}) AND (? IS NULL OR retry_epoch = ?)
             """,
-            (status, now, now, error, run_id, *from_statuses),
+            (status, now, now, error, run_id, *from_statuses, epoch, epoch),
         )
         self._conn.commit()
         return cur.rowcount == 1
 
-    def reopen_run(self, run_id: str, *, stale_ms: int = int(3 * HEARTBEAT_S * 1000)) -> bool:
-        """CAS for B4 retry: flip a failed / cancelled run — or a pending /
-        running one whose owner stopped heartbeating ``stale_ms`` ago
-        (crashed) — back to running, clearing error / completed_at and
-        refreshing the heartbeat. When this call wins, node rows still
-        running / paused lost their owner too and become failed
-        ``crashed: owner process stopped``. Returns True on a real reopen."""
+    def reopen_run(self, run_id: str, *, stale_ms: int = STALE_MS) -> bool:
+        """CAS for B4 retry: flip a failed / cancelled / pending / running run
+        whose owner is gone — heartbeat released (0) or older than
+        ``stale_ms`` (crashed) — back to running, clearing error /
+        completed_at, refreshing the heartbeat and bumping ``retry_epoch``
+        (an old owner that wakes up sees it lost the run and stops). A
+        cancelled run whose owner is still finishing its layer stays owned.
+        When this call wins, node rows still running / paused lost their
+        owner too and become failed ``crashed: owner process stopped``.
+        Returns True on a real reopen."""
         now = _now_ms()
         cur = self._conn.execute(
             """
             UPDATE workflow_runs
-               SET status = 'running', error = NULL, completed_at = NULL, last_heartbeat = ?
+               SET status = 'running', error = NULL, completed_at = NULL, last_heartbeat = ?,
+                   retry_epoch = retry_epoch + 1
              WHERE id = ?
-               AND (status IN ('failed', 'cancelled')
-                    OR (status IN ('pending', 'running') AND last_heartbeat < ?))
+               AND status IN ('failed', 'cancelled', 'pending', 'running')
+               AND last_heartbeat < ?
             """,
             (now, run_id, now - stale_ms),
         )
@@ -708,6 +744,7 @@ class RunStore:
 
     def pause_workflow_run(
         self, run_id: str, metadata: Optional[Dict[str, Any]] = None,
+        epoch: Optional[int] = None,
     ) -> bool:
         """Flip the run to 'paused' only when it's still 'running'.
 
@@ -720,8 +757,8 @@ class RunStore:
         cur = self._conn.execute(
             "UPDATE workflow_runs SET status = 'paused', last_heartbeat = ?, "
             "metadata = json_set(COALESCE(metadata, '{}'), '$.pause', json(?)) "
-            "WHERE id = ? AND status = 'running'",
-            (now, json.dumps(metadata or {}), run_id),
+            "WHERE id = ? AND status = 'running' AND (? IS NULL OR retry_epoch = ?)",
+            (now, json.dumps(metadata or {}), run_id, epoch, epoch),
         )
         self._conn.commit()
         return cur.rowcount == 1

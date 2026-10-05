@@ -545,6 +545,7 @@ class WorkflowEngine:
             run_id, status="failed", error=error, from_statuses=from_statuses,
         )
         if won:
+            self._run_store.release_run(run_id)  # no task owns it: retryable now
             self._run_store.record_phase_transition(
                 run_id=run_id, to_phase="failed", decided_by="user",
                 decision_data={"error": error},
@@ -634,13 +635,15 @@ class WorkflowEngine:
         Completed nodes are kept (``node_skipped`` reason ``prior_success``);
         every failed / cancelled node, ``from_node_id`` (a top-level node of
         the pinned definition) and all their descendants re-run. An approval
-        gate in that set asks for approval again. A crashed run is a
-        pending / running run whose heartbeat is older than 3x HEARTBEAT_S;
-        its running / paused node rows are failed first.
+        gate in that set asks for approval again. The run's owner must be
+        gone: its task ended (heartbeat released) or its heartbeat is older
+        than STALE_MS (crashed) — also for a cancelled run whose owner in
+        another process is still finishing its layer. A crashed run's
+        running / paused node rows are failed first.
 
         Raises LookupError (no run), ValueError (bad from_node_id or
-        unloadable definition), ConflictError (completed / paused, or still
-        owned by a live process).
+        unloadable definition), ConflictError (completed / paused, still
+        owned by a live process, or already retried by a concurrent call).
         """
         run = self._run_store.get_workflow_run(run_id)
         if run is None:
@@ -655,6 +658,9 @@ class WorkflowEngine:
             raise ValueError(f"from_node_id '{from_node_id}' is not a node of the run's definition")
         task = self._runner._tasks.get(run_id)
         if (task is not None and not task.done()) or not self._run_store.reopen_run(run_id):
+            now = self._run_store.get_workflow_run(run_id) or {}
+            if now.get("retry_epoch") != run.get("retry_epoch"):
+                raise ConflictError("run already retried")
             raise ConflictError("run still owned by a live process")
 
         self._run_store.record_phase_transition(

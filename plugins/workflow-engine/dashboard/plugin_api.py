@@ -769,8 +769,11 @@ async def resume_run(run_id: str) -> JSONResponse:
 async def retry_run(run_id: str, request: Request) -> JSONResponse:
     """Body ``{from_node_id?, actor?}``. 200 ``{run}``; 404 unknown run; 400
     bad body / node not in the pinned definition; 409 not retryable
-    (completed / paused) or still owned by a live process (heartbeat
-    younger than 3x HEARTBEAT_S). Same no-ownership note as cancel_run."""
+    (completed / paused), still owned by a live process (its task has not
+    ended and its heartbeat is younger than STALE_MS = 300s — also right
+    after a cross-process cancel, until the owner finishes its layer), or
+    "run already retried" (lost a concurrent retry). Same no-ownership note
+    as cancel_run."""
     if not _ID_RE.match(run_id) or await _engine().get_run(run_id) is None:
         return _json({"error": "workflow_run not found"}, 404)
     try:

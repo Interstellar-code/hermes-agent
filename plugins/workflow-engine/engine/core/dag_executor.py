@@ -617,7 +617,7 @@ async def execute_dag(
                     "dag.stop_detected_between_layers run_id=%s layer=%d status=%s",
                     ctx.run_id, layer_idx, effective,
                 )
-                if effective != "paused":
+                if effective not in ("paused", "superseded"):
                     try:
                         await ctx.send_message(
                             f"⚠️ **Workflow stopped** ({effective}): DAG execution stopped "
