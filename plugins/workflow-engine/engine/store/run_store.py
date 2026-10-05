@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 # One sqlite connection is shared by the engine-loop thread, dashboard
 # threads, tool threads and the cron poller. Python's sqlite3 has one implicit
@@ -23,10 +23,19 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 STORE_LOCK = threading.RLock()
 
 
+def unlocked(fn):
+    """Opt a public RunStore method out of ``locked`` (it locks per step)."""
+    fn.unlocked = True
+    return fn
+
+
 def locked(cls):
     """Class decorator: run every public method under STORE_LOCK."""
     for name, fn in list(vars(cls).items()):
-        if isinstance(fn, type(locked)) and not name.startswith("_"):
+        if (
+            isinstance(fn, type(locked)) and not name.startswith("_")
+            and not getattr(fn, "unlocked", False)
+        ):
             def wrap(f):
                 @functools.wraps(f)
                 def inner(*a, **kw):
@@ -40,6 +49,7 @@ def locked(cls):
 # pending/running run whose heartbeat is older than STALE_MS has lost its
 # owner (process died) and is reaped by any engine's crash recovery.
 HEARTBEAT_S = 30.0
+_BUSY_TIMEOUT_MS = 5000  # engine.db.client.open_db's connection default
 STALE_MS = 5 * 60 * 1000
 
 
@@ -312,14 +322,14 @@ class RunStore:
 
     def mark_scheduled_fired(self, scheduled_id: str) -> None:
         self._conn.execute(
-            "UPDATE scheduled_runs SET status = 'fired' WHERE id = ?",
+            "UPDATE scheduled_runs SET status = 'fired' WHERE id = ? AND status = 'firing'",
             (scheduled_id,),
         )
         self._conn.commit()
 
     def mark_scheduled_failed(self, scheduled_id: str) -> None:
         self._conn.execute(
-            "UPDATE scheduled_runs SET status = 'failed' WHERE id = ?",
+            "UPDATE scheduled_runs SET status = 'failed' WHERE id = ? AND status = 'firing'",
             (scheduled_id,),
         )
         self._conn.commit()
@@ -349,20 +359,39 @@ class RunStore:
         self._conn.commit()
         return cur.rowcount == 1
 
-    def reset_stale_firing(self, cutoff_iso: str) -> int:
+    def reset_stale_firing(
+        self, cutoff_iso: str, cron_next: Optional[Callable[[str], str]] = None,
+    ) -> int:
         """Rows claimed before ``cutoff_iso`` whose firing never finished (the
-        ticking process died mid-fire) go back to 'pending'."""
-        cur = self._conn.execute(
+        ticking process died mid-fire) go back to 'pending'. A cron row moves
+        to ``cron_next(cron_expr)`` (the missed occurrence is skipped, never
+        re-fired late); an "at" row keeps its run_at and fires again."""
+        rows = self._conn.execute(
             """
-            UPDATE scheduled_runs
-               SET status = 'pending', trigger_json = json_remove(trigger_json, '$.claimed_at')
+            SELECT id, cron_expr FROM scheduled_runs
              WHERE status = 'firing'
                AND COALESCE(json_extract(trigger_json, '$.claimed_at'), run_at) < ?
             """,
             (cutoff_iso,),
-        )
+        ).fetchall()
+        for row in rows:
+            run_at = None
+            if row["cron_expr"] and cron_next is not None:
+                try:
+                    run_at = cron_next(row["cron_expr"])
+                except Exception:
+                    run_at = None  # bad stored expr: leave run_at as it was
+            self._conn.execute(
+                """
+                UPDATE scheduled_runs
+                   SET status = 'pending', run_at = COALESCE(?, run_at),
+                       trigger_json = json_remove(trigger_json, '$.claimed_at')
+                 WHERE id = ? AND status = 'firing'
+                """,
+                (run_at, row["id"]),
+            )
         self._conn.commit()
-        return cur.rowcount
+        return len(rows)
 
     def get_scheduled_run(self, scheduled_id: str) -> Optional[Dict[str, Any]]:
         row = self._conn.execute(
@@ -522,15 +551,33 @@ class RunStore:
         self._conn.commit()
         return result.rowcount
 
-    def delete_terminal_runs_older_than(self, days: int) -> int:
+    @unlocked
+    def delete_terminal_runs_older_than(self, days: int, *, batch: int = 200) -> int:
         """Retention sweep: drop terminal runs (and, via CASCADE, their
-        node_runs / events / transitions) completed more than ``days`` ago."""
+        node_runs / events / transitions) completed more than ``days`` ago.
+
+        Deletes ``batch`` runs per transaction and releases STORE_LOCK between
+        batches, so other threads (the engine loop) are never stalled for the
+        whole sweep. Callers on an event loop run it via asyncio.to_thread."""
         cutoff = _now_ms() - days * 86_400_000
-        cur = self._conn.execute(
-            "DELETE FROM workflow_runs WHERE status IN ('completed', 'failed', 'cancelled') "
-            "AND completed_at IS NOT NULL AND completed_at < ?",
-            (cutoff,),
-        )
+        total = 0
+        while True:
+            with STORE_LOCK:
+                cur = self._conn.execute(
+                    "DELETE FROM workflow_runs WHERE id IN (SELECT id FROM workflow_runs "
+                    "WHERE status IN ('completed', 'failed', 'cancelled') "
+                    "AND completed_at IS NOT NULL AND completed_at < ? LIMIT ?)",
+                    (cutoff, batch),
+                )
+                self._conn.commit()
+            total += cur.rowcount
+            if cur.rowcount < batch:
+                break
+        with STORE_LOCK:
+            self._prune_snapshots(cutoff)
+        return total
+
+    def _prune_snapshots(self, cutoff: int) -> None:
         # Snapshots no remaining run pins (as its definition or a subgraph).
         # Only old ones: a run being started pins first, inserts its row after.
         self._conn.execute(
@@ -551,7 +598,6 @@ class RunStore:
             (cutoff,),
         )
         self._conn.commit()
-        return cur.rowcount
 
     def set_owner_session(self, run_id: str, session_id: str) -> None:
         self._conn.execute(
@@ -867,11 +913,24 @@ class RunStore:
         event_id: Optional[str] = None,
         step_index: Optional[int] = None,
         step_name: Optional[str] = None,
+        busy_timeout_ms: Optional[int] = None,
     ) -> Tuple[str, int]:
         """Persist one event; returns ``(id, seq)`` — seq is the row's rowid,
-        the cursor for ``list_events_after`` and the SSE dedupe key."""
+        the cursor for ``list_events_after`` and the SSE dedupe key.
+        ``busy_timeout_ms`` caps the wait for another process's write lock
+        (best-effort events; sqlite3.OperationalError when it runs out)."""
         eid = event_id or str(uuid.uuid4())
         now = _now_ms()
+        if busy_timeout_ms is not None:
+            self._conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+            try:
+                return self.insert_event(
+                    workflow_run_id=workflow_run_id, event_type=event_type,
+                    node_run_id=node_run_id, data=data, event_id=eid,
+                    step_index=step_index, step_name=step_name,
+                )
+            finally:
+                self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         cur = self._conn.execute(
             """
             INSERT OR IGNORE INTO workflow_events
@@ -953,12 +1012,16 @@ class RunStore:
         would crowd lifecycle events out of the replay / run-detail windows.
         """
         where, args = self._event_filter(run_id, node_run_id, types, exclude_types)
+        # One run: insertion (rowid) order — created_at can tie or skew
+        # between processes. Across runs: by time.
+        desc, asc = ("rowid DESC", "seq ASC") if run_id else (
+            "created_at DESC, rowid DESC", "created_at ASC, seq ASC")
         rows = self._conn.execute(
             f"""
             SELECT * FROM (
                 SELECT rowid AS seq, * FROM workflow_events WHERE {where}
-                ORDER BY created_at DESC, rowid DESC LIMIT ?
-            ) ORDER BY created_at ASC, seq ASC
+                ORDER BY {desc} LIMIT ?
+            ) ORDER BY {asc}
             """,
             (*args, limit),
         ).fetchall()

@@ -247,9 +247,14 @@ async def stream_subprocess(
         cut = len(data) > room
         data = data[:room] if cut else data
         state["emitted"] += len(data)
-        text = decoders[stream].decode(data, final=final or cut)
-        if text:
-            emit({"stream": stream, "text": text})
+        # One row per <= NODE_LOG_FLUSH_BYTES (a read can return 64KB); the
+        # incremental decoder carries a multibyte char split across pieces.
+        step = NODE_LOG_FLUSH_BYTES
+        pieces = [data[i:i + step] for i in range(0, len(data), step)] or [b""]
+        for j, piece in enumerate(pieces):
+            text = decoders[stream].decode(piece, final=(final or cut) and j == len(pieces) - 1)
+            if text:
+                emit({"stream": stream, "text": text})
         if cut:
             state["truncated"] = True
             emit({"stream": stream, "text": "", "truncated": True})

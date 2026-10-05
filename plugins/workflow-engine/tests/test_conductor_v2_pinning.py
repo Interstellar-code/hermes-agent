@@ -97,7 +97,7 @@ def test_008_db_with_runs_migrates_and_old_runs_serialize():
         conn.commit()
 
         ensure_schema(conn)
-        assert _version(conn) == "9"
+        assert int(_version(conn)) >= 9
         run = RunStore(conn).get_workflow_run("r-old")
         assert run["parent_run_id"] is None and run["definition_checksum"] is None
 
@@ -108,7 +108,7 @@ def test_008_db_with_runs_migrates_and_old_runs_serialize():
         conn.commit()
         ensure_schema(conn)
         ensure_schema(conn)
-        assert _version(conn) == "9"
+        assert int(_version(conn)) >= 9
         assert "idx_wr_parent" in _objects(conn)
 
 

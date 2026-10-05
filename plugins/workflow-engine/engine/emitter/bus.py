@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+from engine.store.run_store import STORE_LOCK
+
 logger = logging.getLogger("workflow.event-bus")
 
 # Sentinel to signal subscriber shutdown
@@ -24,6 +26,13 @@ _STOP = object()
 
 _SEEN_MAX = 2000  # seqs remembered per subscriber for bus/tail dedupe
 _TAIL_BATCH = 500  # rows per DB-tail poll
+# node_log is high-volume live output: its insert waits at most this long for
+# the store lock / another process's sqlite write lock, else it is dropped
+# from the DB (still fanned out here) so the engine loop never stalls on it.
+_BEST_EFFORT_TYPES = ("node_log",)
+_BEST_EFFORT_WAIT_S = 0.05
+# The run-scoped DB tail stops after a terminal event and restarts on a retry.
+_TERMINAL_TYPES = ("workflow_completed", "workflow_failed", "workflow_cancelled")
 
 
 def _row_payload(row: Dict[str, Any], run_id: Optional[str]) -> Dict[str, Any]:
@@ -85,17 +94,31 @@ class EventBus:
         # 1. Persist
         eid: Optional[str] = None
         seq: Optional[int] = None
+        row = dict(
+            workflow_run_id=run_id,
+            event_type=event_type,
+            node_run_id=node_run_id,
+            data=data,
+            step_index=step_index,
+            step_name=step_name,
+        )
+        best_effort = event_type in _BEST_EFFORT_TYPES
         try:
-            eid, seq = self._run_store.insert_event(
-                workflow_run_id=run_id,
-                event_type=event_type,
-                node_run_id=node_run_id,
-                data=data,
-                step_index=step_index,
-                step_name=step_name,
-            )
+            if not best_effort:
+                eid, seq = self._run_store.insert_event(**row)
+            elif STORE_LOCK.acquire(timeout=_BEST_EFFORT_WAIT_S):
+                try:
+                    eid, seq = self._run_store.insert_event(
+                        **row, busy_timeout_ms=int(_BEST_EFFORT_WAIT_S * 1000),
+                    )
+                finally:
+                    STORE_LOCK.release()
+            else:
+                logger.debug("EventBus: store busy, %s not persisted", event_type)
         except Exception as exc:
-            logger.warning("EventBus: failed to persist event %s: %s", event_type, exc)
+            (logger.debug if best_effort else logger.warning)(
+                "EventBus: failed to persist event %s: %s", event_type, exc,
+            )
 
         # 2. Fan out. id/seq let subscribers dedupe against DB-tailed rows.
         payload = {
@@ -171,7 +194,8 @@ class EventBus:
         loop = asyncio.get_running_loop()
         sub = _Subscriber(queue=queue, run_id=run_id, loop=loop)
         self._subscribers.append(sub)
-        tail = bool(tail_interval_s) and run_id is not None
+        tail_wanted = bool(tail_interval_s) and run_id is not None
+        tail = tail_wanted
         # Bounded seen-seq set. Evict the *smallest* seq: the tail cursor only
         # moves forward, so low seqs can't come back from the tail, while a
         # bus burst far ahead of the tail must stay remembered.
@@ -179,6 +203,12 @@ class EventBus:
         seen_heap: List[int] = []
 
         def unseen(evt: Dict[str, Any]) -> bool:
+            # Settled run: stop tailing; a retry reopens it.
+            nonlocal tail
+            if evt.get("event_type") in _TERMINAL_TYPES:
+                tail = False
+            elif evt.get("event_type") == "workflow_retried":
+                tail = tail_wanted
             seq = evt.get("seq")
             if seq is None:
                 return True
@@ -194,12 +224,12 @@ class EventBus:
             # Snapshot the tail cursor before the replay query so no row
             # committed in between is missed (duplicates are deduped).
             cursor = 0
-            if tail:
+            if tail_wanted:
                 try:
                     cursor = await asyncio.to_thread(self._run_store.max_event_rowid, run_id)
                 except Exception as exc:
                     logger.warning("EventBus: tail cursor failed, tail off: %s", exc)
-                    tail = False
+                    tail = tail_wanted = False
             # Replay last 50 events from DB
             try:
                 replayed = self._run_store.list_recent_events(run_id, limit=50)

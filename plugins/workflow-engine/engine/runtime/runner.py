@@ -902,7 +902,10 @@ class WorkflowRunner:
             if self.retention_days > 0 and time.monotonic() >= next_sweep:
                 next_sweep = time.monotonic() + RETENTION_SWEEP_S
                 try:  # bounds node_log growth: events go with their run (CASCADE)
-                    self._run_store.delete_terminal_runs_older_than(self.retention_days)
+                    # batched, off the engine loop
+                    await asyncio.to_thread(
+                        self._run_store.delete_terminal_runs_older_than, self.retention_days,
+                    )
                 except Exception:
                     logger.exception("retention sweep failed")
             await asyncio.sleep(interval_s)

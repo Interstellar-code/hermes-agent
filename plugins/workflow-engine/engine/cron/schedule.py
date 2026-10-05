@@ -6,7 +6,8 @@ expression is evaluated on naive local wall-clock time and each candidate is
 mapped to an instant with ``time.mktime`` (libc honours the host zone, DST
 included). Wall times that don't exist (spring-forward gap) normalise forward;
 candidates not strictly after ``after`` are skipped, so the result always
-moves forward.
+moves forward. Wall times that repeat (fall-back) map to one instant: there
+are no fires in the repeated DST hour.
 """
 from __future__ import annotations
 

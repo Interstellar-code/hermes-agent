@@ -210,10 +210,12 @@ def test_stale_firing_row_recovers(client, eng):
     soon = (due + timedelta(seconds=5)).isoformat()
     assert _arun(eng.fire_due_scheduled_runs(now_iso=soon, stale_firing_s=20)) == 0
     assert _row(eng, sid)["status"] == "firing"
-    # 30s later: reset to pending, then fired and rescheduled
+    # 30s later: reset to pending at the *next* occurrence — the missed one
+    # is skipped, not fired late
     late = (due + timedelta(seconds=30)).isoformat()
-    assert _arun(eng.fire_due_scheduled_runs(now_iso=late, stale_firing_s=20)) == 1
-    assert _row(eng, sid)["status"] == "pending"
+    assert _arun(eng.fire_due_scheduled_runs(now_iso=late, stale_firing_s=20)) == 0
+    row = _row(eng, sid)
+    assert row["status"] == "pending" and row["next_run_at"] > late
 
 
 def test_disable_enable_delete(client, eng):

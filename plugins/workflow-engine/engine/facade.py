@@ -324,15 +324,34 @@ class WorkflowEngine:
         from engine.cron import schedule as cron  # noqa: PLC0415
         now_dt = datetime.fromisoformat(now_iso) if now_iso else datetime.now(tz=timezone.utc)
         now_iso = now_dt.isoformat()
+        tick_start = time.monotonic()
         reset = self._run_store.reset_stale_firing(
-            (now_dt - timedelta(seconds=stale_firing_s)).isoformat()
+            (now_dt - timedelta(seconds=stale_firing_s)).isoformat(),
+            cron_next=lambda expr: cron.to_iso(cron.next_fire(expr, now_dt.timestamp())),
         )
         if reset:
             logger.warning("fire_due_scheduled_runs: reset %d stale 'firing' rows", reset)
         due = self._run_store.list_due_scheduled_runs(now_iso)
         fired = 0
+
+        def bookkeep(fn, *args, **kwargs) -> None:
+            # The run already started: one retry so a transient sqlite error
+            # can't leave the row 'firing' (and re-fired by the stale reset).
+            for attempt in (1, 2):
+                try:
+                    fn(*args, **kwargs)
+                    return
+                except sqlite3.Error as exc:
+                    logger.warning(
+                        "fire_due_scheduled_runs: %s failed (attempt %d): %s",
+                        fn.__name__, attempt, exc,
+                    )
+
         for row in due:
-            if not self._run_store.claim_scheduled_run(row["id"], now_iso):
+            # claimed_at = this row's own claim time (earlier rows' starts
+            # take a while), so the stale-firing reset measures from it.
+            claim_now = (now_dt + timedelta(seconds=time.monotonic() - tick_start)).isoformat()
+            if not self._run_store.claim_scheduled_run(row["id"], claim_now):
                 continue
             expr = row.get("cron_expr")
             trigger = row.get("trigger") or {}
@@ -361,17 +380,19 @@ class WorkflowEngine:
                 )
                 error = f"{type(exc).__name__}: {exc}"[:500]
             if not expr:
-                if error is None:
-                    self._run_store.mark_scheduled_fired(row["id"])
-                else:
-                    self._run_store.mark_scheduled_failed(row["id"])
+                bookkeep(
+                    self._run_store.mark_scheduled_fired if error is None
+                    else self._run_store.mark_scheduled_failed,
+                    row["id"],
+                )
                 continue
             try:
                 next_iso = cron.to_iso(cron.next_fire(expr, now_dt.timestamp()))
             except Exception as exc:  # stored expr went bad: retry in an hour
                 error = error or f"next fire failed: {exc}"[:500]
                 next_iso = (now_dt + timedelta(hours=1)).isoformat()
-            self._run_store.reschedule_cron_row(
+            bookkeep(
+                self._run_store.reschedule_cron_row,
                 row["id"], next_iso, last_error=error, last_run_id=run_id,
             )
         return fired
@@ -387,10 +408,15 @@ class WorkflowEngine:
     @_on_engine_loop
     async def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> Optional[Dict[str, Any]]:
         """Disable, or re-enable (cron: run_at recomputed from now). None if
-        the schedule is missing or no longer live (fired / cancelled / failed)."""
+        the schedule is missing or no longer live (fired / cancelled / failed).
+        ConflictError when enabling an "at" row that is firing right now
+        (pending again would fire it twice). Cron: ValueError for a bad stored
+        expression, ImportError without croniter."""
         row = self._run_store.get_scheduled_run(schedule_id)
         if row is None or row["status"] not in ("pending", "firing", "disabled"):
             return None
+        if enabled and row["status"] == "firing" and not row["cron"]:
+            raise ConflictError("schedule is firing right now")
         run_at = None
         if enabled and row["cron"]:
             from engine.cron import schedule as cron  # noqa: PLC0415

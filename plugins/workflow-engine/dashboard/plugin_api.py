@@ -60,7 +60,9 @@ FEATURES: List[str] = [
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
 _EVENTS_MAX_ROWS = 1000  # GET /runs/{id}/events row cap
-_NODE_LOG_TEXT_MAX = 8 * 1024  # per-row node_log text cap on the query
+_NODE_LOG_TEXT_MAX = 8 * 1024  # per-row node_log text cap on the query (bytes)
+_EVENT_TYPES_MAX = 32  # names in GET /runs/{id}/events ?type=
+_EVENT_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 # Validation patterns (mirror TS)
 _ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
@@ -416,7 +418,14 @@ async def patch_schedule(schedule_id: str, request: Request) -> JSONResponse:
         return _json({"error": "Invalid JSON body"}, 400)
     if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
         return _json({"error": "enabled (boolean) is required"}, 400)
-    row = await _engine().set_schedule_enabled(schedule_id, body["enabled"])
+    try:
+        row = await _engine().set_schedule_enabled(schedule_id, body["enabled"])
+    except ConflictError as exc:
+        return _json({"error": str(exc)}, 409)
+    except ImportError:
+        return _json({"error": "cron schedules need croniter"}, 501)
+    except ValueError as exc:
+        return _json({"error": str(exc)}, 400)
     if row is None:
         return _json({"error": "schedule not found"}, 404)
     return _json({"schedule": row})
@@ -1101,8 +1110,8 @@ async def list_run_events(run_id: str, request: Request) -> JSONResponse:
     Query: ``limit`` (1-1000, default 200); ``after`` (seq, exclusive) pages
     forward, else the newest ``limit``; ``node_run_id``; ``type`` (csv).
     node_log rows are only returned when ``type`` lists node_log, and then
-    each ``data.text`` is capped at 8KB. ``cursor`` = last row's seq (pass as
-    the next ``after``).
+    each ``data.text`` is capped at 8KB (UTF-8 bytes). ``type`` takes at most
+    32 names. ``cursor`` = highest seq returned (pass as the next ``after``).
     """
     run = await _engine().get_run(run_id)
     if run is None:
@@ -1119,18 +1128,20 @@ async def list_run_events(run_id: str, request: Request) -> JSONResponse:
             after = max(0, int(q["after"]))
         except ValueError:
             return _json({"error": "after must be an integer seq"}, 400)
-    types = [t for t in (q.get("type") or "").split(",") if t.strip()] or None
-    types = [t.strip() for t in types] if types else None
+    types = [t.strip() for t in (q.get("type") or "").split(",") if t.strip()] or None
+    if types and (len(types) > _EVENT_TYPES_MAX or not all(_EVENT_TYPE_RE.match(t) for t in types)):
+        return _json({"error": f"type must be at most {_EVENT_TYPES_MAX} comma-separated event names"}, 400)
     events_list = await _engine().query_workflow_events(
         run_id, limit=limit, after=after,
         node_run_id=q.get("node_run_id") or None, types=types,
     )
     for evt in events_list:
         text = (evt.get("data") or {}).get("text") if evt.get("event_type") == "node_log" else None
-        if isinstance(text, str) and len(text) > _NODE_LOG_TEXT_MAX:
-            evt["data"]["text"] = text[:_NODE_LOG_TEXT_MAX]
+        raw = text.encode("utf-8") if isinstance(text, str) else b""
+        if len(raw) > _NODE_LOG_TEXT_MAX:  # bytes, not chars
+            evt["data"]["text"] = raw[:_NODE_LOG_TEXT_MAX].decode("utf-8", "ignore")
             evt["data"]["text_truncated"] = True
-    cursor = events_list[-1]["seq"] if events_list else after
+    cursor = max((e["seq"] for e in events_list), default=after)
     return _json({"events": events_list, "cursor": cursor})
 
 
