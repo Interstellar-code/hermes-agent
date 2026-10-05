@@ -3831,6 +3831,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
         if await asyncio.to_thread(db.get_session, fork_id):
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
+        at_message_id = body.get("at_message_id")
+        if at_message_id is not None and not isinstance(at_message_id, str):
+            return _error_response("at_message_id must be a string", 400, code="invalid_message_id")
+        end_source = body.get("end_source", True)
+        if not isinstance(end_source, bool):
+            return _error_response("end_source must be a boolean", 400, code="invalid_end_source")
+        messages = await asyncio.to_thread(db.get_messages, source_id)
+        if at_message_id is not None:
+            # Validate before any write so a bad anchor leaves no fork and the source open.
+            ids = [str(m.get("id")) for m in messages]
+            if at_message_id not in ids:
+                return _error_response(f"Message not found in source session: {at_message_id}", 400, code="invalid_message_id")
+            messages = messages[: ids.index(at_message_id) + 1]
 
         # CLI /branch semantics: create the child, then end the original as branched (child first, so
         # a failed create never leaves the source ended with no fork, #11030).
@@ -3841,8 +3854,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             db.create_session, fork_id, "api_server", model=source.get("model"),
             system_prompt=source.get("system_prompt"), parent_session_id=source_id,
             model_config={"_branched_from": source_id})
-        await asyncio.to_thread(db.end_session, source_id, "branched")
-        messages = await asyncio.to_thread(db.get_messages, source_id)
+        if end_source:
+            await asyncio.to_thread(db.end_session, source_id, "branched")
         await asyncio.to_thread(db.replace_messages, fork_id, messages)
         title = body.get("title")
         if title is None:
@@ -3867,7 +3880,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception as p_exc:
             logger.debug("Failed to inherit project binding for fork %s: %s", fork_id, p_exc)
         fork = await asyncio.to_thread(db.get_session, fork_id) or {"id": fork_id, "parent_session_id": source_id}
-        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+        return web.json_response({"object": "hermes.session", "session": self._session_response(fork),
+             "ended_source": end_source}, status=201)
 
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then

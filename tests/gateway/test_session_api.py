@@ -135,6 +135,89 @@ async def test_forked_session_stays_listable_and_parent_survives_failed_fork(ada
         assert resp.status >= 500
     assert session_db.get_session("solo")["end_reason"] is None
 
+def _seed_fork_source(session_db, n=4):
+    session_db.create_session("src", "api_server")
+    for i in range(n):
+        session_db.append_message("src", "user" if i % 2 == 0 else "assistant", f"m{i}")
+    return session_db.get_messages("src")
+
+
+def _contents(session_db, sid):
+    return [(m["role"], m["content"]) for m in session_db.get_messages(sid)]
+
+
+@pytest.mark.asyncio
+async def test_fork_default_copies_all_and_ends_source(adapter, session_db):
+    src = _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/src/fork", json={"id": "child"})
+        assert resp.status == 201
+        assert (await resp.json())["ended_source"] is True
+    assert _contents(session_db, "child") == [(m["role"], m["content"]) for m in src]
+    assert session_db.get_session("src")["end_reason"] == "branched"
+
+
+@pytest.mark.asyncio
+async def test_fork_at_message_id_truncates_inclusively(adapter, session_db):
+    src = _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/src/fork", json={"id": "child", "at_message_id": str(src[1]["id"])})
+        assert resp.status == 201
+    assert _contents(session_db, "child") == [(m["role"], m["content"]) for m in src[:2]]
+    assert session_db.get_session("src")["end_reason"] == "branched"
+
+
+@pytest.mark.asyncio
+async def test_fork_unknown_anchor_400_without_side_effects(adapter, session_db):
+    _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/src/fork", json={"id": "child", "at_message_id": "999999"})
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "invalid_message_id"
+    assert session_db.get_session("child") is None
+    assert session_db.get_session("src")["end_reason"] is None
+    assert session_db.get_session("src")["ended_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_fork_end_source_false_keeps_source_open_and_child_listed(adapter, session_db):
+    src = _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/src/fork", json={"id": "child", "end_source": False})
+        assert resp.status == 201
+        assert (await resp.json())["ended_source"] is False
+        ids = {r["id"] for r in (await (await cli.get("/api/sessions")).json())["data"]}
+        assert {"src", "child"} <= ids
+    assert session_db.get_session("src")["ended_at"] is None
+    assert session_db.get_session("src")["end_reason"] is None
+    assert session_db.get_session("child")["parent_session_id"] == "src"
+    assert len(_contents(session_db, "child")) == len(src)
+
+
+@pytest.mark.asyncio
+async def test_fork_both_params_truncates_and_keeps_source_open(adapter, session_db):
+    src = _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post(
+            "/api/sessions/src/fork",
+            json={"id": "child", "at_message_id": str(src[0]["id"]), "end_source": False})
+        assert resp.status == 201
+        ids = {r["id"] for r in (await (await cli.get("/api/sessions")).json())["data"]}
+        assert "child" in ids
+    assert _contents(session_db, "child") == [(src[0]["role"], src[0]["content"])]
+    assert session_db.get_session("src")["end_reason"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{"at_message_id": 5}, {"end_source": "no"}])
+async def test_fork_rejects_bad_param_types(adapter, session_db, body):
+    _seed_fork_source(session_db)
+    async with TestClient(TestServer(_create_session_app(adapter))) as cli:
+        resp = await cli.post("/api/sessions/src/fork", json={"id": "child", **body})
+        assert resp.status == 400
+    assert session_db.get_session("child") is None
+
+
 @pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
