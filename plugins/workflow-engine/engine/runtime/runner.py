@@ -394,7 +394,10 @@ class WorkflowRunner:
             )
             artifacts_dir = self._runs_dir / run_id / "artifacts"
             artifacts_dir.mkdir(parents=True, exist_ok=True)
-            ctx = self._build_ctx(run_id, working_path, prior_completed)
+            ctx = self._build_ctx(
+                run_id, working_path, prior_completed,
+                {n.id: i for i, n in enumerate(dag_nodes)},
+            )
             ctx.cwd = cwd
             ctx.home = str(self._runs_dir.parent)
             ctx.log_dir = str(self._runs_dir / run_id)
@@ -561,9 +564,11 @@ class WorkflowRunner:
         run_id: str,
         working_path: str,
         prior_completed: Optional[Dict[str, str]] = None,
+        step_index_by_node: Optional[Dict[str, int]] = None,
     ) -> DagRunContext:
         run_store = self._run_store
         bus = self._bus
+        step_index_by_node = step_index_by_node or {}
 
         def emit_event(event_type: str, payload: Dict[str, Any]) -> None:
             node_run_id = payload.pop("node_run_id", None)
@@ -580,7 +585,9 @@ class WorkflowRunner:
                     if nr is not None:
                         run_store.update_node_run(nr["id"], {
                             "status": "running", "completed_at": None,
-                            # a retried routed node must not show the old attempt's run
+                            # a retried node must not show the old attempt's
+                            # result, error or routed run
+                            "error": None, "summary": None,
                             "session_id": None, "gateway_run_id": None,
                         })
                     else:
@@ -593,6 +600,18 @@ class WorkflowRunner:
                     node_run_id = nr["id"]
                 except Exception as e:
                     logger.debug("create_node_run skipped: %s", e)
+            elif event_type == "node_retrying":
+                nr = run_store.find_node_run(run_id, payload.get("node_id", ""))
+                if nr:
+                    node_run_id = nr["id"]
+                    try:
+                        run_store.update_node_run(nr["id"], {
+                            "retries": payload["attempt"] - 1,
+                            "max_retries": payload["max_attempts"] - 1,
+                            "retry_delay_ms": payload["delay_ms"],
+                        })
+                    except Exception as e:
+                        logger.debug("update_node_run failed: %s", e)
             elif event_type == "node_session_started":
                 nr = run_store.find_node_run(run_id, payload.get("node_id", ""))
                 if nr:
@@ -697,11 +716,14 @@ class WorkflowRunner:
                 except Exception as e:
                     logger.debug("loop iteration node_run skipped: %s", e)
 
+            step_name = payload.get("node_id") or None
             bus.emit(
                 run_id=run_id,
                 event_type=event_type,
                 node_run_id=node_run_id,
                 data=payload,
+                step_index=step_index_by_node.get(step_name) if step_name else None,
+                step_name=step_name,
             )
 
         async def get_run_status() -> Optional[str]:

@@ -779,6 +779,16 @@ async def _execute_node_with_retry(
             )
         except Exception:
             pass
+        # attempt is 1-based for the attempt about to start; the runner
+        # turns it into node_runs.retries / max_retries / retry_delay_ms.
+        ctx.emit_event("node_retrying", {
+            "run_id": ctx.run_id,
+            "node_id": node.id,
+            "attempt": attempt + 2,
+            "max_attempts": max_retries + 1,
+            "delay_ms": backoff_ms,
+            "error": error_msg[:500],
+        })
         await asyncio.sleep(backoff_ms / 1000.0)
 
     return result

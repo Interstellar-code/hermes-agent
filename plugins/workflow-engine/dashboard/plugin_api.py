@@ -50,7 +50,10 @@ _VERSION = "0.2.0"
 
 # Capability flags for clients (SwitchUI feature-detects on these, never on
 # _VERSION). Append-only; served by /health as ``features``.
-FEATURES: List[str] = ["definition_pin", "parent_run"]
+FEATURES: List[str] = [
+    "definition_pin", "parent_run",
+    "node_attempts", "approver", "node_retrying_event",
+]
 
 # Validation patterns (mirror TS)
 _ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
@@ -458,6 +461,10 @@ async def approve_run(run_id: str, request: Request) -> JSONResponse:
         return _json({"error": "decision must be 'approved' or 'rejected'"}, 400)
     if not isinstance(response_text, str):
         response_text = ""
+    # Self-reported label (SwitchUI sends "switchui"), not an authenticated identity.
+    approved_by = body.get("approved_by")
+    if approved_by is not None and (not isinstance(approved_by, str) or len(approved_by) > 128):
+        return _json({"error": "approved_by must be a string of at most 128 characters"}, 400)
 
     # Look up node_run by ID to get the DAG node_id
     node_run = _engine()._run_store.get_node_run(node_run_id)
@@ -476,6 +483,7 @@ async def approve_run(run_id: str, request: Request) -> JSONResponse:
             node_id=dag_node_id,
             decision=py_decision,  # type: ignore[arg-type]
             comment=response_text or None,
+            actor=approved_by or None,
         )
     except ValueError as exc:
         return _json({"error": str(exc)}, 404)

@@ -340,19 +340,21 @@ class WorkflowEngine:
         node_id: str,
         decision: Literal["approve", "reject"],
         comment: Optional[str] = None,
+        actor: Optional[str] = None,
     ) -> None:
         """
         Process an approval decision.
 
         1. Find the paused node_run for (run_id, node_id).
-        2. Atomic CAS: update status paused → completed/failed.
+        2. Atomic CAS: update status paused → completed/failed, recording
+           ``actor`` (self-reported approver) + decided_at in its metadata.
         3. If claimed: emit approval_received, resume the workflow run.
         """
         nr = self._run_store.find_node_run(run_id, node_id)
         if nr is None:
             raise ValueError(f"Node run not found: run={run_id} node={node_id}")
 
-        claimed = self._run_store.try_claim_approval(nr["id"], decision, comment)
+        claimed = self._run_store.try_claim_approval(nr["id"], decision, comment, actor)
         if not claimed:
             logger.warning(
                 "approve: node_run %s was not in 'paused' state (already processed?)",
@@ -368,6 +370,7 @@ class WorkflowEngine:
                 "node_id": node_id,
                 "decision": decision,
                 "comment": comment,
+                "approved_by": actor,
             },
         )
 

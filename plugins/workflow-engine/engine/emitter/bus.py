@@ -58,6 +58,8 @@ class EventBus:
         event_type: str,
         node_run_id: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None,
+        step_index: Optional[int] = None,
+        step_name: Optional[str] = None,
     ) -> None:
         """
         Persist event to DB and fan out to all matching subscribers.
@@ -70,6 +72,8 @@ class EventBus:
                 event_type=event_type,
                 node_run_id=node_run_id,
                 data=data,
+                step_index=step_index,
+                step_name=step_name,
             )
         except Exception as exc:
             logger.warning("EventBus: failed to persist event %s: %s", event_type, exc)

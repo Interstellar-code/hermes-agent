@@ -104,5 +104,8 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
                 "ok": False,
             }
 
-    await engine.approve(run_id=run_id, node_id=node_id, decision=decision, comment=note)
+    await engine.approve(
+        run_id=run_id, node_id=node_id, decision=decision, comment=note,
+        actor=f"agent:{_session_key}" if _session_key else "agent",
+    )
     return {"ok": True, "run_id": run_id, "node_id": node_id, "decision": decision}

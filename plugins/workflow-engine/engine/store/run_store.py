@@ -625,7 +625,8 @@ class RunStore:
         _ALLOWED = {
             "status", "error", "summary", "completed_at", "started_at",
             "kanban_task_id", "assigned_agent", "approval_response",
-            "artifact_refs", "metadata", "skip_reason", "retries",
+            "artifact_refs", "metadata", "skip_reason",
+            "retries", "max_retries", "retry_delay_ms",
             "approval_message", "session_id", "gateway_run_id",
         }
         cols: List[str] = []
@@ -678,17 +679,25 @@ class RunStore:
         node_run_id: str,
         decision: Literal["approve", "reject"],
         comment: Optional[str],
+        actor: Optional[str] = None,
     ) -> bool:
-        """Atomic CAS: update node_run status from paused → completed/failed. Returns True if claimed."""
+        """Atomic CAS: update node_run status from paused → completed/failed. Returns True if claimed.
+
+        Merges ``{decided_at, approved_by}`` into metadata (approved_by only
+        when an actor is given; it is self-reported by the caller)."""
         terminal = "completed" if decision == "approve" else "failed"
         now = _now_ms()
+        decided: Dict[str, Any] = {"decided_at": _ms_to_dt(now)}
+        if actor:
+            decided["approved_by"] = actor
         result = self._conn.execute(
             """
             UPDATE node_runs
-               SET status = ?, approval_response = ?, completed_at = ?
+               SET status = ?, approval_response = ?, completed_at = ?,
+                   metadata = json_patch(COALESCE(metadata, '{}'), json(?))
              WHERE id = ? AND status = 'paused'
             """,
-            (terminal, comment or decision, now, node_run_id),
+            (terminal, comment or decision, now, json.dumps(decided), node_run_id),
         )
         self._conn.commit()
         return result.rowcount > 0
@@ -705,20 +714,24 @@ class RunStore:
         node_run_id: Optional[str] = None,
         data: Optional[Dict[str, Any]] = None,
         event_id: Optional[str] = None,
+        step_index: Optional[int] = None,
+        step_name: Optional[str] = None,
     ) -> str:
         eid = event_id or str(uuid.uuid4())
         now = _now_ms()
         self._conn.execute(
             """
             INSERT OR IGNORE INTO workflow_events
-              (id, workflow_run_id, node_run_id, event_type, data, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+              (id, workflow_run_id, node_run_id, event_type, step_index, step_name, data, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 eid,
                 workflow_run_id,
                 node_run_id,
                 event_type,
+                step_index,
+                step_name,
                 json.dumps(data) if data else None,
                 now,
             ),
