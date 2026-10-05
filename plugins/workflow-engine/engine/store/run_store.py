@@ -630,6 +630,36 @@ class RunStore:
         self._conn.commit()
         return cur.rowcount == 1
 
+    def reopen_run(self, run_id: str, *, stale_ms: int = int(3 * HEARTBEAT_S * 1000)) -> bool:
+        """CAS for B4 retry: flip a failed / cancelled run — or a pending /
+        running one whose owner stopped heartbeating ``stale_ms`` ago
+        (crashed) — back to running, clearing error / completed_at and
+        refreshing the heartbeat. When this call wins, node rows still
+        running / paused lost their owner too and become failed
+        ``crashed: owner process stopped``. Returns True on a real reopen."""
+        now = _now_ms()
+        cur = self._conn.execute(
+            """
+            UPDATE workflow_runs
+               SET status = 'running', error = NULL, completed_at = NULL, last_heartbeat = ?
+             WHERE id = ?
+               AND (status IN ('failed', 'cancelled')
+                    OR (status IN ('pending', 'running') AND last_heartbeat < ?))
+            """,
+            (now, run_id, now - stale_ms),
+        )
+        if cur.rowcount == 1:
+            self._conn.execute(
+                """
+                UPDATE node_runs
+                   SET status = 'failed', error = 'crashed: owner process stopped', completed_at = ?
+                 WHERE workflow_run_id = ? AND status IN ('running', 'paused')
+                """,
+                (now, run_id),
+            )
+        self._conn.commit()
+        return cur.rowcount == 1
+
     def pause_workflow_run(
         self, run_id: str, metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:

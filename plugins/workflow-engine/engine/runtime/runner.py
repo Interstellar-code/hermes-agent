@@ -209,18 +209,9 @@ class WorkflowRunner:
 
         task.add_done_callback(_cleanup)
 
-    async def resume(self, run_id: str) -> None:
-        """
-        Restart DAG execution after a pause (e.g. post-approval). Loads the
-        definition the run was pinned to (snapshot) — the current one only
-        for pre-009 runs — builds `prior_completed` from node_runs that are
-        already terminal, and fires a fresh _execute task. The DAG executor
-        skips any node whose id is in prior_completed.
-        """
-        run = self._run_store.get_workflow_run(run_id)
-        if run is None:
-            raise ValueError(f"Run not found: {run_id}")
-
+    def load_dag(self, run: Dict[str, Any]) -> tuple:
+        """``(definition, dag_nodes)`` a run executes: its pinned snapshot —
+        the current definition only for pre-009 runs. Raises ValueError."""
         workflow_id = run["workflow_id"]
         defn = run.get("definition_checksum") and self._run_store.get_definition_snapshot(
             workflow_id, run["definition_checksum"],
@@ -228,7 +219,7 @@ class WorkflowRunner:
         if run.get("definition_checksum") and not defn:
             logger.warning(
                 "resume(%s): pinned snapshot %s/%s missing; using the current definition",
-                run_id, workflow_id, run["definition_checksum"],
+                run["id"], workflow_id, run["definition_checksum"],
             )
         defn = defn or self._def_store.get_definition(workflow_id)
         if defn is None:
@@ -244,6 +235,30 @@ class WorkflowRunner:
         dag_nodes, node_errors = workflow.get_dag_nodes()
         if node_errors:
             raise ValueError(f"Workflow node validation errors: {node_errors}")
+        return defn, dag_nodes
+
+    async def resume(
+        self, run_id: str, *, retry: bool = False, rerun_from: Optional[str] = None,
+    ) -> None:
+        """
+        Restart DAG execution after a pause (e.g. post-approval). Loads the
+        definition the run was pinned to (snapshot) — the current one only
+        for pre-009 runs — builds `prior_completed` from node_runs that are
+        already terminal, and fires a fresh _execute task. The DAG executor
+        skips any node whose id is in prior_completed.
+
+        ``retry`` (B4, run already reopened by ``RunStore.reopen_run``):
+        every failed / cancelled node, ``rerun_from`` (a top-level node id),
+        and all their descendants are re-run — their rows reset to pending —
+        so trigger-rule skips downstream of a failure re-evaluate. An
+        approval gate in that set asks for approval again.
+        """
+        run = self._run_store.get_workflow_run(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+
+        workflow_id = run["workflow_id"]
+        defn, dag_nodes = self.load_dag(run)
 
         # Drain any prior in-flight task before spinning up a fresh one.
         # The pause path is supposed to leave _tasks empty (the original
@@ -310,22 +325,28 @@ class WorkflowRunner:
         meta = run.get("metadata") or {}
         inputs = _resolve_inputs(defn["yaml"], meta.get("inputs") or {})
 
-        # Interactive loop gate (L2-06): re-run the loop node from the
-        # iteration after the one that paused, instead of skipping it (its
-        # node_run was claimed 'completed' by approve) or restarting at 0.
         loop_resume: Dict[str, Dict[str, Any]] = {}
+        rerun: List[str] = []
         pause = meta.get("pause") or {}
-        if pause.get("type") == "interactive_loop" and pause.get("node_id"):
+        if retry:
+            rerun = self._reset_for_retry(run_id, dag_nodes, rerun_from)
+            prior_completed = {
+                k: v for k, v in prior_completed.items()
+                if _top_node_id(k, dag_nodes) not in rerun
+            }
+        elif pause.get("type") == "interactive_loop" and pause.get("node_id"):
+            # Interactive loop gate (L2-06): re-run the loop node from the
+            # iteration after the one that paused, instead of skipping it (its
+            # node_run was claimed 'completed' by approve) or restarting at 0.
             prior_completed.pop(pause["node_id"], None)
             loop_resume[pause["node_id"]] = pause
 
         # Reset to running in case the caller didn't already (idempotent).
         self._run_store.resume_workflow_run(run_id)
-        self._bus.emit(
-            run_id=run_id,
-            event_type="workflow_resumed_execute",
-            data={"prior_completed_count": len(prior_completed)},
-        )
+        data: Dict[str, Any] = {"prior_completed_count": len(prior_completed)}
+        if retry:
+            data.update(retry=True, rerun_nodes=rerun)
+        self._bus.emit(run_id=run_id, event_type="workflow_resumed_execute", data=data)
 
         task = asyncio.create_task(
             self._execute(
@@ -340,6 +361,36 @@ class WorkflowRunner:
             name=f"resume-{run_id}",
         )
         self._register_task(run_id, task)
+
+    def _reset_for_retry(
+        self, run_id: str, dag_nodes: List[Any], rerun_from: Optional[str],
+    ) -> List[str]:
+        """Top-level node ids to re-run (failed / cancelled nodes, rerun_from,
+        and their descendants); resets their rows to pending. Sorted."""
+        rows = self._run_store.list_node_runs(run_id)
+        seeds = {
+            _top_node_id(nr["dag_node_id"], dag_nodes) for nr in rows
+            if nr.get("status") in ("failed", "cancelled")
+        }
+        if rerun_from:
+            seeds.add(rerun_from)
+        children: Dict[str, List[str]] = {}
+        for n in dag_nodes:
+            for dep in n.depends_on or []:
+                children.setdefault(dep, []).append(n.id)
+        rerun, stack = set(), list(seeds)
+        while stack:
+            nid = stack.pop()
+            if nid not in rerun:
+                rerun.add(nid)
+                stack.extend(children.get(nid, []))
+        for nr in rows:
+            if _top_node_id(nr["dag_node_id"], dag_nodes) in rerun:
+                self._run_store.update_node_run(nr["id"], {
+                    "status": "pending", "error": None, "skip_reason": None,
+                    "summary": None, "completed_at": None, "retries": 0,
+                })
+        return sorted(rerun)
 
     async def wait_for(
         self, run_id: str, timeout: Optional[float] = None,
@@ -654,6 +705,8 @@ class WorkflowRunner:
                         # retry's wait; backoff doubles per attempt).
                         run_store.update_node_run(nr["id"], {
                             "retries": 0, "max_retries": cfg[0], "retry_delay_ms": cfg[1],
+                            # a re-executed row (resume / B4 retry) restarts its clock
+                            "started_at": int(time.time() * 1000),
                         })
                 except Exception as e:
                     logger.debug("create_node_run skipped: %s", e)
@@ -853,6 +906,13 @@ class WorkflowRunner:
                 except Exception:
                     logger.exception("retention sweep failed")
             await asyncio.sleep(interval_s)
+
+
+def _top_node_id(node_id: str, dag_nodes: List[Any]) -> str:
+    """Top-level node of a row: a subgraph child ``sub.inner`` maps to ``sub``."""
+    if any(n.id == node_id for n in dag_nodes):
+        return node_id
+    return node_id.split(".", 1)[0]
 
 
 def _resolve_inputs(yaml_text: str, inputs: Dict[str, Any]) -> Dict[str, Any]:

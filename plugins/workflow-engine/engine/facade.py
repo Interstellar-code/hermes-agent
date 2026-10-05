@@ -22,7 +22,7 @@ import time
 from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
 from engine.store.run_store import RunStore
-from engine.store.definition_store import DefinitionStore
+from engine.store.definition_store import ConflictError, DefinitionStore
 from engine.emitter.bus import EventBus
 from engine.runtime.runner import WorkflowRunner
 from engine.runtime.manifest import ManifestWriter
@@ -598,6 +598,54 @@ class WorkflowEngine:
             raise ValueError(f"run {run_id} is not paused")
         await self._runner.resume(run_id)
         return self._run_store.get_workflow_run(run_id)
+
+    @_on_engine_loop
+    async def retry_run(
+        self, run_id: str, from_node_id: Optional[str] = None, actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Re-execute a failed, cancelled or crashed run in place (B4).
+
+        Completed nodes are kept (``node_skipped`` reason ``prior_success``);
+        every failed / cancelled node, ``from_node_id`` (a top-level node of
+        the pinned definition) and all their descendants re-run. An approval
+        gate in that set asks for approval again. A crashed run is a
+        pending / running run whose heartbeat is older than 3x HEARTBEAT_S;
+        its running / paused node rows are failed first.
+
+        Raises LookupError (no run), ValueError (bad from_node_id or
+        unloadable definition), ConflictError (completed / paused, or still
+        owned by a live process).
+        """
+        run = self._run_store.get_workflow_run(run_id)
+        if run is None:
+            raise LookupError(f"run {run_id} not found")
+        status = run["status"]
+        if status not in ("failed", "cancelled", "pending", "running"):
+            raise ConflictError(
+                f"run is {status}; only failed, cancelled or crashed runs can be retried"
+            )
+        _, dag_nodes = self._runner.load_dag(run)
+        if from_node_id is not None and from_node_id not in {n.id for n in dag_nodes}:
+            raise ValueError(f"from_node_id '{from_node_id}' is not a node of the run's definition")
+        task = self._runner._tasks.get(run_id)
+        if (task is not None and not task.done()) or not self._run_store.reopen_run(run_id):
+            raise ConflictError("run still owned by a live process")
+
+        self._run_store.record_phase_transition(
+            run_id=run_id, to_phase="running", decided_by="user",
+            decision_data={"retry_from": from_node_id, "actor": actor},
+        )
+        self._bus.emit(
+            run_id=run_id,
+            event_type="workflow_retried",
+            data={"retry_from": from_node_id, "actor": actor, "previous_status": status},
+        )
+        try:
+            await self._runner.resume(run_id, retry=True, rerun_from=from_node_id)
+        except Exception as exc:
+            logger.exception("retry_run: runner.resume failed run=%s: %s", run_id, exc)
+            self._fail_run(run_id, f"Retry failed: {exc}", ("running",))
+        return self._run_store.get_workflow_run(run_id)  # type: ignore[return-value]
 
     # ------------------------------------------------------------------ #
     # Extended node runs                                                  #

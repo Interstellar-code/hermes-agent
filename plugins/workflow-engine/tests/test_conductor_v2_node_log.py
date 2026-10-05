@@ -346,7 +346,7 @@ def test_api_caps_node_log_text_and_rows(eng, client):
 
 def test_health_lists_b3_features(client):
     body = client.get("/health").json()
-    assert body["version"] == "0.3.0"
+    assert body["version"] == "0.4.0"
     assert {"node_log", "events_query", "sse_db_tail", "cross_process_sse"} <= set(body["features"])
 
 

@@ -1,6 +1,6 @@
 # workflow-engine plugin
 
-Version: `0.3.0`
+Version: `0.4.0`
 
 A DAG workflow engine for [hermes-agent](https://github.com/Interstellar-code/hermes-agent), ported from the Switch UI TypeScript implementation. It runs YAML-defined multi-node workflows with conditional branching, parallel execution, bash nodes, approval gates, and cron-triggered runs.
 
@@ -80,7 +80,7 @@ http://localhost:9119/api/plugins/workflow-engine
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check. Returns `{"ok": true, "version": "0.3.0", "features": [...], ...}` |
+| `GET` | `/health` | Health check. Returns `{"ok": true, "version": "0.4.0", "features": [...], ...}` |
 | `GET` | `/definitions` | List workflow definitions |
 | `POST` | `/definitions` | Create or upsert a workflow definition |
 | `GET` | `/definitions/{def_id}` | Get one definition |
@@ -94,6 +94,7 @@ http://localhost:9119/api/plugins/workflow-engine
 | `POST` | `/runs/{run_id}/approve` | Approve a paused approval node |
 | `POST` | `/runs/{run_id}/cancel` | Cancel a run |
 | `POST` | `/runs/{run_id}/resume` | Resume a paused run (409 if not resumable: not paused, or waiting on an approval/loop gate) |
+| `POST` | `/runs/{run_id}/retry` | Re-run a failed, cancelled or crashed run in place. Body `{from_node_id?, actor?}`; completed nodes are kept, failed/cancelled nodes, `from_node_id` and their descendants re-run (approval gates ask again). 409 when completed/paused or its heartbeat is younger than 3x 30s (still owned by a live process) |
 | `GET` | `/runs/{run_id}/nodes` | List node-runs for a run |
 | `POST` | `/runs/{run_id}/events` | Append run event (internal) |
 | `GET` | `/runs/{run_id}/events` | List stored run events |

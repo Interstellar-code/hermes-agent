@@ -46,7 +46,7 @@ def _engine() -> WorkflowEngine:  # type: ignore[return]  # noqa: N802
 
 router = APIRouter()
 
-_VERSION = "0.3.0"
+_VERSION = "0.4.0"
 
 # Capability flags for clients (SwitchUI feature-detects on these, never on
 # _VERSION). Append-only; served by /health as ``features``.
@@ -55,6 +55,7 @@ FEATURES: List[str] = [
     "node_attempts", "approver", "node_retrying_event",
     "node_log", "events_query", "sse_db_tail", "cross_process_sse",
     "cron_schedule", "schedules_api",
+    "retry_run",
 ]
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
@@ -748,6 +749,46 @@ async def resume_run(run_id: str) -> JSONResponse:
     except ValueError as exc:
         return _json({"error": str(exc)}, 409)
     return _json({"run": updated})
+
+
+# ---------------------------------------------------------------------------
+# Runs — POST /runs/{run_id}/retry  (B4: re-run a failed / crashed run)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/runs/{run_id}/retry")
+async def retry_run(run_id: str, request: Request) -> JSONResponse:
+    """Body ``{from_node_id?, actor?}``. 200 ``{run}``; 404 unknown run; 400
+    bad body / node not in the pinned definition; 409 not retryable
+    (completed / paused) or still owned by a live process (heartbeat
+    younger than 3x HEARTBEAT_S). Same no-ownership note as cancel_run."""
+    if not _ID_RE.match(run_id) or await _engine().get_run(run_id) is None:
+        return _json({"error": "workflow_run not found"}, 404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return _json({"error": "Invalid JSON body"}, 400)
+    from_node_id = body.get("from_node_id")
+    if from_node_id is not None and (
+        not isinstance(from_node_id, str) or not 0 < len(from_node_id) <= 128
+    ):
+        return _json({"error": "from_node_id must be a string of 1-128 characters"}, 400)
+    actor = body.get("actor")
+    if actor is not None:
+        actor = actor.strip() if isinstance(actor, str) else None
+        if not actor or len(actor) > 128 or not actor.isprintable():
+            return _json({"error": "actor must be a non-empty printable string of at most 128 characters"}, 400)
+    try:
+        run = await _engine().retry_run(run_id, from_node_id=from_node_id, actor=actor)
+    except LookupError as exc:
+        return _json({"error": str(exc)}, 404)
+    except ConflictError as exc:
+        return _json({"error": str(exc)}, 409)
+    except ValueError as exc:
+        return _json({"error": str(exc)}, 400)
+    return _json({"run": run})
 
 
 # ---------------------------------------------------------------------------

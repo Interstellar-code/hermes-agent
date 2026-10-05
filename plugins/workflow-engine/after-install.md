@@ -9,7 +9,7 @@
    returns 404; the dashboard needs its session auth token, a bare curl gets 401):
    ```bash
    curl http://127.0.0.1:9119/api/plugins/workflow-engine/health
-   # → {"ok":true,"version":"0.3.0",...}
+   # → {"ok":true,"version":"0.4.0",...}
    ```
 4. Bundled workflows are seeded into the profile DB (`$HERMES_HOME/switchui-workflows.db`)
    on first engine use; the engine initialises lazily on first tool/API call.
