@@ -341,12 +341,14 @@ async def create_run(request: Request) -> JSONResponse:
     # Lineage (RUN AGAIN): carried in the trigger so "at" schedules keep it.
     parent_run_id = body.get("parent_run_id")
     if parent_run_id is not None:
-        if (
-            not isinstance(parent_run_id, str)
-            or not _ID_RE.match(parent_run_id)
-            or await _engine().get_run(parent_run_id) is None
-        ):
+        parent = (
+            await _engine().get_run(parent_run_id)
+            if isinstance(parent_run_id, str) and _ID_RE.match(parent_run_id) else None
+        )
+        if parent is None:
             return _json({"error": "parent_run_id not found"}, 400)
+        if parent["workflow_id"] != workflow_id:
+            return _json({"error": "parent_run_id belongs to a different workflow"}, 400)
         trigger["parent_run_id"] = parent_run_id
 
     inputs: Dict[str, Any] = body.get("variables") or {}
@@ -500,8 +502,12 @@ async def approve_run(run_id: str, request: Request) -> JSONResponse:
         response_text = ""
     # Self-reported label (SwitchUI sends "switchui"), not an authenticated identity.
     approved_by = body.get("approved_by")
-    if approved_by is not None and (not isinstance(approved_by, str) or len(approved_by) > 128):
-        return _json({"error": "approved_by must be a string of at most 128 characters"}, 400)
+    if approved_by is not None:
+        approved_by = approved_by.strip() if isinstance(approved_by, str) else None
+        if not approved_by or len(approved_by) > 128 or not approved_by.isprintable():
+            return _json({
+                "error": "approved_by must be a non-empty printable string of at most 128 characters",
+            }, 400)
 
     # Look up node_run by ID to get the DAG node_id
     node_run = _engine()._run_store.get_node_run(node_run_id)

@@ -67,3 +67,5 @@ async def test_approve_allowed_when_owner_matches(fake_engine):
     )
     assert result["ok"] is True
     fake_engine.approve.assert_called_once()
+    # Agent-tool approvals record the calling session as the approver.
+    assert fake_engine.approve.call_args.kwargs["actor"] == "agent:session-owner-123"

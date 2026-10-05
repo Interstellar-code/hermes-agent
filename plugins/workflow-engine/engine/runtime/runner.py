@@ -132,9 +132,15 @@ class WorkflowRunner:
             definition_version=defn.get("version"),
         )
         run_id = run["id"]
+        # Pin every subgraph the run can expand, so resume / retry expand
+        # the same YAML even after the subgraph definition is edited.
+        pins = self._pin_subgraphs(dag_nodes, {})
 
         # 4. Mark running and emit workflow_started
-        self._run_store.update_workflow_run(run_id, status="running")
+        self._run_store.update_workflow_run(
+            run_id, status="running",
+            metadata={"subgraph_pins": pins} if pins else None,
+        )
         self._run_store.record_phase_transition(
             run_id=run_id,
             to_phase="running",
@@ -164,6 +170,27 @@ class WorkflowRunner:
         self._register_task(run_id, task)
 
         return self._run_store.get_workflow_run(run_id)  # type: ignore[return-value]
+
+    def _pin_subgraphs(self, nodes: List[Any], pins: Dict[str, str]) -> Dict[str, str]:
+        """Snapshot each subgraph ref reachable from ``nodes`` (recursively)
+        and return ``{ref: checksum}``. Missing refs are left unpinned: their
+        expansion fails at run time exactly as before."""
+        for node in nodes:
+            ref = getattr(getattr(node, "subgraph", None), "ref", None)
+            if not ref or ref in pins:
+                continue
+            defn = self._def_store.get_definition(ref)
+            if defn is None:
+                continue
+            pins[ref] = _sha256(defn["yaml"])
+            self._run_store.insert_definition_snapshot(
+                workflow_id=ref, checksum=pins[ref],
+                version=defn.get("version"), yaml=defn["yaml"],
+            )
+            child, _ = parse_workflow(defn["yaml"], f"{ref}.yaml")
+            if child is not None:
+                self._pin_subgraphs(child.get_dag_nodes()[0], pins)
+        return pins
 
     def _register_task(self, run_id: str, task: asyncio.Task) -> None:
         """Track ``task`` for ``run_id`` and arrange for self-cleanup.
@@ -198,6 +225,11 @@ class WorkflowRunner:
         defn = run.get("definition_checksum") and self._run_store.get_definition_snapshot(
             workflow_id, run["definition_checksum"],
         )
+        if run.get("definition_checksum") and not defn:
+            logger.warning(
+                "resume(%s): pinned snapshot %s/%s missing; using the current definition",
+                run_id, workflow_id, run["definition_checksum"],
+            )
         defn = defn or self._def_store.get_definition(workflow_id)
         if defn is None:
             raise ValueError(f"Workflow not found: {workflow_id}")
@@ -573,6 +605,9 @@ class WorkflowRunner:
         bus = self._bus
         step_index_by_node = step_index_by_node or {}
         log_node_runs: Dict[str, str] = {}  # node_id -> node_run_id for node_log
+        # node_id -> (max_retries, delay_ms), set by the executor before a
+        # node's first attempt; popped at that attempt's node_started.
+        attempt_config: Dict[str, Any] = {}
 
         def emit_event(event_type: str, payload: Dict[str, Any]) -> None:
             node_run_id = payload.pop("node_run_id", None)
@@ -610,6 +645,16 @@ class WorkflowRunner:
                             node_run_id=provided_nr_id,
                         )
                     node_run_id = nr["id"]
+                    cfg = attempt_config.pop(node_id, None)
+                    if cfg is not None:
+                        # Attempt 1: attempt counters come from the node's
+                        # retry config (node_retrying updates them later).
+                        # retry_delay_ms = wait before the latest retry; until
+                        # one happens, the configured base delay (= the first
+                        # retry's wait; backoff doubles per attempt).
+                        run_store.update_node_run(nr["id"], {
+                            "retries": 0, "max_retries": cfg[0], "retry_delay_ms": cfg[1],
+                        })
                 except Exception as e:
                     logger.debug("create_node_run skipped: %s", e)
             elif event_type == "node_retrying":
@@ -760,6 +805,18 @@ class WorkflowRunner:
             )
 
         def get_subgraph_yaml(ref: str):
+            # The run's pinned snapshot first; live only for unpinned refs.
+            run = run_store.get_workflow_run(run_id) or {}
+            checksum = ((run.get("metadata") or {}).get("subgraph_pins") or {}).get(ref)
+            snap = checksum and run_store.get_definition_snapshot(ref, checksum)
+            if snap:
+                sub, _ = parse_workflow(snap["yaml"], f"{ref}.yaml")
+                return (snap["yaml"], (sub.kind if sub else None) or "workflow")
+            if checksum:
+                logger.warning(
+                    "run %s: pinned subgraph snapshot %s/%s missing; using live",
+                    run_id, ref, checksum,
+                )
             defn = self._def_store.get_definition(ref)
             if defn:
                 return (defn["yaml"], defn.get("kind", "subgraph"))
@@ -775,6 +832,7 @@ class WorkflowRunner:
             get_subgraph_yaml=get_subgraph_yaml,
             llm=self._llm or getattr(sys.modules.get("engine"), "HOST_LLM", None),
             prior_completed=prior_completed,
+            attempt_config=attempt_config,
         )
 
     async def heartbeat_forever(self, interval_s: float = HEARTBEAT_S) -> None:

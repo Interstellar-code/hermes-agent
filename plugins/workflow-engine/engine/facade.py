@@ -190,6 +190,11 @@ class WorkflowEngine:
         snap = run.get("definition_checksum") and self._run_store.get_definition_snapshot(
             wf_id, run["definition_checksum"],
         )
+        if run.get("definition_checksum") and not snap:
+            logger.warning(
+                "run %s: pinned snapshot %s/%s missing; serving the current definition",
+                run_id, wf_id, run["definition_checksum"],
+            )
         src = snap or current
         if not src:
             return {"definition": None, "parsed": None}
@@ -197,12 +202,15 @@ class WorkflowEngine:
             "definition": {
                 "workflow_id": wf_id,
                 "checksum": src["checksum"],
-                "version": src.get("version"),
+                # the run row records the version it started from
+                "version": (run.get("definition_version") or src.get("version")) if snap else src.get("version"),
                 "yaml": src["yaml"],
                 "source": "snapshot" if snap else "current",
                 "pinned": bool(snap),
                 "current_checksum": current["checksum"] if current else None,
                 "current_updated_at": current["updated_at"] if current else None,
+                # {subgraph ref: checksum} the run expands (pinned at start)
+                "subgraphs_pinned": (run.get("metadata") or {}).get("subgraph_pins") or {},
             },
             "parsed": _parsed_payload(src["yaml"], wf_id),
         }
@@ -277,7 +285,11 @@ class WorkflowEngine:
             row = self._run_store.insert_scheduled_run(
                 workflow_id=workflow_id,
                 inputs=inputs,
-                trigger={**trigger, "tz": cron.local_tz_name()},
+                # a repeating schedule is not a re-run of one run: no lineage
+                trigger={
+                    **{k: v for k, v in trigger.items() if k != "parent_run_id"},
+                    "tz": cron.local_tz_name(),
+                },
                 run_at=next_iso,
                 priority=priority,
                 max_runtime_s=max_runtime_s,
@@ -327,7 +339,7 @@ class WorkflowEngine:
             if expr:
                 trigger = {
                     k: v for k, v in trigger.items()
-                    if k not in ("last_error", "last_run_id", "claimed_at")
+                    if k not in ("last_error", "last_run_id", "claimed_at", "parent_run_id")
                 }
                 trigger.update(kind="cron", schedule_id=row["id"], cron_expr=expr)
             run_id: Optional[str] = None

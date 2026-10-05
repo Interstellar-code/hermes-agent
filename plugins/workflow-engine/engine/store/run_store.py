@@ -208,8 +208,10 @@ class RunStore:
     ) -> None:
         """Pin the YAML a run started from. Idempotent per (workflow_id, checksum)."""
         self._conn.execute(
-            "INSERT OR IGNORE INTO workflow_definition_snapshots "
-            "(workflow_id, checksum, version, yaml, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO workflow_definition_snapshots "
+            "(workflow_id, checksum, version, yaml, created_at) VALUES (?, ?, ?, ?, ?) "
+            # refresh created_at: retention never drops a snapshot just re-pinned
+            "ON CONFLICT (workflow_id, checksum) DO UPDATE SET created_at = excluded.created_at",
             (workflow_id, checksum, version, yaml, _now_ms()),
         )
         self._conn.commit()
@@ -529,6 +531,25 @@ class RunStore:
             "AND completed_at IS NOT NULL AND completed_at < ?",
             (cutoff,),
         )
+        # Snapshots no remaining run pins (as its definition or a subgraph).
+        # Only old ones: a run being started pins first, inserts its row after.
+        self._conn.execute(
+            """
+            DELETE FROM workflow_definition_snapshots
+             WHERE created_at < ?
+               AND NOT EXISTS (
+                     SELECT 1 FROM workflow_runs r
+                      WHERE r.workflow_id = workflow_definition_snapshots.workflow_id
+                        AND r.definition_checksum = workflow_definition_snapshots.checksum)
+               AND NOT EXISTS (
+                     SELECT 1 FROM workflow_runs r, json_each(
+                            CASE WHEN json_valid(r.metadata) THEN r.metadata ELSE '{}' END,
+                            '$.subgraph_pins') p
+                      WHERE p.key = workflow_definition_snapshots.workflow_id
+                        AND p.value = workflow_definition_snapshots.checksum)
+            """,
+            (cutoff,),
+        )
         self._conn.commit()
         return cur.rowcount
 
@@ -793,7 +814,8 @@ class RunStore:
             """
             UPDATE node_runs
                SET status = ?, approval_response = ?, completed_at = ?,
-                   metadata = json_patch(COALESCE(metadata, '{}'), json(?))
+                   metadata = json_patch(
+                       CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END, json(?))
              WHERE id = ? AND status = 'paused'
             """,
             (terminal, comment or decision, now, json.dumps(decided), node_run_id),

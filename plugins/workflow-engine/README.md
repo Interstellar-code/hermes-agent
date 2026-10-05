@@ -1,6 +1,6 @@
 # workflow-engine plugin
 
-Version: `0.1.0`
+Version: `0.3.0`
 
 A DAG workflow engine for [hermes-agent](https://github.com/Interstellar-code/hermes-agent), ported from the Switch UI TypeScript implementation. It runs YAML-defined multi-node workflows with conditional branching, parallel execution, bash nodes, approval gates, and cron-triggered runs.
 
@@ -80,7 +80,7 @@ http://localhost:9119/api/plugins/workflow-engine
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Health check. Returns `{"ok": true, "version": "0.1.0"}` |
+| `GET` | `/health` | Health check. Returns `{"ok": true, "version": "0.3.0", "features": [...], ...}` |
 | `GET` | `/definitions` | List workflow definitions |
 | `POST` | `/definitions` | Create or upsert a workflow definition |
 | `GET` | `/definitions/{def_id}` | Get one definition |

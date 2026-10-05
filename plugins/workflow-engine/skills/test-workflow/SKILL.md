@@ -32,7 +32,7 @@ order of operations, preconditions, pitfalls, and what success looks like.
 2. Confirm the API is live (dashboard port, default 9119; needs the dashboard auth token — 401 without it, and 404 on the gateway's 8642):
    ```bash
    curl -s http://localhost:9119/api/plugins/workflow-engine/health
-   # → {"ok": true, "version": "0.1.0"}
+   # → {"ok": true, "version": "0.3.0", ...}
    ```
    A 404 here almost always means you used the wrong base path.
 3. If the workflow is triggered by a Hermes cron job (`payload.switchui_workflow_id`),

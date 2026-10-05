@@ -110,6 +110,8 @@ class DagRunContext:
     loop_resume: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Hermes home whose config.yaml holds workflow.routing (routed prompt nodes)
     home: Optional[str] = None
+    # node_id → (max_retries, delay_ms) for a node about to make attempt 1
+    attempt_config: Dict[str, Tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -745,6 +747,7 @@ async def _execute_node_with_retry(
 
     # 3. Retry loop
     max_retries, delay_ms, on_error = _get_retry_config(node)
+    ctx.attempt_config[node.id] = (max_retries, delay_ms)
     result = NodeExecutionResult(state="failed", error="Node did not execute")
 
     for attempt in range(max_retries + 1):
