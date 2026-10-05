@@ -46,7 +46,11 @@ def _engine() -> WorkflowEngine:  # type: ignore[return]  # noqa: N802
 
 router = APIRouter()
 
-_VERSION = "0.1.0"
+_VERSION = "0.2.0"
+
+# Capability flags for clients (SwitchUI feature-detects on these, never on
+# _VERSION). Append-only; served by /health as ``features``.
+FEATURES: List[str] = ["definition_pin", "parent_run"]
 
 # Validation patterns (mirror TS)
 _ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
@@ -89,6 +93,7 @@ async def health() -> dict:
         "scheduler_alive": alive,
         "scheduler_heartbeat_at": at,
         "routing": {"enabled": routing["enabled"], "allowed_profiles": routing["allowed_profiles"]},
+        "features": FEATURES,
     }
 
 
@@ -245,7 +250,10 @@ async def list_runs(request: Request) -> JSONResponse:
         limit = 50
     limit = max(1, min(limit, 500))
 
-    rows = await _engine().list_runs(workflow_id=workflow_id, statuses=statuses, limit=limit)
+    rows = await _engine().list_runs(
+        workflow_id=workflow_id, statuses=statuses, limit=limit,
+        parent_run_id=params.get("parent_run_id") or None,
+    )
     return _json({"runs": rows})
 
 
@@ -321,6 +329,16 @@ async def create_run(request: Request) -> JSONResponse:
         trigger["parent_conversation_id"] = body["parent_conversation_id"]
     if body.get("codebase_id"):
         trigger["codebase_id"] = body["codebase_id"]
+    # Lineage (RUN AGAIN): carried in the trigger so "at" schedules keep it.
+    parent_run_id = body.get("parent_run_id")
+    if parent_run_id is not None:
+        if (
+            not isinstance(parent_run_id, str)
+            or not _ID_RE.match(parent_run_id)
+            or await _engine().get_run(parent_run_id) is None
+        ):
+            return _json({"error": "parent_run_id not found"}, 400)
+        trigger["parent_run_id"] = parent_run_id
 
     inputs: Dict[str, Any] = body.get("variables") or {}
 
@@ -388,6 +406,21 @@ async def get_run(run_id: str) -> JSONResponse:
         "nodeRuns": node_runs,
         "events": events,
     })
+
+
+# ---------------------------------------------------------------------------
+# Runs — GET /runs/{run_id}/definition  (pinned YAML the run executes)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/runs/{run_id}/definition")
+async def get_run_definition(run_id: str) -> JSONResponse:
+    result = await _engine().get_run_definition(run_id)
+    if result is None:
+        return _json({"error": "not found"}, 404)
+    if result["definition"] is None:
+        return _json({"error": "definition not found"}, 404)
+    return _json(result)
 
 
 # ---------------------------------------------------------------------------

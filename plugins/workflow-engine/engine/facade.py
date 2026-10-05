@@ -43,6 +43,24 @@ def _on_engine_loop(fn):
     return wrapper
 
 
+def _parsed_payload(yaml_text: str, definition_id: str) -> Dict[str, Any]:
+    """Node list + metadata of a YAML, or ``{id, error}`` when it won't parse."""
+    workflow, error = parse_workflow(yaml_text, f"{definition_id}.yaml")
+    if error or workflow is None:
+        return {"id": definition_id, "error": error.error if error else "parse failed"}
+    dag_nodes, _ = workflow.get_dag_nodes()
+    return {
+        "id": definition_id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "nodes": [
+            {"id": n.id, "type": type(n).__name__.replace("Node", "").lower()}
+            for n in dag_nodes
+        ],
+        "kind": workflow.kind or "workflow",
+    }
+
+
 class WorkflowEngine:
     """
     WorkflowEngine facade.
@@ -132,20 +150,7 @@ class WorkflowEngine:
         defn = self._def_store.get_definition(definition_id)
         if defn is None:
             return None
-        workflow, error = parse_workflow(defn["yaml"], f"{definition_id}.yaml")
-        if error or workflow is None:
-            return {"id": definition_id, "error": error.error if error else "parse failed"}
-        dag_nodes, _ = workflow.get_dag_nodes()
-        return {
-            "id": definition_id,
-            "name": workflow.name,
-            "description": workflow.description,
-            "nodes": [
-                {"id": n.id, "type": type(n).__name__.replace("Node", "").lower()}
-                for n in dag_nodes
-            ],
-            "kind": workflow.kind or "workflow",
-        }
+        return _parsed_payload(defn["yaml"], definition_id)
 
     # ------------------------------------------------------------------ #
     # Runs                                                                #
@@ -158,16 +163,48 @@ class WorkflowEngine:
         workflow_id: Optional[str] = None,
         statuses: Optional[List[str]] = None,
         limit: int = 50,
+        parent_run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         return self._run_store.list_workflow_runs(
             workflow_id=workflow_id,
             statuses=statuses,
             limit=limit,
+            parent_run_id=parent_run_id,
         )
 
     @_on_engine_loop
     async def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
         return self._run_store.get_workflow_run(run_id)
+
+    @_on_engine_loop
+    async def get_run_definition(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """The definition a run executes: its pinned snapshot, else (pre-009
+        run) the current one. None when the run is missing; ``definition``
+        is None when neither exists any more."""
+        run = self._run_store.get_workflow_run(run_id)
+        if run is None:
+            return None
+        wf_id = run["workflow_id"]
+        current = self._def_store.get_definition(wf_id)
+        snap = run.get("definition_checksum") and self._run_store.get_definition_snapshot(
+            wf_id, run["definition_checksum"],
+        )
+        src = snap or current
+        if not src:
+            return {"definition": None, "parsed": None}
+        return {
+            "definition": {
+                "workflow_id": wf_id,
+                "checksum": src["checksum"],
+                "version": src.get("version"),
+                "yaml": src["yaml"],
+                "source": "snapshot" if snap else "current",
+                "pinned": bool(snap),
+                "current_checksum": current["checksum"] if current else None,
+                "current_updated_at": current["updated_at"] if current else None,
+            },
+            "parsed": _parsed_payload(src["yaml"], wf_id),
+        }
 
     @_on_engine_loop
     async def start_run(

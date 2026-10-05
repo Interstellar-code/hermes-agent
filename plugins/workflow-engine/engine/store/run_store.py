@@ -134,6 +134,9 @@ class RunStore:
         max_runtime_s: Optional[int] = None,
         scheduled_for: Optional[str] = None,
         inputs: Optional[Dict[str, Any]] = None,
+        parent_run_id: Optional[str] = None,
+        definition_checksum: Optional[str] = None,
+        definition_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         run_id = str(uuid.uuid4())
         meta: Dict[str, Any] = {}
@@ -147,8 +150,9 @@ class RunStore:
             INSERT INTO workflow_runs
               (id, workflow_id, conversation_id, working_path, user_message,
                status, current_phase, metadata, started_at, last_heartbeat,
-               priority, max_runtime_s, scheduled_for)
-            VALUES (?, ?, ?, ?, ?, 'pending', 'plan', ?, ?, ?, ?, ?, ?)
+               priority, max_runtime_s, scheduled_for,
+               parent_run_id, definition_checksum, definition_version)
+            VALUES (?, ?, ?, ?, ?, 'pending', 'plan', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -162,10 +166,31 @@ class RunStore:
                 priority,
                 max_runtime_s,
                 scheduled_for,
+                parent_run_id,
+                definition_checksum,
+                definition_version,
             ),
         )
         self._conn.commit()
         return self.get_workflow_run(run_id)  # type: ignore[return-value]
+
+    def insert_definition_snapshot(
+        self, *, workflow_id: str, checksum: str, version: Optional[str], yaml: str,
+    ) -> None:
+        """Pin the YAML a run started from. Idempotent per (workflow_id, checksum)."""
+        self._conn.execute(
+            "INSERT OR IGNORE INTO workflow_definition_snapshots "
+            "(workflow_id, checksum, version, yaml, created_at) VALUES (?, ?, ?, ?, ?)",
+            (workflow_id, checksum, version, yaml, _now_ms()),
+        )
+        self._conn.commit()
+
+    def get_definition_snapshot(self, workflow_id: str, checksum: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM workflow_definition_snapshots WHERE workflow_id = ? AND checksum = ?",
+            (workflow_id, checksum),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ------------------------------------------------------------------ #
     # Scheduled Runs                                                       #
@@ -309,12 +334,16 @@ class RunStore:
         workflow_id: Optional[str] = None,
         statuses: Optional[List[str]] = None,
         limit: int = 50,
+        parent_run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
         params: List[Any] = []
         if workflow_id:
             clauses.append("workflow_id = ?")
             params.append(workflow_id)
+        if parent_run_id:
+            clauses.append("parent_run_id = ?")
+            params.append(parent_run_id)
         if statuses:
             clauses.append(f"status IN ({','.join('?' * len(statuses))})")
             params.extend(statuses)

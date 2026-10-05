@@ -19,6 +19,7 @@ EXPECTED_TABLES = {
     "workflow_events",
     "gateway_event_cursor",
     "schema_meta",
+    "workflow_definition_snapshots",
 }
 
 
@@ -100,3 +101,10 @@ def test_subgraph_columns_from_migration_002():
             for r in conn.execute("PRAGMA table_info(node_runs)").fetchall()
         }
         assert "parent_subgraph_node_run_id" in nr_cols
+
+
+def test_workflow_runs_columns_from_migration_009():
+    with open_db(":memory:") as conn:
+        ensure_schema(conn)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(workflow_runs)").fetchall()}
+        assert {"parent_run_id", "definition_checksum", "definition_version"} <= cols

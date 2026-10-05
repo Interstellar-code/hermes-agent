@@ -538,7 +538,7 @@ def test_migrate_008_fresh_and_half_applied():
         conn.execute("UPDATE schema_meta SET value='7' WHERE key='schema_version'")
         conn.commit()
         ensure_schema(conn)  # session_id already present: must converge
-        assert conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0] == "8"
+        assert int(conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]) >= 8
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(node_runs)")}
         assert {"session_id", "gateway_run_id"} <= cols
 

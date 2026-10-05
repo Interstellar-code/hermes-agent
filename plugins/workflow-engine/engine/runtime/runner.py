@@ -29,7 +29,7 @@ from engine.core.dag_executor import DagRunContext, execute_dag
 from engine.core.executor_shared import reserved_input_name
 from engine.discovery.loader import parse_workflow
 from engine.store.run_store import HEARTBEAT_S, RunStore
-from engine.store.definition_store import DefinitionStore
+from engine.store.definition_store import DefinitionStore, _sha256
 from engine.emitter.bus import EventBus
 
 logger = logging.getLogger("workflow.runner")
@@ -107,6 +107,14 @@ class WorkflowRunner:
         conversation_id = trigger.get("conversation_id", f"trigger-{workflow_id}")
         working_path = trigger.get("working_path", "/tmp")
         user_message = trigger.get("user_message", f"run {workflow_id}")
+        # Pin the exact YAML so resume / inspect see what this run started
+        # from. Keyed by the hash of the YAML itself (same function as
+        # workflow_definitions.checksum) so the key can never name other text.
+        checksum = _sha256(yaml_text)
+        self._run_store.insert_definition_snapshot(
+            workflow_id=workflow_id, checksum=checksum,
+            version=defn.get("version"), yaml=yaml_text,
+        )
         run = self._run_store.create_workflow_run(
             workflow_id=workflow_id,
             conversation_id=conversation_id,
@@ -116,6 +124,9 @@ class WorkflowRunner:
             priority=priority,
             max_runtime_s=max_runtime_s,
             inputs=inputs,
+            parent_run_id=trigger.get("parent_run_id"),
+            definition_checksum=checksum,
+            definition_version=defn.get("version"),
         )
         run_id = run["id"]
 
@@ -170,8 +181,9 @@ class WorkflowRunner:
 
     async def resume(self, run_id: str) -> None:
         """
-        Restart DAG execution after a pause (e.g. post-approval). Reloads the
-        workflow definition, builds `prior_completed` from node_runs that are
+        Restart DAG execution after a pause (e.g. post-approval). Loads the
+        definition the run was pinned to (snapshot) — the current one only
+        for pre-009 runs — builds `prior_completed` from node_runs that are
         already terminal, and fires a fresh _execute task. The DAG executor
         skips any node whose id is in prior_completed.
         """
@@ -180,7 +192,10 @@ class WorkflowRunner:
             raise ValueError(f"Run not found: {run_id}")
 
         workflow_id = run["workflow_id"]
-        defn = self._def_store.get_definition(workflow_id)
+        defn = run.get("definition_checksum") and self._run_store.get_definition_snapshot(
+            workflow_id, run["definition_checksum"],
+        )
+        defn = defn or self._def_store.get_definition(workflow_id)
         if defn is None:
             raise ValueError(f"Workflow not found: {workflow_id}")
 
