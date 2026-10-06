@@ -36,7 +36,7 @@ del _sys
 from _shared import get_engine  # noqa: E402
 from engine import WorkflowEngine  # noqa: E402
 from engine.schemas.workflow_run import WorkflowRunStatus  # noqa: E402
-from engine.store.definition_store import ConflictError  # noqa: E402
+from engine.store.definition_store import ConflictError, DefinitionExistsError  # noqa: E402
 
 # Engine is initialized lazily on first request via get_engine(); do not call
 # it at module load time so that importing this file (e.g. during plugin
@@ -58,6 +58,7 @@ FEATURES: List[str] = [
     "retry_run",
     "validate",
     "definition_versions",
+    "create_only",
 ]
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
@@ -192,9 +193,15 @@ async def create_definition(request: Request) -> JSONResponse:
     save_source = "save" if save_source is None else save_source
     if save_source not in ("save", "import"):
         return _json({"error": "save_source must be 'save' | 'import' when provided"}, 400)
+    # Create-only: never overwrite an existing id (bundled included)
+    if_absent = body.get("if_absent", False)
+    if not isinstance(if_absent, bool):
+        return _json({"error": "if_absent must be a boolean when provided"}, 400)
+    if if_absent and expected_checksum:
+        return _json({"error": "if_absent and expected_checksum are mutually exclusive"}, 400)
 
     # Check if target row is an existing bundled row — route to mark_user_edit
-    existing = await _engine().get_definition(body["id"])
+    existing = None if if_absent else await _engine().get_definition(body["id"])
     if existing is not None and existing.get("source") == "bundled":
         # Edit-in-place: keep source='bundled', set user_modified=1
         try:
@@ -222,7 +229,10 @@ async def create_definition(request: Request) -> JSONResponse:
             source_path=scope_path,
             expected_checksum=expected_checksum,
             snapshot_source=save_source,
+            if_absent=if_absent,
         )
+    except DefinitionExistsError:
+        return _json({"error": f"definition '{body['id']}' already exists", "code": "id_taken"}, 409)
     except ConflictError as exc:
         return _json({"error": str(exc)}, 409)
     except ValueError as exc:

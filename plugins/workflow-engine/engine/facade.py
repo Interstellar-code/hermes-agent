@@ -135,6 +135,7 @@ class WorkflowEngine:
         source_path: Optional[str] = None,
         expected_checksum: Optional[str] = None,
         snapshot_source: str = "save",
+        if_absent: bool = False,
     ) -> Dict[str, Any]:
         row = self._def_store.upsert_definition(
             definition_id=definition_id,
@@ -143,6 +144,7 @@ class WorkflowEngine:
             source_path=source_path,
             expected_checksum=expected_checksum,
             snapshot_source=snapshot_source,
+            if_absent=if_absent,
         )
         # Refresh manifest
         self._manifest_writer.write()

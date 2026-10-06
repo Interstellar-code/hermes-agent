@@ -44,6 +44,10 @@ class ConflictError(Exception):
     """Raised when a compare-and-swap write detects a concurrent modification."""
 
 
+class DefinitionExistsError(ConflictError):
+    """Raised by a create-only (``if_absent``) upsert when the id is taken."""
+
+
 @locked
 class DefinitionStore:
     """CRUD operations over workflow_definitions."""
@@ -178,12 +182,16 @@ class DefinitionStore:
         source_path: Optional[str] = None,
         expected_checksum: Optional[str] = None,
         snapshot_source: str = "save",
+        if_absent: bool = False,
     ) -> Dict[str, Any]:
         """Parse yaml_text, validate, upsert, return the row dict.
 
         CR-1: when expected_checksum is provided and the row exists, uses
         a compare-and-swap WHERE clause.  Raises ConflictError on rowcount==0.
         ``snapshot_source`` labels the version snapshot ('save' or 'import').
+        ``if_absent`` makes this create-only: a plain INSERT, so the PRIMARY KEY
+        decides atomically across connections/processes; an existing id raises
+        DefinitionExistsError and writes nothing.
         """
         workflow, error = validate_workflow_yaml(yaml_text, source_path or "<inline>")
         if error or workflow is None:
@@ -196,7 +204,7 @@ class DefinitionStore:
         checksum = _sha256(yaml_text)
         now = _now_ms()
 
-        existing = self._conn.execute(
+        existing = None if if_absent else self._conn.execute(
             "SELECT checksum FROM workflow_definitions WHERE id = ?",
             (workflow.id,),
         ).fetchone()
@@ -252,26 +260,36 @@ class DefinitionStore:
                     ),
                 )
         else:
-            self._conn.execute(
-                """
-                INSERT INTO workflow_definitions
-                  (id, name, description, source, scope_path, yaml, checksum,
-                   created_at, updated_at, kind)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    workflow.id,
-                    workflow.name,
-                    workflow.description,
-                    source,
-                    source_path,
-                    yaml_text,
-                    checksum,
-                    now,
-                    now,
-                    workflow.kind or "workflow",
-                ),
-            )
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO workflow_definitions
+                      (id, name, description, source, scope_path, yaml, checksum,
+                       created_at, updated_at, kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workflow.id,
+                        workflow.name,
+                        workflow.description,
+                        source,
+                        source_path,
+                        yaml_text,
+                        checksum,
+                        now,
+                        now,
+                        workflow.kind or "workflow",
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # Only the id PRIMARY KEY means "taken"; other violations propagate.
+                if not if_absent or "workflow_definitions.id" not in str(exc):
+                    raise
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise DefinitionExistsError(
+                    f"definition {workflow.id!r} already exists"
+                ) from exc
         self._snapshot(workflow.id, snapshot_source)
         self._conn.commit()
         return self.get_definition(workflow.id)  # type: ignore[return-value]
