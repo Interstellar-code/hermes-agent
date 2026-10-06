@@ -9,7 +9,8 @@ description: >-
   MNEMOSYNE_MATRIX_SAFETY=1) and a 3-tier discipline skill.
 author: Interstellar-code (fork of AxDSan/mnemosyne)
 # Engine + contract live in the pinned submodule at
-#   plugins/memory/_matrix-memory-mnemosyne  (fork main @ aa09b29)
+#   plugins/memory/_matrix-memory-mnemosyne  (fork merge/upstream-4.0 @ 691eba6,
+#   upstream mnemosyne-oss e871f39 / 4.0.0b4; the gitlink is the authoritative pin)
 # This dir is a thin registration shim that delegates to the fork's
 # hermes_memory_provider.register_memory_provider(ctx).
 provides_hooks:
