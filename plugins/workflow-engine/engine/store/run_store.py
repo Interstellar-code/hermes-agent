@@ -229,12 +229,14 @@ class RunStore:
         self, *, workflow_id: str, checksum: str, version: Optional[str], yaml: str,
     ) -> None:
         """Pin the YAML a run started from. Idempotent per (workflow_id, checksum)."""
+        now = _now_ms()
         self._conn.execute(
             "INSERT INTO workflow_definition_snapshots "
-            "(workflow_id, checksum, version, yaml, created_at) VALUES (?, ?, ?, ?, ?) "
+            "(workflow_id, checksum, version, yaml, created_at, saved_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'run') "
             # refresh created_at: retention never drops a snapshot just re-pinned
             "ON CONFLICT (workflow_id, checksum) DO UPDATE SET created_at = excluded.created_at",
-            (workflow_id, checksum, version, yaml, _now_ms()),
+            (workflow_id, checksum, version, yaml, now, now),
         )
         self._conn.commit()
 
@@ -606,10 +608,13 @@ class RunStore:
     def _prune_snapshots(self, cutoff: int) -> None:
         # Snapshots no remaining run pins (as its definition or a subgraph).
         # Only old ones: a run being started pins first, inserts its row after.
+        # Only run-written ones: save-time snapshots are version history, kept
+        # by DefinitionStore's count retention instead of by age.
         self._conn.execute(
             """
             DELETE FROM workflow_definition_snapshots
              WHERE created_at < ?
+               AND COALESCE(source, 'run') = 'run'
                AND NOT EXISTS (
                      SELECT 1 FROM workflow_runs r
                       WHERE r.workflow_id = workflow_definition_snapshots.workflow_id

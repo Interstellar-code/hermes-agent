@@ -28,6 +28,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# Version history retention, per workflow: keep the newest SNAPSHOT_KEEP
+# snapshots no run references. Run-referenced ones are always kept and do not
+# use up slots. Rows (re)pinned in the last SNAPSHOT_GRACE_MS are never deleted
+# (another process may be between pinning a snapshot and inserting its run).
+SNAPSHOT_KEEP = 50
+SNAPSHOT_GRACE_MS = 10 * 60_000
+
+
 def _row_to_def(row: sqlite3.Row) -> Dict[str, Any]:
     return dict(row)
 
@@ -82,6 +90,82 @@ class DefinitionStore:
         return _row_to_def(row) if row else None
 
     # ------------------------------------------------------------------
+    # version history (workflow_definition_snapshots)
+    # ------------------------------------------------------------------
+
+    def list_snapshots(self, workflow_id: str) -> List[Dict[str, Any]]:
+        """Every snapshot of ``workflow_id``, newest first, with the number of
+        runs pinned to it as their definition or a subgraph (``in_use_by_runs``)."""
+        rows = self._conn.execute(
+            """
+            SELECT s.checksum, s.version, s.saved_at, s.source, s.yaml,
+                   (SELECT COUNT(*) FROM workflow_runs r
+                     WHERE (r.workflow_id = s.workflow_id AND r.definition_checksum = s.checksum)
+                        OR EXISTS (
+                             SELECT 1 FROM json_each(
+                                    CASE WHEN json_valid(r.metadata) THEN r.metadata ELSE '{}' END,
+                                    '$.subgraph_pins') p
+                              WHERE p.key = s.workflow_id AND p.value = s.checksum)
+                   ) AS in_use_by_runs
+              FROM workflow_definition_snapshots s
+             WHERE s.workflow_id = ?
+             ORDER BY COALESCE(s.saved_at, s.created_at) DESC, s.checksum DESC
+            """,
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _snapshot(self, definition_id: str, source: str) -> None:
+        """Record the row's current YAML as a version, then apply retention.
+
+        Runs inside the caller's save transaction (the caller commits). Keyed
+        by the same ``_sha256`` the runner pins runs with, so a save and a run
+        of identical YAML share one row. A re-save of an existing version only
+        moves its ``saved_at``/``source``; ``created_at`` (the run-pin time the
+        age sweep uses) is left alone."""
+        row = self._conn.execute(
+            "SELECT yaml, version FROM workflow_definitions WHERE id = ?", (definition_id,),
+        ).fetchone()
+        if row is None:
+            return
+        now = _now_ms()
+        self._conn.execute(
+            "INSERT INTO workflow_definition_snapshots "
+            "(workflow_id, checksum, version, yaml, created_at, saved_at, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (workflow_id, checksum) DO UPDATE "
+            "SET saved_at = excluded.saved_at, source = excluded.source",
+            (definition_id, _sha256(row["yaml"]), row["version"], row["yaml"], now, now, source),
+        )
+        # Retention: delete only snapshots no run pins (as its definition or as
+        # a subgraph) that rank beyond SNAPSHOT_KEEP among the unpinned ones.
+        # ponytail: scans workflow_runs.metadata once per save; fine while runs
+        # are pruned by retention_days, index the pins if that ever stops.
+        self._conn.execute(
+            """
+            WITH pinned(checksum) AS (
+                SELECT definition_checksum FROM workflow_runs
+                 WHERE workflow_id = :wf AND definition_checksum IS NOT NULL
+                UNION
+                SELECT p.value FROM workflow_runs r, json_each(
+                       CASE WHEN json_valid(r.metadata) THEN r.metadata ELSE '{}' END,
+                       '$.subgraph_pins') p
+                 WHERE p.key = :wf AND p.value IS NOT NULL
+            )
+            DELETE FROM workflow_definition_snapshots
+             WHERE workflow_id = :wf
+               AND created_at < :grace
+               AND checksum IN (
+                     SELECT checksum FROM workflow_definition_snapshots
+                      WHERE workflow_id = :wf
+                        AND checksum NOT IN (SELECT checksum FROM pinned)
+                      ORDER BY COALESCE(saved_at, created_at) DESC, checksum DESC
+                      LIMIT -1 OFFSET :keep)
+            """,
+            {"wf": definition_id, "grace": now - SNAPSHOT_GRACE_MS, "keep": SNAPSHOT_KEEP},
+        )
+
+    # ------------------------------------------------------------------
     # upsert (user/project rows)
     # ------------------------------------------------------------------
 
@@ -93,11 +177,13 @@ class DefinitionStore:
         source: WorkflowSource = "user",
         source_path: Optional[str] = None,
         expected_checksum: Optional[str] = None,
+        snapshot_source: str = "save",
     ) -> Dict[str, Any]:
         """Parse yaml_text, validate, upsert, return the row dict.
 
         CR-1: when expected_checksum is provided and the row exists, uses
         a compare-and-swap WHERE clause.  Raises ConflictError on rowcount==0.
+        ``snapshot_source`` labels the version snapshot ('save' or 'import').
         """
         workflow, error = validate_workflow_yaml(yaml_text, source_path or "<inline>")
         if error or workflow is None:
@@ -186,6 +272,7 @@ class DefinitionStore:
                     workflow.kind or "workflow",
                 ),
             )
+        self._snapshot(workflow.id, snapshot_source)
         self._conn.commit()
         return self.get_definition(workflow.id)  # type: ignore[return-value]
 
@@ -198,6 +285,7 @@ class DefinitionStore:
         definition_id: str,
         yaml_text: str,
         expected_checksum: Optional[str] = None,
+        snapshot_source: str = "save",
     ) -> Dict[str, Any]:
         """Edit a bundled workflow row.  Keeps source='bundled', sets user_modified=1.
 
@@ -262,6 +350,7 @@ class DefinitionStore:
             if result.rowcount == 0:
                 raise ValueError(f"Not a bundled row or not found: {definition_id!r}")
 
+        self._snapshot(definition_id, snapshot_source)
         self._conn.commit()
         return self.get_definition(definition_id)  # type: ignore[return-value]
 
@@ -306,6 +395,7 @@ class DefinitionStore:
         if result.rowcount == 0:
             raise ValueError(f"Not a bundled row or not found: {definition_id!r}")
 
+        self._snapshot(definition_id, "reset")
         self._conn.commit()
         return self.get_definition(definition_id)  # type: ignore[return-value]
 
@@ -337,6 +427,21 @@ class DefinitionStore:
                 )
             self._conn.execute("DELETE FROM workflow_runs WHERE workflow_id = ?", (definition_id,))
             self._conn.execute("DELETE FROM scheduled_runs WHERE workflow_id = ?", (definition_id,))
+            # Its version history goes too (else a recreated id inherits it),
+            # except snapshots other workflows' runs still pin as a subgraph.
+            self._conn.execute(
+                """
+                DELETE FROM workflow_definition_snapshots
+                 WHERE workflow_id = ?
+                   AND NOT EXISTS (
+                         SELECT 1 FROM workflow_runs r, json_each(
+                                CASE WHEN json_valid(r.metadata) THEN r.metadata ELSE '{}' END,
+                                '$.subgraph_pins') p
+                          WHERE p.key = workflow_definition_snapshots.workflow_id
+                            AND p.value = workflow_definition_snapshots.checksum)
+                """,
+                (definition_id,),
+            )
             result = self._conn.execute(
                 "DELETE FROM workflow_definitions WHERE id = ?", (definition_id,)
             )
@@ -371,6 +476,9 @@ class DefinitionStore:
             return {"inserted": 0, "updated": 0, "skipped": 0, "errors": 0}
 
         for yaml_file in sorted(bundled_dir.glob("*.yaml")):
+            # Per file: a failure (e.g. in _snapshot) undoes that file's writes
+            # only, so a definition never lands without its snapshot.
+            self._conn.execute("SAVEPOINT seed_file")
             try:
                 content = yaml_file.read_text(encoding="utf-8")
                 workflow, error = validate_workflow_yaml(content, yaml_file.name)
@@ -401,6 +509,7 @@ class DefinitionStore:
                             file_sum, 0, now, now, workflow.kind or "workflow",
                         ),
                     )
+                    self._snapshot(workflow.id, "seed")
                     inserted += 1
                     continue
 
@@ -453,14 +562,18 @@ class DefinitionStore:
                         )
                         skipped += 1
                     else:
+                        self._snapshot(workflow.id, "seed")
                         updated += 1
                 else:
                     # bundled_checksum == file_sum and user_modified==0 — unchanged
                     skipped += 1
 
             except Exception:
+                self._conn.execute("ROLLBACK TO seed_file")
                 logger.exception("seed_bundled: error processing %s", yaml_file)
                 errors += 1
+            finally:
+                self._conn.execute("RELEASE seed_file")
 
         self._conn.commit()
         return {"inserted": inserted, "updated": updated, "skipped": skipped, "errors": errors}

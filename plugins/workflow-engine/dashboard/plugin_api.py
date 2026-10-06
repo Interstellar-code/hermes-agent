@@ -57,6 +57,7 @@ FEATURES: List[str] = [
     "cron_schedule", "schedules_api",
     "retry_run",
     "validate",
+    "definition_versions",
 ]
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
@@ -175,6 +176,11 @@ async def create_definition(request: Request) -> JSONResponse:
             return _json({"error": "tags must be a string[] when provided"}, 400)
     # Optional optimistic-concurrency checksum (CR-1)
     expected_checksum: Optional[str] = body.get("expected_checksum") or None
+    # How the version snapshot of this save is labelled (VERSIONS tab)
+    save_source = body.get("save_source")
+    save_source = "save" if save_source is None else save_source
+    if save_source not in ("save", "import"):
+        return _json({"error": "save_source must be 'save' | 'import' when provided"}, 400)
 
     # Check if target row is an existing bundled row — route to mark_user_edit
     existing = await _engine().get_definition(body["id"])
@@ -185,6 +191,7 @@ async def create_definition(request: Request) -> JSONResponse:
                 body["id"],
                 yaml_text,
                 expected_checksum=expected_checksum,
+                snapshot_source=save_source,
             )
         except ConflictError as exc:
             return _json({"error": str(exc)}, 409)
@@ -203,6 +210,7 @@ async def create_definition(request: Request) -> JSONResponse:
             source=source,
             source_path=scope_path,
             expected_checksum=expected_checksum,
+            snapshot_source=save_source,
         )
     except ConflictError as exc:
         return _json({"error": str(exc)}, 409)
@@ -247,6 +255,52 @@ async def validate_definition(request: Request) -> JSONResponse:
                                "message": f"a workflow with id '{def_id}' already exists"})
     return _json({"ok": not errors, "errors": errors, "warnings": warnings,
                   "id_available": id_available})
+
+
+# ---------------------------------------------------------------------------
+# Definitions — version history (snapshots taken on every save and run start)
+# ---------------------------------------------------------------------------
+
+
+def _version_summaries(def_id: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    from engine.facade import _parsed_payload  # noqa: PLC0415
+
+    out = []
+    for r in rows:
+        parsed = _parsed_payload(r["yaml"], def_id)
+        out.append({
+            "checksum": r["checksum"], "version": r["version"],
+            "saved_at": r["saved_at"], "source": r["source"],
+            # None when an old snapshot no longer parses
+            "node_count": None if "error" in parsed else len(parsed["nodes"]),
+            "size_bytes": len(r["yaml"].encode("utf-8")),
+            "in_use_by_runs": r["in_use_by_runs"],
+        })
+    return out
+
+
+@router.get("/definitions/{def_id}/versions")
+async def list_definition_versions(def_id: str) -> JSONResponse:
+    rows = await _engine().list_definition_versions(def_id)
+    if rows is None:
+        return _json({"error": "not found"}, 404)
+    # YAML parsing is CPU work: keep it off the event loop
+    return _json(await asyncio.to_thread(_version_summaries, def_id, rows))
+
+
+@router.get("/definitions/{def_id}/versions/{checksum}")
+async def get_definition_version(def_id: str, checksum: str) -> JSONResponse:
+    from engine.facade import _parsed_payload  # noqa: PLC0415
+
+    snap = await _engine().get_definition_version(def_id, checksum)
+    if snap is None:
+        return _json({"error": "not found"}, 404)
+    return _json({
+        "checksum": snap["checksum"], "version": snap["version"],
+        "saved_at": snap["saved_at"], "source": snap["source"],
+        "yaml": snap["yaml"],
+        "parsed": await asyncio.to_thread(_parsed_payload, snap["yaml"], def_id),
+    })
 
 
 # ---------------------------------------------------------------------------

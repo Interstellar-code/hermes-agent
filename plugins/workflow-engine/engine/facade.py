@@ -134,6 +134,7 @@ class WorkflowEngine:
         source: str = "user",
         source_path: Optional[str] = None,
         expected_checksum: Optional[str] = None,
+        snapshot_source: str = "save",
     ) -> Dict[str, Any]:
         row = self._def_store.upsert_definition(
             definition_id=definition_id,
@@ -141,6 +142,7 @@ class WorkflowEngine:
             source=source,
             source_path=source_path,
             expected_checksum=expected_checksum,
+            snapshot_source=snapshot_source,
         )
         # Refresh manifest
         self._manifest_writer.write()
@@ -152,6 +154,23 @@ class WorkflowEngine:
         if defn is None:
             return None
         return _parsed_payload(defn["yaml"], definition_id)
+
+    @_on_engine_loop
+    async def list_definition_versions(self, definition_id: str) -> Optional[List[Dict[str, Any]]]:
+        """Snapshots of a definition, newest first (rows include ``yaml``).
+        None when the definition does not exist."""
+        if self._def_store.get_definition(definition_id) is None:
+            return None
+        return self._def_store.list_snapshots(definition_id)
+
+    @_on_engine_loop
+    async def get_definition_version(
+        self, definition_id: str, checksum: str,
+    ) -> Optional[Dict[str, Any]]:
+        """One snapshot row, or None when the definition or snapshot is unknown."""
+        if self._def_store.get_definition(definition_id) is None:
+            return None
+        return self._run_store.get_definition_snapshot(definition_id, checksum)
 
     # ------------------------------------------------------------------ #
     # Runs                                                                #
@@ -564,10 +583,12 @@ class WorkflowEngine:
         definition_id: str,
         yaml_text: str,
         expected_checksum: Optional[str] = None,
+        snapshot_source: str = "save",
     ) -> Dict[str, Any]:
         """Edit a bundled workflow in-place; keeps source='bundled', sets user_modified=1."""
         row = self._def_store.mark_user_edit(
-            definition_id, yaml_text, expected_checksum=expected_checksum
+            definition_id, yaml_text, expected_checksum=expected_checksum,
+            snapshot_source=snapshot_source,
         )
         self._manifest_writer.write()
         return row
