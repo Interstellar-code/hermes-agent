@@ -56,6 +56,7 @@ FEATURES: List[str] = [
     "node_log", "events_query", "sse_db_tail", "cross_process_sse",
     "cron_schedule", "schedules_api",
     "retry_run",
+    "validate",
 ]
 
 _SSE_TAIL_S = 0.5  # run-scoped SSE: DB tail poll interval
@@ -209,6 +210,43 @@ async def create_definition(request: Request) -> JSONResponse:
         return _json({"error": str(exc)}, 422)
 
     return _json({"definition": defn}, 201)
+
+
+# ---------------------------------------------------------------------------
+# Definitions — POST /definitions/validate   (read-only lint for the editor)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/definitions/validate")
+async def validate_definition(request: Request) -> JSONResponse:
+    from engine.discovery.validator import lint_workflow_yaml  # noqa: PLC0415
+
+    try:
+        body: Dict[str, Any] = await request.json()
+    except Exception:
+        return _json({"error": "Invalid JSON body"}, 400)
+    if not isinstance(body, dict):
+        return _json({"error": "Invalid JSON body"}, 400)
+    yaml_text = body.get("yaml")
+    if not isinstance(yaml_text, str):
+        return _json({"error": "yaml must be a string"}, 400)
+    if len(yaml_text.encode("utf-8")) > _MAX_YAML_BYTES:
+        return _json({"error": f"yaml exceeds {_MAX_YAML_BYTES} bytes"}, 413)
+
+    errors, warnings = await asyncio.to_thread(lint_workflow_yaml, yaml_text)
+    def_id = body.get("id")
+    id_available: Optional[bool] = None
+    if def_id is not None:
+        if not isinstance(def_id, str) or not _ID_RE.match(def_id):
+            errors.append({"line": None, "col": None, "code": "schema",
+                           "message": "id must be 1-128 chars of [A-Za-z0-9_:.-]"})
+        else:
+            id_available = await _engine().get_definition(def_id) is None
+            if not id_available:
+                errors.append({"line": None, "col": None, "code": "id_taken",
+                               "message": f"a workflow with id '{def_id}' already exists"})
+    return _json({"ok": not errors, "errors": errors, "warnings": warnings,
+                  "id_available": id_available})
 
 
 # ---------------------------------------------------------------------------
