@@ -180,7 +180,7 @@ async def _handler_impl(args: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
 
     engine = get_engine()
 
-    trigger: Dict[str, Any] = {"type": "agent", "source": "workflow_run_tool"}
+    trigger: Dict[str, Any] = {"kind": "agent", "type": "agent", "source": "workflow_run_tool"}
     if working_path:
         trigger["working_path"] = working_path
     # Default to the invoking session so the run links back to its chat

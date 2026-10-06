@@ -71,6 +71,14 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_:.\-]{1,128}$")
 _MAX_YAML_BYTES = 1024 * 1024
 
 
+def _yaml_bytes(text: str) -> Optional[int]:
+    """UTF-8 size of text, None when it holds a lone surrogate (JSON allows "\\ud800")."""
+    try:
+        return len(text.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -154,7 +162,10 @@ async def create_definition(request: Request) -> JSONResponse:
     yaml_text = body.get("yaml")
     if not isinstance(yaml_text, str) or len(yaml_text) == 0:
         return _json({"error": "yaml must be a non-empty string"}, 400)
-    if len(yaml_text.encode("utf-8")) > _MAX_YAML_BYTES:
+    yaml_size = _yaml_bytes(yaml_text)
+    if yaml_size is None:
+        return _json({"error": "yaml must be valid UTF-8 (no lone surrogates)"}, 400)
+    if yaml_size > _MAX_YAML_BYTES:
         return _json({"error": f"yaml exceeds {_MAX_YAML_BYTES} bytes"}, 413)
     # Validate source
     source = body.get("source", "project")
@@ -238,7 +249,10 @@ async def validate_definition(request: Request) -> JSONResponse:
     yaml_text = body.get("yaml")
     if not isinstance(yaml_text, str):
         return _json({"error": "yaml must be a string"}, 400)
-    if len(yaml_text.encode("utf-8")) > _MAX_YAML_BYTES:
+    yaml_size = _yaml_bytes(yaml_text)
+    if yaml_size is None:
+        return _json({"error": "yaml must be valid UTF-8 (no lone surrogates)"}, 400)
+    if yaml_size > _MAX_YAML_BYTES:
         return _json({"error": f"yaml exceeds {_MAX_YAML_BYTES} bytes"}, 413)
 
     errors, warnings = await asyncio.to_thread(lint_workflow_yaml, yaml_text)

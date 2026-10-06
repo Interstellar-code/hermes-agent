@@ -20,16 +20,18 @@ def validate_workflow_yaml(
 
     Returns (workflow, None) on success or (None, error) on failure.
     """
-    # 1. YAML parse
+    # 1. YAML parse (bounded: alias bombs and deep nesting are parse errors)
     try:
-        raw = yaml_lib.safe_load(content)
+        _root, raw = _load_bounded(content)
     except yaml_lib.YAMLError as exc:
-        return None, WorkflowLoadError(
-            filename=filename,
-            error=f"YAML parse error: {exc}",
-            errorType="parse_error",
-        )
-    return validate_workflow_raw(raw, filename)
+        error = f"YAML parse error: {exc}"
+    except _Rejected as exc:
+        error = str(exc)
+    except (RecursionError, MemoryError):
+        error = _TOO_DEEP_MSG
+    else:
+        return validate_workflow_raw(raw, filename)
+    return None, WorkflowLoadError(filename=filename, error=error, errorType="parse_error")
 
 
 def validate_workflow_raw(
@@ -109,11 +111,16 @@ _INPUT_REF_RE = re.compile(r"\$INPUTS\.([A-Za-z_][A-Za-z0-9_]*)")
 _MISCASED_INPUT_REF_RE = re.compile(r"\$(?!INPUTS\.)(?i:inputs)\.([A-Za-z_][A-Za-z0-9_]*)")
 _MAX_EXPANDED_NODES = 100_000  # composed nodes after alias expansion
 _MAX_DIAGNOSTICS = 200  # per list; overflow becomes one `truncated` warning
+# Longest int/float scalar: Python's own int-digit limit. Also bounds PyYAML's
+# quadratic base-60 int (`1:1:1:...`) construction.
+_MAX_NUMBER_CHARS = 4300
+_NUMBER_TAGS = ("tag:yaml.org,2002:int", "tag:yaml.org,2002:float")
 
 
 def _expanded_size(root: Any) -> int:
     """Node count with aliases expanded, memoized by node identity (so the
-    check is linear in the composed graph). Raises ValueError on a recursive alias."""
+    check is linear in the composed graph). Raises ValueError on a recursive alias,
+    _Rejected on an over-long number."""
     memo: Dict[int, Optional[int]] = {}
 
     def size(n: Any) -> int:
@@ -128,11 +135,48 @@ def _expanded_size(root: Any) -> int:
         elif isinstance(n, yaml_lib.MappingNode):
             total = 1 + sum(size(k) + size(v) for k, v in n.value)
         else:
+            if n.tag in _NUMBER_TAGS and len(n.value) > _MAX_NUMBER_CHARS:
+                raise _Rejected(f"YAML parse error: number longer than {_MAX_NUMBER_CHARS} characters")
             total = 1
         memo[key] = total
         return total
 
     return size(root)
+
+
+class _Rejected(Exception):
+    """Hostile or unconstructible YAML; str(exc) is the user-facing error."""
+
+
+_TOO_LARGE_MSG = (f"YAML parse error: document expands too large (over {_MAX_EXPANDED_NODES} nodes "
+                  "after alias expansion, or a recursive alias)")
+_TOO_DEEP_MSG = "YAML parse error: document too deeply nested"
+
+
+def _load_bounded(content: str) -> Tuple[Any, Any]:
+    """(composed root node, data) — yaml.safe_load's own steps (compose, then
+    construct) with alias expansion capped at _MAX_EXPANDED_NODES in between.
+    Raises yaml.YAMLError, _Rejected, or RecursionError (deep nesting)."""
+    loader = yaml_lib.SafeLoader(content)
+    try:
+        root = loader.get_single_node()
+        try:
+            too_big = root is not None and _expanded_size(root) > _MAX_EXPANDED_NODES
+        except ValueError:
+            too_big = True
+        if too_big:
+            raise _Rejected(_TOO_LARGE_MSG)
+        try:
+            return root, (loader.construct_document(root) if root is not None else None)
+        except yaml_lib.YAMLError:
+            raise
+        # Composition already passed the bounds; SafeConstructor itself raises
+        # non-YAML errors on bad values (base-60 float overflow, `!!int ''`,
+        # `!!bool maybe`, bad dates).
+        except Exception as exc:
+            raise _Rejected(f"YAML parse error: {exc!r}") from exc
+    finally:
+        loader.dispose()
 
 
 def _diag(code: str, message: str, pos: Optional[Tuple[int, Optional[int]]] = None,
@@ -169,15 +213,21 @@ def _locate(root: Any, path: List[Any]) -> Optional[Tuple[int, int]]:
     return (node.start_mark.line + 1, node.start_mark.column + 1) if node is not None else None
 
 
-def _scalars(node: Any):
+def _scalars(node: Any, seen: Optional[set] = None):
+    """Each scalar node once: an alias shares its anchor's node, so revisiting
+    it would only repeat the same diagnostics (and the scan cost)."""
+    seen = set() if seen is None else seen
+    if id(node) in seen:
+        return
+    seen.add(id(node))
     if isinstance(node, yaml_lib.ScalarNode):
         yield node
     elif isinstance(node, yaml_lib.SequenceNode):
         for v in node.value:
-            yield from _scalars(v)
+            yield from _scalars(v, seen)
     elif isinstance(node, yaml_lib.MappingNode):
         for _k, v in node.value:
-            yield from _scalars(v)
+            yield from _scalars(v, seen)
 
 
 def lint_workflow_yaml(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -192,7 +242,7 @@ def lint_workflow_yaml(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[st
     try:
         errors, warnings = _lint(content)
     except (RecursionError, MemoryError):
-        return [_diag("yaml_parse", "YAML parse error: document too deeply nested")], []
+        return [_diag("yaml_parse", _TOO_DEEP_MSG)], []
     dropped = max(0, len(errors) - _MAX_DIAGNOSTICS) + max(0, len(warnings) - _MAX_DIAGNOSTICS)
     errors, warnings = errors[:_MAX_DIAGNOSTICS], warnings[:_MAX_DIAGNOSTICS]
     if dropped:
@@ -208,25 +258,16 @@ def _lint(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
 
-    # One parse: compose (positions), bound alias expansion, then construct —
-    # the same steps yaml.safe_load runs, so `raw` is what save would see.
-    loader = yaml_lib.SafeLoader(content)
+    # One parse, the same one save runs, so `raw` is what save would see;
+    # `root` keeps positions.
     try:
-        root = loader.get_single_node()
-        try:
-            too_big = root is not None and _expanded_size(root) > _MAX_EXPANDED_NODES
-        except ValueError:
-            too_big = True
-        if too_big:
-            return [_diag("yaml_parse", "YAML parse error: document expands too large "
-                                        "(alias bomb or recursive alias)")], warnings
-        raw = loader.construct_document(root) if root is not None else None
+        root, raw = _load_bounded(content)
+    except _Rejected as exc:
+        return [_diag("yaml_parse", str(exc))], warnings
     except yaml_lib.YAMLError as exc:
         mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
         pos = (mark.line + 1, mark.column + 1) if mark else None
         return [_diag("yaml_parse", f"YAML parse error: {exc}", pos)], warnings
-    finally:
-        loader.dispose()
 
     workflow, error = validate_workflow_raw(raw, "<inline>")
     if error is not None or workflow is None:
@@ -268,6 +309,7 @@ def _lint(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
                                 _locate(root, ["inputs", j, "name"])))
 
     seen: set = set()
+    scanned: set = set()  # scalar nodes already scanned, shared across nodes (aliases)
     for i, n in enumerate(dag_nodes):
         if n.id in seen:
             errors.append(_diag("duplicate_id", f"duplicate node id '{n.id}'",
@@ -278,7 +320,7 @@ def _lint(content: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
                 errors.append(_diag("unknown_dependency",
                                     f"node '{n.id}' depends on unknown node '{dep}'",
                                     _locate(root, ["nodes", i, "depends_on", j]), n.id))
-        for s in _scalars(_node_at(root, ["nodes", i])):
+        for s in _scalars(_node_at(root, ["nodes", i]), scanned):
             for rx in (_INPUT_REF_RE, _MISCASED_INPUT_REF_RE):
                 for m in rx.finditer(s.value):
                     line = s.start_mark.line + 1
