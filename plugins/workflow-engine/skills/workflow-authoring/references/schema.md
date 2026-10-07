@@ -77,7 +77,7 @@ Source: `dag_node.py:200-216`, `dag_node.py:399-403`, `engine/nodes/approval.py:
   - `max_attempts` (`integer`, optional): Allowed rejection attempts (1–10; `dag_node.py:208`).
 
 ### 2.6 `loop` Node (Iterative Execution)
-Source: `dag_node.py:196-198`, `engine/schemas/loop.py:11-57`, `engine/nodes/loop.py:1-150`
+Source: `dag_node.py:196-198`, `engine/schemas/loop.py:11-56`, `engine/nodes/loop.py:1-150`
 - `loop` (`mapping`, required): Loop configuration (`LoopNodeConfig`; `dag_node.py:197`).
   - `prompt` (`string`, required): Prompt executed on each iteration (`loop.py:18-22`).
   - `over` (`list`, optional): Static list of items to iterate over; `$LOOP_ITEM` is substituted each iteration (`loop.py:14-17`).
@@ -94,7 +94,7 @@ Source: `dag_node.py:218-220`, `engine/nodes/cancel.py:1-40`
 - `cancel` (`string`, required): Reason string explaining why the workflow run was aborted (`dag_node.py:219`).
 
 ### 2.8 `subgraph` Node (Modular Subgraph Invocation)
-Source: `dag_node.py:222-232`, `engine/core/dag_executor.py:149-235`, `engine/nodes/subgraph.py:1-27`
+Source: `dag_node.py:222-232`, `engine/core/dag_executor.py:149-235`, `engine/nodes/subgraph.py:1-26`
 - `subgraph` (`mapping`, required): Reference configuration (`dag_node.py:231`).
   - `ref` (`string`, required): ID of child workflow definition (`^[a-z0-9][a-z0-9_-]*$`; `dag_node.py:223`).
   - `inputs` (`mapping`, optional): Input arguments passed to child subgraph (`dag_node.py:224`).
@@ -117,7 +117,7 @@ These fields can be attached to any DAG node:
 | `depends_on` | `list[string]` | List of upstream node IDs that must finish before this node runs (`dag_node.py:140, 318-322`). |
 | `when` | `string` | Condition expression evaluated before scheduling node (`dag_node.py:141`, `condition_evaluator.py:1-35`). |
 | `trigger_rule` | `string` | Dependency gating rule (`dag_node.py:142`): `"all_success"` (default), `"one_success"`, `"none_failed_min_one_success"`, `"all_done"` (`dag_node.py:24-36`, `dag_executor.py:415-430`). |
-| `retry` | `mapping` | Step retry policy (`StepRetryConfig`; `dag_node.py:150`, `retry.py:11-30`). Forbidden on loop nodes (`dag_node.py:363`). |
+| `retry` | `mapping` | Step retry policy (`StepRetryConfig`; `dag_node.py:150`, `retry.py:11-29`). Forbidden on loop nodes (`dag_node.py:363`). |
 | `idle_timeout` | `number` | Inactivity timeout in **milliseconds** (`dag_node.py:149, 371-375`). |
 | `context` | `string` | Session context mode: `"fresh"` or `"shared"` (`dag_node.py:145`). |
 | `output_format` | `mapping` | Structured JSON output schema definition (`dag_node.py:146`). |
@@ -138,7 +138,7 @@ Evaluated at runtime against completed node outputs. Returns `True` to run the n
 - **Compound AND/OR**: `"$a.output == 'X' && $b.output != 'Y'"` or `"$a.output == 'X' || $b.output == 'Y'"` (`condition_evaluator.py:10-12`). `&&` takes precedence over `||`. Parentheses are not supported (`condition_evaluator.py:12`).
 
 ### 3.2 `retry:` Configuration
-Source: `plugins/workflow-engine/engine/schemas/retry.py:11-30`
+Source: `plugins/workflow-engine/engine/schemas/retry.py:11-29`
 
 - `max_attempts` (`integer`, required): Maximum retry attempts (excluding initial try); must be between 1 and 5 (`retry.py:14-19`).
 - `delay_ms` (`number`, optional): Initial backoff delay in **milliseconds** (1000–60000 ms; `retry.py:20-25`). Doubled on each subsequent attempt.
