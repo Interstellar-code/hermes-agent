@@ -82,6 +82,9 @@ SEAMS = [
     ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
      "self._beam.canonical_hits(",
      "Mnemosyne recall merges canonical facts (plan step 11b)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
+     '_NIGHTLY_META_KEY = "nightly_sleep_last_run"',
+     "Mnemosyne nightly consolidation timer (nightly_sleep_enabled)"),
 ]
 
 
