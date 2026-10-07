@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ALLOWLIST = ROOT / "scripts" / "fork_drops_allowlist.txt"
 REPO = ROOT  # overridable via --repo, mainly for tests against a throwaway repo
 
+SUBMODULE_PREFIX = "plugins/memory/_matrix-memory-mnemosyne/"
 EXCLUDED_PREFIXES = ("tests/", "plugins/memory/_matrix-memory-mnemosyne/")
 
 DEF_LINE_RE = re.compile(r"(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
@@ -69,6 +70,9 @@ SEAMS = [
     ("hermes_cli/plugins.py", '"transform_tools"', "transform_tools in VALID_HOOKS (mcp_lazy)"),
     ("agent/usage_pricing.py", "def register_usage_observer(", "usage observer registry (mcp_lazy)"),
     ("agent/usage_pricing.py", "_notify_usage_observers(usage)", "usage observer notify call (mcp_lazy)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
+     "sleep_beam.canonical_owner_id = self._canonical_owner()",
+     "Mnemosyne sleep threads inherit canonical owner (model refresh writes to the right owner)"),
 ]
 
 
@@ -76,8 +80,13 @@ def missing_seams(after: str) -> list[tuple[str, str, str]]:
     missing = []
     for path, text, why in SEAMS:
         ref = [] if after == "WORKTREE" else [after]  # WORKTREE = uncommitted tree
+        cwd = REPO
+        if path.startswith(SUBMODULE_PREFIX):
+            # ponytail: parent git can't grep into a submodule; check its checked-out
+            # worktree (ignores --after). Upgrade to `git -C sub grep <gitlink-sha>` if needed.
+            cwd, path, ref = REPO / SUBMODULE_PREFIX.rstrip("/"), path[len(SUBMODULE_PREFIX):], []
         r = subprocess.run(["git", "grep", "-q", "-F", text, *ref, "--", path],
-                           cwd=REPO, capture_output=True, text=True)
+                           cwd=cwd, capture_output=True, text=True)
         if r.returncode not in (0, 1):
             raise RuntimeError(f"git grep failed: {r.stderr.strip()}")
         if r.returncode == 1:
