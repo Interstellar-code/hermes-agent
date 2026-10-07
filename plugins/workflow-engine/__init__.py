@@ -76,6 +76,14 @@ def register(ctx) -> None:  # noqa: ANN001
             )
         except Exception:
             logger.debug("workflow-engine: register_skill failed", exc_info=True)
+        try:
+            ctx.register_skill(
+                name="workflow-authoring",
+                path=Path(__file__).parent / "skills" / "workflow-authoring" / "SKILL.md",
+                description="Author, validate and save a workflow DAG YAML (schema, validate API, create-only save, versions).",
+            )
+        except Exception:
+            logger.debug("workflow-engine: register_skill failed", exc_info=True)
 
     logger.info(
         "workflow-engine plugin loaded — 5 tools + 1 CLI command registered; "
