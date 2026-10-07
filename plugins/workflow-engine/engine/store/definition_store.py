@@ -191,7 +191,8 @@ class DefinitionStore:
         ``snapshot_source`` labels the version snapshot ('save' or 'import').
         ``if_absent`` makes this create-only: a plain INSERT, so the PRIMARY KEY
         decides atomically across connections/processes; an existing id raises
-        DefinitionExistsError and writes nothing.
+        DefinitionExistsError and writes nothing. Without it, losing an insert
+        race to another connection raises ConflictError, also writing nothing.
         """
         workflow, error = validate_workflow_yaml(yaml_text, source_path or "<inline>")
         if error or workflow is None:
@@ -283,12 +284,19 @@ class DefinitionStore:
                 )
             except sqlite3.IntegrityError as exc:
                 # Only the id PRIMARY KEY means "taken"; other violations propagate.
-                if not if_absent or "workflow_definitions.id" not in str(exc):
+                if "workflow_definitions.id" not in str(exc):
                     raise
                 if self._conn.in_transaction:
                     self._conn.rollback()
-                raise DefinitionExistsError(
-                    f"definition {workflow.id!r} already exists"
+                if if_absent:
+                    raise DefinitionExistsError(
+                        f"definition {workflow.id!r} already exists"
+                    ) from exc
+                # Default path: another connection inserted this id between our
+                # SELECT and INSERT. Conflict, not a silent overwrite of a row
+                # the caller never saw.
+                raise ConflictError(
+                    f"definition {workflow.id!r} was created concurrently; reload and retry"
                 ) from exc
         self._snapshot(workflow.id, snapshot_source)
         self._conn.commit()

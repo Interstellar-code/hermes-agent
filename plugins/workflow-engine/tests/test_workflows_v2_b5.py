@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 
 import pytest
@@ -171,3 +172,51 @@ def test_invalid_yaml_still_422(eng, client):
 
 def test_feature_flag(client):
     assert "create_only" in client.get("/health").json()["features"]
+
+
+class _InsertAfterSelect:
+    """Connection proxy: right after the store's existence SELECT, another
+    connection (another process in production) inserts the same id — the
+    window the default save path can lose."""
+
+    def __init__(self, conn, db, wf):
+        self._real, self._db, self._wf = conn, db, wf
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def execute(self, sql, *args):
+        cur = self._real.execute(sql, *args)
+        if self._wf and sql.startswith("SELECT checksum FROM workflow_definitions"):
+            wf, self._wf = self._wf, None
+            other = sqlite3.connect(self._db)
+            other.execute(
+                "INSERT INTO workflow_definitions (id, name, description, source, yaml,"
+                " checksum, created_at, updated_at) VALUES (?, 'wf', 'd', 'user', ?, 'x', 0, 0)",
+                (wf, _yaml("other")),
+            )
+            other.commit()
+            other.close()
+        return cur
+
+
+def test_default_save_losing_insert_race_is_409(tmp_path):
+    db = str(tmp_path / "wf.db")
+    e = create_engine(db_path=db, seed_bundled=False, write_manifest=False, crash_recovery=False)
+    import plugins.workflow_engine.dashboard.plugin_api as api_mod
+    original = api_mod._engine
+    api_mod._engine = lambda: e
+    app = FastAPI()
+    app.include_router(api_mod.router)
+    try:
+        e._def_store._conn = _InsertAfterSelect(e._def_store._conn, db, "wf")
+        with TestClient(app) as c:
+            r = _post(c, _yaml("mine"))
+        assert r.status_code == 409, r.text
+        assert r.json()["error"] and "code" not in r.json()  # plain conflict, not id_taken
+        assert _row(e)["yaml"] == _yaml("other")  # the winner's row is untouched
+        assert _nsnaps(e) == 0
+        assert not e._conn.in_transaction
+    finally:
+        api_mod._engine = original
+        _arun(e.shutdown())
