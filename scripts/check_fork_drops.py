@@ -73,6 +73,15 @@ SEAMS = [
     ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
      "sleep_beam.canonical_owner_id = self._canonical_owner()",
      "Mnemosyne sleep threads inherit canonical owner (model refresh writes to the right owner)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/mnemosyne/core/beam.py",
+     "beam.canonical_owner_id = self.canonical_owner_id",
+     "Mnemosyne cross-session sweep beams inherit canonical owner"),
+    ("plugins/memory/_matrix-memory-mnemosyne/mnemosyne/core/beam.py",
+     "SLEEP_AGE_HOURS = int(",
+     "Mnemosyne sleep age decoupled from WM TTL (TTL=87600 must not stop consolidation)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
+     "self._beam.canonical_hits(",
+     "Mnemosyne recall merges canonical facts (plan step 11b)"),
 ]
 
 
