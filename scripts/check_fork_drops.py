@@ -85,6 +85,9 @@ SEAMS = [
     ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
      '_NIGHTLY_META_KEY = "nightly_sleep_last_run"',
      "Mnemosyne nightly consolidation timer (nightly_sleep_enabled)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
+     "def _strip_reply_quotes(",
+     "Mnemosyne memory hygiene (skip/strip rules in sync_turn, sleep skip, retention)"),
 ]
 
 
