@@ -88,6 +88,9 @@ SEAMS = [
     ("plugins/memory/_matrix-memory-mnemosyne/hermes_memory_provider/__init__.py",
      "def _strip_reply_quotes(",
      "Mnemosyne memory hygiene (skip/strip rules in sync_turn, sleep skip, retention)"),
+    ("plugins/memory/_matrix-memory-mnemosyne/mnemosyne/core/local_llm.py",
+     "_NOTHING_DURABLE = _NothingDurable()",
+     "Mnemosyne dynamic sleep prompts + NOTHING_DURABLE sentinel (no store, no nightly retry)"),
 ]
 
 
