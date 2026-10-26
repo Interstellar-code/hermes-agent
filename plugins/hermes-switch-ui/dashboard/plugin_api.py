@@ -139,79 +139,93 @@ _CHAIN_DEPTH_CAP = 50  # parent_session_id walks; also the cycle guard
 
 
 def _project_rollup(state_db: Path, projects_db: Path) -> dict:
-    """Inherited folders + listable counts for one profile, read-only, missing files -> zeros.
+    """Effective folders + listable counts for one profile, read-only; any failure -> zeros.
 
-    - ``inherited``: {session_id: project_id} for non-subagent sessions with no explicit binding
-      whose nearest parent_session_id ancestor has one (explicit always wins; depth-capped walk,
-      so cycles terminate).
-    - ``counts`` / ``listable_total``: the dashboard list/count rule (``_session_filter_where``,
-      exclude_children, archived=exclude -> matches ``profile_totals``). A listed row shows its
-      compression TIP, so each listable root is filed under its tip's effective project.
+    Rows are what the dashboard list shows: each listable root (``_session_filter_where``,
+    exclude_children, archived=exclude -> matches ``profile_totals``) projected to its compression
+    tip via the canonical ``_CHAIN_STEP_SQL`` choice. For each tip, walk ``parent_session_id`` up
+    (existing parents only, never across a /new reset, depth-capped so cycles end) to the nearest
+    explicitly bound session:
+    - ``owner``: {tip: bound ancestor} whenever the folder comes from an ancestor;
+    - ``inherited``: {tip: project} only when the walk crossed a non-compression edge (a
+      compression continuation is the same conversation, so it counts as filed).
     """
-    empty = {"inherited": {}, "counts": {}, "listable_total": 0}
+    empty = {"inherited": {}, "owner": {}, "effective": {}, "counts": {}, "listable_total": 0}
     if not state_db.is_file():
         return empty
     try:
-        from hermes_state_common import _ephemeral_child_sql, _sql_json_extract
+        from hermes_state_common import _RESET_CHILD_SQL, _sql_json_extract
+        from hermes_state_compression import _CHAIN_STEP_SQL
         from hermes_state_sessions import _session_filter_where, _where_sql
     except ImportError:
         return empty
     where, params = _session_filter_where(exclude_children=True)
-    delegate = _sql_json_extract("{a}.model_config", "$._delegate_from")
-    conn = sqlite3.connect(f"{state_db.resolve().as_uri()}?mode=ro", uri=True)
+    if _CHAIN_STEP_SQL.count("parent.id = ?") == 1:
+        step = _CHAIN_STEP_SQL.replace("parent.id = ?", "parent.id = down.cur")
+        down_step = f"JOIN sessions nxt ON nxt.id = ({step}) WHERE down.depth < ?"
+    else:
+        # Upstream reshaped the step SQL: each root is its own tip (non-compressed counts stay
+        # exact) rather than failing the whole rollup to zeros.
+        log.error("project-map: _CHAIN_STEP_SQL shape changed; compression tips not followed")
+        down_step = "JOIN sessions nxt ON nxt.id = down.cur WHERE 0 AND down.depth < ?"
+    tips_sql = f"""down(root, cur, depth) AS (
+            SELECT s.id, s.id, 0 FROM sessions s{_where_sql(where, ' ')}
+            UNION ALL
+            SELECT down.root, nxt.id, down.depth + 1 FROM down
+            {down_step}
+        ), tips(tip) AS (
+            SELECT cur FROM (SELECT cur, ROW_NUMBER() OVER (PARTITION BY root ORDER BY depth DESC) AS rn
+                             FROM down) WHERE rn = 1
+        )"""
+    jx = _sql_json_extract
+    conn = None
     try:
+        conn = sqlite3.connect(f"{state_db.resolve().as_uri()}?mode=ro", uri=True)
         if not projects_db.is_file():
-            total = conn.execute(f"SELECT COUNT(*) FROM sessions s{_where_sql(where, ' ')}", params).fetchone()[0]
+            total = conn.execute(f"WITH RECURSIVE {tips_sql} SELECT COUNT(*) FROM tips",
+                                 [*params, _CHAIN_DEPTH_CAP]).fetchone()[0]
             return {**empty, "listable_total": total}
         conn.execute("ATTACH DATABASE ? AS pj", (f"{projects_db.resolve().as_uri()}?mode=ro",))
-        # Effective project per non-subagent session: walk up until the first bound node.
-        effective: dict = {}
-        inherited: dict = {}
-        for sid, pid, depth in conn.execute(
-            f"""WITH RECURSIVE up(start, cur, depth, pid) AS (
-                SELECT s.id, s.id, 0, b.project_id FROM sessions s
-                LEFT JOIN pj.project_sessions b ON b.session_id = s.id
-                WHERE NOT {_ephemeral_child_sql('s')} AND {delegate.format(a='s')} IS NULL
+        rows = conn.execute(
+            f"""WITH RECURSIVE {tips_sql},
+            up(tip, cur, depth, pid, crossed) AS (
+                SELECT t.tip, t.tip, 0, b.project_id, 0 FROM tips t
+                LEFT JOIN pj.project_sessions b ON b.session_id = t.tip
+                    AND b.project_id IN (SELECT id FROM pj.projects)
                 UNION ALL
-                SELECT up.start, p.parent_session_id, up.depth + 1, b.project_id FROM up
-                JOIN sessions p ON p.id = up.cur
-                LEFT JOIN pj.project_sessions b ON b.session_id = p.parent_session_id
-                WHERE up.pid IS NULL AND p.parent_session_id IS NOT NULL AND up.depth < ?
-            ) SELECT start, pid, depth FROM up WHERE pid IS NOT NULL""",
-            (_CHAIN_DEPTH_CAP,),
-        ):
-            effective[sid] = pid
-            if depth:
-                inherited[sid] = pid
-        # Listable roots -> deepest compression descendant (the row the list shows).
-        counts: dict = {}
-        total = 0
-        for _root, tip in conn.execute(
-            f"""WITH RECURSIVE down(root, cur, depth) AS (
-                SELECT s.id, s.id, 0 FROM sessions s{_where_sql(where, ' ')}
-                UNION ALL
-                SELECT down.root, c.id, down.depth + 1 FROM down
-                JOIN sessions p ON p.id = down.cur AND p.end_reason = 'compression'
-                JOIN sessions c ON c.parent_session_id = p.id
-                    AND {_sql_json_extract('c.model_config', '$._branched_from')} IS NULL
-                    AND {delegate.format(a='c')} IS NULL AND COALESCE(c.source, '') != 'tool'
-                WHERE down.depth < ?
-            ), ranked AS (
-                SELECT root, cur, ROW_NUMBER() OVER (PARTITION BY root ORDER BY depth DESC, cur DESC) AS rn
-                FROM down
-            ) SELECT root, cur FROM ranked WHERE rn = 1""",
-            [*params, _CHAIN_DEPTH_CAP],
-        ):
-            total += 1
-            pid = effective.get(tip)
-            if pid:
-                counts[pid] = counts.get(pid, 0) + 1
-        return {"inherited": inherited, "counts": counts, "listable_total": total}
+                SELECT up.tip, p.id, up.depth + 1, b.project_id,
+                       up.crossed OR NOT (p.end_reason = 'compression'
+                           AND {jx('c.model_config', '$._branched_from')} IS NULL
+                           AND {jx('c.model_config', '$._delegate_from')} IS NULL
+                           AND COALESCE(c.source, '') != 'tool')
+                FROM up
+                JOIN sessions c ON c.id = up.cur
+                JOIN sessions p ON p.id = c.parent_session_id
+                LEFT JOIN pj.project_sessions b ON b.session_id = p.id
+                    AND b.project_id IN (SELECT id FROM pj.projects)
+                WHERE up.pid IS NULL AND up.depth < ? AND NOT ({_RESET_CHILD_SQL.format(a='c')})
+            )
+            SELECT t.tip, up.cur, up.pid, up.depth, up.crossed FROM tips t
+            LEFT JOIN up ON up.tip = t.tip AND up.pid IS NOT NULL""",
+            [*params, _CHAIN_DEPTH_CAP, _CHAIN_DEPTH_CAP],
+        ).fetchall()
     except sqlite3.Error as exc:
         log.warning("project-map rollup failed: %s", exc)
         return empty
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+    out = {**empty, "listable_total": len(rows)}
+    for tip, owner, pid, depth, crossed in rows:
+        if not pid:
+            continue
+        out["effective"][tip] = pid
+        out["counts"][pid] = out["counts"].get(pid, 0) + 1
+        if depth:
+            out["owner"][tip] = owner
+            if crossed:
+                out["inherited"][tip] = pid
+    return out
 
 
 @router.get("/project-map", dependencies=[Depends(_require_auth)])
@@ -221,7 +235,9 @@ def project_map(request: Request, profile: str | None = None):
     Read-only: a missing projects.db yields an empty map (never created on read).
     Response: { version, projects: [{id,slug,name,icon,color,archived,board_slug}],
                 sessions: {session_id: project_id} (explicit + inherited from the parent chain),
-                inherited: {session_id: true}, counts: {project_id: listable sessions},
+                inherited: {session_id: true}, binding_owner: {session_id: bound ancestor id},
+                counts: {project_id: listable sessions},
+                listable: [filed listable tip ids — the rows behind counts],
                 listable_total, unfiled }; ETag + 304 on If-None-Match.
     """
     try:
@@ -260,12 +276,16 @@ def project_map(request: Request, profile: str | None = None):
             }
 
     rollup = _project_rollup(db_path.parent / "state.db", db_path)
-    sessions.update(rollup["inherited"])
+    sessions.update(rollup["effective"])
     counts, listable_total = rollup["counts"], rollup["listable_total"]
     payload = {
         "version": _VERSION, "projects": projects, "sessions": sessions,
-        "inherited": {sid: True for sid in rollup["inherited"]}, "counts": counts,
+        "inherited": {sid: True for sid in rollup["inherited"]},
+        "binding_owner": rollup["owner"], "counts": counts,
         "listable_total": listable_total, "unfiled": max(0, listable_total - sum(counts.values())),
+        # Filed listable tips (exactly the rows behind ``counts``), so clients can fetch a
+        # folder's missing rows without re-deriving which chain segment the list shows.
+        "listable": sorted(rollup["effective"]),
     }
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     etag = '"' + hashlib.sha1(body.encode()).hexdigest() + '"'
