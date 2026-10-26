@@ -470,7 +470,7 @@ async def get_session_stats(profile: Optional[str] = None):
             pass
         return out
 
-    return _with_db(profile, _stats, read_only=True)
+    return await asyncio.to_thread(_with_db, profile, _stats, read_only=True)
 
 
 @manage_router.get("/api/sessions/{session_id}")
@@ -486,7 +486,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
         session["is_default_profile"] = session["profile"] == "default"
         return session
 
-    return _with_db(profile, _detail, read_only=True)
+    return await asyncio.to_thread(_with_db, profile, _detail, read_only=True)
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
@@ -648,7 +648,7 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
         result["title"] = db.get_session_title(sid) or ""
         return result
 
-    return _with_db(body.profile, _update, read_only=False)
+    return await asyncio.to_thread(_with_db, body.profile, _update, read_only=False)
 
 
 def _compact_json(obj) -> str:
