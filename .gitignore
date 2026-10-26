@@ -247,3 +247,4 @@ cache/
 # Regenerated on demand; never a repo artifact.
 .serena/
 /.matrixkoder/
+/.archify/
