@@ -8,7 +8,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-09-11T05:46:46.693678Z"
+exclude-newer = "2026-09-21T05:48:27.505967Z"
 exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
@@ -87,9 +87,10 @@ python-dotenv = false
 daytona = false
 uvicorn = false
 nemo-relay = false
-requests = false
+av = false
 httplib2 = false
 httpx = false
+requests = false
 pyasn1 = false
 snowballstemmer = false
 concurrent-log-handler = false
@@ -1954,6 +1955,7 @@ vertex = [
     { name = "google-auth" },
 ]
 voice = [
+    { name = "av" },
     { name = "faster-whisper" },
     { name = "numpy" },
     { name = "sounddevice" },
@@ -1996,6 +1998,7 @@ requires-dist = [
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = "==0.87.0" },
     { name = "asyncpg", marker = "extra == 'matrix'", specifier = "==0.31.0" },
+    { name = "av", marker = "extra == 'voice'", specifier = "==17.0.0" },
     { name = "azure-identity", marker = "extra == 'azure-identity'", specifier = "==1.25.3" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.2" },

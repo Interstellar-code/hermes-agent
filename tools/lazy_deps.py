@@ -68,6 +68,12 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "stt.mistral": ("mistralai==2.4.8",),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
+        # av must be pinned in lockstep with the [voice] extra in
+        # pyproject.toml: faster-whisper declares only `av>=11`, and PyAV
+        # removed the `metadata_errors` kwarg after 17.x, so an unpinned
+        # resolve pulls av 19+ and crashes decode_audio with a TypeError
+        # (observed 2026-10-05). See pyproject.toml [voice] comment.
+        "av==17.0.0",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),

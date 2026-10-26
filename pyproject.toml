@@ -219,6 +219,15 @@ tts-premium = ["elevenlabs==1.59.0"]
 voice = [
   # Local STT pulls in wheel-only transitive deps (ctranslate2, onnxruntime).
   "faster-whisper==1.2.1",
+  # av is a transitive of faster-whisper (declared only as `av>=11`), but it
+  # is exact-pinned here anyway: faster-whisper 1.2.1's decode_audio calls
+  # `av.open(..., metadata_errors="ignore")`, a kwarg PyAV removed after
+  # 17.x (verified: av 19.0.1 rejects it with TypeError; 17.0.0 accepts).
+  # Left unpinned, the lazy-install path (tools/lazy_deps.py) resolved the
+  # latest av on 2026-10-05 and broke every local transcription with
+  # "open() got an unexpected keyword argument 'metadata_errors'".
+  # Keep in lockstep with LAZY_DEPS["stt.faster_whisper"].
+  "av==17.0.0",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
 ]
@@ -486,6 +495,7 @@ aiosqlite = false
 alibabacloud-dingtalk = false
 anthropic = false
 asyncpg = false
+av = false
 azure-identity = false
 boto3 = false
 brotlicffi = false
