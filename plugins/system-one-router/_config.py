@@ -17,6 +17,23 @@ DEFAULTS: dict[str, Any] = {
     "base_url": "https://jevtypesafeai.com/api/v1/decide",
     "model": "jev-latest",
     "max_monthly_usd": 2.0,
+    # Model-tier map (use case #2): Jev picks a TIER (small menu, its sweet
+    # spot); this map turns the tier into a concrete model on the Manifest
+    # proxy. Verified 2026-10-04: zai family live-working, ollama-cloud
+    # weekly-capped (fallbacks absorb), clawbay/opencode-go excluded by owner.
+    # Override per-tier in config.yaml under plugins.system-one-router.tier_map.
+    "tier_map": {
+        "flash": {"model": "zai/glm-5.3-flash-subscription",
+                  "fallback": "zai/glm-5-turbo-subscription"},
+        "standard": {"model": "zai/glm-5.2-subscription",
+                     "fallback": "zai/glm-5.1-subscription"},
+        "coding": {"model": "ollama-cloud/kimi-k2.7-code-subscription",
+                   "fallback": "zai/glm-5.3-subscription"},
+        "strong": {"model": "ollama-cloud/kimi-k3-subscription",
+                   "fallback": "zai/glm-5.3-subscription"},
+        "bulk": {"model": "ollama-cloud/deepseek-v4.1-flash-subscription",
+                 "fallback": "zai/glm-5.3-flash-subscription"},
+    },
 }
 
 _ENV_KEYS = {
