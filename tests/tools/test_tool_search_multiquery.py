@@ -562,3 +562,26 @@ class TestConfigAndSchema:
         name_description = describe_params["properties"]["names"]["description"]
         assert "single string is accepted" in name_description
         assert "one name" in name_description
+
+    def test_bridge_free_form_objects_allow_any_keys(self):
+        """A properties-less object without additionalProperties is read by
+        schema-constrained backends as "no keys allowed", so every deferred
+        call arrives with {} (#96610). Walk every bridge schema node."""
+        from tools.tool_search import bridge_tool_schemas
+
+        def walk(node, path):
+            if isinstance(node, dict):
+                if node.get("type") == "object" and "properties" not in node:
+                    assert node.get("additionalProperties") is True, path
+                for key, child in node.items():
+                    walk(child, f"{path}.{key}")
+            elif isinstance(node, list):
+                for i, child in enumerate(node):
+                    walk(child, f"{path}[{i}]")
+
+        schemas = bridge_tool_schemas(3)
+        for schema in schemas:
+            walk(schema["function"]["parameters"], schema["function"]["name"])
+        call = next(s for s in schemas if s["function"]["name"] == "tool_call")
+        args = call["function"]["parameters"]["properties"]["calls"]["items"]["properties"]["arguments"]
+        assert args["additionalProperties"] is True

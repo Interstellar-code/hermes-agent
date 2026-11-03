@@ -311,7 +311,14 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
                         "type": "object",
                         "properties": {
                             "name": {"type": "string", "description": "Exact tool name to invoke."},
-                            "arguments": {"type": "object", "description": "Arguments matching the tool schema."},
+                            # Free-form: the shape is per-target. Without
+                            # additionalProperties, schema-constrained backends
+                            # read "object with no keys" and emit {} (#96610).
+                            "arguments": {
+                                "type": "object",
+                                "description": "Arguments matching the tool schema.",
+                                "additionalProperties": True,
+                            },
                         },
                         "required": ["name", "arguments"],
                     },
